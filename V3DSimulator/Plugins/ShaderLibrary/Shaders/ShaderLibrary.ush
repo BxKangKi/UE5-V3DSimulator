@@ -1,0 +1,143 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+#ifndef SHADER_LIBRARY_USH
+#define SHADER_LIBRARY_USH
+#pragma once
+// /Plugin/ShaderLibrary/ShaderLibrary.ush
+
+float InvLerp(float a, float b, float v)
+{
+    return (v - a) / (b - a);
+}
+
+float NormalToTangent(float3 NormalMap)
+{
+    // Convert from [0,1] to [-1,1]
+    float3 tangentNormal = normalize(NormalMap * 2.0f - 1.0f);
+    return tangentNormal;
+}
+
+
+float2 ParticlePosToScreenUV(float3 World, float3 View, float FlipY)
+{
+    // Assuming World is your input float3 position
+    // Assuming ViewProj is your View * Projection matrix (pre-multiplied on CPU)
+    // Assuming FlipY is a uniform/constant
+
+    const float4 clipPos = mul(float4(World, 1.0f), ViewProj);
+
+    // --- Epsilon-Max Approach (Branchless W-Guard) ---
+    // 1. Get the sign of W (1.0 or -1.0).
+    // 2. Force W to be at least 1e-6 to avoid division by zero or extreme precision loss.
+    const float w = sign(clipPos.w) * max(abs(clipPos.w), 1e-6f);
+
+    // Standard perspective divide to get Normalized Device Coordinates
+    const float3 ndc = clipPos.xyz / w;
+
+    // --- Optimized UV Mapping ---
+    // Combined Scale, Bias, and Y-Flip into a single MAD (Multiply-Add) operation.
+    // The ternary operator for the float2 constant is resolved at compile time if FlipY is a uniform.
+    const float2 uvScale = float2(0.5f, FlipY ? -0.5f : 0.5f);
+    const float2 uvBias = float2(0.5f, FlipY ? 1.0f : 0.0f);
+
+    const float2 uv = ndc.xy * uvScale + uvBias;
+
+    // saturate() is a "free" hardware instruction that clamps 0.0 to 1.0
+    return saturate(uv);
+}
+
+
+float3 WorldToTangent(float3 TangentWS, float3 NormalWS, float3 NormalMap)
+{
+    // Inputs from vertex shader or interpolated per-pixel
+    const TangentWS = normalize(TangentWS); // Tangent vector in world space
+    const NormalWS = normalize(NormalWS);   // Normal vector in world space
+    const float TangentW = 1.0;               // Handedness component
+
+    // Calculate Binormal (bitangent) using cross product and handedness
+    const float3 BinormalWS = normalize(cross(NormalWS, TangentWS) * TangentW);
+
+    // Sampled normal from normal map in tangent space (usually read from texture)
+    const float3 TangentNormal = normalize(NormalMap * 2.0 - 1.0);
+
+    // Transform tangent space normal to world space
+    const float3 WorldNormal = normalize(
+        TangentWS * TangentNormal.x +
+        BinormalWS * TangentNormal.y +
+        NormalWS * TangentNormal.z);
+
+    return WorldNormal;
+    // Use WorldNormal for lighting or other calculations
+}
+
+float3x3 TransformMatrix(float3 X, float3 Y, float3 Z)
+{
+    return float3x3(X.x, Y.x, Z.x, X.y, Y.y, Z.y, X.z, Y.z, Z.z);
+}
+
+float4 NormalFromBase(float3 L, float3 R, float3 T, float3 B, float3 C)
+{
+    // 입력:
+    float3x3 ColorLRT = TransformMatrix(L,R,T); // L, R, T 색상 3개 (각 행이 RGB 벡터)
+    float3x3 ColorBC = TransformMatrix(B,C,0);      // B, Center, (0,0,0) 3개 RGB 벡터
+
+    const float3 Weight = float3(0.299, 0.587, 0.114);
+
+    // L, R, T 회색조 계산 (3x3 * 3x1)
+    const float3 heightsLRT = mul(ColorLRT, Weight);
+
+    // B, Center, 빈 행 회색조 계산 (3x3 * 3x1)
+    const float3 heightsBC = mul(ColorBC, Weight);
+
+    // 높이 차이 계산
+    const float dX = heightsLRT[1] - heightsLRT[0]; // R - L
+    const float dY = heightsLRT[2] - heightsBC[0];   // T - B
+
+    // 중앙 높이
+    const float HeightCenter = heightsBC[1];
+
+    // 노멀 벡터 계산
+    // 기존 노멀 계산 코드 후
+    const float normalStrength = 1.0;
+    float3 normal = normalize(float3(-dX * normalStrength, -dY * normalStrength, 1.0));
+
+    // 기본적으로 Z 축을 양수로 유지 (노말 방향이 표면 밖으로 향하도록)
+    normal.z = saturate(normal.z);
+
+    // 노멀 맵은 일반적으로 [0,1] 범위에 매핑
+    const float3 normalMap = normal * 0.5 + 0.5;
+
+    // (보통 언리얼은 RGB 각각 X,Y,Z축으로 사용하므로 그대로 써도 무방)
+    // 만약 필요하면 Y 축을 반전할 수 있음 (normalMap.g = 1 - normalMap.g)
+
+    // 결과 (R = 높이, G, B, A = 노멀)
+    return float4(HeightCenter, normalMap.g, -normalMap.b, normalMap.r);
+}
+
+
+float CausticsFadeOut(float Z, float MinZ, float MaxZ, float3 ObjPos)
+{
+    Z = abs(ObjPos.z - Z);
+    return saturate(InvLerp(MaxZ, MinZ, Z)) * saturate(InvLerp(0.0, MinZ, Z));
+}
+
+float2 AltasUV(float GridSize, float Index, float2 UV)
+{
+    float2 CellSize = 1.0 / GridSize;
+
+    float SafeIndex = floor(Index + 0.5);
+
+    float2 Offset;
+    Offset.x = fmod(SafeIndex, GridSize);
+    Offset.y = floor(SafeIndex / GridSize);
+
+    float2 TiledUV = frac(UV);
+
+    float2 Inset = 0.01;
+
+    float2 CellMin = Offset * CellSize + Inset;
+    float2 CellMax = (Offset + 1.0) * CellSize - Inset;
+
+    return lerp(CellMin, CellMax, TiledUV);
+}
+
+#endif

@@ -1,0 +1,1 @@
+sh "/Users/Shared/Epic Games/UE_5.7/Engine/Build/BatchFiles/Mac/GenerateProjectFiles.sh" "/Users/owner/Documents/GitHub/UE5-V3DSimulator/V3DSimulator/V3DSimulator.uproject"

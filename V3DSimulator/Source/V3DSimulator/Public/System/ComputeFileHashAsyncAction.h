@@ -1,0 +1,41 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+// Copyright © 2026 Epic Games, Inc. All rights reserved.
+
+/**
+ * @file ComputeFileHashAsyncAction.h
+ * Role: Defines this source unit's responsibility within V3DSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
+ */
+
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Kismet/BlueprintAsyncActionBase.h"
+#include "ComputeFileHashAsyncAction.generated.h"
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnHashComputed, FString, Hash);
+
+UCLASS()
+class V3DSIMULATOR_API UComputeFileHashAsyncAction : public UBlueprintAsyncActionBase
+{
+    GENERATED_BODY()
+
+public:
+    // Static function callable from Blueprint.
+    UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true"), Category = "File|Hash")
+    static UComputeFileHashAsyncAction *ComputeFileHashAsync(UObject *WorldContextObject, const FString &FilePath);
+
+    // Blueprint event binding.
+    UPROPERTY(BlueprintAssignable)
+    FOnHashComputed OnCompleted;
+
+    // Asynchronous execution override.
+    virtual void Activate() override;
+
+private:
+    FString TargetFilePath;
+
+    UPROPERTY()
+    TObjectPtr<UObject> WorldContextObject;
+};

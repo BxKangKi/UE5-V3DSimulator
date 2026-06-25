@@ -1,0 +1,26 @@
+using UnrealBuildTool;
+
+public class ShaderLibrary : ModuleRules
+{
+    public ShaderLibrary(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        PublicDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Core",
+                "CoreUObject",
+                "Engine"
+            });
+
+        PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Niagara",
+                "Projects",
+                "RenderCore",
+                "RHI"
+            });
+    }
+}
