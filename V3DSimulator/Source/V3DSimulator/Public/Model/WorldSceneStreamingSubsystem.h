@@ -71,12 +71,28 @@ public:
     bool IsPlayerLoaded() const;
     float GetLoadingStatus() const;
 
+    /** Preloads a destination without moving the player; current and destination areas may coexist. */
+    void SetPriorityStreamingFocus(const FVector& WorldLocation);
+    void ClearPriorityStreamingFocus();
+    bool IsLocationReady(const FVector& WorldLocation) const;
+
+    /** Resolves the coarse built-world vertical range intersecting WorldLocation.XY. */
+    bool GetVerticalBoundsAtXY(const FVector& WorldLocation, double& OutMinZ, double& OutMaxZ) const;
+
+    /** Primary streaming observer. Priority preload focus wins while one is active. */
+    FVector GetStreamingLocation() const;
+    /** All active observers, with the priority preload target first and the live player retained. */
+    void GetStreamingObserverLocations(TArray<FVector>& OutLocations) const;
+
     UFUNCTION(BlueprintCallable, Category="World|Streaming|Player")
     bool CycleNextPlayerCharacter();
 
     /** Mutates game-thread-owned streaming state. Worker-thread calls are rejected. */
     void SetRenderOnlyStreaming(bool bInRenderOnlyStreaming);
     bool IsRenderOnlyStreaming() const;
+
+    /** Re-applies the automatic streaming profile after ViewDistanceQuality changes. */
+    void RefreshStreamingQuality();
 
     /** True only while this persistent GameInstance subsystem belongs to World. */
     bool IsActiveForWorld(const UWorld* World) const;
@@ -116,6 +132,8 @@ private:
     bool bPlayerActivated = false;
     bool bRenderOnlyStreaming = false;
     bool bInitialBurstUpdateQueued = false;
+    bool bHasPriorityStreamingFocus = false;
+    FVector PriorityStreamingFocus = FVector::ZeroVector;
 
     TWeakObjectPtr<ACharacterController> ActivePlayerCharacter;
     double PlayerActorWaitStartedAt = 0.0;

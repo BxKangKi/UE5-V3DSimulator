@@ -14,9 +14,13 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/DefaultValueHelper.h"
 #include "Misc/Parse.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/WorldObjectStreamingSubsystem.h"
+#include "Model/WorldSceneStreamingSubsystem.h"
+#include "TimerManager.h"
 #include "Weather/WeatherSubsystem.h"
 #include "World/WorldData.h"
 
@@ -26,6 +30,17 @@ namespace
     {
         return Value.Equals(Expected, ESearchCase::IgnoreCase);
     }
+}
+
+void USimulatorCommandSubsystem::Deinitialize()
+{
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(PendingTeleportTimer);
+    }
+    ClearTeleportStreamingFocus();
+    PendingTeleport = FPendingTeleportRequest();
+    Super::Deinitialize();
 }
 
 bool USimulatorCommandSubsystem::ExecuteCommand(
@@ -233,6 +248,12 @@ bool USimulatorCommandSubsystem::ExecuteTeleport(
         return false;
     }
 
+    if (PendingTeleport.bActive)
+    {
+        OutMessage = TEXT("Teleport rejected: another destination is still being preloaded.");
+        return false;
+    }
+
     double X = 0.0;
     double Y = 0.0;
     double Z = 0.0;
@@ -252,8 +273,6 @@ bool USimulatorCommandSubsystem::ExecuteTeleport(
     FString PlayerName;
     if (Args.Num() >= 4)
     {
-        // TArray does not expose FString-style Mid(). Build the optional player name
-        // explicitly so names containing spaces remain supported on every UE5 version.
         PlayerName = Args[3];
         for (int32 Index = 4; Index < Args.Num(); ++Index)
         {
@@ -270,24 +289,204 @@ bool USimulatorCommandSubsystem::ExecuteTeleport(
         return false;
     }
 
-    const FVector Destination(X, Y, Z);
-    const bool bMoved = TargetPawn->TeleportTo(
-        Destination,
-        TargetPawn->GetActorRotation(),
-        false,
-        true);
-    if (!bMoved)
+    UWorld* World = TargetPawn->GetWorld();
+    if (!World || World != Controller->GetWorld())
     {
+        OutMessage = TEXT("Teleport failed because the target world is unavailable.");
+        return false;
+    }
+
+    const FVector Destination(X, Y, Z);
+    const FString TargetName = IsValid(TargetController->PlayerState)
+        ? TargetController->PlayerState->GetPlayerName()
+        : TargetController->GetName();
+
+    // Add the destination as a second streaming observer before moving the Pawn. The current player
+    // area remains resident until both the 512 m object chunks and every intersecting static model
+    // (including its internal fine chunks) report completion.
+    PendingTeleport.RequestingController = Controller;
+    PendingTeleport.TargetController = TargetController;
+    PendingTeleport.Destination = Destination;
+    PendingTeleport.TargetName = TargetName;
+    PendingTeleport.StartedAtSeconds = FPlatformTime::Seconds();
+    PendingTeleport.bActive = true;
+
+    if (PrepareTeleportDestination(World, Destination))
+    {
+        const bool bMoved = TargetPawn->TeleportTo(
+            Destination, TargetPawn->GetActorRotation(), false, true);
+        if (bMoved)
+        {
+            if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(TargetPawn))
+            {
+                Manager->SetPlayerLocation(TargetPawn->GetActorLocation(), TargetPawn);
+            }
+            ClearTeleportStreamingFocus();
+            ResetPendingTeleport();
+            OutMessage = FString::Printf(
+                TEXT("Teleported %s to %.3f %.3f %.3f"), *TargetName, X, Y, Z);
+            return true;
+        }
+
+        ClearTeleportStreamingFocus();
+        ResetPendingTeleport();
         OutMessage = TEXT("Teleport failed because the destination was rejected.");
         return false;
     }
 
-    const FString TargetName = IsValid(TargetController->PlayerState)
-        ? TargetController->PlayerState->GetPlayerName()
-        : TargetController->GetName();
-    OutMessage = FString::Printf(TEXT("Teleported %s to %.3f %.3f %.3f"), *TargetName, X, Y, Z);
+    SchedulePendingTeleportCheck();
+    OutMessage = FString::Printf(
+        TEXT("Preloading destination for %s at %.3f %.3f %.3f; teleport will occur when the area is fully ready."),
+        *TargetName, X, Y, Z);
     return true;
 }
+
+bool USimulatorCommandSubsystem::PrepareTeleportDestination(
+    UWorld* World,
+    const FVector& Destination) const
+{
+    if (!World
+        || !FMath::IsFinite(Destination.X)
+        || !FMath::IsFinite(Destination.Y)
+        || !FMath::IsFinite(Destination.Z))
+    {
+        return false;
+    }
+
+    bool bObjectAreaReady = true;
+    if (UWorldObjectStreamingSubsystem* Chunks = World->GetSubsystem<UWorldObjectStreamingSubsystem>())
+    {
+        if (Chunks->IsRunning())
+        {
+            Chunks->SetPriorityStreamingFocus(Destination);
+            bObjectAreaReady = Chunks->IsAreaLoaded(Destination);
+        }
+    }
+
+    bool bSceneAreaReady = true;
+    if (UWorldSceneStreamingSubsystem* Scenes = UWorldSceneStreamingSubsystem::Get(World))
+    {
+        if (Scenes->IsActiveForWorld(World))
+        {
+            Scenes->SetPriorityStreamingFocus(Destination);
+            bSceneAreaReady = Scenes->IsLocationReady(Destination);
+        }
+    }
+
+    return bObjectAreaReady && bSceneAreaReady;
+}
+
+void USimulatorCommandSubsystem::SchedulePendingTeleportCheck()
+{
+    if (!PendingTeleport.bActive) return;
+    APlayerController* TargetController = PendingTeleport.TargetController.Get();
+    UWorld* World = IsValid(TargetController) ? TargetController->GetWorld() : GetWorld();
+    if (!World)
+    {
+        ClearTeleportStreamingFocus();
+        ResetPendingTeleport();
+        return;
+    }
+
+    World->GetTimerManager().SetTimer(
+        PendingTeleportTimer,
+        this,
+        &USimulatorCommandSubsystem::ProcessPendingTeleport,
+        TeleportPollIntervalSeconds,
+        false);
+}
+
+void USimulatorCommandSubsystem::ProcessPendingTeleport()
+{
+    if (!PendingTeleport.bActive) return;
+
+    APlayerController* TargetController = PendingTeleport.TargetController.Get();
+    APawn* TargetPawn = IsValid(TargetController) ? TargetController->GetPawn() : nullptr;
+    UWorld* World = IsValid(TargetPawn) ? TargetPawn->GetWorld() : nullptr;
+    if (!World || !IsValid(TargetPawn))
+    {
+        SendTeleportStatus(TEXT("Teleport cancelled because the target player/pawn is no longer available."));
+        ClearTeleportStreamingFocus();
+        ResetPendingTeleport();
+        return;
+    }
+
+    if (FPlatformTime::Seconds() - PendingTeleport.StartedAtSeconds > TeleportLoadTimeoutSeconds)
+    {
+        SendTeleportStatus(FString::Printf(
+            TEXT("Teleport to %.3f %.3f %.3f timed out while waiting for streaming."),
+            PendingTeleport.Destination.X, PendingTeleport.Destination.Y, PendingTeleport.Destination.Z));
+        ClearTeleportStreamingFocus();
+        ResetPendingTeleport();
+        return;
+    }
+
+    if (!PrepareTeleportDestination(World, PendingTeleport.Destination))
+    {
+        SchedulePendingTeleportCheck();
+        return;
+    }
+
+    const FVector Destination = PendingTeleport.Destination;
+    const FString TargetName = PendingTeleport.TargetName;
+    const bool bMoved = TargetPawn->TeleportTo(
+        Destination, TargetPawn->GetActorRotation(), false, true);
+    if (bMoved)
+    {
+        if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(TargetPawn))
+        {
+            Manager->SetPlayerLocation(TargetPawn->GetActorLocation(), TargetPawn);
+        }
+        SendTeleportStatus(FString::Printf(
+            TEXT("Teleported %s to %.3f %.3f %.3f after destination streaming completed."),
+            *TargetName, Destination.X, Destination.Y, Destination.Z));
+    }
+    else
+    {
+        SendTeleportStatus(TEXT("Teleport failed because the fully streamed destination was rejected."));
+    }
+
+    ClearTeleportStreamingFocus();
+    ResetPendingTeleport();
+}
+
+void USimulatorCommandSubsystem::ClearTeleportStreamingFocus()
+{
+    UWorld* World = nullptr;
+    if (APlayerController* TargetController = PendingTeleport.TargetController.Get())
+    {
+        World = TargetController->GetWorld();
+    }
+    if (!World) World = GetWorld();
+    if (!World) return;
+
+    if (UWorldObjectStreamingSubsystem* Chunks = World->GetSubsystem<UWorldObjectStreamingSubsystem>())
+    {
+        Chunks->ClearPriorityStreamingFocus();
+    }
+    if (UWorldSceneStreamingSubsystem* Scenes = UWorldSceneStreamingSubsystem::Get(World))
+    {
+        Scenes->ClearPriorityStreamingFocus();
+    }
+}
+
+void USimulatorCommandSubsystem::ResetPendingTeleport()
+{
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(PendingTeleportTimer);
+    }
+    PendingTeleport = FPendingTeleportRequest();
+}
+
+void USimulatorCommandSubsystem::SendTeleportStatus(const FString& Message) const
+{
+    if (APlayerController* RequestingController = PendingTeleport.RequestingController.Get())
+    {
+        RequestingController->ClientMessage(Message);
+    }
+}
+
 
 void USimulatorCommandSubsystem::Tokenize(const FString& Input, TArray<FString>& OutTokens)
 {

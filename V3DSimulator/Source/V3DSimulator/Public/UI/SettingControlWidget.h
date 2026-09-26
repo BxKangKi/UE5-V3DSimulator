@@ -21,8 +21,9 @@ class USettingsMenuWidget;
 /**
  * Base contract for a generated setting row WBP.
  *
- * Visual layout is owned entirely by Blueprint. Native code only supplies the field metadata,
- * current pending value, and forwards user interaction back to USettingsMenuWidget.
+ * Blueprint subclasses own their visual layout; native classes supply a fallback
+ * when row assets cannot load. Native code supplies field metadata and pending
+ * values, and forwards user interaction back to USettingsMenuWidget.
  */
 UCLASS(Abstract, Blueprintable, BlueprintType)
 class V3DSIMULATOR_API USettingControlWidget : public UUserWidget
@@ -60,6 +61,8 @@ class V3DSIMULATOR_API UBooleanSettingWidget : public USettingControlWidget
     GENERATED_BODY()
 
 public:
+    virtual TSharedRef<SWidget> RebuildWidget() override;
+    virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
     virtual void ConfigureSetting(USettingsMenuWidget* InOwner, ESettingsField InField) override;
     virtual void RefreshSettingWidget() override;
@@ -99,6 +102,8 @@ class V3DSIMULATOR_API UFloatSettingWidget : public USettingControlWidget
     GENERATED_BODY()
 
 public:
+    virtual TSharedRef<SWidget> RebuildWidget() override;
+    virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
     virtual void ConfigureSetting(USettingsMenuWidget* InOwner, ESettingsField InField) override;
     virtual void RefreshSettingWidget() override;
@@ -142,6 +147,8 @@ class V3DSIMULATOR_API UEnumSettingWidget : public USettingControlWidget
     GENERATED_BODY()
 
 public:
+    virtual TSharedRef<SWidget> RebuildWidget() override;
+    virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
     virtual void ConfigureSetting(USettingsMenuWidget* InOwner, ESettingsField InField) override;
     virtual void RefreshSettingWidget() override;

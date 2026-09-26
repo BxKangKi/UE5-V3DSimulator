@@ -9,6 +9,8 @@
 
 #include "UI/SettingsMenuWidget.h"
 #include "UI/SettingControlWidget.h"
+#include "System/SimulatorFileServices.h"
+#include "Blueprint/WidgetTree.h"
 
 #include "Components/ContentWidget.h"
 #include "Components/TextBlock.h"
@@ -68,11 +70,6 @@ namespace
             ESettingsField::TextureQuality,
             ESettingsField::MaxTextureResolution,
             ESettingsField::ViewDistanceQuality,
-            ESettingsField::StreamingDistanceMultiplier,
-            ESettingsField::StreamingUnloadDistanceMultiplier,
-            ESettingsField::ObjectStreamingRadiusMeters,
-            ESettingsField::StreamingSceneSpawnBudget,
-            ESettingsField::StreamingNodeBudgetPerFrame,
             ESettingsField::AntiAliasingQuality,
             ESettingsField::PostProcessingQuality,
             ESettingsField::EffectsQuality,
@@ -84,6 +81,21 @@ namespace
             ESettingsField::ReflectionMethod
         };
         return Fields;
+    }
+
+    bool IsAutomaticStreamingField(const ESettingsField Field)
+    {
+        switch (Field)
+        {
+        case ESettingsField::StreamingDistanceMultiplier:
+        case ESettingsField::StreamingUnloadDistanceMultiplier:
+        case ESettingsField::ObjectStreamingRadiusMeters:
+        case ESettingsField::StreamingSceneSpawnBudget:
+        case ESettingsField::StreamingNodeBudgetPerFrame:
+            return true;
+        default:
+            return false;
+        }
     }
 
     int32 WrapIndex(int32 Value, int32 MinValue, int32 MaxValue)
@@ -303,6 +315,12 @@ void USettingsCycleButton::SetupCycleButton(USettingsMenuWidget* InOwner, ESetti
     OwnerWidget = InOwner;
     Field = InField;
     Direction = InDirection;
+    if (IsAutomaticStreamingField(Field))
+    {
+        SetVisibility(ESlateVisibility::Collapsed);
+        OnClicked.RemoveDynamic(this, &USettingsCycleButton::HandleClicked);
+        return;
+    }
     OnClicked.RemoveDynamic(this, &USettingsCycleButton::HandleClicked);
     OnClicked.AddDynamic(this, &USettingsCycleButton::HandleClicked);
     RefreshDisplayedText();
@@ -329,10 +347,14 @@ void USettingsMenuWidget::NativeConstruct()
 {
     Super::NativeConstruct();
 
+    // Keep explicit Blueprint controls; repair missing bindings using the shipped layout names.
+    if (!AssignedSettingsListBox.IsValid())
+        AssignedSettingsListBox = Cast<UVerticalBox>(GetWidgetFromName(TEXT("SettingsList")));
+    if (!AssignedBackButton.IsValid())
+        SetBackButton(Cast<UButton>(GetWidgetFromName(TEXT("Back"))));
     CollectAssignedWidgetReferences();
     BindButtonEvents();
     InitializeSettingsFromSavedData();
-    RebuildGeneratedSettingWidgets();
 }
 
 void USettingsMenuWidget::NativeDestruct()
@@ -454,10 +476,7 @@ void USettingsMenuWidget::ClearGeneratedSettingWidgets()
 UClass* USettingsMenuWidget::ResolveGeneratedSettingWidgetClass(const ESettingsControlType ControlType)
 {
     UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
-    if (!IsValid(Registry))
-    {
-        return nullptr;
-    }
+    if (IsValid(Registry)) Registry->EnsureMenuDefaults();
 
     TObjectPtr<UClass>* Cache = nullptr;
     UClass* LoadedClass = nullptr;
@@ -466,28 +485,35 @@ UClass* USettingsMenuWidget::ResolveGeneratedSettingWidgetClass(const ESettingsC
     case ESettingsControlType::Toggle:
         Cache = &ResolvedBooleanSettingWidgetClass;
         if (IsValid(Cache->Get())) return Cache->Get();
-        if (!Registry->BooleanSettingWidgetClass.IsNull())
+        if (IsValid(Registry) && !Registry->BooleanSettingWidgetClass.IsNull())
             LoadedClass = Registry->BooleanSettingWidgetClass.LoadSynchronous();
         break;
     case ESettingsControlType::Slider:
         Cache = &ResolvedFloatSettingWidgetClass;
         if (IsValid(Cache->Get())) return Cache->Get();
-        if (!Registry->FloatSettingWidgetClass.IsNull())
+        if (IsValid(Registry) && !Registry->FloatSettingWidgetClass.IsNull())
             LoadedClass = Registry->FloatSettingWidgetClass.LoadSynchronous();
         break;
     case ESettingsControlType::Dropdown:
         Cache = &ResolvedEnumSettingWidgetClass;
         if (IsValid(Cache->Get())) return Cache->Get();
-        if (!Registry->EnumSettingWidgetClass.IsNull())
+        if (IsValid(Registry) && !Registry->EnumSettingWidgetClass.IsNull())
             LoadedClass = Registry->EnumSettingWidgetClass.LoadSynchronous();
         break;
     default:
         return nullptr;
     }
 
-    if (!Cache || !IsValid(LoadedClass) || !LoadedClass->IsChildOf(USettingControlWidget::StaticClass()))
+    if (!Cache) return nullptr;
+    UClass* ExpectedClass = ControlType == ESettingsControlType::Toggle ? UBooleanSettingWidget::StaticClass()
+        : ControlType == ESettingsControlType::Slider ? UFloatSettingWidget::StaticClass()
+        : UEnumSettingWidget::StaticClass();
+    if (!IsValid(LoadedClass) || !LoadedClass->IsChildOf(ExpectedClass)
+        || LoadedClass->HasAnyClassFlags(CLASS_Abstract))
     {
-        return nullptr;
+        FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
+            TEXT("Settings row class unavailable for control %d; using native row."), static_cast<int32>(ControlType)));
+        LoadedClass = ExpectedClass;
     }
     *Cache = LoadedClass;
     return LoadedClass;
@@ -507,9 +533,24 @@ USettingControlWidget* USettingsMenuWidget::CreateGeneratedSettingWidget(ESettin
 
 void USettingsMenuWidget::RebuildGeneratedSettingWidgets()
 {
+    if (!AssignedSettingsListBox.IsValid())
+        AssignedSettingsListBox = Cast<UVerticalBox>(GetWidgetFromName(TEXT("SettingsList")));
+    if (!AssignedSettingsListBox.IsValid() && IsValid(WidgetTree))
+    {
+        TArray<UWidget*> Widgets;
+        WidgetTree->GetAllWidgets(Widgets);
+        UVerticalBox* Candidate = nullptr;
+        int32 Count = 0;
+        for (UWidget* Widget : Widgets)
+            if (UVerticalBox* Box = Cast<UVerticalBox>(Widget); Box && Box != WidgetTree->RootWidget && Box->GetChildrenCount() == 0)
+            { Candidate = Box; ++Count; }
+        if (Count == 1) AssignedSettingsListBox = Candidate;
+    }
     UVerticalBox* Host = AssignedSettingsListBox.Get();
     if (!IsValid(Host))
     {
+        FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
+            TEXT("Settings host missing. Widget=%s Root=%s"), *GetClass()->GetPathName(), *GetNameSafe(GetRootWidget())));
         return;
     }
 
@@ -527,10 +568,13 @@ void USettingsMenuWidget::RebuildGeneratedSettingWidgets()
             continue;
         }
 
-        Host->AddChildToVerticalBox(Row);
+        // Supply metadata before the row's Slate tree and Construct events can run.
         Row->ConfigureSetting(this, Field);
+        Host->AddChildToVerticalBox(Row);
         GeneratedSettingWidgets.Add(Row);
     }
+    FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
+        TEXT("Settings rows=%d Host=%s"), GeneratedSettingWidgets.Num(), *GetNameSafe(Host)));
 }
 
 void USettingsMenuWidget::RefreshGeneratedSettingWidgets()
@@ -546,6 +590,12 @@ void USettingsMenuWidget::RefreshGeneratedSettingWidgets()
 
 void USettingsMenuWidget::RegisterSettingValueText(ESettingsField Field, UTextBlock* InTextBlock)
 {
+    if (IsAutomaticStreamingField(Field))
+    {
+        if (IsValid(InTextBlock)) InTextBlock->SetVisibility(ESlateVisibility::Collapsed);
+        RegisteredValueTextWidgets.Remove(Field);
+        return;
+    }
     if (IsValid(InTextBlock))
     {
         RegisteredValueTextWidgets.FindOrAdd(Field) = InTextBlock;
@@ -561,6 +611,12 @@ void USettingsMenuWidget::RegisterSettingValueText(ESettingsField Field, UTextBl
 
 void USettingsMenuWidget::RegisterSettingButton(ESettingsField Field, UButton* InButton)
 {
+    if (IsAutomaticStreamingField(Field))
+    {
+        if (IsValid(InButton)) InButton->SetVisibility(ESlateVisibility::Collapsed);
+        RegisteredSettingButtons.Remove(Field);
+        return;
+    }
     if (TWeakObjectPtr<UButton>* ExistingButtonPtr = RegisteredSettingButtons.Find(Field))
     {
         if (UButton* ExistingButton = ExistingButtonPtr->Get())
@@ -585,6 +641,12 @@ void USettingsMenuWidget::RegisterSettingButton(ESettingsField Field, UButton* I
 
 void USettingsMenuWidget::RegisterSettingSlider(ESettingsField Field, USlider* InSlider)
 {
+    if (IsAutomaticStreamingField(Field))
+    {
+        if (IsValid(InSlider)) InSlider->SetVisibility(ESlateVisibility::Collapsed);
+        RemoveControlBinding(Field);
+        return;
+    }
     RemoveControlBinding(Field);
     if (!IsValid(InSlider))
     {
@@ -618,6 +680,12 @@ void USettingsMenuWidget::RegisterSettingSlider(ESettingsField Field, USlider* I
 
 void USettingsMenuWidget::RegisterSettingDropdown(ESettingsField Field, UComboBoxString* InDropdown)
 {
+    if (IsAutomaticStreamingField(Field))
+    {
+        if (IsValid(InDropdown)) InDropdown->SetVisibility(ESlateVisibility::Collapsed);
+        RemoveControlBinding(Field);
+        return;
+    }
     RemoveControlBinding(Field);
     if (!IsValid(InDropdown))
     {
@@ -646,6 +714,12 @@ void USettingsMenuWidget::RegisterSettingDropdown(ESettingsField Field, UComboBo
 
 void USettingsMenuWidget::RegisterSettingToggleButton(ESettingsField Field, UButton* InButton)
 {
+    if (IsAutomaticStreamingField(Field))
+    {
+        if (IsValid(InButton)) InButton->SetVisibility(ESlateVisibility::Collapsed);
+        RemoveControlBinding(Field);
+        return;
+    }
     RemoveControlBinding(Field);
     if (!IsValid(InButton))
     {
@@ -839,6 +913,7 @@ UGameSettings* USettingsMenuWidget::GetEditableSettings() const
 void USettingsMenuWidget::InitializeSettingsFromSavedData()
 {
     CopySettingsToPending(GetEditableSettings());
+    if (GeneratedSettingWidgets.IsEmpty()) RebuildGeneratedSettingWidgets();
     RefreshSettingsValues();
 }
 
@@ -949,6 +1024,11 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
 {
     if (!IsValid(Button) || Button == GetApplyButton() || Button == GetConfirmButton() || Button == GetBackButton() || Button == GetCancelButton())
     {
+        return;
+    }
+    if (IsAutomaticStreamingField(Field))
+    {
+        Button->SetVisibility(ESlateVisibility::Collapsed);
         return;
     }
 
@@ -1197,11 +1277,6 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
     PendingMaxTextureResolution = FMath::Clamp(Settings->MaxTextureResolution, TextureResolutionMin, TextureResolutionMax);
     PendingViewDistanceQuality = FMath::Clamp(Settings->ViewDistanceQuality, QualityMin, QualityMax);
-    PendingStreamingDistanceMultiplier = FMath::Clamp(Settings->StreamingDistanceMultiplier, StreamingDistanceMin, StreamingDistanceMax);
-    PendingStreamingUnloadDistanceMultiplier = FMath::Clamp(Settings->StreamingUnloadDistanceMultiplier, StreamingUnloadMin, StreamingUnloadMax);
-    PendingObjectStreamingRadiusMeters = FMath::Clamp(Settings->ObjectStreamingRadiusMeters, ObjectRadiusMin, ObjectRadiusMax);
-    PendingStreamingSceneSpawnBudget = FMath::Clamp(Settings->StreamingSceneSpawnBudget, 1, 32);
-    PendingStreamingNodeBudgetPerFrame = FMath::Clamp(Settings->StreamingNodeBudgetPerFrame, 1, 256);
     PendingAntiAliasingQuality = FMath::Clamp(Settings->AntiAliasingQuality, QualityMin, QualityMax);
     PendingPostProcessingQuality = FMath::Clamp(Settings->PostProcessingQuality, QualityMin, QualityMax);
     PendingEffectsQuality = FMath::Clamp(Settings->EffectsQuality, QualityMin, QualityMax);
@@ -1232,11 +1307,6 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->TextureQuality = PendingTextureQuality;
     Settings->MaxTextureResolution = PendingMaxTextureResolution;
     Settings->ViewDistanceQuality = PendingViewDistanceQuality;
-    Settings->StreamingDistanceMultiplier = PendingStreamingDistanceMultiplier;
-    Settings->StreamingUnloadDistanceMultiplier = PendingStreamingUnloadDistanceMultiplier;
-    Settings->ObjectStreamingRadiusMeters = PendingObjectStreamingRadiusMeters;
-    Settings->StreamingSceneSpawnBudget = PendingStreamingSceneSpawnBudget;
-    Settings->StreamingNodeBudgetPerFrame = PendingStreamingNodeBudgetPerFrame;
     Settings->AntiAliasingQuality = PendingAntiAliasingQuality;
     Settings->PostProcessingQuality = PendingPostProcessingQuality;
     Settings->EffectsQuality = PendingEffectsQuality;
@@ -1271,6 +1341,7 @@ void USettingsMenuWidget::RefreshSettingsValues()
 
 void USettingsMenuWidget::CycleSettingValueFromUI(ESettingsField Field, int32 Direction)
 {
+    if (IsAutomaticStreamingField(Field)) return;
     CyclePendingValue(Field, Direction);
     RefreshSettingsValues();
 }
@@ -1348,7 +1419,7 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
     case ESettingsField::MaxTextureResolution: return FText::FromString(TEXT("Max Texture Resolution"));
-    case ESettingsField::ViewDistanceQuality: return FText::FromString(TEXT("View Distance"));
+    case ESettingsField::ViewDistanceQuality: return FText::FromString(TEXT("Render Distance Quality"));
     case ESettingsField::StreamingDistanceMultiplier: return FText::FromString(TEXT("Streaming Distance Multiplier"));
     case ESettingsField::StreamingUnloadDistanceMultiplier: return FText::FromString(TEXT("Streaming Unload Multiplier"));
     case ESettingsField::ObjectStreamingRadiusMeters: return FText::FromString(TEXT("Object Streaming Radius"));
@@ -1627,11 +1698,11 @@ void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(E
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
 void USettingsMenuWidget::CycleMaxTextureResolutionFromUI() { CycleSettingValueFromUI(ESettingsField::MaxTextureResolution); }
 void USettingsMenuWidget::CycleViewDistanceQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ViewDistanceQuality); }
-void USettingsMenuWidget::CycleStreamingDistanceMultiplierFromUI() { CycleSettingValueFromUI(ESettingsField::StreamingDistanceMultiplier); }
-void USettingsMenuWidget::CycleStreamingUnloadDistanceMultiplierFromUI() { CycleSettingValueFromUI(ESettingsField::StreamingUnloadDistanceMultiplier); }
-void USettingsMenuWidget::CycleObjectStreamingRadiusMetersFromUI() { CycleSettingValueFromUI(ESettingsField::ObjectStreamingRadiusMeters); }
-void USettingsMenuWidget::CycleStreamingSceneSpawnBudgetFromUI() { CycleSettingValueFromUI(ESettingsField::StreamingSceneSpawnBudget); }
-void USettingsMenuWidget::CycleStreamingNodeBudgetPerFrameFromUI() { CycleSettingValueFromUI(ESettingsField::StreamingNodeBudgetPerFrame); }
+void USettingsMenuWidget::CycleStreamingDistanceMultiplierFromUI() { /* automatic from ViewDistanceQuality */ }
+void USettingsMenuWidget::CycleStreamingUnloadDistanceMultiplierFromUI() { /* automatic from ViewDistanceQuality */ }
+void USettingsMenuWidget::CycleObjectStreamingRadiusMetersFromUI() { /* automatic from ViewDistanceQuality */ }
+void USettingsMenuWidget::CycleStreamingSceneSpawnBudgetFromUI() { /* automatic from ViewDistanceQuality */ }
+void USettingsMenuWidget::CycleStreamingNodeBudgetPerFrameFromUI() { /* automatic from ViewDistanceQuality */ }
 void USettingsMenuWidget::CycleAntiAliasingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::AntiAliasingQuality); }
 void USettingsMenuWidget::CyclePostProcessingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::PostProcessingQuality); }
 void USettingsMenuWidget::CycleEffectsQualityFromUI() { CycleSettingValueFromUI(ESettingsField::EffectsQuality); }

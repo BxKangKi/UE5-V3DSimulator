@@ -8,6 +8,8 @@
 class V3DSIMULATOR_API FSimulatorFileServices
 {
 public:
+    /** Synchronous startup checkpoints; available even when Shipping UE_LOG is disabled. */
+    static void WriteStartupLog(const FString& Message);
     static void WriteLogAsync(const FString& Category, const FString& Message);
     static TSharedPtr<FJsonObject> LoadJson(const FString& Path);
     static void SaveJsonAsync(TSharedRef<FJsonObject> Json, const FString& Path);

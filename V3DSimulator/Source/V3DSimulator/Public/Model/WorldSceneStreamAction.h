@@ -90,6 +90,19 @@ public:
         bool bInWaterGroup = false,
         float InUnloadDistanceMultiplier = 1.0f);
 
+    /** Native multi-observer variant used while a destination is preloaded before teleport/spawn. */
+    static UWorldSceneStreamAction* StreamAsyncForObservers(
+        UObject* WorldContextObject,
+        AStaticActor* Actor,
+        AInstancedMeshActor* InMeshActor,
+        const TArray<FVector>& InObserverLocations,
+        const FglTFRuntimeStaticMeshConfig& StaticMeshConfig,
+        float InDistance = 65536.0f,
+        int32 InChunkSize = 256,
+        bool bInRenderOnly = false,
+        bool bInWaterGroup = false,
+        float InUnloadDistanceMultiplier = 1.0f);
+
     UFUNCTION(BlueprintCallable, Category="World Streaming")
     void Activate();
 
@@ -154,6 +167,8 @@ private:
     int32 CurrentLoadWaterIndex = 0;
     int32 CurrentUnloadWaterIndex = 0;
     int32 ChunkSize;
+    /** Game-thread work cap for one ProcessChunk pass; derived from render-distance quality. */
+    float FrameTimeBudgetMs = 1.5f;
     /** All model/water nodes evaluated this pass, including no-op and sanitized nodes. */
     int32 TotalOperationCount = 0;
     /** Nodes that require no UObject work still advance as progress-only work over several ticks. */
@@ -163,7 +178,7 @@ private:
 
     FTimerHandle ProcessTimerHandle;
     FglTFRuntimeStaticMeshConfig StaticMeshConfig;
-    FVector PlayerLocation;
+    TArray<FVector> ObserverLocations;
     float Distance;
     float UnloadDistanceMultiplier = 1.0f;
 

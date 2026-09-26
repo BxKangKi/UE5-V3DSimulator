@@ -8,10 +8,6 @@
 #include "V3DSimulatorAssetRegistry.generated.h"
 
 class AActor;
-class AGameModeBase;
-class AMainGameMode;
-class ASingleplayGameMode;
-class AMultiplayGameMode;
 class AStaticActor;
 class ADynamicActor;
 class AVehiclePawn;
@@ -69,9 +65,11 @@ struct V3DSIMULATOR_API FV3DWorldLaunchProfile
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="World Launch")
     FString WorldFolderName;
 
+    /** Destination map for local play. Its World Settings owns the local GameMode class. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="World Launch")
     TSoftObjectPtr<UWorld> SinglePlayerWorld;
 
+    /** Destination map for hosting. Assign explicitly; it is not inferred from SinglePlayerWorld. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="World Launch")
     TSoftObjectPtr<UWorld> HostWorld;
 
@@ -104,6 +102,9 @@ class V3DSIMULATOR_API UV3DSimulatorAssetRegistry : public UDataAsset
 
 public:
     UV3DSimulatorAssetRegistry(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+    /** Repairs missing built-in menu classes and the legacy project-widget redirector path. */
+    void EnsureMenuDefaults();
 
     // Native actor classes can be replaced by Blueprint subclasses without forcing them to load at startup.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Actors")
@@ -183,27 +184,22 @@ public:
     TSoftClassPtr<UUserWidget> LoadingWidgetClass;
 
     // Menu/navigation worlds. Soft references prevent menu maps from being resident in gameplay.
+    // GameMode classes are deliberately not registered here; each destination map owns that choice.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Worlds")
     TSoftObjectPtr<UWorld> GameplayWorld;
 
+    /** Host map. Assign the same map explicitly only if that map intentionally uses a unified GameMode. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Worlds")
     TSoftObjectPtr<UWorld> HostWorld;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Worlds")
     TSoftObjectPtr<UWorld> ClientWorld;
 
-    /** Single MainWorld. Start, world selection, multiplayer, project build and settings are UI states inside this same map. */
+    /** Single MainWorld. Set its menu GameMode explicitly in the map's World Settings. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Worlds")
     TSoftObjectPtr<UWorld> MainWorld;
 
-    /** Gameplay GameMode classes used as explicit travel overrides when the common gameplay map is shared. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Game Modes")
-    TSoftClassPtr<ASingleplayGameMode> SingleplayGameModeClass;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Game Modes")
-    TSoftClassPtr<AMultiplayGameMode> MultiplayGameModeClass;
-
-    /** Optional per-world map overrides. GameMode selection is fixed by SingleplayGameModeClass / MultiplayGameModeClass. */
+    /** Optional per-world map overrides. Each referenced map owns its GameMode through World Settings. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Worlds", meta=(TitleProperty="WorldFolderName"))
     TArray<FV3DWorldLaunchProfile> WorldLaunchProfiles;
 

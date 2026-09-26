@@ -4,10 +4,30 @@
 #include "System/SafeFileIO.h"
 #include "System/SimulatorPaths.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+#include "Misc/ScopeLock.h"
+#include "HAL/FileManager.h"
 
 namespace
 {
     constexpr int64 MaxSafeJsonBytes = 64ll * 1024ll * 1024ll;
+}
+
+void FSimulatorFileServices::WriteStartupLog(const FString& Message)
+{
+    static FCriticalSection StartupLogMutex;
+    FScopeLock Lock(&StartupLogMutex);
+    const FString Line = FString::Printf(TEXT("[%s] %s%s"),
+        *FDateTime::Now().ToString(), *Message, LINE_TERMINATOR);
+    // Independent of the asynchronous service and the selected GameInstance/Map.
+    const FString Root = V3DSimulatorPaths::LogsRoot();
+    IFileManager::Get().MakeDirectory(*Root, true);
+    const FString Path = FPaths::Combine(Root, TEXT("startup.log"));
+    if (!FFileHelper::SaveStringToFile(Line, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM,
+        &IFileManager::Get(), FILEWRITE_Append))
+    {
+        UE_LOG(LogTemp, Error, TEXT("Startup log write failed. Path=%s"), *Path);
+    }
 }
 
 void FSimulatorFileServices::WriteLogAsync(const FString& Category, const FString& Message)

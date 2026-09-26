@@ -138,6 +138,10 @@ public:
     FVector GetImpactVelocity() const { return ImpactVelocity; }
     bool IsRagdollDamage();
 
+    /** Streaming stops/restores velocity artificially; rebase impact history at both boundaries. */
+    void SetStreamingMovementSuspended(bool bSuspended);
+    bool IsStreamingMovementSuspended() const { return bStreamingMovementSuspended; }
+
     UFUNCTION(BlueprintCallable)
     void SetRagdollActive(bool bActive);
 
@@ -252,6 +256,7 @@ private:
     UPROPERTY()
     TObjectPtr<UCharacterMovementComponent> Movement;
 
+    bool bStreamingMovementSuspended = false;
     FVector ImpactVelocity = FVector::ZeroVector;
     FVector CurrentSpeed = FVector::ZeroVector;
     FVector PrevVelocity = FVector::ZeroVector;

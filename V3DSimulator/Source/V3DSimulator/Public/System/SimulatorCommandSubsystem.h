@@ -11,6 +11,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
+#include "TimerManager.h"
 #include "SimulatorCommandSubsystem.generated.h"
 
 class APlayerController;
@@ -27,6 +28,8 @@ class V3DSIMULATOR_API USimulatorCommandSubsystem : public UGameInstanceSubsyste
     GENERATED_BODY()
 
 public:
+    virtual void Deinitialize() override;
+
     /** Returns true when CommandLine begins with a simulator command, even if its arguments are invalid. */
     bool ExecuteCommand(APlayerController* RequestingController, const FString& CommandLine, FString& OutMessage);
 
@@ -37,6 +40,28 @@ private:
     bool ExecuteWeather(APlayerController* Controller, const TArray<FString>& Args, FString& OutMessage);
     bool ExecuteTime(APlayerController* Controller, const TArray<FString>& Args, FString& OutMessage);
     bool ExecuteTeleport(APlayerController* Controller, const TArray<FString>& Args, FString& OutMessage);
+
+    struct FPendingTeleportRequest
+    {
+        TWeakObjectPtr<APlayerController> RequestingController;
+        TWeakObjectPtr<APlayerController> TargetController;
+        FVector Destination = FVector::ZeroVector;
+        FString TargetName;
+        double StartedAtSeconds = 0.0;
+        bool bActive = false;
+    };
+
+    FPendingTeleportRequest PendingTeleport;
+    FTimerHandle PendingTeleportTimer;
+    static constexpr float TeleportPollIntervalSeconds = 0.05f;
+    static constexpr double TeleportLoadTimeoutSeconds = 120.0;
+
+    bool PrepareTeleportDestination(UWorld* World, const FVector& Destination) const;
+    void SchedulePendingTeleportCheck();
+    void ProcessPendingTeleport();
+    void ClearTeleportStreamingFocus();
+    void ResetPendingTeleport();
+    void SendTeleportStatus(const FString& Message) const;
 
     static void Tokenize(const FString& Input, TArray<FString>& OutTokens);
     static bool ParseFiniteDouble(const FString& Token, double& OutValue);

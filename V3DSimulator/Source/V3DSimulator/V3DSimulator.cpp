@@ -11,6 +11,10 @@
 #include "V3DSimulator.h"
 
 #include "MoviePlayer.h"
+#include "System/SimulatorFileServices.h"
+#include "Engine/World.h"
+#include "Engine/GameInstance.h"
+#include "GameFramework/GameModeBase.h"
 #include "Framework/Application/SlateApplication.h"
 #include "System/SafeFileIO.h"
 #include "System/V3DRuntimeSafety.h"
@@ -34,6 +38,9 @@ namespace
 void FV3DSimulatorModule::StartupModule()
 {
     FDefaultGameModuleImpl::StartupModule();
+    FSimulatorFileServices::WriteStartupLog(TEXT("=== V3DSimulator module started ==="));
+    PostLoadMapHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddRaw(
+        this, &FV3DSimulatorModule::HandlePostLoadMap);
 
     if (!CanUseV3DSimulatorLoadingScreen())
     {
@@ -95,14 +102,27 @@ void FV3DSimulatorModule::PrepareLoadingScreen()
 
 void FV3DSimulatorModule::HandlePreLoadMap(const FString& MapName)
 {
+    FSimulatorFileServices::WriteStartupLog(TEXT("Loading map: ") + MapName);
     // MapName is intentionally not dereferenced or resolved here: package lookup can create UObjects,
     // while this callback only needs to arm the already self-contained Slate loading screen.
     UE_LOG(LogTemp, VeryVerbose, TEXT("Preparing blocking loading screen for map: %s"), *MapName);
     PrepareLoadingScreen();
 }
 
+void FV3DSimulatorModule::HandlePostLoadMap(UWorld* World)
+{
+    FSimulatorFileServices::WriteStartupLog(FString::Printf(
+        TEXT("Map loaded: %s; GameInstance=%s; GameMode=%s"),
+        *GetPathNameSafe(World),
+        *GetNameSafe(World && World->GetGameInstance() ? World->GetGameInstance()->GetClass() : nullptr),
+        *GetNameSafe(World && World->GetAuthGameMode() ? World->GetAuthGameMode()->GetClass() : nullptr)));
+}
+
 void FV3DSimulatorModule::ShutdownModule()
 {
+    FSimulatorFileServices::WriteStartupLog(TEXT("V3DSimulator module shutting down"));
+    FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapHandle);
+    PostLoadMapHandle.Reset();
     // Remove all engine callbacks first. This guarantees that no late map-load notification can call
     // into the game module after its shutdown sequence has begun.
     if (PreLoadMapHandle.IsValid())

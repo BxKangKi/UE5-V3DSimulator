@@ -53,6 +53,7 @@ bool AInstancedMeshActor::InitializeGroup(
     FreeInstanceIndices.Empty();
     DynamicComponentMap.Empty();
     bRuntimeResourcesReleased = false;
+    bInstanceRenderStateDirty = false;
     return true;
 }
 
@@ -217,7 +218,7 @@ bool AInstancedMeshActor::AddNodeInstance(const FName NodeName, const FTransform
         InstanceIndex = MeshComponent->AddInstance(LocalTransform);
     }
     else if (!MeshComponent->UpdateInstanceTransform(
-        InstanceIndex, LocalTransform, false, true, true))
+        InstanceIndex, LocalTransform, false, false, true))
     {
         FreeInstanceIndices.Add(InstanceIndex);
         return false;
@@ -229,6 +230,7 @@ bool AInstancedMeshActor::AddNodeInstance(const FName NodeName, const FTransform
     }
     NodeInstanceIndices.Add(NodeName, InstanceIndex);
     LoadedNodes.Add(NodeName);
+    bInstanceRenderStateDirty = true;
     return true;
 }
 
@@ -251,7 +253,7 @@ bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
     FTransform HiddenTransform = FTransform::Identity;
     HiddenTransform.SetScale3D(FVector::ZeroVector);
     const bool bInstanceHidden = InstanceIndex >= 0 && InstanceIndex < MeshComponent->GetNumInstances()
-        && MeshComponent->UpdateInstanceTransform(InstanceIndex, HiddenTransform, false, true, true);
+        && MeshComponent->UpdateInstanceTransform(InstanceIndex, HiddenTransform, false, false, true);
     if (!bInstanceHidden)
     {
         return false;
@@ -260,6 +262,7 @@ bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
     NodeInstanceIndices.Remove(NodeName);
     LoadedNodes.Remove(NodeName);
     FreeInstanceIndices.Add(InstanceIndex);
+    bInstanceRenderStateDirty = true;
 
     if (LoadedNodes.IsEmpty())
     {
@@ -267,8 +270,17 @@ bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
         MeshComponent->SetStaticMesh(nullptr);
         NodeInstanceIndices.Empty();
         FreeInstanceIndices.Empty();
+        bInstanceRenderStateDirty = false;
     }
     return true;
+}
+
+void AInstancedMeshActor::FlushInstanceRenderUpdates()
+{
+    check(IsInGameThread());
+    if (!bInstanceRenderStateDirty || !IsValid(MeshComponent)) return;
+    MeshComponent->MarkRenderStateDirty();
+    bInstanceRenderStateDirty = false;
 }
 
 bool AInstancedMeshActor::HasDynamicComponents(const FName NodeName) const

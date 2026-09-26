@@ -47,8 +47,13 @@ public:
             && LoadingChunks.IsEmpty() && FailedLoadRetryAt.IsEmpty();
     }
     bool IsLocationLoaded(const FVector& WorldLocation) const;
+    /** True only when every chunk in the configured streaming radius around WorldLocation is resident. */
+    bool IsAreaLoaded(const FVector& WorldLocation, float RadiusMeters = -1.0f) const;
     /** Boundary crossing prefetch. The transient chunk is saved and released after the object moves. */
     void EnsureLocationLoaded(const FVector& WorldLocation);
+    /** Adds a second observer without moving the player, used by spawn/teleport destination preloading. */
+    void SetPriorityStreamingFocus(const FVector& WorldLocation);
+    void ClearPriorityStreamingFocus();
     FWorldChunkCoordinate ToChunk(const FVector& WorldLocation) const;
 
     /** Registers a newly placed entity in the sole entity chunk store. */
@@ -60,8 +65,8 @@ public:
     void LoadRuntimeStateAsync(
         TFunction<void(bool, bool, FWorldRuntimeState, FString)> Callback);
 
-    /** Coalesced player/time state save; completion is always delivered on the game thread. */
-    void SaveRuntimeStateAsync(
+    /** Coalesced player/time state save; completion is always delivered on the game thread. Returns false when the write could not be queued. */
+    bool SaveRuntimeStateAsync(
         const FWorldRuntimeState& State,
         FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());
 
@@ -98,6 +103,8 @@ private:
     float LoadRadiusCentimeters = 204800.0f;
     uint64 Generation = 0;
     bool bRunning = false;
+    bool bHasPriorityStreamingFocus = false;
+    FVector PriorityStreamingFocus = FVector::ZeroVector;
     float DesiredRefreshAccumulator = 0.0f;
     int32 ActiveLoads = 0;
     static constexpr int32 MaxConcurrentLoads = 8;
