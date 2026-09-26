@@ -4,20 +4,45 @@
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/ProjectWorkspace.h"
 #include "Engine/World.h"
+#include "UObject/UObjectGlobals.h"
+#include "Engine/World.h"
+#include "System/SimulatorFileServices.h"
 
 void UV3DSimulatorGameInstance::Init()
 {
+    FSimulatorFileServices::WriteStartupLog(TEXT("GameInstance Init entered"));
     Super::Init();
     if (!V3DSimulatorProjectWorkspace::EnsureWorkspaceRoots())
     {
         UE_LOG(LogTemp, Error,
             TEXT("V3DSimulator failed to create the Projects, Resources, or Worlds user-data directory."));
     }
-    EnsureAssetRegistry();
+    const bool bRegistryReady = EnsureAssetRegistry();
+    FSimulatorFileServices::WriteStartupLog(bRegistryReady ? TEXT("AssetRegistry ready") : TEXT("ERROR: AssetRegistry initialization failed"));
+    if (bRegistryReady && IsValid(RuntimeAssetRegistry))
+    {
+        FSimulatorFileServices::WriteStartupLog(FString::Printf(
+            TEXT("Registry world refs: MainWorld=%s GameplayWorld=%s HostWorld=%s ClientWorld=%s"),
+            *RuntimeAssetRegistry->MainWorld.ToSoftObjectPath().ToString(),
+            *RuntimeAssetRegistry->GameplayWorld.ToSoftObjectPath().ToString(),
+            *RuntimeAssetRegistry->HostWorld.ToSoftObjectPath().ToString(),
+            *RuntimeAssetRegistry->ClientWorld.ToSoftObjectPath().ToString()));
+        if (RuntimeAssetRegistry->MainWorld.IsNull())
+        {
+            UE_LOG(LogTemp, Error, TEXT("AssetRegistry.MainWorld is not assigned."));
+        }
+    }
 }
 
 bool UV3DSimulatorGameInstance::EnsureAssetRegistry()
 {
+    // Loading a Blueprint class and allocating a UObject are game-thread operations. During GC/map
+    // teardown, fail closed instead of trying to recreate project assets from a stale callback.
+    if (!IsInGameThread() || IsGarbageCollecting())
+    {
+        return IsValid(RuntimeAssetRegistry);
+    }
+
     if (IsValid(RuntimeAssetRegistry))
     {
         return true;
@@ -26,9 +51,8 @@ bool UV3DSimulatorGameInstance::EnsureAssetRegistry()
     RuntimeAssetRegistry = nullptr;
     if (AssetRegistryClass.IsNull())
     {
-        UE_LOG(LogTemp, Error,
-            TEXT("V3DSimulatorGameInstance has no AssetRegistryClass. Assign a Blueprint subclass of UV3DSimulatorAssetRegistry in the GameInstance defaults."));
-        return false;
+        AssetRegistryClass = TSoftClassPtr<UV3DSimulatorAssetRegistry>(FSoftObjectPath(
+            TEXT("/Game/Blueprints/BP_AssetRegistry.BP_AssetRegistry_C")));
     }
 
     UClass* RegistryClass = AssetRegistryClass.LoadSynchronous();
@@ -39,6 +63,7 @@ bool UV3DSimulatorGameInstance::EnsureAssetRegistry()
         UE_LOG(LogTemp, Error,
             TEXT("V3DSimulatorGameInstance AssetRegistryClass is invalid or cannot be instantiated. Class=%s"),
             *GetNameSafe(RegistryClass));
+        FSimulatorFileServices::WriteStartupLog(TEXT("ERROR: Cannot load AssetRegistry class: ") + AssetRegistryClass.ToSoftObjectPath().ToString());
         return false;
     }
 
@@ -51,6 +76,8 @@ bool UV3DSimulatorGameInstance::EnsureAssetRegistry()
             *GetNameSafe(RegistryClass));
         return false;
     }
+
+    RuntimeAssetRegistry->EnsureMenuDefaults();
 
     UE_LOG(LogTemp, Display,
         TEXT("V3DSimulator asset registry initialized from class %s."),
@@ -65,18 +92,29 @@ UV3DSimulatorAssetRegistry* UV3DSimulatorGameInstance::GetAssetRegistry() const
 
 UV3DSimulatorAssetRegistry* UV3DSimulatorGameInstance::GetAssetRegistryFromContext(const UObject* WorldContextObject)
 {
-    if (!IsValid(WorldContextObject))
+    if (!IsValid(WorldContextObject) || !IsInGameThread() || IsGarbageCollecting())
     {
         return nullptr;
     }
-    const UWorld* World = WorldContextObject->GetWorld();
-    UGameInstance* GameInstance = World ? World->GetGameInstance() : Cast<UGameInstance>(const_cast<UObject*>(WorldContextObject));
+
+    UGameInstance* GameInstance = Cast<UGameInstance>(const_cast<UObject*>(WorldContextObject));
+    if (!GameInstance)
+    {
+        const UWorld* World = WorldContextObject->GetWorld();
+        GameInstance = IsValid(World) ? World->GetGameInstance() : nullptr;
+    }
+
     if (UV3DSimulatorGameInstance* SimulatorGameInstance = Cast<UV3DSimulatorGameInstance>(GameInstance))
     {
-        // Init normally creates this before any world starts. The fallback makes direct/editor world
-        // startup robust if a custom lifecycle calls into the registry unusually early.
-        SimulatorGameInstance->EnsureAssetRegistry();
-        return SimulatorGameInstance->GetAssetRegistry();
+        if (UV3DSimulatorAssetRegistry* Existing = SimulatorGameInstance->GetAssetRegistry())
+        {
+            return Existing;
+        }
+
+        if (SimulatorGameInstance->EnsureAssetRegistry())
+        {
+            return SimulatorGameInstance->GetAssetRegistry();
+        }
     }
     return nullptr;
 }

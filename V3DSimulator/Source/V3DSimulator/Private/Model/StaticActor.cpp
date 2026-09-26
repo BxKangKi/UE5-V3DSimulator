@@ -14,6 +14,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Model/InstancedMeshActor.h"
 #include "Model/WorldSceneStreamAction.h"
+#include "Model/WorldSceneStreamingSubsystem.h"
 #include "Model/V3DMaterialOverrideUtils.h"
 #include "Setting/GameSettings.h"
 #include "Simulator/ModelDatabaseSubsystem.h"
@@ -226,6 +227,91 @@ void AStaticActor::SetRenderOnlyStreaming(const bool bRenderOnly)
     {
         bRenderOnlyStreaming = bRenderOnly;
     }
+}
+
+void AStaticActor::RequestStreamingRefresh()
+{
+    if (!StaticActorPrivate::EnsureGameThread(TEXT("AStaticActor::RequestStreamingRefresh"))
+        || bIsDestroyed
+        || !bHasModelMetadata
+        || !IsValid(BakedAsset))
+    {
+        // A newly spawned coarse scene may still be reading metadata/preparing its facade. Its
+        // existing bIsLoaded=false state already keeps destination readiness blocked; do not run
+        // StartStreamingStep early and accidentally treat an unfinished empty group set as ready.
+        return;
+    }
+    StartStreamingStep();
+}
+
+bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
+{
+    check(IsInGameThread());
+    if (bIsDestroyed || !bHasModelMetadata || !IsValid(BakedAsset)
+        || WorldLocation.ContainsNaN())
+    {
+        return false;
+    }
+
+    float EffectiveDistanceMultiplier = FMath::Max(1.0f, StreamDistance + 1.0f);
+    if (const UGameManagerSubSystem* Manager =
+            UGameManagerSubSystem::GetSubSystem(const_cast<AStaticActor*>(this)))
+    {
+        if (const UGameSettings* Settings = Manager->GetGameSettings())
+        {
+            EffectiveDistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
+        }
+    }
+    const float EffectiveStreamDistance = FMath::Max(0.0f, EffectiveDistanceMultiplier - 1.0f);
+    const FTransform OwnerTransform = GetActorTransform();
+
+    for (const TPair<FName, TObjectPtr<AInstancedMeshActor>>& GroupPair : OwnedInstancedMeshActors)
+    {
+        const AInstancedMeshActor* Group = GroupPair.Value.Get();
+        if (!IsValid(Group)) return false;
+
+        float MaxWorldRadius = 0.0f;
+        for (const FName MeshName : Group->GetReferencedMeshNames())
+        {
+            const FModelMeshData* MeshData = AllMeshMap.Find(MeshName);
+            if (!MeshData) return false;
+            const float MeshSize = MeshData->Size.Size();
+            MaxWorldRadius = FMath::Max(
+                MaxWorldRadius, MeshSize + MeshSize * EffectiveStreamDistance);
+        }
+
+        TMap<FName, FModelNodeData> CandidateNodes;
+        Group->BuildStreamNodeSnapshot(
+            WorldLocation, OwnerTransform, MaxWorldRadius, CandidateNodes);
+        TSet<FName> LoadedNodes;
+        Group->GetLoadedNodeSnapshot(LoadedNodes);
+        for (const TPair<FName, FModelNodeData>& NodePair : CandidateNodes)
+        {
+            const FModelNodeData& Node = NodePair.Value;
+            const FModelMeshData* MeshData = AllMeshMap.Find(Node.MeshName);
+            if (!MeshData) return false;
+            const float MeshSize = MeshData->Size.Size();
+            const float LoadRadius = MeshSize + MeshSize * EffectiveStreamDistance;
+            const FVector NodeWorldLocation = (Node.Transform * OwnerTransform).GetLocation();
+            const bool bRequired = Node.bAlwaysLoaded
+                || FVector::DistSquared(WorldLocation, NodeWorldLocation) <= FMath::Square(LoadRadius);
+            if (bRequired && !LoadedNodes.Contains(NodePair.Key)) return false;
+        }
+    }
+
+    const float WaterDistanceRadius = FMath::Max(EffectiveStreamDistance * 1024.0f, 2048.0f);
+    for (const TPair<FName, FWaterStreamNodeData>& WaterPair : WaterNodeMap)
+    {
+        const FVector WaterWorldLocation =
+            (WaterPair.Value.Transform * OwnerTransform).GetLocation();
+        const float LoadRadius = FMath::Max(WaterPair.Value.StreamRadius, WaterDistanceRadius);
+        if (FVector::DistSquared(WorldLocation, WaterWorldLocation) <= FMath::Square(LoadRadius)
+            && !LoadedWaterNodes.Contains(WaterPair.Key))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 void AStaticActor::BeginPlay()
@@ -856,13 +942,19 @@ bool AStaticActor::IsPlayerInsideModelRange() const
         return true;
     }
 
-    FVector PlayerLocation = FVector::ZeroVector;
-    if (UGameManagerSubSystem* Manager =
+    TArray<FVector> ObserverLocations;
+    if (UWorldSceneStreamingSubsystem* Streamer =
+            UWorldSceneStreamingSubsystem::Get(const_cast<AStaticActor*>(this)))
+    {
+        Streamer->GetStreamingObserverLocations(ObserverLocations);
+    }
+    else if (UGameManagerSubSystem* Manager =
             UGameManagerSubSystem::GetSubSystem(
                 const_cast<AStaticActor*>(this)))
     {
-        PlayerLocation = Manager->GetPlayerLocation();
+        ObserverLocations.Add(Manager->GetPlayerLocation());
     }
+    if (ObserverLocations.IsEmpty()) ObserverLocations.Add(FVector::ZeroVector);
     float DistanceMultiplier = 64.0f;
     if (UGameManagerSubSystem* Manager =
             UGameManagerSubSystem::GetSubSystem(const_cast<AStaticActor*>(this)))
@@ -878,8 +970,12 @@ bool AStaticActor::IsPlayerInsideModelRange() const
         ModelMetadata.Size.Z) * FMath::Max(1.0f, DistanceMultiplier);
     const FVector WorldCenter =
         GetActorTransform().TransformPosition(ModelMetadata.Center);
-    return FVector::DistSquared(PlayerLocation, WorldCenter)
-        <= FMath::Square(FMath::Max(1.0f, Radius));
+    const double RadiusSq = FMath::Square(FMath::Max(1.0f, Radius));
+    for (const FVector& Observer : ObserverLocations)
+    {
+        if (FVector::DistSquared(Observer, WorldCenter) <= RadiusSq) return true;
+    }
+    return false;
 }
 
 void AStaticActor::WriteLogAsync(const FString& Message) const
@@ -1052,7 +1148,7 @@ void AStaticActor::LaunchNextStreamingBatch()
         return;
     }
 
-    FVector PlayerLocation = FVector::ZeroVector;
+    TArray<FVector> ObserverLocations;
     int32 SafeChunkSize = FMath::Max(1, ChunkSize);
     // Keep the number of decoded-but-not-yet-finalized bundles bounded by the same limit that
     // protects glTFRuntime's native mesh finalizers. The old scene-spawn budget could be 32, which
@@ -1061,19 +1157,27 @@ void AStaticActor::LaunchNextStreamingBatch()
     int32 GroupBudget = FV3DRuntimeSafety::GetMeshBuildConcurrencyLimit();
     float UnloadDistanceMultiplier = 1.10f;
     float EffectiveDistanceMultiplier = FMath::Max(1.0f, StreamDistance + 1.0f);
+    if (UWorldSceneStreamingSubsystem* Streamer = UWorldSceneStreamingSubsystem::Get(this))
+    {
+        Streamer->GetStreamingObserverLocations(ObserverLocations);
+    }
     if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        PlayerLocation = Manager->GetPlayerLocation();
+        if (ObserverLocations.IsEmpty())
+        {
+            ObserverLocations.Add(Manager->GetPlayerLocation());
+        }
         if (const UGameSettings* Settings = Manager->GetGameSettings())
         {
             SafeChunkSize = FMath::Min(
                 SafeChunkSize, Settings->GetStreamingNodeBudgetPerFrame());
             GroupBudget = FMath::Min(
-                GroupBudget, Settings->GetStreamingSceneSpawnBudget());
+                GroupBudget, Settings->GetStreamingMeshGroupConcurrency());
             UnloadDistanceMultiplier = Settings->GetStreamingUnloadDistanceMultiplier();
             EffectiveDistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
         }
     }
+    if (ObserverLocations.IsEmpty()) ObserverLocations.Add(FVector::ZeroVector);
     GroupBudget = FMath::Clamp(GroupBudget, 1, 16);
     const int32 AvailableSlots = FMath::Max(
         0, GroupBudget - ActiveStreamActions.Num());
@@ -1084,18 +1188,18 @@ void AStaticActor::LaunchNextStreamingBatch()
     const FglTFRuntimeStaticMeshConfig MeshConfig = BuildStreamingMeshConfig();
 
     const auto StartGroup =
-        [this, &PlayerLocation, &MeshConfig, SafeChunkSize, EffectiveStreamDistance, UnloadDistanceMultiplier](
+        [this, &ObserverLocations, &MeshConfig, SafeChunkSize, EffectiveStreamDistance, UnloadDistanceMultiplier](
             AInstancedMeshActor* InstancedActor,
             const bool bWaterGroup)
         {
             const FName GroupName = bWaterGroup
                 ? NAME_None : InstancedActor->GetGroupName();
             UWorldSceneStreamAction* Action =
-                UWorldSceneStreamAction::StreamAsync(
+                UWorldSceneStreamAction::StreamAsyncForObservers(
                     this,
                     this,
                     InstancedActor,
-                    PlayerLocation,
+                    ObserverLocations,
                     MeshConfig,
                     EffectiveStreamDistance,
                     SafeChunkSize,

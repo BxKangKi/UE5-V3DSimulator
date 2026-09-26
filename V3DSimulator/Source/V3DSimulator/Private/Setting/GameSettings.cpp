@@ -36,11 +36,6 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetNumberField(TEXT("TextureQuality"), TextureQuality);
     Json->SetNumberField(TEXT("MaxTextureResolution"), GetClampedMaxTextureResolution());
     Json->SetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
-    Json->SetNumberField(TEXT("StreamingDistanceMultiplier"), StreamingDistanceMultiplier);
-    Json->SetNumberField(TEXT("StreamingUnloadDistanceMultiplier"), StreamingUnloadDistanceMultiplier);
-    Json->SetNumberField(TEXT("ObjectStreamingRadiusMeters"), ObjectStreamingRadiusMeters);
-    Json->SetNumberField(TEXT("StreamingSceneSpawnBudget"), StreamingSceneSpawnBudget);
-    Json->SetNumberField(TEXT("StreamingNodeBudgetPerFrame"), StreamingNodeBudgetPerFrame);
     Json->SetNumberField(TEXT("AntiAliasingQuality"), AntiAliasingQuality);
     Json->SetNumberField(TEXT("PostProcessingQuality"), PostProcessingQuality);
     Json->SetNumberField(TEXT("EffectsQuality"), EffectsQuality);
@@ -71,16 +66,7 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(TEXT("MaxTextureResolution"), MaxTextureResolution);
         MaxTextureResolution = GetClampedMaxTextureResolution();
         Json->TryGetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
-        Json->TryGetNumberField(TEXT("StreamingDistanceMultiplier"), StreamingDistanceMultiplier);
-        Json->TryGetNumberField(TEXT("StreamingUnloadDistanceMultiplier"), StreamingUnloadDistanceMultiplier);
-        Json->TryGetNumberField(TEXT("ObjectStreamingRadiusMeters"), ObjectStreamingRadiusMeters);
-        Json->TryGetNumberField(TEXT("StreamingSceneSpawnBudget"), StreamingSceneSpawnBudget);
-        Json->TryGetNumberField(TEXT("StreamingNodeBudgetPerFrame"), StreamingNodeBudgetPerFrame);
-        StreamingDistanceMultiplier = FMath::Clamp(StreamingDistanceMultiplier, 1.0f, 512.0f);
-        StreamingUnloadDistanceMultiplier = FMath::Clamp(StreamingUnloadDistanceMultiplier, 1.0f, 2.0f);
-        ObjectStreamingRadiusMeters = FMath::Clamp(ObjectStreamingRadiusMeters, 512.0f, 4096.0f);
-        StreamingSceneSpawnBudget = FMath::Clamp(StreamingSceneSpawnBudget, 1, 32);
-        StreamingNodeBudgetPerFrame = FMath::Clamp(StreamingNodeBudgetPerFrame, 1, 256);
+        ViewDistanceQuality = FMath::Clamp(ViewDistanceQuality, 0, 3);
         Json->TryGetNumberField(TEXT("AntiAliasingQuality"), AntiAliasingQuality);
         Json->TryGetNumberField(TEXT("PostProcessingQuality"), PostProcessingQuality);
         Json->TryGetNumberField(TEXT("EffectsQuality"), EffectsQuality);
@@ -110,8 +96,6 @@ int32 UGameSettings::GetClampedMaxTextureResolution() const
 
 float UGameSettings::GetViewDistanceScale() const
 {
-    // Preserve the historical custom-streaming radius at High (2). Lower tiers reduce I/O and
-    // UObject churn; Epic increases the same authored size-proportional radius without changing data.
     switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
     {
     case 0: return 0.50f;
@@ -124,27 +108,98 @@ float UGameSettings::GetViewDistanceScale() const
 
 float UGameSettings::GetEffectiveStreamingDistanceMultiplier() const
 {
-    return FMath::Clamp(StreamingDistanceMultiplier, 1.0f, 512.0f) * GetViewDistanceScale();
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 40.0f;
+    case 1: return 52.0f;
+    case 3: return 88.0f;
+    case 2:
+    default: return 64.0f;
+    }
 }
 
 float UGameSettings::GetEffectiveObjectStreamingRadiusMeters() const
 {
-    return FMath::Clamp(ObjectStreamingRadiusMeters, 512.0f, 4096.0f) * GetViewDistanceScale();
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 1024.0f;
+    case 1: return 1536.0f;
+    case 3: return 3072.0f;
+    case 2:
+    default: return 2048.0f;
+    }
 }
 
 float UGameSettings::GetStreamingUnloadDistanceMultiplier() const
 {
-    return FMath::Clamp(StreamingUnloadDistanceMultiplier, 1.0f, 2.0f);
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 1.20f;
+    case 1: return 1.17f;
+    case 3: return 1.12f;
+    case 2:
+    default: return 1.14f;
+    }
 }
 
 int32 UGameSettings::GetStreamingSceneSpawnBudget() const
 {
-    return FMath::Clamp(StreamingSceneSpawnBudget, 1, 32);
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 2;
+    case 1: return 4;
+    case 3: return 8;
+    case 2:
+    default: return 6;
+    }
 }
 
 int32 UGameSettings::GetStreamingNodeBudgetPerFrame() const
 {
-    return FMath::Clamp(StreamingNodeBudgetPerFrame, 1, 256);
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 48;
+    case 1: return 72;
+    case 3: return 144;
+    case 2:
+    default: return 96;
+    }
+}
+
+float UGameSettings::GetStreamingUpdateIntervalSeconds() const
+{
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 0.12f;
+    case 1: return 0.10f;
+    case 3: return 0.06f;
+    case 2:
+    default: return 0.08f;
+    }
+}
+
+float UGameSettings::GetStreamingFrameTimeBudgetMs() const
+{
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 0.75f;
+    case 1: return 1.00f;
+    case 3: return 2.00f;
+    case 2:
+    default: return 1.50f;
+    }
+}
+
+int32 UGameSettings::GetStreamingMeshGroupConcurrency() const
+{
+    switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
+    {
+    case 0: return 1;
+    case 1: return 2;
+    case 3: return 4;
+    case 2:
+    default: return 3;
+    }
 }
 
 int32 UGameSettings::ResolveMaxTextureResolution(const UObject* WorldContextObject)

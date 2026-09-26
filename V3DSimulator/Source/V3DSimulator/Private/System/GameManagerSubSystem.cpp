@@ -59,6 +59,7 @@
 #include "Weather/WeatherSubsystem.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/PrimitiveComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/Skeleton.h"
@@ -72,6 +73,7 @@
 #include "GameFramework/Character.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/PackageName.h"
 #include "Templates/UnrealTemplate.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/GarbageCollection.h"
@@ -174,6 +176,37 @@ namespace
         return FMath::IsFinite(Rotation.Pitch)
             && FMath::IsFinite(Rotation.Yaw)
             && FMath::IsFinite(Rotation.Roll);
+    }
+
+    FString CanonicalRuntimeMapPackage(FString Package)
+    {
+        Package = FPackageName::ObjectPathToPackageName(Package);
+        int32 Slash = INDEX_NONE;
+        Package.FindLastChar(TEXT('/'), Slash);
+        const FString Folder = Package.Left(Slash + 1);
+        FString Leaf = Package.Mid(Slash + 1);
+        if (Leaf.StartsWith(TEXT("UEDPIE_")))
+        {
+            const int32 Separator = Leaf.Find(TEXT("_"), ESearchCase::CaseSensitive, ESearchDir::FromStart, 7);
+            if (Separator > 7 && Leaf.Mid(7, Separator - 7).IsNumeric())
+            {
+                Leaf = Leaf.Mid(Separator + 1);
+            }
+        }
+        return Folder + Leaf;
+    }
+
+    bool CurrentWorldMatchesSoftAsset(const UWorld* World, const TSoftObjectPtr<UWorld>& ExpectedWorld)
+    {
+        if (!IsValid(World) || ExpectedWorld.IsNull())
+        {
+            return false;
+        }
+        const FString Actual = CanonicalRuntimeMapPackage(World->GetOutermost()->GetName());
+        const FString Expected = CanonicalRuntimeMapPackage(
+            ExpectedWorld.ToSoftObjectPath().GetLongPackageName());
+        return !Actual.IsEmpty() && !Expected.IsEmpty()
+            && Actual.Equals(Expected, ESearchCase::IgnoreCase);
     }
 
 }
@@ -514,6 +547,14 @@ void UGameManagerSubSystem::SetPlayerLocation(
     }
 
     PlayerLocation = Location;
+    if (IsValid(ActiveWorldData)) ActiveWorldData->PlayerLocation = Location;
+    if (IsValid(ActivePlayerData))
+    {
+        FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+        PlayerRecord.Location = Location;
+        const FRotator Rotation = SourceActor->GetActorRotation();
+        if (IsFiniteRotation(Rotation)) PlayerRecord.Rotation = Rotation.GetNormalized();
+    }
 }
 
 void UGameManagerSubSystem::ApplyPendingInitialPlayerControlRotation(
@@ -564,6 +605,11 @@ void UGameManagerSubSystem::UpdateSettings()
         {
             Chunks->SetLoadRadiusMeters(GameSettings->GetEffectiveObjectStreamingRadiusMeters());
         }
+    }
+
+    if (UWorldSceneStreamingSubsystem* SceneStreaming = UWorldSceneStreamingSubsystem::Get(this))
+    {
+        SceneStreaming->RefreshStreamingQuality();
     }
 
     // Height fog/cloud are ordinary settings.json toggles as well. Re-apply them to the active
@@ -925,15 +971,88 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         };
 
     const TCHAR* WorldOption = World->URL.GetOption(TEXT("World="), nullptr);
-    if (WorldOption && FCString::Strlen(WorldOption) > 0)
-    {
-        TryWorldCandidate(FString(WorldOption), TEXT("URL option"));
-    }
+    const FString UrlWorldCandidate =
+        (WorldOption && FCString::Strlen(WorldOption) > 0) ? FString(WorldOption) : FString();
+
+    bool bMatchedLaunchDescriptor = false;
+    bool bLaunchDescriptorMismatch = false;
     if (IsValid(Multiplayer))
     {
-        TryWorldCandidate(Multiplayer->GetSelectedWorldFolderName(), TEXT("world selection"));
+        const TSoftObjectPtr<UWorld> RequestedWorld = Multiplayer->GetRequestedWorldAsset();
+        if (!RequestedWorld.IsNull())
+        {
+            bMatchedLaunchDescriptor = CurrentWorldMatchesSoftAsset(World, RequestedWorld);
+            if (bMatchedLaunchDescriptor)
+            {
+                // The GameInstance-persistent descriptor is authoritative for local/host travel.
+                // The URL carries the same folder only as a hand-off/diagnostic value; it must never
+                // be allowed to redirect a verified map/GameMode pair to another external .v3d world.
+                TryWorldCandidate(
+                    Multiplayer->GetRequestedWorldFolder(),
+                    TEXT("validated launch descriptor"));
+                TryWorldCandidate(
+                    Multiplayer->GetSelectedWorldFolderName(),
+                    TEXT("validated world selection"));
+
+                if (!UrlWorldCandidate.IsEmpty())
+                {
+                    FString NormalizedUrlWorld;
+                    if (!TryNormalizeWorldFolderName(UrlWorldCandidate, NormalizedUrlWorld, true))
+                    {
+                        UE_LOG(LogTemp, Warning,
+                            TEXT("[WorldTravel] Ignoring invalid World= URL option on a validated launch. Value=%s"),
+                            *UrlWorldCandidate.Left(256));
+                    }
+                    else if (!ResolvedWorldName.IsEmpty()
+                        && !NormalizedUrlWorld.Equals(ResolvedWorldName, ESearchCase::CaseSensitive))
+                    {
+                        UE_LOG(LogTemp, Error,
+                            TEXT("[WorldTravel] World hand-off mismatch ignored. Map=%s DescriptorFolder=%s URLFolder=%s"),
+                            *World->GetOutermost()->GetName(),
+                            *ResolvedWorldName,
+                            *NormalizedUrlWorld);
+                    }
+                }
+            }
+            else
+            {
+                bLaunchDescriptorMismatch = true;
+                UE_LOG(LogTemp, Error,
+                    TEXT("[WorldTravel] Launch descriptor map mismatch. Active=%s Requested=%s Folder=%s"),
+                    *World->GetOutermost()->GetName(),
+                    *RequestedWorld.ToSoftObjectPath().ToString(),
+                    *Multiplayer->GetRequestedWorldFolder());
+            }
+        }
     }
-    TryWorldCandidate(CurrentWorldName, TEXT("pending selection"));
+
+    if (bLaunchDescriptorMismatch)
+    {
+        // Do not continue with a fallback folder: that can load a valid .v3d archive into the wrong
+        // UWorld and makes the entire scene appear corrupted even though the underlying assets are fine.
+        FailWorldStartup(FString::Printf(
+            TEXT("World startup refused: active map does not match the pending launch descriptor. Active=%s Requested=%s"),
+            *World->GetOutermost()->GetName(),
+            *Multiplayer->GetRequestedWorldAsset().ToSoftObjectPath().ToString()));
+        return;
+    }
+
+    if (!bMatchedLaunchDescriptor)
+    {
+        // Network-client/server travel has no local launch descriptor, so the server-provided URL
+        // remains the authoritative hand-off in that path.
+        if (!UrlWorldCandidate.IsEmpty())
+        {
+            TryWorldCandidate(UrlWorldCandidate, TEXT("URL option"));
+        }
+
+        // CurrentWorldName is a compatibility fallback only when there is no explicit map launch
+        // descriptor. Never let state from another destination outrank the active GameMode/map.
+        if (!IsValid(Multiplayer) || Multiplayer->GetRequestedWorldAsset().IsNull())
+        {
+            TryWorldCandidate(CurrentWorldName, TEXT("pending selection"));
+        }
+    }
     TryWorldCandidate(InConfigGameMode->WorldFolderName, TEXT("game mode default"));
 
     if (ResolvedWorldName.IsEmpty())
@@ -948,6 +1067,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
     {
         Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
     }
+    if (bMatchedLaunchDescriptor && IsValid(Multiplayer)) Multiplayer->ClearRequestedWorld();
 
     const FString ResolvedWorldRoot = GetWorldRootPath();
     UE_LOG(LogTemp, Display,
@@ -967,7 +1087,11 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         AMultiplayerWorldStateActor::SpawnOrUpdateForWorld(this, CurrentWorldName);
     }
 
-    ValidateResolvedGameMode();
+    if (!ValidateResolvedGameMode())
+    {
+        FailWorldStartup(TEXT("World startup refused: the destination map's World Settings GameMode is missing or invalid."));
+        return;
+    }
     EnsureRuntimeComponents();
 
     if (bManagerStarted)
@@ -1133,7 +1257,6 @@ void UGameManagerSubSystem::StopGameplaySession(
     {
         // Fallback for editor shutdown or travel paths that did not run the pre-travel commit.
         SaveScene();
-        SaveWorldData();
         SavePlayerData();
         bMenuTravelSaveCompleted = true;
     }
@@ -1164,7 +1287,6 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
     // so every live object is snapshotted before its owning chunk is released.
     WorldNameBeforeMenuTravel = CurrentWorldName;
     const bool bEntitySaveCompleted = SaveScene();
-    SaveWorldData();
     SavePlayerData();
 
     bMenuTravelStatePrepared = true;
@@ -1908,11 +2030,19 @@ void UGameManagerSubSystem::LoadPlayerData()
 
 void UGameManagerSubSystem::ResetInitialPlayerTransformState()
 {
+    if (UWorld* RetryWorld = InitialPlayerTransformRetryWorld.Get())
+    {
+        RetryWorld->GetTimerManager().ClearTimer(InitialPlayerTransformRetryTimer);
+    }
+    InitialPlayerTransformRetryTimer.Invalidate();
+    InitialPlayerTransformRetryWorld.Reset();
+
     InitialPlayerLocationSource = EInitialPlayerLocationSource::None;
     LoadedInitialPlayerRotation = FRotator::ZeroRotator;
     bHasLoadedInitialPlayerRotation = false;
     bInitialPlayerDataLoadCompleted = false;
     bInitialPlayerTransformResolved = false;
+    bInitialPlayerTransformRetryScheduled = false;
     bPendingInitialControlRotation = false;
     bPendingInitialWorldDataSave = false;
     bPendingInitialPlayerDataSave = false;
@@ -1931,6 +2061,147 @@ void UGameManagerSubSystem::ResetInitialPlayerTransformState()
     PlayerLocation = IsFiniteWorldLocation(RegisteredLocation)
         ? RegisteredLocation
         : FVector::ZeroVector;
+}
+
+void UGameManagerSubSystem::ScheduleInitialPlayerTransformRetry()
+{
+    check(IsInGameThread());
+    if (bInitialPlayerTransformRetryScheduled || bInitialPlayerTransformResolved) return;
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) return;
+    constexpr float InitialSpawnPollIntervalSeconds = 0.05f;
+    bInitialPlayerTransformRetryScheduled = true;
+    InitialPlayerTransformRetryWorld = World;
+    TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+    World->GetTimerManager().SetTimer(
+        InitialPlayerTransformRetryTimer,
+        FTimerDelegate::CreateLambda([WeakThis]()
+        {
+            if (UGameManagerSubSystem* StrongThis = WeakThis.Get())
+            {
+                StrongThis->bInitialPlayerTransformRetryScheduled = false;
+                StrongThis->TryResolveInitialPlayerTransform();
+            }
+        }), InitialSpawnPollIntervalSeconds, false);
+}
+
+bool UGameManagerSubSystem::PrepareInitialPlayerSpawnArea(const FVector& WorldLocation)
+{
+    check(IsInGameThread());
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+        || !IsFiniteWorldLocation(WorldLocation)) return false;
+
+    bool bChunkReady = true;
+    if (UWorldObjectStreamingSubsystem* Chunks = World->GetSubsystem<UWorldObjectStreamingSubsystem>())
+    {
+        if (!Chunks->IsRunning()) return false;
+        Chunks->SetPriorityStreamingFocus(WorldLocation);
+        bChunkReady = Chunks->IsAreaLoaded(WorldLocation);
+    }
+
+    UWorldSceneStreamingSubsystem* Scenes = IsValid(StreamSubSystem)
+        ? StreamSubSystem.Get()
+        : UWorldSceneStreamingSubsystem::Get(this);
+    if (!IsValid(Scenes) || !Scenes->IsActiveForWorld(World))
+    {
+        return false;
+    }
+    Scenes->SetPriorityStreamingFocus(WorldLocation);
+    return bChunkReady && Scenes->IsLocationReady(WorldLocation);
+}
+
+bool UGameManagerSubSystem::ResolveInitialGroundProbeRange(
+    const FVector& DesiredLocation,
+    double& OutBottomZ,
+    double& OutTopZ) const
+{
+    if (!IsFiniteWorldLocation(DesiredLocation)) return false;
+    constexpr double FallbackProbeCm = 500000.0;
+    OutBottomZ = static_cast<double>(DesiredLocation.Z) - FallbackProbeCm;
+    OutTopZ = static_cast<double>(DesiredLocation.Z) + FallbackProbeCm;
+    UWorldSceneStreamingSubsystem* Scenes = IsValid(StreamSubSystem)
+        ? StreamSubSystem.Get() : UWorldSceneStreamingSubsystem::Get(const_cast<UGameManagerSubSystem*>(this));
+    double SceneBottomZ = 0.0;
+    double SceneTopZ = 0.0;
+    if (IsValid(Scenes) && Scenes->GetVerticalBoundsAtXY(DesiredLocation, SceneBottomZ, SceneTopZ))
+    {
+        constexpr double BoundsPaddingCm = 200.0;
+        OutBottomZ = SceneBottomZ - BoundsPaddingCm;
+        OutTopZ = SceneTopZ + BoundsPaddingCm;
+    }
+    if (IsValid(ActiveWorldData) && ActiveWorldData->bOcean && FMath::IsFinite(ActiveWorldData->OceanHeightCm))
+    {
+        OutTopZ = FMath::Max(OutTopZ, ActiveWorldData->OceanHeightCm + 200.0);
+    }
+    return FMath::IsFinite(OutBottomZ) && FMath::IsFinite(OutTopZ) && OutTopZ > OutBottomZ;
+}
+
+void UGameManagerSubSystem::ClearInitialPlayerSpawnFocus()
+{
+    check(IsInGameThread());
+    if (UWorld* World = GetWorld())
+    {
+        if (UWorldObjectStreamingSubsystem* Chunks = World->GetSubsystem<UWorldObjectStreamingSubsystem>())
+        {
+            Chunks->ClearPriorityStreamingFocus();
+        }
+    }
+    if (UWorldSceneStreamingSubsystem* Scenes = IsValid(StreamSubSystem)
+            ? StreamSubSystem.Get()
+            : UWorldSceneStreamingSubsystem::Get(this))
+    {
+        Scenes->ClearPriorityStreamingFocus();
+    }
+}
+
+bool UGameManagerSubSystem::FindNearestGroundSpawnLocation(
+    AActor* Player,
+    const FVector& DesiredLocation,
+    FVector& OutLocation) const
+{
+    check(IsInGameThread());
+    OutLocation = DesiredLocation;
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+        || !IsValid(Player) || !IsFiniteWorldLocation(DesiredLocation))
+    {
+        return false;
+    }
+    double BottomZ = 0.0, TopZ = 0.0;
+    if (!ResolveInitialGroundProbeRange(DesiredLocation, BottomZ, TopZ)) return false;
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(InitialPlayerGround), true, Player);
+    Params.bReturnPhysicalMaterial = false;
+    Params.bFindInitialOverlaps = false;
+    const FVector TraceStart(DesiredLocation.X, DesiredLocation.Y, TopZ);
+    const FVector TraceEnd(DesiredLocation.X, DesiredLocation.Y, BottomZ);
+    FHitResult Hit;
+    FCollisionObjectQueryParams GroundObjectTypes;
+    GroundObjectTypes.AddObjectTypesToQuery(ECC_WorldStatic);
+    const bool bHit = World->LineTraceSingleByObjectType(Hit, TraceStart, TraceEnd, GroundObjectTypes, Params)
+        && Hit.bBlockingHit && IsFiniteWorldLocation(Hit.ImpactPoint) && Hit.ImpactNormal.Z >= 0.20f;
+    float VerticalClearance = 2.0f;
+    if (const ACharacter* Character = Cast<ACharacter>(Player))
+    {
+        if (const UCapsuleComponent* Capsule = Character->GetCapsuleComponent()) VerticalClearance += Capsule->GetScaledCapsuleHalfHeight();
+    }
+    if (bHit)
+    {
+        double SpawnSurfaceZ = static_cast<double>(Hit.ImpactPoint.Z);
+        if (IsValid(ActiveWorldData) && ActiveWorldData->bOcean && FMath::IsFinite(ActiveWorldData->OceanHeightCm)
+            && SpawnSurfaceZ < ActiveWorldData->OceanHeightCm)
+        {
+            SpawnSurfaceZ = ActiveWorldData->OceanHeightCm;
+        }
+        OutLocation = FVector(DesiredLocation.X, DesiredLocation.Y, SpawnSurfaceZ + static_cast<double>(VerticalClearance));
+        return IsFiniteWorldLocation(OutLocation);
+    }
+    if (IsValid(ActiveWorldData) && ActiveWorldData->bOcean && FMath::IsFinite(ActiveWorldData->OceanHeightCm))
+    {
+        OutLocation = FVector(DesiredLocation.X, DesiredLocation.Y, ActiveWorldData->OceanHeightCm + static_cast<double>(VerticalClearance));
+        return IsFiniteWorldLocation(OutLocation);
+    }
+    return false;
 }
 
 void UGameManagerSubSystem::TryResolveInitialPlayerTransform()
@@ -1980,61 +2251,81 @@ void UGameManagerSubSystem::TryResolveInitialPlayerTransform()
             ResolvedRotation = LoadedInitialPlayerRotation;
             bShouldRestoreSavedControlRotation = true;
         }
+    }
 
-        // This is the sole initial teleport. The resolved marker is set immediately afterward so
-        // SetPlayerActor calls from later runtime GLB/Pawn replacement cannot replay the save.
-        const bool bApplied = RegisteredPlayer->SetActorLocationAndRotation(
-            ResolvedLocation,
-            ResolvedRotation,
-            false,
-            nullptr,
-            ETeleportType::TeleportPhysics);
-        if (!bApplied)
+    double GroundProbeBottomZ = 0.0;
+    double GroundProbeTopZ = 0.0;
+    const bool bHasGroundProbeRange = ResolveInitialGroundProbeRange(ResolvedLocation, GroundProbeBottomZ, GroundProbeTopZ);
+    const FVector GroundProbeFocus = bHasGroundProbeRange ? FVector(ResolvedLocation.X, ResolvedLocation.Y, GroundProbeTopZ) : ResolvedLocation;
+    if (!PrepareInitialPlayerSpawnArea(GroundProbeFocus))
+    {
+        ScheduleInitialPlayerTransformRetry();
+        return;
+    }
+    FVector GroundedLocation = ResolvedLocation;
+    if (FindNearestGroundSpawnLocation(RegisteredPlayer, ResolvedLocation, GroundedLocation))
+    {
+        if (!PrepareInitialPlayerSpawnArea(GroundedLocation))
         {
-            UE_LOG(LogTemp, Error,
-                TEXT("[PlayerSpawn] Failed to apply the validated saved transform to %s; "
-                     "preserving its actual transform instead."),
-                *GetNameSafe(RegisteredPlayer));
-
-            const FVector ActualLocation = RegisteredPlayer->GetActorLocation();
-            const FRotator ActualRotation = RegisteredPlayer->GetActorRotation();
-            if (!IsFiniteWorldLocation(ActualLocation))
-            {
-                // Leave the handshake unresolved so a later valid registration can retry.
-                return;
-            }
-
-            ResolvedLocation = ActualLocation;
-            ResolvedRotation = IsFiniteRotation(ActualRotation)
-                ? ActualRotation.GetNormalized()
-                : FRotator::ZeroRotator;
-            bShouldRestoreSavedControlRotation = false;
+            ScheduleInitialPlayerTransformRetry();
+            return;
         }
+        ResolvedLocation = GroundedLocation;
+    }
 
-        if (bShouldRestoreSavedControlRotation)
+    // Apply the resolved transform for both saved spawns and fresh PlayerStart spawns. The latter
+    // normally changes only Z, ensuring the capsule begins immediately above the nearest floor.
+    const bool bApplied = RegisteredPlayer->SetActorLocationAndRotation(
+        ResolvedLocation,
+        ResolvedRotation,
+        false,
+        nullptr,
+        ETeleportType::TeleportPhysics);
+    if (!bApplied)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[PlayerSpawn] Failed to apply the streamed/grounded initial transform to %s; "
+                 "preserving its actual transform instead."),
+            *GetNameSafe(RegisteredPlayer));
+
+        const FVector ActualLocation = RegisteredPlayer->GetActorLocation();
+        const FRotator ActualRotation = RegisteredPlayer->GetActorRotation();
+        if (!IsFiniteWorldLocation(ActualLocation))
         {
-            // Keep this pending even when the controller already exists: this function can run
-            // from OnPossess, before FinishRestartPlayer performs its final PlayerStart override.
-            bPendingInitialControlRotation = true;
-            if (const APawn* Pawn = Cast<APawn>(RegisteredPlayer))
+            ScheduleInitialPlayerTransformRetry();
+            return;
+        }
+        ResolvedLocation = ActualLocation;
+        ResolvedRotation = IsFiniteRotation(ActualRotation)
+            ? ActualRotation.GetNormalized()
+            : FRotator::ZeroRotator;
+        bShouldRestoreSavedControlRotation = false;
+    }
+
+    if (bShouldRestoreSavedControlRotation)
+    {
+        // Keep this pending even when the controller already exists: this function can run
+        // from OnPossess, before FinishRestartPlayer performs its final PlayerStart override.
+        bPendingInitialControlRotation = true;
+        if (const APawn* Pawn = Cast<APawn>(RegisteredPlayer))
+        {
+            if (AController* Controller = Pawn->GetController())
             {
-                if (AController* Controller = Pawn->GetController())
-                {
-                    // CharacterMovement/camera code may immediately consume control rotation, so
-                    // restore it with the actor rotation instead of letting it overwrite the save.
-                    Controller->SetControlRotation(ResolvedRotation);
-                }
+                Controller->SetControlRotation(ResolvedRotation);
             }
         }
     }
 
     PlayerLocation = ResolvedLocation;
     bInitialPlayerTransformResolved = true;
+    bInitialPlayerTransformRetryScheduled = false;
+    if (InitialPlayerTransformRetryWorld.Get() == World) World->GetTimerManager().ClearTimer(InitialPlayerTransformRetryTimer);
+    InitialPlayerTransformRetryTimer.Invalidate();
+    InitialPlayerTransformRetryWorld.Reset();
+    ClearInitialPlayerSpawnFocus();
 
     if (bPendingInitialControlRotation)
     {
-        // The controller's OnPossess callback also consumes this flag. Scheduling here covers the
-        // inverse initialization order where the manager resolves after OnPossess has already run.
         World->GetTimerManager().SetTimerForNextTick(
             FTimerDelegate::CreateWeakLambda(this, [this]()
             {
@@ -2062,49 +2353,82 @@ void UGameManagerSubSystem::TryResolveInitialPlayerTransform()
 
 void UGameManagerSubSystem::FlushPendingInitialTransformSaves()
 {
-    // Save functions clear their own pending bit only after a validated transform is serializable.
-    if (bPendingInitialWorldDataSave)
-    {
-        SaveWorldData();
-    }
-    if (bPendingInitialPlayerDataSave)
-    {
-        SavePlayerData();
-    }
+    if (bPendingInitialPlayerDataSave) SavePlayerData();
+    else if (bPendingInitialWorldDataSave) SaveWorldData();
 }
 
-void UGameManagerSubSystem::SaveWorldData()
+bool UGameManagerSubSystem::CaptureCurrentPlayerTransformForPersistence()
 {
     check(IsInGameThread());
-    if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return;
-    if (!IsValid(ActiveWorldData) || !IsValid(ActivePlayerData) || !FMath::IsFinite(ActiveWorldData->WorldTime)) return;
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->GetNetMode() == NM_Client) return false;
+    AActor* LivePlayer = PlayerActor.Get();
+    if (!IsValid(LivePlayer) || LivePlayer->IsActorBeingDestroyed() || LivePlayer->GetWorld() != World)
+    {
+        LivePlayer = nullptr;
+        if (APlayerController* PrimaryController = World->GetFirstPlayerController())
+        {
+            APawn* PrimaryPawn = PrimaryController->GetPawn();
+            if (IsValid(PrimaryPawn) && !PrimaryPawn->IsActorBeingDestroyed() && PrimaryPawn->GetWorld() == World)
+            {
+                LivePlayer = PrimaryPawn;
+                PlayerActor = PrimaryPawn;
+            }
+        }
+    }
+    if (!IsValid(LivePlayer)) return false;
+    const FVector LiveLocation = LivePlayer->GetActorLocation();
+    const FRotator LiveRotation = LivePlayer->GetActorRotation();
+    if (!IsFiniteWorldLocation(LiveLocation)) return false;
+    PlayerLocation = LiveLocation;
+    if (IsValid(ActiveWorldData)) ActiveWorldData->PlayerLocation = LiveLocation;
+    if (IsValid(ActivePlayerData))
+    {
+        FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+        PlayerRecord.Location = LiveLocation;
+        if (IsFiniteRotation(LiveRotation)) PlayerRecord.Rotation = LiveRotation.GetNormalized();
+    }
+    return true;
+}
+
+bool UGameManagerSubSystem::SaveWorldData()
+{
+    check(IsInGameThread());
+    if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return false;
+    if (!IsValid(ActiveWorldData) || !IsValid(ActivePlayerData) || !FMath::IsFinite(ActiveWorldData->WorldTime)) return false;
     FWorldRuntimeState Snapshot;
     Snapshot.WorldTime = ActiveWorldData->WorldTime;
     Snapshot.SelectedPlayer = FPaths::GetCleanFilename(ActiveWorldData->Player);
     Snapshot.Players = ActivePlayerData->Players;
     UWorldObjectStreamingSubsystem* Chunks = GetWorld()
         ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
-    if (!Chunks || !Chunks->IsRunning()) return;
-    Chunks->SaveRuntimeStateAsync(Snapshot, [](FSafeFileWriteResult Result)
+    if (!Chunks || !Chunks->IsRunning()) return false;
+    const bool bQueued = Chunks->SaveRuntimeStateAsync(Snapshot, [](FSafeFileWriteResult Result)
     {
         if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::ShuttingDown
             && Result.Status != ESafeFileIOStatus::Superseded)
             UE_LOG(LogTemp, Error, TEXT(".dat transactional save failed. Path=%s Reason=%s"), *Result.Path, *Result.Error);
     });
-    bPendingInitialWorldDataSave = false;
+    if (bQueued) bPendingInitialWorldDataSave = false;
+    return bQueued;
 }
 
-void UGameManagerSubSystem::SavePlayerData()
+bool UGameManagerSubSystem::SavePlayerData()
 {
     check(IsInGameThread());
-    if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return;
-    if (!IsValid(ActivePlayerData) || !IsFiniteWorldLocation(PlayerLocation)) return;
+    if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return false;
+    if (!IsValid(ActivePlayerData)) return false;
+
+    // Refresh from the live Pawn before validating the cached location. The old ordering could both
+    // fail compilation (bare return in a bool function) and reject a valid live transform merely
+    // because the previous cache had not been initialized yet.
+    CaptureCurrentPlayerTransformForPersistence();
+    if (!IsFiniteWorldLocation(PlayerLocation)) return false;
     FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
     PlayerRecord.Location = PlayerLocation;
-    if (const AActor* Player = PlayerActor.Get(); IsValid(Player) && IsFiniteRotation(Player->GetActorRotation()))
-        PlayerRecord.Rotation = Player->GetActorRotation().GetNormalized();
-    SaveWorldData();
-    bPendingInitialPlayerDataSave = false;
+    const bool bQueued = SaveWorldData();
+    if (bQueued) bPendingInitialPlayerDataSave = false;
+    return bQueued;
 }
 
 void UGameManagerSubSystem::SetSelectedPlayerForRuntime(const FString& PlayerId)
@@ -2133,109 +2457,34 @@ void UGameManagerSubSystem::SetSelectedPlayerForRuntime(const FString& PlayerId)
     SaveWorldData();
 }
 
-void UGameManagerSubSystem::ValidateResolvedGameMode() const
+bool UGameManagerSubSystem::ValidateResolvedGameMode() const
 {
     const UWorld* World = GetWorld();
-    if (!World)
-    {
-        UE_LOG(LogTemp, Warning, TEXT("[GameModeTravel] Cannot validate GameMode because no UWorld is available."));
-        return;
-    }
-
+    if (!IsValid(World)) return false;
     const AWorldSettings* WorldSettings = World->GetWorldSettings();
-    UClass* MapGameModeClass = WorldSettings ? WorldSettings->DefaultGameMode.Get() : nullptr;
-    const FString MapGameModePath = IsValid(MapGameModeClass)
-        ? MapGameModeClass->GetPathName()
-        : FString();
-
-    const UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this);
-    const TSoftClassPtr<AGameModeBase> RequestedOverride = IsValid(Multiplayer)
-        ? Multiplayer->GetRequestedGameModeOverride()
-        : TSoftClassPtr<AGameModeBase>();
-    const FString RequestedOverridePath = RequestedOverride.IsNull()
-        ? FString()
-        : RequestedOverride.ToSoftObjectPath().ToString();
-    const FString RequestedFolder = IsValid(Multiplayer)
-        ? Multiplayer->GetRequestedGameModeWorldFolder()
-        : FString();
-
-    const TCHAR* UrlGameModeOption = World->URL.GetOption(TEXT("game="), nullptr);
-    const FString UrlGameMode = UrlGameModeOption ? FString(UrlGameModeOption) : FString();
-
-    // GameMode exists only on the authority. Network clients receive GameState/PlayerState instead.
-    if (World->GetNetMode() == NM_Client)
+    UClass* MapGameModeClass = IsValid(WorldSettings) ? WorldSettings->DefaultGameMode.Get() : nullptr;
+    const FString MapGameModePath = IsValid(MapGameModeClass) ? MapGameModeClass->GetPathName() : FString();
+    if (World->GetNetMode() == NM_Client) return true;
+    if (!IsValid(MapGameModeClass))
     {
-        UE_LOG(LogTemp, Display,
-            TEXT("[GameModeTravel] Client world loaded. Map=%s RequestedFolder=%s; authoritative GameMode is owned by the server."),
-            *World->GetMapName(),
-            RequestedFolder.IsEmpty() ? TEXT("<none>") : *RequestedFolder);
-        return;
+        UE_LOG(LogTemp, Error, TEXT("[WorldSettings] Gameplay map %s has no explicit GameMode Override. Set it in World Settings; project/AssetRegistry fallbacks are intentionally not used."), *World->GetMapName());
+        return false;
     }
-
+    if (!MapGameModeClass->IsChildOf(AV3DSimulatorGameplayGameModeBase::StaticClass()))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[WorldSettings] Gameplay map %s has an invalid GameMode Override: %s. It must derive from AV3DSimulatorGameplayGameModeBase."), *World->GetMapName(), *MapGameModePath);
+        return false;
+    }
     const AGameModeBase* ActiveGameMode = World->GetAuthGameMode();
-    if (!IsValid(ActiveGameMode))
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("[GameModeTravel] No authoritative GameMode exists after map initialization. Map=%s MapOverride=%s URLGame=%s"),
-            *World->GetMapName(),
-            MapGameModePath.IsEmpty() ? TEXT("<project default>") : *MapGameModePath,
-            UrlGameMode.IsEmpty() ? TEXT("<none>") : *UrlGameMode);
-        return;
-    }
-
+    if (!IsValid(ActiveGameMode)) return false;
     UClass* ActiveGameModeClass = ActiveGameMode->GetClass();
-    const FString ActiveGameModePath = IsValid(ActiveGameModeClass)
-        ? ActiveGameModeClass->GetPathName()
-        : FString(TEXT("<invalid>"));
-
-    FString ExpectedGameModePath;
-    FString ResolutionSource;
-    if (!RequestedOverridePath.IsEmpty())
+    const FString ActiveGameModePath = IsValid(ActiveGameModeClass) ? ActiveGameModeClass->GetPathName() : FString(TEXT("<invalid>"));
+    if (!ActiveGameModePath.Equals(MapGameModePath, ESearchCase::CaseSensitive))
     {
-        ExpectedGameModePath = RequestedOverridePath;
-        ResolutionSource = TEXT("folder launch profile");
+        UE_LOG(LogTemp, Error, TEXT("[WorldSettings] Active GameMode does not match the destination map's World Settings. Map=%s Expected=%s Active=%s"), *World->GetMapName(), *MapGameModePath, *ActiveGameModePath);
+        return false;
     }
-    else if (!MapGameModePath.IsEmpty())
-    {
-        ExpectedGameModePath = MapGameModePath;
-        ResolutionSource = TEXT("map World Settings");
-    }
-    else
-    {
-        ResolutionSource = TEXT("project default");
-    }
-
-    const bool bExpectedClassMismatch = !ExpectedGameModePath.IsEmpty()
-        && !ActiveGameModePath.Equals(ExpectedGameModePath, ESearchCase::CaseSensitive);
-    if (bExpectedClassMismatch)
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("[GameModeTravel] GameMode mismatch. Map=%s Folder=%s Expected=%s Active=%s Source=%s URLGame=%s"),
-            *World->GetMapName(),
-            RequestedFolder.IsEmpty() ? TEXT("<none>") : *RequestedFolder,
-            *ExpectedGameModePath,
-            *ActiveGameModePath,
-            *ResolutionSource,
-            UrlGameMode.IsEmpty() ? TEXT("<none>") : *UrlGameMode);
-        return;
-    }
-
-    if (ExpectedGameModePath.IsEmpty() && ActiveGameModeClass == AGameModeBase::StaticClass())
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("[GameModeTravel] Map=%s has no map/profile GameMode override and resolved to bare GameModeBase. "
-                 "Assign a valid World Settings override, launch-profile override, or project default."),
-            *World->GetMapName());
-    }
-
-    UE_LOG(LogTemp, Display,
-        TEXT("[GameModeTravel] Active GameMode confirmed. Map=%s Folder=%s Active=%s Source=%s MapOverride=%s URLGame=%s"),
-        *World->GetMapName(),
-        RequestedFolder.IsEmpty() ? TEXT("<none>") : *RequestedFolder,
-        *ActiveGameModePath,
-        *ResolutionSource,
-        MapGameModePath.IsEmpty() ? TEXT("<none>") : *MapGameModePath,
-        UrlGameMode.IsEmpty() ? TEXT("<none>") : *UrlGameMode);
+    return true;
 }
 
 void UGameManagerSubSystem::ApplyLevelSettings()
@@ -2296,7 +2545,6 @@ void UGameManagerSubSystem::SaveWorldDataDelayed()
         return;
     }
 
-    SaveWorldData();
     SavePlayerData();
 
     if (!World || !bManagerStarted)
@@ -2464,6 +2712,7 @@ void UGameManagerSubSystem::SetLoadingWidget(UUserWidget* InWidget)
     if (IsValid(LoadingWidgetInstance.Get()))
     {
         LoadingWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
+        LoadingWidgetInstance->RemoveFromParent();
     }
     LoadingWidgetInstance = InWidget;
     if (IsValid(LoadingWidgetInstance.Get()))
@@ -2742,6 +2991,11 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     PostProcess = nullptr;
     CurrentWorldData = nullptr;
     ActiveWorldData = nullptr;
+    if (IsValid(LoadingWidgetInstance.Get()))
+    {
+        LoadingWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
+        LoadingWidgetInstance->RemoveFromParent();
+    }
     LoadingWidgetInstance = nullptr;
     StreamSubSystem = nullptr;
     OceanActor = nullptr;
@@ -3307,7 +3561,7 @@ bool UGameManagerSubSystem::TryOpenWorldSelectionScreen(
     Manager->PrepareForMenuLevelTravelRequest();
 
     // MainGameMode clears the pending request only after the destination UI is input-safe.
-    // Editor-only transaction cleanup is handled centrally by V3DSimulatorEditor::PreLoadMap.
+    // No project editor-module callback participates in travel; runtime teardown owns this transition.
     UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Calling OpenLevelBySoftObjectPtr for world selection."));
     UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, MainWorld, true, FString());
     return true;

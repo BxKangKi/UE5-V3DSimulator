@@ -495,7 +495,7 @@ namespace WorldBakedModelAssetPrivate
                 Primitive.bHasMaterial = bLoadMaterials && Baked.bHasMaterial;
                 Primitive.bHighPrecisionUVs = Baked.bHighPrecisionUVs;
                 Primitive.bHighPrecisionWeights = Baked.bHighPrecisionWeights;
-                Primitive.bDisableShadows = Baked.bDisableShadows;
+                Primitive.bDisableShadows = false;
                 Primitive.bHasIndices = Baked.bHasIndices;
                 OutMaterialIds[MeshArrayIndex][PrimitiveIndex] = Baked.MaterialId;
             });

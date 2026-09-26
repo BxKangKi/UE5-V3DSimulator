@@ -1260,6 +1260,13 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     if (!IsValid(OwnerCharacter) || !IsValid(Movement) || !IsValid(MeshComp))
         return;
 
+    if (bStreamingMovementSuspended)
+    {
+        // Keep the gate's disabled movement state and discard artificial speed changes.
+        SetStreamingMovementSuspended(true);
+        return;
+    }
+
     const FVector CurrentVelocity = OwnerCharacter->GetVelocity();
     const FRotator ControlRot = OwnerCharacter->GetControlRotation();
     const bool bInWaterState = UCharacterFunctionLibrary::IsStateActive(CharacterState, STATE_WATER);
@@ -2716,9 +2723,19 @@ void UCharacterComponent::UpdateRagdollVelocityHistory(float DeltaTime, const FV
     }
 }
 
+void UCharacterComponent::SetStreamingMovementSuspended(bool bSuspended)
+{
+    bStreamingMovementSuspended = bSuspended;
+    PrevVelocity = IsValid(OwnerCharacter) ? OwnerCharacter->GetVelocity() : FVector::ZeroVector;
+    ImpactVelocity = FVector::ZeroVector;
+    // The cached pre-impact velocity must not retain the artificial stop/resume transition.
+    LastPreRagdollVelocity = FVector::ZeroVector;
+    LastPreRagdollVelocityAge = TNumericLimits<float>::Max();
+}
+
 bool UCharacterComponent::IsRagdollDamage()
 {
-    return (ImpactVelocity.Size() > RagdollResistance) && !bInvincible;
+    return !bStreamingMovementSuspended && (ImpactVelocity.Size() > RagdollResistance) && !bInvincible;
 }
 
 FVector UCharacterComponent::CapturePreRagdollVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement) const
@@ -3034,6 +3051,7 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     SkeletalMesh->SetGenerateOverlapEvents(true);
     SkeletalMesh->SetAllBodiesSimulatePhysics(true);
     UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, CharacterRagdollTuning::MaxBlendWeight);
+    UCharacterFunctionLibrary::PrepareHairForRagdoll(*SkeletalMesh, InitialRagdollVelocity);
     ApplyInitialRagdollVelocity(SkeletalMesh, InitialRagdollVelocity);
     BeginRagdollCameraStabilization();
 }

@@ -15,6 +15,8 @@
 #include "Engine/World.h"
 #include "GameMode/MainGameMode.h"
 #include "UI/ProjectSelectionWidget.h"
+#include "System/V3DSimulatorAssetRegistry.h"
+#include "System/V3DSimulatorGameInstance.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "System/SimulatorPaths.h"
@@ -64,9 +66,21 @@ void UStartWorldWidget::SetMainGameMode(AMainGameMode* InMainGameMode)
     MainGameMode = InMainGameMode;
 }
 
+AMainGameMode* UStartWorldWidget::ResolveMainGameMode() const
+{
+    UWorld* World = GetWorld();
+    if (!World) return nullptr;
+    if (AMainGameMode* Assigned = MainGameMode.Get())
+    {
+        if (Assigned->GetWorld() == World) return Assigned;
+    }
+    // A Blueprint-created/reconstructed widget may not have received SetMainGameMode yet.
+    return Cast<AMainGameMode>(World->GetAuthGameMode());
+}
+
 void UStartWorldWidget::ExecuteStartGame()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->StartGame();
         return;
@@ -77,7 +91,7 @@ void UStartWorldWidget::ExecuteStartGame()
 
 void UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->ReturnToMainMenuFromWorldSelection();
         return;
@@ -88,7 +102,7 @@ void UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection()
 
 void UStartWorldWidget::ExecuteShowStartMenu()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->ShowStartMenu();
         return;
@@ -99,7 +113,7 @@ void UStartWorldWidget::ExecuteShowStartMenu()
 
 void UStartWorldWidget::ExecuteShowWorldSelectionMenu()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->ShowWorldSelectionMenu();
         return;
@@ -110,7 +124,7 @@ void UStartWorldWidget::ExecuteShowWorldSelectionMenu()
 
 void UStartWorldWidget::ExecuteShowMultiplayerMenu()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->ShowMultiplayerMenu();
         return;
@@ -121,7 +135,7 @@ void UStartWorldWidget::ExecuteShowMultiplayerMenu()
 
 void UStartWorldWidget::ExecuteShowSettingsMenu()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->ShowSettingsMenu();
         return;
@@ -130,9 +144,38 @@ void UStartWorldWidget::ExecuteShowSettingsMenu()
     UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show settings because MainGameMode is not assigned."));
 }
 
+bool UStartWorldWidget::EnsureProjectSelectionWidget()
+{
+    APlayerController* PlayerController = GetOwningPlayer();
+    if (!IsValid(PlayerController) || !PlayerController->IsLocalController()
+        || !PlayerController->GetLocalPlayer())
+        return false;
+
+    if (!IsValid(ProjectSelectionWidget))
+    {
+        UV3DSimulatorAssetRegistry* Registry =
+            UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+        if (!IsValid(Registry)) return false;
+        Registry->EnsureMenuDefaults();
+        UClass* WidgetClass = Registry->ProjectSelectionWidgetClass.LoadSynchronous();
+        if (!IsValid(WidgetClass) || !WidgetClass->IsChildOf(UProjectSelectionWidget::StaticClass()))
+        {
+            UE_LOG(LogTemp, Error, TEXT("Cannot load project browser class: %s. Check the Shipping cook."),
+                *Registry->ProjectSelectionWidgetClass.ToSoftObjectPath().ToString());
+            return false;
+        }
+        SetProjectSelectionWidget(CreateWidget<UProjectSelectionWidget>(PlayerController, WidgetClass));
+    }
+    if (!IsValid(ProjectSelectionWidget)) return false;
+    if (!ProjectSelectionWidget->IsInViewport() && !ProjectSelectionWidget->AddToPlayerScreen(30))
+        return false;
+    ProjectSelectionWidget->SetOwnerStartWidget(this);
+    return true;
+}
+
 void UStartWorldWidget::ExecuteShowProjectSelectionWidget()
 {
-    if (!IsValid(ProjectSelectionWidget))
+    if (!EnsureProjectSelectionWidget())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("Projects button requires ProjectSelectionWidgetClass in the central AssetRegistry or an explicit SetProjectSelectionWidget() override."));
@@ -232,7 +275,7 @@ void UStartWorldWidget::ApplyProjectSelectionInputMode(UUserWidget* FocusWidget)
 
 void UStartWorldWidget::ExecuteRefreshWorldSelectionData()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->RefreshWorldFolderNameMap();
         return;
@@ -567,7 +610,7 @@ bool UStartWorldWidget::OpenWorldByFolderName(const FString& WorldFolderName)
     }
 
     SelectedWorldFolderName = ResolvedFolderName;
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->OpenSinglePlayerWorldByFolderName(ResolvedFolderName);
         return true;
@@ -597,7 +640,7 @@ bool UStartWorldWidget::HostWorldByFolderName(const FString& WorldFolderName)
     }
 
     SelectedWorldFolderName = ResolvedFolderName;
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->HostMultiplayerWorldByFolderName(ResolvedFolderName);
         return true;
@@ -614,7 +657,7 @@ void UStartWorldWidget::ExecuteJoinSelectedWorld()
 
 bool UStartWorldWidget::JoinSelectedWorld()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->JoinMultiplayerServer(ServerAddress, SelectedWorldFolderName);
         return true;
@@ -627,7 +670,7 @@ bool UStartWorldWidget::JoinSelectedWorld()
 bool UStartWorldWidget::JoinServer(const FString& InServerAddress)
 {
     SetServerAddress(InServerAddress);
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->JoinMultiplayerServer(ServerAddress, SelectedWorldFolderName);
         return true;
@@ -644,7 +687,7 @@ void UStartWorldWidget::ExecuteOpenClientConnectionWorld()
 
 bool UStartWorldWidget::OpenClientConnectionWorld()
 {
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->OpenClientConnectionWorld(ServerAddress);
         return true;
@@ -662,7 +705,7 @@ void UStartWorldWidget::SetServerAddress(const FString& InServerAddress)
         ServerAddress = TEXT("127.0.0.1:7777");
     }
 
-    if (AMainGameMode* Owner = MainGameMode.Get())
+    if (AMainGameMode* Owner = ResolveMainGameMode())
     {
         Owner->SetPendingServerAddress(ServerAddress);
     }
@@ -670,7 +713,7 @@ void UStartWorldWidget::SetServerAddress(const FString& InServerAddress)
 
 TMap<FString, FString> UStartWorldWidget::GetFolderNameMap() const
 {
-    if (const AMainGameMode* Owner = MainGameMode.Get())
+    if (const AMainGameMode* Owner = ResolveMainGameMode())
     {
         return Owner->GetFolderNameMap();
     }

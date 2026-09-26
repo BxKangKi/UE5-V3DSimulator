@@ -19,6 +19,8 @@
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"
+#include "Setting/GameSettings.h"
 #include "Model/StaticActor.h"
 #include "Model/InstancedMeshActor.h"
 #include "System/StreamingMovementGateSubsystem.h"
@@ -102,7 +104,7 @@ namespace
         FWorldSceneStreamPlan& Plan,
         const TSet<FName>& LoadedMeshNodes,
         const FTransform& OwnerWorldTransform,
-        const FVector& PlayerLocation,
+        const TArray<FVector>& ObserverLocations,
         const float Distance,
         const float UnloadDistanceMultiplier)
     {
@@ -161,8 +163,23 @@ namespace
         Plan.PendingLoadNodes.Reserve(Plan.NodeMap.Num());
         Plan.PendingUnloadNodes.Reserve(LoadedMeshNodes.Num());
         Plan.UnavailableRegions.Reserve(Plan.NodeMap.Num());
+        TMap<FName, double> NodeDistanceSqCache;
+        NodeDistanceSqCache.Reserve(Plan.NodeMap.Num());
+        TMap<FName, double> WaterDistanceSqCache;
+        WaterDistanceSqCache.Reserve(Plan.WaterNodeMap.Num());
 
         const float SafeUnloadMultiplier = FMath::Max(1.0f, UnloadDistanceMultiplier);
+        const auto NearestObserverDistanceSq = [&ObserverLocations](const FVector& WorldLocation)
+        {
+            double BestDistanceSq = TNumericLimits<double>::Max();
+            for (const FVector& Observer : ObserverLocations)
+            {
+                BestDistanceSq = FMath::Min(
+                    BestDistanceSq, static_cast<double>(FVector::DistSquared(Observer, WorldLocation)));
+            }
+            return BestDistanceSq == TNumericLimits<double>::Max()
+                ? TNumericLimits<double>::Max() : BestDistanceSq;
+        };
         for (const TPair<FName, FModelNodeData>& NodePair : Plan.NodeMap)
         {
             const FModelNodeData& Info = NodePair.Value;
@@ -174,7 +191,8 @@ namespace
             const float LoadRadiusSq = FMath::Square(LoadRadius);
             const float UnloadRadiusSq = FMath::Square(LoadRadius * SafeUnloadMultiplier);
             const FTransform WorldTransform = Info.Transform * OwnerWorldTransform;
-            const float CurrentDist = FVector::DistSquared(PlayerLocation, WorldTransform.GetLocation());
+            const double CurrentDist = NearestObserverDistanceSq(WorldTransform.GetLocation());
+            NodeDistanceSqCache.Add(NodePair.Key, CurrentDist);
             const bool bIsLoaded = LoadedMeshNodes.Contains(NodePair.Key);
 
             if (bIsLoaded)
@@ -197,7 +215,8 @@ namespace
         {
             const FVector WaterWorldLocation =
                 (WaterPair.Value.Transform * OwnerWorldTransform).GetLocation();
-            const float CurrentDist = FVector::DistSquared(PlayerLocation, WaterWorldLocation);
+            const double CurrentDist = NearestObserverDistanceSq(WaterWorldLocation);
+            WaterDistanceSqCache.Add(WaterPair.Key, CurrentDist);
             const float LoadRadius = FMath::Max(WaterPair.Value.StreamRadius, WaterDistanceRadius);
             const float LoadRadiusSq = FMath::Square(LoadRadius);
             const float UnloadRadiusSq = LoadRadiusSq * FMath::Square(SafeUnloadMultiplier);
@@ -210,6 +229,10 @@ namespace
                 Plan.PendingLoadWaterNodes.Add(WaterPair.Key);
             }
         }
+        Plan.PendingLoadNodes.Sort([&NodeDistanceSqCache](const FName A, const FName B) { return NodeDistanceSqCache.FindChecked(A) < NodeDistanceSqCache.FindChecked(B); });
+        Plan.PendingUnloadNodes.Sort([&NodeDistanceSqCache](const FName A, const FName B) { return NodeDistanceSqCache.FindChecked(A) > NodeDistanceSqCache.FindChecked(B); });
+        Plan.PendingLoadWaterNodes.Sort([&WaterDistanceSqCache](const FName A, const FName B) { return WaterDistanceSqCache.FindChecked(A) < WaterDistanceSqCache.FindChecked(B); });
+        Plan.PendingUnloadWaterNodes.Sort([&WaterDistanceSqCache](const FName A, const FName B) { return WaterDistanceSqCache.FindChecked(A) > WaterDistanceSqCache.FindChecked(B); });
     }
 }
 
@@ -259,15 +282,45 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
     bool bInWaterGroup,
     float InUnloadDistanceMultiplier)
 {
-    if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::StreamAsync")))
+    TArray<FVector> Observers;
+    Observers.Add(InPlayerLocation);
+    return StreamAsyncForObservers(
+        WorldContextObject, Actor, InMeshActor, Observers, StaticMeshConfig, InDistance,
+        InChunkSize, bInRenderOnly, bInWaterGroup, InUnloadDistanceMultiplier);
+}
+
+UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
+    UObject* WorldContextObject,
+    AStaticActor* Actor,
+    AInstancedMeshActor* InMeshActor,
+    const TArray<FVector>& InObserverLocations,
+    const FglTFRuntimeStaticMeshConfig& StaticMeshConfig,
+    float InDistance,
+    int32 InChunkSize,
+    bool bInRenderOnly,
+    bool bInWaterGroup,
+    float InUnloadDistanceMultiplier)
+{
+    if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::StreamAsyncForObservers")))
     {
         return nullptr;
+    }
+
+    TArray<FVector> ValidObservers;
+    ValidObservers.Reserve(InObserverLocations.Num());
+    for (const FVector& Observer : InObserverLocations)
+    {
+        if (!Observer.ContainsNaN()
+            && FMath::IsFinite(Observer.X) && FMath::IsFinite(Observer.Y) && FMath::IsFinite(Observer.Z))
+        {
+            ValidObservers.Add(Observer);
+        }
     }
 
     if (!IsValid(Actor)
         || (bInWaterGroup ? IsValid(InMeshActor) : !IsValid(InMeshActor))
         || (!bInWaterGroup && InMeshActor->GetOwner() != Actor)
-        || InPlayerLocation.ContainsNaN()
+        || ValidObservers.IsEmpty()
         || !FMath::IsFinite(InDistance) || InDistance < 0.0f
         || InChunkSize <= 0
         || !FMath::IsFinite(InUnloadDistanceMultiplier) || InUnloadDistanceMultiplier < 1.0f
@@ -276,17 +329,15 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
         return nullptr;
     }
 
-    auto *Action = NewObject<UWorldSceneStreamAction>();
+    auto* Action = NewObject<UWorldSceneStreamAction>();
     Action->WorldContextObject = WorldContextObject;
-    // Collision build context is allocated lazily per mesh group. Most world groups are visual-only
-    // even when the actor itself is in collision-capable streaming mode; eagerly allocating one
-    // UObject/context per action prevented them from sharing the completed render-mesh cache.
     Action->OwnerActor = Actor;
     Action->MeshActor = InMeshActor;
     Action->DecalLight = Actor->GetDecalLight();
     Action->Asset = Actor->GetBakedAsset();
     Action->WaterClass = Actor->GetWaterClass();
     Action->bWaterGroup = bInWaterGroup;
+    Action->ObserverLocations = ValidObservers;
     if (bInWaterGroup)
     {
         Action->GroupName = NAME_None;
@@ -304,12 +355,21 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
             if (!MeshData) return nullptr;
             Action->MeshMap.Add(MeshName, *MeshData);
             const float MeshSize = MeshData->Size.Size();
-            MaxWorldRadius = FMath::Max(MaxWorldRadius, MeshSize + MeshSize * FMath::Max(0.0f, InDistance));
+            MaxWorldRadius = FMath::Max(
+                MaxWorldRadius, MeshSize + MeshSize * FMath::Max(0.0f, InDistance));
         }
-        InMeshActor->BuildStreamNodeSnapshot(InPlayerLocation, Actor->GetActorTransform(),
-            MaxWorldRadius, Action->NodeMap);
+
+        // Build the union of the hierarchical 8192 m -> 512 m buckets around every observer.
+        // Each call also contributes currently loaded nodes so leaving the live-player bucket can
+        // still schedule unloads only after the extra destination observer has been removed.
+        TMap<FName, FModelNodeData> ObserverNodes;
+        for (const FVector& Observer : ValidObservers)
+        {
+            InMeshActor->BuildStreamNodeSnapshot(
+                Observer, Actor->GetActorTransform(), MaxWorldRadius, ObserverNodes);
+            Action->NodeMap.Append(ObserverNodes);
+        }
     }
-    Action->PlayerLocation = InPlayerLocation;
     Action->Distance = InDistance;
     Action->UnloadDistanceMultiplier = FMath::Clamp(InUnloadDistanceMultiplier, 1.0f, 2.0f);
     Action->ChunkSize = InChunkSize;
@@ -317,11 +377,10 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
     {
         Action->MaterialReferenceGuard = GameManager->AcquireMaterialDefaultReferenceGuard();
+        if (const UGameSettings* Settings = GameManager->GetGameSettings()) Action->FrameTimeBudgetMs = Settings->GetStreamingFrameTimeBudgetMs();
     }
+    Action->FrameTimeBudgetMs = FMath::Clamp(Action->FrameTimeBudgetMs, 0.25f, 4.0f);
     Action->bRenderOnly = bInRenderOnly;
-    // This action is C++-owned by AStaticActor, not a Blueprint latent action. Root it only while
-    // native I/O/finalizer callbacks may outlive the actor's map entry. This avoids UE's global
-    // UBlueprintAsyncActionBase limit when a large world streams hundreds of mesh groups.
     Action->AddToRoot();
     return Action;
 }
@@ -410,6 +469,7 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     CurrentLoadingMesh = NAME_None;
     bIsLoading = false;
     bRenderOnly = false;
+    ObserverLocations.Empty();
     if (IsRooted())
     {
         RemoveFromRoot();
@@ -453,7 +513,7 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
     TSet<FName> LoadedMeshNodes;
     if (IsValid(MeshActor)) MeshActor->GetLoadedNodeSnapshot(LoadedMeshNodes);
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
-    const FVector PlanningPlayerLocation = PlayerLocation;
+    const TArray<FVector> PlanningObserverLocations = ObserverLocations;
     const float PlanningDistance = Distance;
     const float PlanningUnloadMultiplier = UnloadDistanceMultiplier;
     const uint32 Serial = ++PreparationSerial;
@@ -462,9 +522,9 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
 
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
         [WeakThis, Serial, Plan = MoveTemp(Plan), LoadedMeshNodes = MoveTemp(LoadedMeshNodes),
-            OwnerTransform, PlanningPlayerLocation, PlanningDistance, PlanningUnloadMultiplier]() mutable
+            OwnerTransform, PlanningObserverLocations, PlanningDistance, PlanningUnloadMultiplier]() mutable
         {
-            BuildNativeStreamPlan(Plan, LoadedMeshNodes, OwnerTransform, PlanningPlayerLocation,
+            BuildNativeStreamPlan(Plan, LoadedMeshNodes, OwnerTransform, PlanningObserverLocations,
                 PlanningDistance, PlanningUnloadMultiplier);
             FSafeFileIO::DispatchTrackedGameThread(
                 [WeakThis, Serial, Plan = MoveTemp(Plan)]() mutable
@@ -595,83 +655,48 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
 
 void UWorldSceneStreamAction::ProcessChunk()
 {
-    if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::ProcessChunk")))
+    if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::ProcessChunk"))) return;
+    if (bAbortRequested || !IsValid(OwnerActor)) { AbortAndRelease(); return; }
+    const double SliceStartSeconds = FPlatformTime::Seconds();
+    const double SliceBudgetSeconds = static_cast<double>(FMath::Clamp(FrameTimeBudgetMs, 0.25f, 4.0f)) * 0.001;
+    int32 OperationsThisSlice = 0;
+    bool bProgressChanged = false;
+    const auto HasSliceBudget = [&]()
     {
-        return;
-    }
-
-    if (bAbortRequested || !IsValid(OwnerActor))
-    {
-        AbortAndRelease();
-        return;
-    }
-
+        return OperationsThisSlice < ChunkSize && (OperationsThisSlice == 0 || (FPlatformTime::Seconds() - SliceStartSeconds) < SliceBudgetSeconds);
+    };
     if (CurrentSkippedOperationIndex < TotalSkippedOperationCount)
     {
-        CurrentSkippedOperationIndex = FMath::Min(
-            CurrentSkippedOperationIndex + SkippedProgressChunkSize,
-            TotalSkippedOperationCount);
-        BroadcastProgress();
+        CurrentSkippedOperationIndex = FMath::Min(CurrentSkippedOperationIndex + SkippedProgressChunkSize, TotalSkippedOperationCount);
+        bProgressChanged = true;
     }
-
-    const int32 WaterUnloadEnd = FMath::Min(CurrentUnloadWaterIndex + ChunkSize, PendingUnloadWaterNodes.Num());
-    for (int32 i = CurrentUnloadWaterIndex; i < WaterUnloadEnd; ++i)
+    const bool bHasPendingLoads = CurrentLoadIndex < PendingLoadNodes.Num() || CurrentLoadWaterIndex < PendingLoadWaterNodes.Num();
+    const int32 UnloadQuota = bHasPendingLoads ? FMath::Max(0, ChunkSize / 3) : ChunkSize;
+    int32 UnloadsThisSlice = 0;
+    while (CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
+    { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true; }
+    while (CurrentUnloadIndex < PendingUnloadNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
+    { ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true; }
+    while (!bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num() && HasSliceBudget())
     {
-        ProcessUnloadWaterNode(PendingUnloadWaterNodes[i]);
-        CurrentUnloadWaterIndex = i + 1;
-        BroadcastProgress();
+        const FName TargetNode = PendingLoadNodes[CurrentLoadIndex++]; ++OperationsThisSlice; bProgressChanged = true;
+        if (IsValid(MeshActor) && MeshActor->IsNodeLoaded(TargetNode)) continue;
+        if (ProcessLoadNode(TargetNode)) break;
     }
-
-    const int32 UnloadEnd = FMath::Min(CurrentUnloadIndex + ChunkSize, PendingUnloadNodes.Num());
-    for (int32 i = CurrentUnloadIndex; i < UnloadEnd; ++i)
+    while (!bIsLoading && CurrentLoadWaterIndex < PendingLoadWaterNodes.Num() && HasSliceBudget())
+    { ProcessLoadWaterNode(PendingLoadWaterNodes[CurrentLoadWaterIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
+    while (!bIsLoading && CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && HasSliceBudget())
+    { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
+    while (!bIsLoading && CurrentUnloadIndex < PendingUnloadNodes.Num() && HasSliceBudget())
+    { ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
+    if (IsValid(MeshActor)) MeshActor->FlushInstanceRenderUpdates();
+    if (bProgressChanged) BroadcastProgress();
+    if (CurrentSkippedOperationIndex >= TotalSkippedOperationCount
+        && CurrentLoadIndex >= PendingLoadNodes.Num() && CurrentUnloadIndex >= PendingUnloadNodes.Num()
+        && CurrentLoadWaterIndex >= PendingLoadWaterNodes.Num() && CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num() && !bIsLoading)
     {
-        ProcessUnloadNode(PendingUnloadNodes[i]);
-        CurrentUnloadIndex = i + 1;
-        BroadcastProgress();
-    }
-
-    const int32 WaterLoadEnd = FMath::Min(CurrentLoadWaterIndex + ChunkSize, PendingLoadWaterNodes.Num());
-    for (int32 i = CurrentLoadWaterIndex; i < WaterLoadEnd; ++i)
-    {
-        ProcessLoadWaterNode(PendingLoadWaterNodes[i]);
-        CurrentLoadWaterIndex = i + 1;
-        BroadcastProgress();
-    }
-
-    if (!bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num())
-    {
-        const int32 EndIndex = FMath::Min(CurrentLoadIndex + ChunkSize, PendingLoadNodes.Num());
-        for (int32 i = CurrentLoadIndex; i < EndIndex; ++i)
-        {
-            const FName TargetNode = PendingLoadNodes[i];
-            CurrentLoadIndex = i + 1;
-            if (IsValid(MeshActor) && MeshActor->IsNodeLoaded(TargetNode))
-            {
-                BroadcastProgress();
-                continue;
-            }
-            if (ProcessLoadNode(TargetNode))
-            {
-                // The active node is subtracted by BroadcastProgress until its terminal callback.
-                BroadcastProgress();
-                break;
-            }
-            BroadcastProgress();
-        }
-    }
-
-    if (CurrentSkippedOperationIndex >= TotalSkippedOperationCount &&
-        CurrentLoadIndex >= PendingLoadNodes.Num() &&
-        CurrentUnloadIndex >= PendingUnloadNodes.Num() &&
-        CurrentLoadWaterIndex >= PendingLoadWaterNodes.Num() &&
-        CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num() &&
-        !bIsLoading)
-    {
-        UWorld *World = OwnerActor->GetWorld();
-        if (IsValid(World))
-        {
-            World->GetTimerManager().ClearTimer(ProcessTimerHandle);
-        }
+        UWorld* World = OwnerActor->GetWorld();
+        if (IsValid(World)) World->GetTimerManager().ClearTimer(ProcessTimerHandle);
         FWorldSceneStreamResult Result;
         Result.GroupName = GroupName;
         Result.bWaterGroup = bWaterGroup;
@@ -679,23 +704,14 @@ void UWorldSceneStreamAction::ProcessChunk()
         Result.WaterNodeMap = MoveTemp(WaterNodeMap);
         Result.LoadedWaterNodes = MoveTemp(LoadedWaterNodes);
         Result.WaterActorMap = MoveTemp(WaterActorMap);
-
         Progress.Broadcast(GroupName, 1.0f);
         Completed.Broadcast(Result);
         ReleaseActionReferences();
-        if (IsRooted())
-    {
-        RemoveFromRoot();
+        return;
     }
-    }
-    else
+    if (UWorld* World = OwnerActor->GetWorld())
     {
-        UWorld *World = OwnerActor->GetWorld();
-        if (IsValid(World))
-        {
-            ProcessTimerHandle = World->GetTimerManager().SetTimerForNextTick(
-                FTimerDelegate::CreateUObject(this, &UWorldSceneStreamAction::ProcessChunk));
-        }
+        ProcessTimerHandle = World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateUObject(this, &UWorldSceneStreamAction::ProcessChunk));
     }
 }
 
@@ -912,6 +928,7 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
         // AddInstance creates the per-instance body. Avoid a second explicit physics-state rebuild;
         // it can overlap Chaos scene insertion while the generated mesh is being finalized.
         AddTransform(CurrentLoadingNode);
+        MeshActor->FlushInstanceRenderUpdates();
     }
     else
     {

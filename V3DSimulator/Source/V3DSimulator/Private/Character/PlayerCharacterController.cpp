@@ -37,6 +37,17 @@
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
 
+namespace
+{
+    bool IsUsablePlayerWidgetClass(UClass* WidgetClass, UClass* RequiredBaseClass)
+    {
+        return IsValid(WidgetClass)
+            && IsValid(RequiredBaseClass)
+            && WidgetClass->IsChildOf(RequiredBaseClass)
+            && !WidgetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
+    }
+}
+
 bool APlayerCharacterController::ProcessConsoleExec(const TCHAR* Cmd, FOutputDevice& Ar, UObject* Executor)
 {
     if (USimulatorCommandSubsystem::IsSimulatorCommand(Cmd))
@@ -147,7 +158,8 @@ void APlayerCharacterController::ResolveCentralAssets()
 
 void APlayerCharacterController::InitializeRegistryDrivenUI()
 {
-    if (!IsLocalController())
+    UWorld* World = GetWorld();
+    if (!IsLocalController() || !GetLocalPlayer() || !IsValid(World) || !World->GetGameViewport())
     {
         return;
     }
@@ -169,7 +181,8 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
 
     if (!IsValid(CreatorHUDWidget) && !Registry->CreatorHUDWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->CreatorHUDWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->CreatorHUDWidgetClass.LoadSynchronous();
+            IsUsablePlayerWidgetClass(WidgetClass, UCreatorHUDWidget::StaticClass()))
         {
             UCreatorHUDWidget* Widget = CreateWidget<UCreatorHUDWidget>(this, WidgetClass);
             SetCreatorHUDWidget(Widget);
@@ -179,7 +192,8 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
 
     if (!IsValid(DebugWidget) && !Registry->DebugWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->DebugWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->DebugWidgetClass.LoadSynchronous();
+            IsUsablePlayerWidgetClass(WidgetClass, UUserWidget::StaticClass()))
         {
             UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
             SetDebugWidget(Widget);
@@ -189,7 +203,8 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
 
     if (!IsValid(PauseMenuWidget) && !Registry->PauseMenuWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->PauseMenuWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->PauseMenuWidgetClass.LoadSynchronous();
+            IsUsablePlayerWidgetClass(WidgetClass, UPauseMenuWidget::StaticClass()))
         {
             UPauseMenuWidget* Widget = CreateWidget<UPauseMenuWidget>(this, WidgetClass);
             SetPauseMenuWidget(Widget);
@@ -197,19 +212,12 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
         }
     }
 
-    if (!IsValid(SettingsMenuWidget) && !Registry->SettingsMenuWidgetClass.IsNull())
-    {
-        if (UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous())
-        {
-            USettingsMenuWidget* Widget = CreateWidget<USettingsMenuWidget>(this, WidgetClass);
-            SetSettingsMenuWidget(Widget);
-            AddTopLevelWidget(Widget, 60);
-        }
-    }
+    EnsurePauseSettingsWidget();
 
     if (IsValid(SubSystem) && !SubSystem->HasLoadingWidget() && !Registry->LoadingWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous();
+            IsUsablePlayerWidgetClass(WidgetClass, UUserWidget::StaticClass()))
         {
             UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
             if (IsValid(Widget))
@@ -498,9 +506,12 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
-            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
     }
+    if (IsValid(CreatorHUDWidget)) CreatorHUDWidget->RemoveFromParent();
+    if (IsValid(DebugWidget)) DebugWidget->RemoveFromParent();
+    if (IsValid(PauseMenuWidget)) PauseMenuWidget->RemoveFromParent();
+    if (IsValid(SettingsMenuWidget)) SettingsMenuWidget->RemoveFromParent();
     CreatorHUDWidget = nullptr;
     DebugWidget = nullptr;
     PauseMenuWidget = nullptr;
@@ -1597,6 +1608,28 @@ void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
     bPrevGamePaused = IsValid(SubSystem) ? SubSystem->GetGamePaused() : false;
 }
 
+bool APlayerCharacterController::EnsurePauseSettingsWidget()
+{
+    if (!IsLocalController() || !GetLocalPlayer() || !GetWorld() || !GetWorld()->GetGameViewport())
+        return false;
+    if (!IsValid(SettingsMenuWidget))
+    {
+        UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+        if (!IsValid(Registry)) return false;
+        Registry->EnsureMenuDefaults();
+        UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous();
+        if (!IsUsablePlayerWidgetClass(WidgetClass, USettingsMenuWidget::StaticClass()))
+        {
+            UE_LOG(LogTemp, Error, TEXT("Cannot load pause settings menu class: %s"),
+                *Registry->SettingsMenuWidgetClass.ToSoftObjectPath().ToString());
+            return false;
+        }
+        SetSettingsMenuWidget(CreateWidget<USettingsMenuWidget>(this, WidgetClass));
+    }
+    return IsValid(SettingsMenuWidget)
+        && (SettingsMenuWidget->IsInViewport() || SettingsMenuWidget->AddToPlayerScreen(60));
+}
+
 void APlayerCharacterController::ShowSettingsMenuFromPause()
 {
     if (bMenuWorldTravelPending)
@@ -1613,7 +1646,7 @@ void APlayerCharacterController::ShowSettingsMenuFromPause()
         return;
     }
 
-    if (!IsValid(SettingsMenuWidget))
+    if (!EnsurePauseSettingsWidget())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("Settings requested from pause but no SettingsMenuWidget is available from the central AssetRegistry or an explicit override."));
@@ -1626,6 +1659,7 @@ void APlayerCharacterController::ShowSettingsMenuFromPause()
     }
 
     SettingsMenuWidget->InitializeSettingsFromSavedData();
+    SettingsMenuWidget->SetIsEnabled(true);
     SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
     SubSystem->SetGamePaused(true);
     ApplyUIInputMode(SettingsMenuWidget.Get());

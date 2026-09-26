@@ -26,6 +26,7 @@ class V3DSIMULATOR_API UCharacterFunctionLibrary : public UBlueprintFunctionLibr
 
 public:
     static void BlendRagdoll(USkeletalMeshComponent &Mesh, const float Weight, const float Threshold = 0.0f);
+    static void PrepareHairForRagdoll(USkeletalMeshComponent &Mesh, const FVector &LinearVelocity);
     static void KeepSecondaryPhysicsBodies(USkeletalMeshComponent &Mesh);
     static void DisableRagdollPhysicsButKeepSecondary(USkeletalMeshComponent &Mesh);
     static bool HasNonSecondarySimulatingPhysicsBodies(USkeletalMeshComponent &Mesh);

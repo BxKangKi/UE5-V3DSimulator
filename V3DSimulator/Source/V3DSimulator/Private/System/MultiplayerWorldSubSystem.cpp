@@ -11,7 +11,6 @@
 
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
-#include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "System/GameManagerSubSystem.h"
@@ -47,26 +46,6 @@ namespace
         InOutOptions += Key;
         InOutOptions += TEXT("=");
         InOutOptions += Value;
-    }
-
-    /** Converts a directly assigned soft class into the URL value understood by Unreal travel. */
-    bool AppendGameModeOption(FString& InOutOptions, TSoftClassPtr<AGameModeBase> GameModeOverride)
-    {
-        if (GameModeOverride.IsNull())
-        {
-            return true;
-        }
-
-        const FString GameModeClassPath = GameModeOverride.ToSoftObjectPath().ToString();
-        if (GameModeClassPath.IsEmpty())
-        {
-            UE_LOG(LogTemp, Error,
-                TEXT("[GameModeTravel] An explicit GameMode was assigned, but its soft class path is invalid."));
-            return false;
-        }
-
-        AppendTravelOption(InOutOptions, TEXT("game"), GameModeClassPath);
-        return true;
     }
 
     /**
@@ -126,6 +105,17 @@ UMultiplayerWorldSubSystem* UMultiplayerWorldSubSystem::Get(const UObject* World
     return GameInstance ? GameInstance->GetSubsystem<UMultiplayerWorldSubSystem>() : nullptr;
 }
 
+void UMultiplayerWorldSubSystem::ClearRequestedWorld()
+{
+    check(IsInGameThread());
+
+    // The requested map descriptor is only a transient travel-validation token. Clear both fields
+    // together so a failed/cancelled travel cannot leave a stale asset paired with a newer folder
+    // (or vice versa) for GameManagerSubSystem to validate on the next map.
+    RequestedWorldAsset.Reset();
+    RequestedWorldFolder.Reset();
+}
+
 void UMultiplayerWorldSubSystem::SetSelectedWorldFolderName(
     const FString& InWorldFolderName)
 {
@@ -141,17 +131,11 @@ void UMultiplayerWorldSubSystem::SetSelectedWorldFolderName(
     SelectedWorldFolderName = MoveTemp(Normalized);
 }
 
-void UMultiplayerWorldSubSystem::ClearRequestedGameModeOverride()
-{
-    RequestedGameModeOverride = TSoftClassPtr<AGameModeBase>();
-    RequestedGameModeWorldFolder.Reset();
-}
 
 bool UMultiplayerWorldSubSystem::OpenWorldByReference(
     const UObject* WorldContextObject,
     TSoftObjectPtr<UWorld> WorldAsset,
-    const FString& Options,
-    TSoftClassPtr<AGameModeBase> GameModeOverride) const
+    const FString& Options) const
 {
     if (!IsValid(WorldContextObject) || WorldAsset.IsNull())
     {
@@ -163,25 +147,16 @@ bool UMultiplayerWorldSubSystem::OpenWorldByReference(
         return false;
     }
 
-    FString FinalOptions = Options;
-    if (!AppendGameModeOption(FinalOptions, GameModeOverride))
-    {
-        return false;
-    }
-
+    const FString FinalOptions = Options;
     const FString WorldPath = WorldAsset.ToSoftObjectPath().ToString();
-    const FString GameModePath = GameModeOverride.IsNull()
-        ? FString(TEXT("<map World Settings>"))
-        : GameModeOverride.ToSoftObjectPath().ToString();
 
     UE_LOG(LogTemp, Display,
-        TEXT("[GameModeTravel] Open world. World=%s GameMode=%s Options=%s"),
+        TEXT("[WorldTravel] Open world. World=%s GameMode=<map World Settings> Options=%s"),
         WorldPath.IsEmpty() ? TEXT("<invalid>") : *WorldPath,
-        *GameModePath,
         FinalOptions.IsEmpty() ? TEXT("<none>") : *FinalOptions);
 
-    // Absolute travel deliberately drops the previous map's URL options. This prevents an old
-    // ?game= value from leaking into a later world that expects its own World Settings override.
+    // Absolute travel deliberately drops the previous map's URL options, especially stale ?game=
+    // values. The destination map's World Settings is the only GameMode authority.
     UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, WorldAsset, true, FinalOptions);
     return true;
 }
@@ -191,58 +166,18 @@ bool UMultiplayerWorldSubSystem::StartSinglePlayerWorld(
     const FString& WorldFolderName,
     TSoftObjectPtr<UWorld> SinglePlayerWorld)
 {
-    return StartSinglePlayerWorldWithGameMode(
-        WorldContextObject,
-        WorldFolderName,
-        SinglePlayerWorld,
-        TSoftClassPtr<AGameModeBase>());
-}
-
-bool UMultiplayerWorldSubSystem::StartSinglePlayerWorldWithGameMode(
-    const UObject* WorldContextObject,
-    const FString& WorldFolderName,
-    TSoftObjectPtr<UWorld> SinglePlayerWorld,
-    TSoftClassPtr<AGameModeBase> GameModeOverride)
-{
-    if (IsReturningToWorldSelection(WorldContextObject))
-    {
-        return false;
-    }
-
+    if (IsReturningToWorldSelection(WorldContextObject)) return false;
     FString NormalizedWorldFolderName;
-    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName))
-    {
-        return false;
-    }
-
+    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName)) return false;
     WorldMode = EMultiplayerWorldMode::SinglePlayer;
     SelectedWorldFolderName = NormalizedWorldFolderName;
-    RequestedGameModeOverride = GameModeOverride;
-    RequestedGameModeWorldFolder = NormalizedWorldFolderName;
-
-    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
-    {
-        Manager->SetCurrentWorldName(NormalizedWorldFolderName);
-    }
-
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject)) Manager->SetCurrentWorldName(NormalizedWorldFolderName);
+    RequestedWorldAsset = SinglePlayerWorld;
+    RequestedWorldFolder = NormalizedWorldFolderName;
     FString Options;
-    if (!NormalizedWorldFolderName.IsEmpty())
-    {
-        // GameManagerSubSystem reads this option in the destination map. This is required because
-        // the old world's shutdown can clear transient references during OpenLevel.
-        AppendTravelOption(Options, TEXT("World"), NormalizedWorldFolderName);
-    }
-
-    const bool bOpened = OpenWorldByReference(
-        WorldContextObject,
-        SinglePlayerWorld,
-        Options,
-        GameModeOverride);
-    if (!bOpened)
-    {
-        ClearRequestedGameModeOverride();
-    }
-    return bOpened;
+    if (!NormalizedWorldFolderName.IsEmpty()) AppendTravelOption(Options, TEXT("World"), NormalizedWorldFolderName);
+    if (!OpenWorldByReference(WorldContextObject, SinglePlayerWorld, Options)) { ClearRequestedWorld(); return false; }
+    return true;
 }
 
 bool UMultiplayerWorldSubSystem::HostMultiplayerWorld(
@@ -251,62 +186,19 @@ bool UMultiplayerWorldSubSystem::HostMultiplayerWorld(
     TSoftObjectPtr<UWorld> HostWorld,
     int32 Port)
 {
-    return HostMultiplayerWorldWithGameMode(
-        WorldContextObject,
-        WorldFolderName,
-        HostWorld,
-        TSoftClassPtr<AGameModeBase>(),
-        Port);
-}
-
-bool UMultiplayerWorldSubSystem::HostMultiplayerWorldWithGameMode(
-    const UObject* WorldContextObject,
-    const FString& WorldFolderName,
-    TSoftObjectPtr<UWorld> HostWorld,
-    TSoftClassPtr<AGameModeBase> GameModeOverride,
-    int32 Port)
-{
-    if (IsReturningToWorldSelection(WorldContextObject))
-    {
-        return false;
-    }
-
+    if (IsReturningToWorldSelection(WorldContextObject)) return false;
     FString NormalizedWorldFolderName;
-    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName))
-    {
-        return false;
-    }
-
+    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName)) return false;
     WorldMode = EMultiplayerWorldMode::Host;
     SelectedWorldFolderName = NormalizedWorldFolderName;
-    RequestedGameModeOverride = GameModeOverride;
-    RequestedGameModeWorldFolder = NormalizedWorldFolderName;
-
-    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
-    {
-        Manager->SetCurrentWorldName(NormalizedWorldFolderName);
-    }
-
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject)) Manager->SetCurrentWorldName(NormalizedWorldFolderName);
+    RequestedWorldAsset = HostWorld;
+    RequestedWorldFolder = NormalizedWorldFolderName;
     FString Options(TEXT("listen"));
-    if (!NormalizedWorldFolderName.IsEmpty())
-    {
-        AppendTravelOption(Options, TEXT("World"), NormalizedWorldFolderName);
-    }
-    if (Port > 0)
-    {
-        AppendTravelOption(Options, TEXT("Port"), FString::FromInt(Port));
-    }
-
-    const bool bOpened = OpenWorldByReference(
-        WorldContextObject,
-        HostWorld,
-        Options,
-        GameModeOverride);
-    if (!bOpened)
-    {
-        ClearRequestedGameModeOverride();
-    }
-    return bOpened;
+    if (!NormalizedWorldFolderName.IsEmpty()) AppendTravelOption(Options, TEXT("World"), NormalizedWorldFolderName);
+    if (Port > 0) AppendTravelOption(Options, TEXT("Port"), FString::FromInt(Port));
+    if (!OpenWorldByReference(WorldContextObject, HostWorld, Options)) { ClearRequestedWorld(); return false; }
+    return true;
 }
 
 bool UMultiplayerWorldSubSystem::OpenClientConnectionWorld(
@@ -319,7 +211,6 @@ bool UMultiplayerWorldSubSystem::OpenClientConnectionWorld(
     }
 
     WorldMode = EMultiplayerWorldMode::Client;
-    ClearRequestedGameModeOverride();
     // The connection map is UI, not an external data world. Clear any prior selection so the
     // automatic destination bootstrap cannot mistake this intermediate map for gameplay.
     SelectedWorldFolderName.Reset();
@@ -330,8 +221,7 @@ bool UMultiplayerWorldSubSystem::OpenClientConnectionWorld(
     return OpenWorldByReference(
         WorldContextObject,
         ClientWorld,
-        FString(),
-        TSoftClassPtr<AGameModeBase>());
+        FString());
 }
 
 bool UMultiplayerWorldSubSystem::JoinMultiplayerWorld(
@@ -352,7 +242,7 @@ bool UMultiplayerWorldSubSystem::JoinMultiplayerWorld(
 
     // A client does not select the authoritative GameMode. The server's active map/travel URL does.
     WorldMode = EMultiplayerWorldMode::Client;
-    ClearRequestedGameModeOverride();
+    ClearRequestedWorld();
     SelectedWorldFolderName = NormalizedWorldFolderName;
     if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
     {

@@ -53,6 +53,7 @@ public:
     UInstancedStaticMeshComponent* AssignStaticMesh(UStaticMesh* Mesh);
     bool AddNodeInstance(FName NodeName, const FTransform& LocalTransform);
     bool RemoveNodeInstance(FName NodeName);
+    void FlushInstanceRenderUpdates();
 
     bool HasDynamicComponents(FName NodeName) const;
     void StoreDynamicComponents(FName NodeName, FComponentGroup&& Group);
@@ -89,4 +90,5 @@ private:
     TArray<FName> AlwaysLoadedNodeNames;
     TArray<FName> ReferencedMeshNames;
     bool bRuntimeResourcesReleased = false;
+    bool bInstanceRenderStateDirty = false;
 };

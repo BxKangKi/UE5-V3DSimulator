@@ -7,6 +7,9 @@
 #include "Components/ComboBoxString.h"
 #include "Components/Slider.h"
 #include "Components/TextBlock.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/VerticalBox.h"
+#include "Components/VerticalBoxSlot.h"
 
 void USettingControlWidget::ConfigureSetting(USettingsMenuWidget* InOwner, ESettingsField InField)
 {
@@ -27,6 +30,31 @@ FText USettingControlWidget::GetSettingLabel() const
 FText USettingControlWidget::GetSettingValueText() const
 {
     return IsValid(OwnerMenu) ? OwnerMenu->GetPendingSettingValueText(SettingField) : FText::GetEmpty();
+}
+
+TSharedRef<SWidget> UBooleanSettingWidget::RebuildWidget()
+{
+    if (GetClass() == StaticClass() && IsValid(WidgetTree) && !WidgetTree->RootWidget)
+    {
+        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), NAME_None);
+        WidgetTree->RootWidget = Root;
+        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Label"));
+        Root->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
+        UButton* Control = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), TEXT("Button"));
+        Root->AddChildToVerticalBox(Control)->SetPadding(FMargin(8.f));
+        UTextBlock* Value = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Value"));
+        Control->AddChild(Value);
+    }
+    return Super::RebuildWidget();
+}
+
+void UBooleanSettingWidget::NativeConstruct()
+{
+    Super::NativeConstruct();
+    if (!AssignedToggleButton.IsValid()) SetToggleButton(Cast<UButton>(GetWidgetFromName(TEXT("Button"))));
+    if (!AssignedLabelText.IsValid()) SetLabelTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Label"))));
+    if (!AssignedValueText.IsValid()) SetValueTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Value"))));
+    RefreshSettingWidget();
 }
 
 void UBooleanSettingWidget::NativeDestruct()
@@ -107,6 +135,31 @@ bool UBooleanSettingWidget::GetBooleanValue() const
 void UBooleanSettingWidget::HandleToggleClicked()
 {
     ToggleValue();
+}
+
+TSharedRef<SWidget> UFloatSettingWidget::RebuildWidget()
+{
+    if (GetClass() == StaticClass() && IsValid(WidgetTree) && !WidgetTree->RootWidget)
+    {
+        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), NAME_None);
+        WidgetTree->RootWidget = Root;
+        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Label"));
+        Root->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
+        USlider* Control = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("Slider"));
+        Root->AddChildToVerticalBox(Control)->SetPadding(FMargin(8.f));
+        UTextBlock* Value = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Value"));
+        Root->AddChildToVerticalBox(Value)->SetPadding(FMargin(8.f));
+    }
+    return Super::RebuildWidget();
+}
+
+void UFloatSettingWidget::NativeConstruct()
+{
+    Super::NativeConstruct();
+    if (!AssignedSlider.IsValid()) SetSlider(Cast<USlider>(GetWidgetFromName(TEXT("Slider"))));
+    if (!AssignedLabelText.IsValid()) SetLabelTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Label"))));
+    if (!AssignedValueText.IsValid()) SetValueTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Value"))));
+    RefreshSettingWidget();
 }
 
 void UFloatSettingWidget::NativeDestruct()
@@ -210,6 +263,28 @@ void UFloatSettingWidget::HandleSliderValueChanged(float Value)
     {
         SetNumericValue(Value);
     }
+}
+
+TSharedRef<SWidget> UEnumSettingWidget::RebuildWidget()
+{
+    if (GetClass() == StaticClass() && IsValid(WidgetTree) && !WidgetTree->RootWidget)
+    {
+        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), NAME_None);
+        WidgetTree->RootWidget = Root;
+        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Label"));
+        Root->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
+        UComboBoxString* Control = WidgetTree->ConstructWidget<UComboBoxString>(UComboBoxString::StaticClass(), TEXT("Dropdown"));
+        Root->AddChildToVerticalBox(Control)->SetPadding(FMargin(8.f));
+    }
+    return Super::RebuildWidget();
+}
+
+void UEnumSettingWidget::NativeConstruct()
+{
+    Super::NativeConstruct();
+    if (!AssignedDropdown.IsValid()) SetDropdown(Cast<UComboBoxString>(GetWidgetFromName(TEXT("Dropdown"))));
+    if (!AssignedLabelText.IsValid()) SetLabelTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Label"))));
+    RefreshSettingWidget();
 }
 
 void UEnumSettingWidget::NativeDestruct()

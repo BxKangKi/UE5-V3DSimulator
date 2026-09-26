@@ -868,7 +868,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
         return;
     }
 
-    if (Component->IsRagdollActive() || !OtherComp->IsSimulatingPhysics())
+    if (Component->IsStreamingMovementSuspended() || Component->IsRagdollActive() || !OtherComp->IsSimulatingPhysics())
     {
         return;
     }

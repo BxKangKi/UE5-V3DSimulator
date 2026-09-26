@@ -9,8 +9,6 @@
 
 #include "System/WorldArchive.h"
 
-#include "Misc/ScopeLock.h"
-
 #include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -25,34 +23,6 @@
 
 namespace GWorldArchivePrivate
 {
-    int64 EstimateResidentMetadataBytes(const FGWorldModelMetadata& Metadata)
-    {
-        int64 Bytes = sizeof(FGWorldModelMetadata)
-            + static_cast<int64>(Metadata.NodeTransforms.GetAllocatedSize())
-            + static_cast<int64>(Metadata.SceneData.NodeMap.GetAllocatedSize())
-            + static_cast<int64>(Metadata.SceneData.WaterNodeMap.GetAllocatedSize())
-            + static_cast<int64>(Metadata.SceneData.MeshMap.GetAllocatedSize())
-            + static_cast<int64>(Metadata.SceneData.ModelData.MeshData.GetAllocatedSize());
-        for (const FGWorldNodeTransform& Node : Metadata.NodeTransforms)
-        {
-            Bytes += static_cast<int64>(Node.Name.GetAllocatedSize());
-        }
-        const auto AddMeshPayloadBytes = [&Bytes](const FMeshData& Data)
-        {
-            Bytes += static_cast<int64>(Data.Colliders.GetAllocatedSize());
-            Bytes += static_cast<int64>(Data.Lights.GetAllocatedSize());
-        };
-        for (const TPair<FName, FModelMeshData>& Pair : Metadata.SceneData.MeshMap)
-        {
-            AddMeshPayloadBytes(Pair.Value.Data);
-        }
-        for (const TPair<FName, FMeshData>& Pair : Metadata.SceneData.ModelData.MeshData)
-        {
-            AddMeshPayloadBytes(Pair.Value);
-        }
-        return FMath::Max<int64>(Bytes, 0);
-    }
-
     // Current .v3d identity. This format intentionally has no compatibility reader for older layouts.
     constexpr uint64 Magic = 0x0000444C524F5747ull; // ASCII "GWORLD\0\0", little endian.
     constexpr int32 HeaderBytes = 64;
@@ -2535,15 +2505,6 @@ bool FGWorldArchiveReader::ReadModelMetadata(
         return false;
     }
 
-    {
-        FScopeLock Lock(&ResidentTableCacheLock);
-        if (const FGWorldModelMetadata* Cached = ResidentMetadataCache.Find(UUID))
-        {
-            OutMetadata = *Cached;
-            return true;
-        }
-    }
-
     TArray<uint8> Bytes;
     if (!ReadChecksummedRange(
             Path, FileSize, DataEndOffset, Record->MetadataRange, FGWorldArchive::MaxDirectoryBytes,
@@ -2563,49 +2524,6 @@ bool FGWorldArchiveReader::ReadModelMetadata(
         OutError = TEXT("The streamed metadata does not match its .v3d directory summary");
         return false;
     }
-    const int64 EstimatedBytes = EstimateResidentMetadataBytes(OutMetadata);
-    {
-        FScopeLock Lock(&ResidentTableCacheLock);
-
-        // A concurrent reader may have populated this UUID while this thread was deserializing.
-        // Never replace that entry and increment the byte counter twice.
-        if (!ResidentMetadataCache.Contains(UUID)
-            && EstimatedBytes > 0
-            && EstimatedBytes <= MaxResidentMetadataCacheBytes)
-        {
-            // Eviction is intentionally simple and lock-local: the facade/scene owns the live data,
-            // while this cache is only a reload accelerator. Keep both entry count and estimated
-            // resident bytes bounded before publishing the new copy.
-            while (!ResidentMetadataCache.IsEmpty()
-                && (ResidentMetadataCache.Num() >= MaxResidentMetadataEntries
-                    || ResidentMetadataCacheTotalBytes + EstimatedBytes > MaxResidentMetadataCacheBytes))
-            {
-                auto It = ResidentMetadataCache.CreateIterator();
-                if (!It)
-                {
-                    break;
-                }
-                const FGuid EvictedUUID = It.Key();
-                if (const int64* CachedBytes = ResidentMetadataCacheBytes.Find(EvictedUUID))
-                {
-                    ResidentMetadataCacheTotalBytes = FMath::Max<int64>(
-                        0, ResidentMetadataCacheTotalBytes - *CachedBytes);
-                }
-                ResidentMetadataCacheBytes.Remove(EvictedUUID);
-                It.RemoveCurrent();
-            }
-
-            if (ResidentMetadataCache.Num() < MaxResidentMetadataEntries
-                && ResidentMetadataCacheTotalBytes + EstimatedBytes <= MaxResidentMetadataCacheBytes)
-            {
-                ResidentMetadataCache.Add(UUID, OutMetadata);
-                ResidentMetadataCacheBytes.Add(UUID, EstimatedBytes);
-                ResidentMetadataCacheTotalBytes += EstimatedBytes;
-            }
-        }
-        // One model larger than the cache cap is deliberately not cached. It remains fully usable;
-        // skipping the extra resident copy prevents a large world from evicting unrelated hot rows.
-    }
     return true;
 }
 
@@ -2622,14 +2540,6 @@ bool FGWorldArchiveReader::ReadModelManifest(
     {
         OutError = FString::Printf(TEXT("Model UUID is absent from .v3d: %s"), *UUID.ToString());
         return false;
-    }
-    {
-        FScopeLock Lock(&ResidentTableCacheLock);
-        if (const FGWorldModelManifest* Cached = ResidentManifestCache.Find(UUID))
-        {
-            OutManifest = *Cached;
-            return true;
-        }
     }
     TArray<uint8> Bytes;
     if (!ReadChecksummedRange(Path, FileSize, DataEndOffset, Record->ManifestRange,
@@ -2705,16 +2615,6 @@ bool FGWorldArchiveReader::ReadModelManifest(
             OutError = TEXT("A manifest .dat member overlaps an archive root member");
             return false;
         }
-    }
-    {
-        FScopeLock Lock(&ResidentTableCacheLock);
-        if (!ResidentManifestCache.Contains(UUID)
-            && ResidentManifestCache.Num() >= MaxResidentManifestEntries)
-        {
-            auto It = ResidentManifestCache.CreateIterator();
-            if (It) It.RemoveCurrent();
-        }
-        ResidentManifestCache.Add(UUID, OutManifest);
     }
     return true;
 }

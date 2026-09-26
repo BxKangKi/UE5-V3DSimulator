@@ -32,6 +32,8 @@ private:
 
     /** Prepares the screen before a blocking map load starts. */
     void HandlePreLoadMap(const FString& MapName);
+    void HandlePostLoadMap(class UWorld* World);
+    FDelegateHandle PostLoadMapHandle;
 
     /** Delegate handles are removed before module shutdown to prevent callbacks into unloaded code. */
     FDelegateHandle PrepareLoadingScreenHandle;

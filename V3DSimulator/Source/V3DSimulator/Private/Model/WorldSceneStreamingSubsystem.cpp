@@ -30,7 +30,6 @@ namespace
 {
     constexpr float SceneDistanceScale = 64.0f;
     constexpr float StreamPollIntervalSeconds = 0.10f;
-    constexpr float StreamUpdateIntervalSeconds = 0.25f;
     constexpr double PlayerActorWaitTimeoutSeconds = 30.0;
     constexpr double PlayerLoadTimeoutSeconds = 120.0;
 
@@ -92,6 +91,18 @@ bool UWorldSceneStreamingSubsystem::IsRenderOnlyStreaming() const
 {
     return EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::IsRenderOnlyStreaming"))
         && bRenderOnlyStreaming;
+}
+
+void UWorldSceneStreamingSubsystem::RefreshStreamingQuality()
+{
+    if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::RefreshStreamingQuality")) || !bActive || !IsValid(OwnerActor)) return;
+    if (UWorld* World = OwnerActor->GetWorld()) World->GetTimerManager().ClearTimer(TimerHandle_UpdateStreaming);
+    UpdateStreaming();
+    for (const TPair<FString, TObjectPtr<AStaticActor>>& Pair : ActiveSceneActors)
+    {
+        if (IsValid(Pair.Value)) Pair.Value->RequestStreamingRefresh();
+    }
+    ScheduleStreamingUpdates();
 }
 
 bool UWorldSceneStreamingSubsystem::IsActiveForWorld(const UWorld* World) const
@@ -284,6 +295,8 @@ void UWorldSceneStreamingSubsystem::StopWorldStreaming()
     bPlayerActivated = false;
     bRenderOnlyStreaming = false;
     bInitialBurstUpdateQueued = false;
+    bHasPriorityStreamingFocus = false;
+    PriorityStreamingFocus = FVector::ZeroVector;
     PlayerActorWaitStartedAt = 0.0;
     PlayerLoadStartedAt = 0.0;
     LastReportedLoadingStatus = 0.0f;
@@ -425,6 +438,176 @@ float UWorldSceneStreamingSubsystem::GetLoadingStatus() const
     return FMath::Clamp(LastReportedLoadingStatus, 0.0f, 1.0f);
 }
 
+void UWorldSceneStreamingSubsystem::SetPriorityStreamingFocus(const FVector& WorldLocation)
+{
+    if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::SetPriorityStreamingFocus"))
+        || !bActive
+        || !IsFiniteVector(WorldLocation))
+    {
+        return;
+    }
+    if (bHasPriorityStreamingFocus && PriorityStreamingFocus.Equals(WorldLocation, 1.0))
+    {
+        return;
+    }
+
+    bHasPriorityStreamingFocus = true;
+    PriorityStreamingFocus = WorldLocation;
+    UpdateStreaming();
+
+    // An already-active coarse scene may cover both the live player and destination while only its
+    // old fine buckets are resident. Force its next internal evaluation now so IsLocationReady()
+    // cannot observe a stale bIsLoaded=true from the previous observer set.
+    for (TPair<FString, TObjectPtr<AStaticActor>>& Pair : ActiveSceneActors)
+    {
+        if (IsValid(Pair.Value)) Pair.Value->RequestStreamingRefresh();
+    }
+    if (!bInitialScenePassComplete) QueueInitialStreamingBurst();
+}
+
+void UWorldSceneStreamingSubsystem::ClearPriorityStreamingFocus()
+{
+    if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::ClearPriorityStreamingFocus"))
+        || !bHasPriorityStreamingFocus)
+    {
+        return;
+    }
+    bHasPriorityStreamingFocus = false;
+    PriorityStreamingFocus = FVector::ZeroVector;
+    if (bActive)
+    {
+        UpdateStreaming();
+        for (TPair<FString, TObjectPtr<AStaticActor>>& Pair : ActiveSceneActors)
+        {
+            if (IsValid(Pair.Value)) Pair.Value->RequestStreamingRefresh();
+        }
+    }
+}
+
+FVector UWorldSceneStreamingSubsystem::GetStreamingLocation() const
+{
+    if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::GetStreamingLocation")))
+    {
+        return FVector::ZeroVector;
+    }
+    if (bHasPriorityStreamingFocus) return PriorityStreamingFocus;
+    return GetPlayerLocation();
+}
+
+void UWorldSceneStreamingSubsystem::GetStreamingObserverLocations(TArray<FVector>& OutLocations) const
+{
+    check(IsInGameThread());
+    OutLocations.Reset();
+    OutLocations.Reserve(2);
+
+    // Destination preloading must be additive. Put the destination first so bounded spawn/build
+    // budgets favor it, but retain the live player observer until the teleport actually commits.
+    if (bHasPriorityStreamingFocus && IsFiniteVector(PriorityStreamingFocus))
+    {
+        OutLocations.Add(PriorityStreamingFocus);
+    }
+
+    const FVector LivePlayerLocation = GetPlayerLocation();
+    if (IsFiniteVector(LivePlayerLocation)
+        && (!bHasPriorityStreamingFocus || !LivePlayerLocation.Equals(PriorityStreamingFocus, 1.0)))
+    {
+        OutLocations.Add(LivePlayerLocation);
+    }
+
+    if (OutLocations.IsEmpty())
+    {
+        OutLocations.Add(FVector::ZeroVector);
+    }
+}
+
+bool UWorldSceneStreamingSubsystem::GetVerticalBoundsAtXY(
+    const FVector& WorldLocation,
+    double& OutMinZ,
+    double& OutMaxZ) const
+{
+    if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::GetVerticalBoundsAtXY"))
+        || !bActive || !IsValid(OwnerActor) || !IsFiniteVector(WorldLocation))
+    {
+        return false;
+    }
+    const FTransform OwnerTransform = OwnerActor->GetActorTransform();
+    bool bFound = false;
+    double MinZ = TNumericLimits<double>::Max();
+    double MaxZ = -TNumericLimits<double>::Max();
+    constexpr double HorizontalToleranceCm = 100.0;
+    for (const FWorldSceneStreamRecord& Record : SceneRecords)
+    {
+        if (!IsFiniteVector(Record.Bounds.Center) || !IsFiniteVector(Record.Bounds.Size)
+            || Record.Bounds.Size.X < 0.0 || Record.Bounds.Size.Y < 0.0 || Record.Bounds.Size.Z < 0.0
+            || Record.Bounds.Size.IsNearlyZero(0.001f))
+        {
+            continue;
+        }
+        const FVector HalfSize = Record.Bounds.Size.GetAbs() * 0.5;
+        const FBox LocalBounds(Record.Bounds.Center - HalfSize, Record.Bounds.Center + HalfSize);
+        const FBox WorldBounds = LocalBounds.TransformBy(OwnerTransform);
+        if (!WorldBounds.IsValid || !IsFiniteVector(WorldBounds.Min) || !IsFiniteVector(WorldBounds.Max)
+            || WorldLocation.X < static_cast<double>(WorldBounds.Min.X) - HorizontalToleranceCm
+            || WorldLocation.X > static_cast<double>(WorldBounds.Max.X) + HorizontalToleranceCm
+            || WorldLocation.Y < static_cast<double>(WorldBounds.Min.Y) - HorizontalToleranceCm
+            || WorldLocation.Y > static_cast<double>(WorldBounds.Max.Y) + HorizontalToleranceCm)
+        {
+            continue;
+        }
+        MinZ = FMath::Min(MinZ, static_cast<double>(WorldBounds.Min.Z));
+        MaxZ = FMath::Max(MaxZ, static_cast<double>(WorldBounds.Max.Z));
+        bFound = true;
+    }
+    if (!bFound || !FMath::IsFinite(MinZ) || !FMath::IsFinite(MaxZ) || MaxZ < MinZ) return false;
+    OutMinZ = MinZ;
+    OutMaxZ = MaxZ;
+    return true;
+}
+
+bool UWorldSceneStreamingSubsystem::IsLocationReady(const FVector& WorldLocation) const
+{
+    if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::IsLocationReady"))) return false;
+    if (bStartupFailed) return false;
+    if (!bActive) return true;
+    if (!IsValid(OwnerActor) || !IsFiniteVector(WorldLocation)) return false;
+
+    float DistanceMultiplier = SceneDistanceScale;
+    if (const UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(OwnerActor.Get()))
+    {
+        if (const UGameSettings* Settings = Manager->GetGameSettings())
+        {
+            DistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
+        }
+    }
+    const double SafeDistanceMultiplier = static_cast<double>(FMath::Max(1.0f, DistanceMultiplier));
+    const FTransform OwnerTransform = OwnerActor->GetActorTransform();
+
+    for (const FWorldSceneStreamRecord& Record : SceneRecords)
+    {
+        bool bInside = true;
+        if (IsFiniteVector(Record.Bounds.Center)
+            && IsFiniteVector(Record.Bounds.Size)
+            && !Record.Bounds.Size.IsNearlyZero(0.001f))
+        {
+            const double Radius = FMath::Max3(Record.Bounds.Size.X, Record.Bounds.Size.Y, Record.Bounds.Size.Z)
+                * SafeDistanceMultiplier;
+            if (!FMath::IsFinite(Radius)) return false;
+            const FVector WorldCenter = OwnerTransform.TransformPosition(Record.Bounds.Center);
+            bInside = FVector::DistSquared(WorldLocation, WorldCenter)
+                <= FMath::Square(FMath::Max(1.0, Radius));
+        }
+        if (!bInside) continue;
+
+        const TObjectPtr<AStaticActor>* Existing = ActiveSceneActors.Find(Record.RuntimeReference);
+        if (!Existing || !IsValid(Existing->Get())
+            || !Existing->Get()->IsLocationStreamingReady(WorldLocation))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 void UWorldSceneStreamingSubsystem::UpdateStreaming()
 {
     if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::UpdateStreaming"))
@@ -458,15 +641,16 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     TArray<FPendingSceneLoad> PendingLoads;
     PendingLoads.Reserve(FMath::Min(SceneRecords.Num(), SpawnBudget));
     int32 PendingLoadCount = 0;
-    const FVector PlayerLocation = GetPlayerLocation();
+    TArray<FVector> StreamingObservers;
+    GetStreamingObserverLocations(StreamingObservers);
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
     const double SafeDistanceMultiplier = static_cast<double>(FMath::Max(1.0f, DistanceMultiplier));
 
-    // UpdateStreaming can scan thousands of compact directory records. Avoid a subsystem/settings
-    // lookup and a second player-location query for every row; the player/settings snapshot is
-    // coherent for this one streaming tick and dramatically reduces game-thread overhead.
+    // UpdateStreaming can scan thousands of compact directory records. Snapshot both observers
+    // once. A priority destination is additive, so current-area actors stay resident until the
+    // destination has completed and the teleport/spawn transaction clears its extra focus.
     const auto IsInsideRange =
-        [&OwnerTransform, &PlayerLocation, SafeDistanceMultiplier](
+        [&OwnerTransform, &StreamingObservers, SafeDistanceMultiplier](
             const FModelData& Bounds, const float RadiusMultiplier)
         {
             if (!IsFiniteVector(Bounds.Center) || !IsFiniteVector(Bounds.Size)
@@ -483,8 +667,26 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
                 return false;
             }
             const FVector WorldCenter = OwnerTransform.TransformPosition(Bounds.Center);
-            return FVector::DistSquared(PlayerLocation, WorldCenter)
-                <= FMath::Square(FMath::Max(1.0, Radius));
+            const double RadiusSq = FMath::Square(FMath::Max(1.0, Radius));
+            for (const FVector& Observer : StreamingObservers)
+            {
+                if (FVector::DistSquared(Observer, WorldCenter) <= RadiusSq) return true;
+            }
+            return false;
+        };
+
+    const auto GetNearestObserverDistanceSq =
+        [&OwnerTransform, &StreamingObservers](const FModelData& Bounds)
+        {
+            if (!IsFiniteVector(Bounds.Center)) return 0.0;
+            const FVector WorldCenter = OwnerTransform.TransformPosition(Bounds.Center);
+            double BestDistanceSq = TNumericLimits<double>::Max();
+            for (const FVector& Observer : StreamingObservers)
+            {
+                BestDistanceSq = FMath::Min(
+                    BestDistanceSq, static_cast<double>(FVector::DistSquared(Observer, WorldCenter)));
+            }
+            return BestDistanceSq == TNumericLimits<double>::Max() ? 0.0 : BestDistanceSq;
         };
 
     for (const FWorldSceneStreamRecord& Record : SceneRecords)
@@ -504,10 +706,7 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
         if (IsInsideRange(Record.Bounds, 1.0f))
         {
             ++PendingLoadCount;
-            const double CandidateDistanceSq = IsFiniteVector(Record.Bounds.Center)
-                ? FVector::DistSquared(
-                    PlayerLocation, OwnerTransform.TransformPosition(Record.Bounds.Center))
-                : 0.0;
+            const double CandidateDistanceSq = GetNearestObserverDistanceSq(Record.Bounds);
 
             if (PendingLoads.Num() < SpawnBudget)
             {
@@ -594,17 +793,18 @@ void UWorldSceneStreamingSubsystem::RunInitialStreamingBurst()
 
 void UWorldSceneStreamingSubsystem::ScheduleStreamingUpdates()
 {
-    if (!bActive || !IsValid(OwnerActor))
+    if (!bActive || !IsValid(OwnerActor)) return;
+    float UpdateIntervalSeconds = 0.08f;
+    if (const UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(OwnerActor.Get()))
     {
-        return;
+        if (const UGameSettings* Settings = Manager->GetGameSettings()) UpdateIntervalSeconds = Settings->GetStreamingUpdateIntervalSeconds();
     }
+    UpdateIntervalSeconds = FMath::Clamp(UpdateIntervalSeconds, 0.04f, 0.25f);
     if (UWorld* World = OwnerActor->GetWorld())
     {
-        World->GetTimerManager().SetTimer(
-            TimerHandle_UpdateStreaming,
-            FTimerDelegate::CreateUObject(this, &UWorldSceneStreamingSubsystem::UpdateStreaming),
-            StreamUpdateIntervalSeconds,
-            true);
+        World->GetTimerManager().ClearTimer(TimerHandle_UpdateStreaming);
+        World->GetTimerManager().SetTimer(TimerHandle_UpdateStreaming,
+            FTimerDelegate::CreateUObject(this, &UWorldSceneStreamingSubsystem::UpdateStreaming), UpdateIntervalSeconds, true);
     }
 }
 

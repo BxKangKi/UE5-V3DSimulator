@@ -703,6 +703,9 @@ private:
     bool bHasLoadedInitialPlayerRotation = false;
     bool bInitialPlayerDataLoadCompleted = false;
     bool bInitialPlayerTransformResolved = false;
+    bool bInitialPlayerTransformRetryScheduled = false;
+    FTimerHandle InitialPlayerTransformRetryTimer;
+    TWeakObjectPtr<UWorld> InitialPlayerTransformRetryWorld;
     bool bPendingInitialControlRotation = false;
     bool bPendingInitialWorldDataSave = false;
     bool bPendingInitialPlayerDataSave = false;
@@ -907,16 +910,25 @@ private:
     bool CheckWorldSystemsLoaded();
     void LoadWorldData();
     void LoadPlayerData();
-    void SaveWorldData();
-    void SavePlayerData();
+    bool SaveWorldData();
+    bool SavePlayerData();
+    /** Refreshes the authoritative in-memory player record from the live primary Pawn immediately before persistence. */
+    bool CaptureCurrentPlayerTransformForPersistence();
     void ResetInitialPlayerTransformState();
     void TryResolveInitialPlayerTransform();
+    void ScheduleInitialPlayerTransformRetry();
+    bool PrepareInitialPlayerSpawnArea(const FVector& WorldLocation);
+    bool ResolveInitialGroundProbeRange(
+        const FVector& DesiredLocation, double& OutBottomZ, double& OutTopZ) const;
+    void ClearInitialPlayerSpawnFocus();
+    bool FindNearestGroundSpawnLocation(
+        AActor* Player, const FVector& DesiredLocation, FVector& OutLocation) const;
     void FlushPendingInitialTransformSaves();
     void SaveWorldDataDelayed();
     void ApplyLevelSettings();
     void ApplyGameplaySettings();
     /** Logs and validates the actual server GameMode selected before gameplay runtime initialization begins. */
-    void ValidateResolvedGameMode() const;
+    bool ValidateResolvedGameMode() const;
     void LoadWorldAsync();
     void UpdateWorldTime(float DeltaSeconds);
     void ShowLoadingWidget();

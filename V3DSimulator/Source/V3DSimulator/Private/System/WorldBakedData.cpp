@@ -796,7 +796,7 @@ bool FGWorldBakedDataCapture::CaptureMesh(
         Target.bHasMaterial = Source.bHasMaterial;
         Target.bHighPrecisionUVs = Source.bHighPrecisionUVs;
         Target.bHighPrecisionWeights = Source.bHighPrecisionWeights;
-        Target.bDisableShadows = Source.bDisableShadows;
+        Target.bDisableShadows = false;
         Target.bHasIndices = Source.bHasIndices;
         // A material pointer on a material-less primitive may be glTFRuntime's temporary default.
         // Do not serialize it: dependency streaming must follow only an authored material edge.

@@ -6,6 +6,7 @@
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/V3DSimulatorGameInstance.h"
 #include "UI/MenuButtonWidget.h"
+#include "System/SimulatorFileServices.h"
 
 void USelectionWidgetBase::NativeDestruct()
 {
@@ -23,16 +24,13 @@ UClass* USelectionWidgetBase::ResolveSelectionEntryWidgetClass()
     }
 
     UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
-    if (!IsValid(Registry) || Registry->SelectionEntryWidgetClass.IsNull())
+    UClass* LoadedClass = IsValid(Registry) ? Registry->SelectionEntryWidgetClass.LoadSynchronous() : nullptr;
+    if (!IsValid(LoadedClass) || !LoadedClass->IsChildOf(UMenuButtonWidget::StaticClass())
+        || LoadedClass->HasAnyClassFlags(CLASS_Abstract))
     {
-        return nullptr;
-    }
-
-    UClass* LoadedClass = Registry->SelectionEntryWidgetClass.LoadSynchronous();
-    if (!IsValid(LoadedClass) || !LoadedClass->IsChildOf(UMenuButtonWidget::StaticClass()))
-    {
-        UE_LOG(LogTemp, Error, TEXT("AssetRegistry SelectionEntryWidgetClass is invalid."));
-        return nullptr;
+        FSimulatorFileServices::WriteLogAsync(TEXT("UI"),
+            TEXT("Selection entry class unavailable; using native button."));
+        LoadedClass = UMenuButtonWidget::StaticClass();
     }
 
     ResolvedSelectionEntryWidgetClass = LoadedClass;

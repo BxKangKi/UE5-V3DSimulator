@@ -200,21 +200,8 @@ private:
     /** Sorted root-member intervals used for O(children + roots) manifest overlap checks. */
     TArray<TPair<uint64, uint64>> RootMemberRanges;
 
-    /**
-     * Tiny bounded resident cache for the hottest model tables. Repeated placements normally share
-     * one UWorldBakedModelAsset, but this also avoids synchronous disk reads after GC/recreation.
-     * The reader is shared by worker tasks, so all cache access is protected.
-     */
-    mutable FCriticalSection ResidentTableCacheLock;
-    mutable TMap<FGuid, FGWorldModelMetadata> ResidentMetadataCache;
-    mutable TMap<FGuid, int64> ResidentMetadataCacheBytes;
-    mutable int64 ResidentMetadataCacheTotalBytes = 0;
-    mutable TMap<FGuid, FGWorldModelManifest> ResidentManifestCache;
-    // Metadata contains scene node maps and can be orders of magnitude larger than a manifest.
-    // Keep only a small, byte-bounded hot set so caching can never silently mirror a dense world.
-    static constexpr int32 MaxResidentMetadataEntries = 8;
-    static constexpr int64 MaxResidentMetadataCacheBytes = 128ll * 1024ll * 1024ll;
-    static constexpr int32 MaxResidentManifestEntries = 64;
+    // Deliberately no metadata/manifest resident cache. The reader retains only the compact root
+    // directory; model tables are range-read from disk when a live Unreal facade needs them.
 };
 
 /** Static helpers for the immutable world-build file and its opaque runtime model references. */

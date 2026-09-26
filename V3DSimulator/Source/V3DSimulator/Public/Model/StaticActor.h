@@ -67,6 +67,10 @@ public:
     void ReleaseRuntimeResourcesForWorldExit();
     void SetRenderOnlyStreaming(bool bRenderOnly);
     bool IsRenderOnlyStreaming() const { return bRenderOnlyStreaming; }
+    /** Immediately starts a fresh internal node-stream evaluation when an observer/focus changes. */
+    void RequestStreamingRefresh();
+    /** Exact destination readiness check independent of the actor's per-frame evaluation cycle. */
+    bool IsLocationStreamingReady(const FVector& WorldLocation) const;
 
     const TMap<FName, FModelMeshData>& GetAllMeshMapRef() const { return AllMeshMap; }
     const TMap<FName, FWaterStreamNodeData>& GetWaterNodeMapRef() const { return WaterNodeMap; }

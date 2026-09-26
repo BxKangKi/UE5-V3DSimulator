@@ -9,15 +9,14 @@
  */
 
 #include "GameMode/MainGameMode.h"
-#include "GameMode/SingleplayGameMode.h"
-#include "GameMode/MultiplayGameMode.h"
 
 #include "Engine/World.h"
-#include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/WorldSettings.h"
 #include "InputCoreTypes.h"
 #include "Kismet/GameplayStatics.h"
 #include "Misc/Paths.h"
+#include "Misc/PackageName.h"
 #include "System/SimulatorFileServices.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
@@ -32,6 +31,7 @@
 #include "Blueprint/UserWidget.h"
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/V3DSimulatorAssetRegistry.h"
+#include "System/SimulatorFileServices.h"
 #include "System/WorldArchive.h"
 #include "System/SafeFileIO.h"
 #include "World/WorldData.h"
@@ -44,22 +44,72 @@ namespace
         return Value;
     }
 
-    /** Adds one travel option without inheriting any option from the menu map. */
-    void AppendStartWorldTravelOption(FString& InOutOptions, const FString& Key, const FString& Value)
+    bool ValidateLaunchWorld(const TSoftObjectPtr<UWorld>& WorldAsset, const TCHAR* Label)
     {
-        if (Key.IsEmpty() || Value.IsEmpty())
+        if (WorldAsset.IsNull())
         {
-            return;
+            UE_LOG(LogTemp, Error, TEXT("[WorldTravel] %s world is not assigned in AssetRegistry."), Label);
+            return false;
         }
 
-        if (!InOutOptions.IsEmpty())
+        const FSoftObjectPath Path = WorldAsset.ToSoftObjectPath();
+        if (!Path.IsValid() || Path.GetLongPackageName().IsEmpty())
         {
-            InOutOptions += TEXT("?");
+            UE_LOG(LogTemp, Error, TEXT("[WorldTravel] %s world reference is invalid: %s"),
+                Label, *Path.ToString());
+            return false;
         }
-        InOutOptions += Key;
-        InOutOptions += TEXT("=");
-        InOutOptions += Value;
+        return true;
     }
+
+
+    bool IsUsableWidgetClass(UClass* WidgetClass, UClass* RequiredBaseClass)
+    {
+        return IsValid(WidgetClass)
+            && IsValid(RequiredBaseClass)
+            && WidgetClass->IsChildOf(RequiredBaseClass)
+            && !WidgetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
+    }
+
+    bool SameWorldAsset(const TSoftObjectPtr<UWorld>& A, const TSoftObjectPtr<UWorld>& B)
+    {
+        if (A.IsNull() || B.IsNull())
+        {
+            return false;
+        }
+        const FString APackage = A.ToSoftObjectPath().GetLongPackageName();
+        const FString BPackage = B.ToSoftObjectPath().GetLongPackageName();
+        return !APackage.IsEmpty() && APackage.Equals(BPackage, ESearchCase::IgnoreCase);
+    }
+
+    FString CanonicalMenuMapPackage(FString Package)
+    {
+        Package = FPackageName::ObjectPathToPackageName(Package);
+        int32 Slash = INDEX_NONE;
+        Package.FindLastChar(TEXT('/'), Slash);
+        const FString Folder = Package.Left(Slash + 1);
+        FString Leaf = Package.Mid(Slash + 1);
+        if (Leaf.StartsWith(TEXT("UEDPIE_")))
+        {
+            const int32 Separator = Leaf.Find(TEXT("_"), ESearchCase::CaseSensitive, ESearchDir::FromStart, 7);
+            if (Separator > 7 && Leaf.Mid(7, Separator - 7).IsNumeric())
+            {
+                Leaf = Leaf.Mid(Separator + 1);
+            }
+        }
+        return Folder + Leaf;
+    }
+
+    bool CurrentWorldMatches(const UWorld* World, const TSoftObjectPtr<UWorld>& Expected)
+    {
+        if (!IsValid(World) || Expected.IsNull()) return false;
+        const FString ActualPackage = CanonicalMenuMapPackage(World->GetOutermost()->GetName());
+        const FString ExpectedPackage = CanonicalMenuMapPackage(
+            Expected.ToSoftObjectPath().GetLongPackageName());
+        return !ActualPackage.IsEmpty() && !ExpectedPackage.IsEmpty()
+            && ActualPackage.Equals(ExpectedPackage, ESearchCase::IgnoreCase);
+    }
+
 }
 
 AMainGameMode::AMainGameMode()
@@ -116,16 +166,41 @@ void AMainGameMode::SetSettingsWidget(USettingsMenuWidget* InWidget)
     }
 }
 
-void AMainGameMode::ShowSettingsMenu()
+bool AMainGameMode::EnsureSettingsMenuWidget()
 {
-    HideAllMenuWidgets();
+    UWorld* World = GetWorld();
+    APlayerController* PlayerController = IsValid(World) ? UGameplayStatics::GetPlayerController(this, 0) : nullptr;
+    if (!IsValid(World) || !IsValid(PlayerController) || !PlayerController->IsLocalController()
+        || !PlayerController->GetLocalPlayer() || !World->GetGameViewport())
+        return false;
     if (!IsValid(SettingsWidget))
     {
-        UE_LOG(LogTemp, Warning, TEXT("MainGameMode has no registered Settings widget. Blueprint must create it and call SetSettingsWidget."));
-        ShowStartMenu();
+        UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+        if (!IsValid(Registry)) return false;
+        Registry->EnsureMenuDefaults();
+        UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous();
+        if (!IsUsableWidgetClass(WidgetClass, USettingsMenuWidget::StaticClass()))
+        {
+            UE_LOG(LogTemp, Error, TEXT("Cannot load settings menu class: %s"),
+                *Registry->SettingsMenuWidgetClass.ToSoftObjectPath().ToString());
+            return false;
+        }
+        SetSettingsWidget(CreateWidget<USettingsMenuWidget>(PlayerController, WidgetClass));
+    }
+    return IsValid(SettingsWidget)
+        && (SettingsWidget->IsInViewport() || SettingsWidget->AddToPlayerScreen(20));
+}
+
+void AMainGameMode::ShowSettingsMenu()
+{
+    if (bGameplayWorldTravelPending || !EnsureSettingsMenuWidget())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Settings menu is not ready; keeping the current menu visible."));
         return;
     }
+    HideAllMenuWidgets();
     SettingsWidget->InitializeSettingsFromSavedData();
+    SettingsWidget->SetIsEnabled(true);
     SettingsWidget->SetVisibility(ESlateVisibility::Visible);
     ApplyMenuInputMode(SettingsWidget.Get());
 }
@@ -141,11 +216,47 @@ void AMainGameMode::ReturnFromSettings()
 
 void AMainGameMode::BeginPlay()
 {
+    FSimulatorFileServices::WriteStartupLog(TEXT("MainGameMode BeginPlay entered"));
+
+    if (const UWorld* World = GetWorld())
+    {
+        const AWorldSettings* WorldSettings = World->GetWorldSettings();
+        UClass* ConfiguredGameMode = IsValid(WorldSettings) ? WorldSettings->DefaultGameMode.Get() : nullptr;
+        if (!IsValid(ConfiguredGameMode))
+        {
+            UE_LOG(LogTemp, Error, TEXT("[WorldSettings] MainWorld has no explicit GameMode Override. Assign AMainGameMode (or its Blueprint subclass) in this map's World Settings."));
+        }
+        else if (!ConfiguredGameMode->IsChildOf(AMainGameMode::StaticClass()))
+        {
+            UE_LOG(LogTemp, Error, TEXT("[WorldSettings] MainWorld GameMode Override is %s, not an AMainGameMode subclass."), *ConfiguredGameMode->GetPathName());
+        }
+    }
     // The registry is class-backed and privately instantiated by the GameInstance. Prepare it before
     // Blueprint ReceiveBeginPlay so even legacy menu Blueprint code can resolve central assets.
     if (UV3DSimulatorGameInstance* SimulatorGameInstance = Cast<UV3DSimulatorGameInstance>(GetGameInstance()))
     {
         SimulatorGameInstance->EnsureAssetRegistry();
+    }
+
+    if (const UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this))
+    {
+        FSimulatorFileServices::WriteStartupLog(FString::Printf(
+            TEXT("MainGameMode map binding: ActiveMap=%s ActiveGM=%s RegistryMainWorld=%s (GameMode comes from World Settings)"),
+            GetWorld() ? *GetWorld()->GetOutermost()->GetName() : TEXT("<none>"),
+            *GetClass()->GetPathName(),
+            *Registry->MainWorld.ToSoftObjectPath().ToString()));
+
+        if (Registry->MainWorld.IsNull())
+        {
+            UE_LOG(LogTemp, Error, TEXT("MainGameMode is running but AssetRegistry.MainWorld is empty."));
+        }
+        else if (GetWorld() && !CurrentWorldMatches(GetWorld(), Registry->MainWorld))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("MainGameMode is running on a map that is not AssetRegistry.MainWorld. Active=%s RegistryMainWorld=%s"),
+                *GetWorld()->GetOutermost()->GetName(),
+                *Registry->MainWorld.ToSoftObjectPath().ToString());
+        }
     }
 
     // Arm before Super::BeginPlay so a legacy Blueprint ReceiveBeginPlay cannot consume the
@@ -155,13 +266,6 @@ void AMainGameMode::BeginPlay()
         bWorldSelectionReturnInputGuardActive = GameManager->ShouldOpenWorldSelectionMenuOnNextMainWorld();
     }
 
-    // The menu world must not retain an explicit gameplay GameMode request from the previous travel.
-    // A later world with no override must be free to use its own World Settings.
-    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
-    {
-        Multiplayer->ClearRequestedGameModeOverride();
-    }
-
     Super::BeginPlay();
 
     // Rebuild the level list before any UI asks for it.
@@ -169,23 +273,58 @@ void AMainGameMode::BeginPlay()
 
     // Blueprint ReceiveBeginPlay has completed when Super::BeginPlay() returns. Keep any instances
     // explicitly registered by Blueprint, then fill only the missing slots from AssetRegistryClass.
-    InitializeRegistryDrivenUI();
-    InitializeStartScreenAfterBlueprintBeginPlay();
+    // BeginPlay can precede local-player/viewport readiness in PIE and packaged startup.
+    if (GetNetMode() != NM_DedicatedServer)
+    {
+        TryInitializeStartScreen();
+        if (!bStartScreenInitialized)
+        {
+            GetWorldTimerManager().SetTimer(StartScreenInitializationHandle, this,
+                &AMainGameMode::TryInitializeStartScreen, 0.1f, true);
+        }
+    }
 }
 
-void AMainGameMode::InitializeRegistryDrivenUI()
+void AMainGameMode::TryInitializeStartScreen()
 {
-    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
-    if (!IsValid(PlayerController) || !PlayerController->IsLocalController())
+    if (bStartScreenInitialized || GetNetMode() == NM_DedicatedServer)
     {
+        GetWorldTimerManager().ClearTimer(StartScreenInitializationHandle);
         return;
+    }
+    ++StartScreenInitializationAttempts;
+    if (StartScreenInitializationAttempts == 1)
+        FSimulatorFileServices::WriteStartupLog(TEXT("Attempting start menu initialization"));
+    if (InitializeRegistryDrivenUI())
+    {
+        FSimulatorFileServices::WriteStartupLog(TEXT("Start menu created and attached"));
+        bStartScreenInitialized = true;
+        GetWorldTimerManager().ClearTimer(StartScreenInitializationHandle);
+        InitializeStartScreenAfterBlueprintBeginPlay();
+    }
+    else if (StartScreenInitializationAttempts >= 100)
+    {
+        FSimulatorFileServices::WriteStartupLog(TEXT("ERROR: Start menu initialization exhausted 100 attempts; check map classes, viewport and cooked widgets"));
+        GetWorldTimerManager().ClearTimer(StartScreenInitializationHandle);
+        UE_LOG(LogTemp, Error, TEXT("MainWorld menu initialization failed after 100 attempts. Check GameInstance, AssetRegistry and cooked menu classes."));
+    }
+}
+
+bool AMainGameMode::InitializeRegistryDrivenUI()
+{
+    UWorld* World = GetWorld();
+    APlayerController* PlayerController = IsValid(World) ? UGameplayStatics::GetPlayerController(this, 0) : nullptr;
+    if (!IsValid(World) || !IsValid(PlayerController) || !PlayerController->IsLocalController()
+        || !PlayerController->GetLocalPlayer() || !World->GetGameViewport())
+    {
+        return false;
     }
 
     UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
     if (!IsValid(Registry))
     {
         UE_LOG(LogTemp, Error, TEXT("MainGameMode cannot initialize registry-driven UI because the central AssetRegistry is unavailable."));
-        return;
+        return false;
     }
 
     const auto AddTopLevelWidget = [](UUserWidget* Widget, const int32 ZOrder)
@@ -198,7 +337,8 @@ void AMainGameMode::InitializeRegistryDrivenUI()
 
     if (!IsValid(StartMenuWidget) && !Registry->StartMenuWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->StartMenuWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->StartMenuWidgetClass.LoadSynchronous();
+            IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
         {
             UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
             SetStartMenuWidget(Widget);
@@ -208,7 +348,8 @@ void AMainGameMode::InitializeRegistryDrivenUI()
 
     if (!IsValid(WorldSelectionWidget) && !Registry->WorldSelectionWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->WorldSelectionWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->WorldSelectionWidgetClass.LoadSynchronous();
+            IsUsableWidgetClass(WidgetClass, UWorldSelectionWidget::StaticClass()))
         {
             UWorldSelectionWidget* Widget = CreateWidget<UWorldSelectionWidget>(PlayerController, WidgetClass);
             SetWorldSelectionWidget(Widget);
@@ -218,7 +359,8 @@ void AMainGameMode::InitializeRegistryDrivenUI()
 
     if (!IsValid(MultiplayerMenuWidget) && !Registry->MultiplayerMenuWidgetClass.IsNull())
     {
-        if (UClass* WidgetClass = Registry->MultiplayerMenuWidgetClass.LoadSynchronous())
+        if (UClass* WidgetClass = Registry->MultiplayerMenuWidgetClass.LoadSynchronous();
+            IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
         {
             UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
             SetMultiplayerMenuWidget(Widget);
@@ -226,35 +368,26 @@ void AMainGameMode::InitializeRegistryDrivenUI()
         }
     }
 
-    if (!IsValid(SettingsWidget) && !Registry->SettingsMenuWidgetClass.IsNull())
-    {
-        if (UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous())
-        {
-            USettingsMenuWidget* Widget = CreateWidget<USettingsMenuWidget>(PlayerController, WidgetClass);
-            SetSettingsWidget(Widget);
-            AddTopLevelWidget(Widget, 20);
-        }
-    }
+    EnsureSettingsMenuWidget();
 
-    // Project selection is owned by the start widget rather than MainGameMode. Create and register it
-    // automatically so the WBP only needs to expose/bind its internal buttons/panel.
-    if (IsValid(StartMenuWidget)
-        && !IsValid(StartMenuWidget->GetProjectSelectionWidget())
-        && !Registry->ProjectSelectionWidgetClass.IsNull())
-    {
-        if (UClass* WidgetClass = Registry->ProjectSelectionWidgetClass.LoadSynchronous())
-        {
-            UProjectSelectionWidget* ProjectWidget = CreateWidget<UProjectSelectionWidget>(PlayerController, WidgetClass);
-            if (IsValid(ProjectWidget))
-            {
-                ProjectWidget->SetVisibility(ESlateVisibility::Collapsed);
-                AddTopLevelWidget(ProjectWidget, 30);
-                StartMenuWidget->SetProjectSelectionWidget(ProjectWidget);
-            }
-        }
-    }
+    // Use the same creation/attachment path here and when the Projects button is clicked.
+    if (IsValid(StartMenuWidget))
+        StartMenuWidget->EnsureProjectSelectionWidget();
 
+    AddTopLevelWidget(StartMenuWidget.Get(), 10);
+    AddTopLevelWidget(WorldSelectionWidget.Get(), 11);
+    AddTopLevelWidget(MultiplayerMenuWidget.Get(), 12);
+    AddTopLevelWidget(SettingsWidget.Get(), 20);
+    if (IsValid(StartMenuWidget) && IsValid(StartMenuWidget->GetProjectSelectionWidget()))
+        AddTopLevelWidget(StartMenuWidget->GetProjectSelectionWidget(), 30);
+    if (StartScreenInitializationAttempts == 1)
+    {
+        FSimulatorFileServices::WriteStartupLog(FString::Printf(TEXT("Start menu class=%s; instance=%s; viewport=%d"),
+            *Registry->StartMenuWidgetClass.ToSoftObjectPath().ToString(), *GetNameSafe(StartMenuWidget.Get()),
+            IsValid(StartMenuWidget) && StartMenuWidget->IsInViewport()));
+    }
     HideAllMenuWidgets();
+    return IsValid(StartMenuWidget) && StartMenuWidget->IsInViewport();
 }
 
 void AMainGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -266,14 +399,25 @@ void AMainGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
     if (UWorld* World = GetWorld())
     {
+        World->GetTimerManager().ClearTimer(StartScreenInitializationHandle);
         World->GetTimerManager().ClearTimer(GameplayTravelWatchdogHandle);
         World->GetTimerManager().ClearTimer(WorldSelectionReturnInputGuardHandle);
     }
     HideAllMenuWidgets();
 
+    if (IsValid(StartMenuWidget) && IsValid(StartMenuWidget->GetProjectSelectionWidget())) StartMenuWidget->GetProjectSelectionWidget()->RemoveFromParent();
+    if (IsValid(StartMenuWidget)) StartMenuWidget->RemoveFromParent();
+    if (IsValid(WorldSelectionWidget)) WorldSelectionWidget->RemoveFromParent();
+    if (IsValid(MultiplayerMenuWidget)) MultiplayerMenuWidget->RemoveFromParent();
+    if (IsValid(SettingsWidget)) SettingsWidget->RemoveFromParent();
+    StartMenuWidget = nullptr;
+    WorldSelectionWidget = nullptr;
+    MultiplayerMenuWidget = nullptr;
+    SettingsWidget = nullptr;
+
     // Do not force garbage collection from EndPlay. During level travel this can block asset loading
     // and make the editor/game appear stuck around the loading-progress phase. Editor-only world-travel
-    // cleanup is owned centrally by the V3DSimulatorEditor module.
+    // cleanup is owned by the engine/runtime teardown path; no project editor module participates.
     Super::EndPlay(EndPlayReason);
 }
 
@@ -465,7 +609,7 @@ const FV3DWorldLaunchProfile* AMainGameMode::FindWorldLaunchProfile(const FStrin
         if (Match)
         {
             UE_LOG(LogTemp, Warning,
-                TEXT("[GameModeTravel] Duplicate launch profile for folder '%s'. The first profile is used."),
+                TEXT("[WorldTravel] Duplicate launch profile for folder '%s'. The first profile is used."),
                 *NormalizedFolderName);
             continue;
         }
@@ -479,53 +623,18 @@ void AMainGameMode::ResolveWorldLaunch(
     const FString& WorldFolderName,
     bool bForHost,
     TSoftObjectPtr<UWorld>& OutWorld,
-    TSoftClassPtr<AGameModeBase>& OutGameModeOverride,
     FString& OutResolutionSource) const
 {
-    const UV3DSimulatorAssetRegistry* Registry =
-        UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
-    OutWorld = Registry
-        ? (bForHost ? Registry->HostWorld : Registry->GameplayWorld)
-        : TSoftObjectPtr<UWorld>();
-
-    UClass* RequestedGameMode = nullptr;
-    if (Registry)
-    {
-        RequestedGameMode = bForHost
-            ? Registry->MultiplayGameModeClass.LoadSynchronous()
-            : Registry->SingleplayGameModeClass.LoadSynchronous();
-    }
-    if (!IsValid(RequestedGameMode))
-    {
-        RequestedGameMode = bForHost
-            ? AMultiplayGameMode::StaticClass()
-            : ASingleplayGameMode::StaticClass();
-    }
-    OutGameModeOverride = RequestedGameMode;
-    OutResolutionSource = bForHost
-        ? FString(TEXT("Common HostWorld + MultiplayGameMode"))
-        : FString(TEXT("Common GameplayWorld + SingleplayGameMode"));
-
+    const UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    OutWorld = Registry ? (bForHost ? Registry->HostWorld : Registry->GameplayWorld) : TSoftObjectPtr<UWorld>();
+    OutResolutionSource = bForHost ? FString(TEXT("Common HostWorld (GameMode from World Settings)")) : FString(TEXT("Common GameplayWorld (GameMode from World Settings)"));
     const FV3DWorldLaunchProfile* Profile = FindWorldLaunchProfile(WorldFolderName);
-    if (!Profile)
-    {
-        return;
-    }
-
-    TSoftObjectPtr<UWorld> ProfileWorld = bForHost
-        ? Profile->HostWorld
-        : Profile->SinglePlayerWorld;
-    if (bForHost && ProfileWorld.IsNull() && !Profile->SinglePlayerWorld.IsNull())
-    {
-        ProfileWorld = Profile->SinglePlayerWorld;
-    }
-
+    if (!Profile) return;
+    TSoftObjectPtr<UWorld> ProfileWorld = bForHost ? Profile->HostWorld : Profile->SinglePlayerWorld;
     if (!ProfileWorld.IsNull())
     {
         OutWorld = ProfileWorld;
-        OutResolutionSource = bForHost
-            ? FString(TEXT("Profile world + MultiplayGameMode"))
-            : FString(TEXT("Profile SinglePlayerWorld + SingleplayGameMode"));
+        OutResolutionSource = TEXT("Profile world (GameMode from World Settings)");
     }
 }
 
@@ -556,20 +665,31 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
     }
 
     TSoftObjectPtr<UWorld> SelectedGameplayWorld;
-    TSoftClassPtr<AGameModeBase> SelectedGameModeOverride;
     FString LaunchResolutionSource;
-    ResolveWorldLaunch(
-        ResolvedFolderName,
-        false,
-        SelectedGameplayWorld,
-        SelectedGameModeOverride,
-        LaunchResolutionSource);
+    ResolveWorldLaunch(ResolvedFolderName, false, SelectedGameplayWorld, LaunchResolutionSource);
 
     if (SelectedGameplayWorld.IsNull())
     {
         UE_LOG(LogTemp, Error,
             TEXT("[WorldSelection] Cannot open world '%s': neither the folder profile nor GameplayWorld has a map assigned."),
             *ResolvedFolderName);
+        return;
+    }
+
+    if (!ValidateLaunchWorld(SelectedGameplayWorld, TEXT("single-player gameplay")))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[WorldSelection] Refused to load '%s' because its world reference is invalid."), *ResolvedFolderName);
+        return;
+    }
+
+    if (const UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+        IsValid(Registry) && SameWorldAsset(SelectedGameplayWorld, Registry->MainWorld))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[WorldTravel] Refused world '%s': GameplayWorld resolves to AssetRegistry.MainWorld (%s). "
+                 "MainWorld is UI-only and must not be reused as the gameplay map."),
+            *ResolvedFolderName,
+            *Registry->MainWorld.ToSoftObjectPath().ToString());
         return;
     }
 
@@ -584,12 +704,9 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
     PendingGameplayWorldFolderName = ResolvedFolderName;
 
     UE_LOG(LogTemp, Display,
-        TEXT("[GameModeTravel] Single-player selection. Folder=%s World=%s GameMode=%s Source=%s"),
+        TEXT("[WorldTravel] Single-player selection. Folder=%s World=%s GameMode=<map World Settings> Source=%s"),
         *ResolvedFolderName,
         *SelectedGameplayWorld.ToSoftObjectPath().ToString(),
-        SelectedGameModeOverride.IsNull()
-            ? TEXT("<map World Settings>")
-            : *SelectedGameModeOverride.ToSoftObjectPath().ToString(),
         *LaunchResolutionSource);
 
     PrepareMenuForWorldTravel();
@@ -607,25 +724,13 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
     bool bTravelRequested = false;
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        bTravelRequested = Multiplayer->StartSinglePlayerWorldWithGameMode(
-            this,
-            ResolvedFolderName,
-            SelectedGameplayWorld,
-            SelectedGameModeOverride);
+        bTravelRequested = Multiplayer->StartSinglePlayerWorld(this, ResolvedFolderName, SelectedGameplayWorld);
     }
     else
     {
-        FString Options;
-        AppendStartWorldTravelOption(Options, TEXT("World"), ResolvedFolderName);
-        if (!SelectedGameModeOverride.IsNull())
-        {
-            AppendStartWorldTravelOption(
-                Options,
-                TEXT("game"),
-                SelectedGameModeOverride.ToSoftObjectPath().ToString());
-        }
-        UGameplayStatics::OpenLevelBySoftObjectPtr(this, SelectedGameplayWorld, true, Options);
-        bTravelRequested = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("[WorldSelection] Cannot travel because MultiplayerWorldSubSystem is unavailable; "
+                 "refusing the old direct OpenLevel fallback so GameMode selection cannot diverge."));
     }
 
     if (!bTravelRequested)
@@ -638,7 +743,7 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
         PendingGameplayWorldFolderName.Reset();
         if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
         {
-            Multiplayer->ClearRequestedGameModeOverride();
+            Multiplayer->ClearRequestedWorld();
         }
         ShowWorldSelectionMenu();
         return;
@@ -660,20 +765,31 @@ void AMainGameMode::HostMultiplayerWorldByFolderName(const FString& WorldFolderN
     }
 
     TSoftObjectPtr<UWorld> SelectedHostWorld;
-    TSoftClassPtr<AGameModeBase> SelectedGameModeOverride;
     FString LaunchResolutionSource;
-    ResolveWorldLaunch(
-        ResolvedFolderName,
-        true,
-        SelectedHostWorld,
-        SelectedGameModeOverride,
-        LaunchResolutionSource);
+    ResolveWorldLaunch(ResolvedFolderName, true, SelectedHostWorld, LaunchResolutionSource);
 
     if (SelectedHostWorld.IsNull())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("MainGameMode cannot host world '%s': neither the folder profile nor HostWorld has a map assigned."),
             *ResolvedFolderName);
+        return;
+    }
+
+    if (!ValidateLaunchWorld(SelectedHostWorld, TEXT("host gameplay")))
+    {
+        UE_LOG(LogTemp, Error, TEXT("[WorldTravel] Refused to host '%s' because its world reference is invalid."), *ResolvedFolderName);
+        return;
+    }
+
+    if (const UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+        IsValid(Registry) && SameWorldAsset(SelectedHostWorld, Registry->MainWorld))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[WorldTravel] Refused host world '%s': HostWorld resolves to AssetRegistry.MainWorld (%s). "
+                 "MainWorld is UI-only and must not be reused as the host gameplay map."),
+            *ResolvedFolderName,
+            *Registry->MainWorld.ToSoftObjectPath().ToString());
         return;
     }
 
@@ -685,35 +801,26 @@ void AMainGameMode::HostMultiplayerWorldByFolderName(const FString& WorldFolderN
     }
 
     UE_LOG(LogTemp, Display,
-        TEXT("[GameModeTravel] Host selection. Folder=%s World=%s GameMode=%s Source=%s"),
+        TEXT("[WorldTravel] Host selection. Folder=%s World=%s GameMode=<map World Settings> Source=%s"),
         *ResolvedFolderName,
         *SelectedHostWorld.ToSoftObjectPath().ToString(),
-        SelectedGameModeOverride.IsNull()
-            ? TEXT("<map World Settings>")
-            : *SelectedGameModeOverride.ToSoftObjectPath().ToString(),
         *LaunchResolutionSource);
 
     PrepareMenuForWorldTravel();
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        Multiplayer->HostMultiplayerWorldWithGameMode(
-            this,
-            ResolvedFolderName,
-            SelectedHostWorld,
-            SelectedGameModeOverride);
+        if (!Multiplayer->HostMultiplayerWorld(this, ResolvedFolderName, SelectedHostWorld))
+        {
+            UE_LOG(LogTemp, Error, TEXT("[WorldTravel] Host travel request was rejected for '%s'."), *ResolvedFolderName);
+            ShowMultiplayerMenu();
+        }
     }
     else
     {
-        FString Options(TEXT("listen"));
-        AppendStartWorldTravelOption(Options, TEXT("World"), ResolvedFolderName);
-        if (!SelectedGameModeOverride.IsNull())
-        {
-            AppendStartWorldTravelOption(
-                Options,
-                TEXT("game"),
-                SelectedGameModeOverride.ToSoftObjectPath().ToString());
-        }
-        UGameplayStatics::OpenLevelBySoftObjectPtr(this, SelectedHostWorld, true, Options);
+        UE_LOG(LogTemp, Error,
+            TEXT("[WorldTravel] Cannot host because MultiplayerWorldSubSystem is unavailable; "
+                 "direct OpenLevel fallback is disabled to keep GameMode selection deterministic."));
+        ShowMultiplayerMenu();
     }
 }
 
@@ -791,7 +898,7 @@ void AMainGameMode::HandleGameplayTravelWatchdogExpired()
     PendingGameplayWorldFolderName.Reset();
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        Multiplayer->ClearRequestedGameModeOverride();
+        Multiplayer->ClearRequestedWorld();
     }
 
     UE_LOG(LogTemp, Error,

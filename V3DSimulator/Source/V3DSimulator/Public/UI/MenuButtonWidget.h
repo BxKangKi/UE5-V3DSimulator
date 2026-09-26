@@ -19,7 +19,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMenuButtonClicked, const FString&, 
 /**
  * Minimal native contract for a fully Blueprint-authored button WBP.
  *
- * The Blueprint owns all appearance, layout, animation, iconography, and hover/pressed styling.
+ * Blueprint subclasses own their appearance; the native class also provides a basic fallback button.
  * Native code only supplies a stable key/label and receives a click notification.
  *
  * Typical Blueprint setup:
@@ -36,6 +36,8 @@ class V3DSIMULATOR_API UMenuButtonWidget : public UUserWidget
     GENERATED_BODY()
 
 public:
+    virtual TSharedRef<SWidget> RebuildWidget() override;
+    virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
 
     UPROPERTY(BlueprintAssignable, Category="Menu Button")

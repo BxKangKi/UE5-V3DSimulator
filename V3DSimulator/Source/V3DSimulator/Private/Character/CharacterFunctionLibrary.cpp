@@ -9,7 +9,6 @@
  */
 
 #include "Character/CharacterFunctionLibrary.h"
-#include "Editor/V3DSimulatorEditorServices.h"
 #include "System/MacroLibrary.h"
 #include "PhysicsEngine/SkeletalBodySetup.h"
 #include "PhysicsEngine/PhysicsAsset.h"
@@ -394,6 +393,33 @@ void UCharacterFunctionLibrary::SetBodiesBelowPhysics(
     }
 }
 
+void UCharacterFunctionLibrary::PrepareHairForRagdoll(
+    USkeletalMeshComponent &SkeletalMesh,
+    const FVector &LinearVelocity)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("PrepareHairForRagdoll must run on the game thread"))) return;
+    TArray<FName> HairRoots;
+    SecondaryMotionRouting::GatherHairPhysicsRoots(SkeletalMesh, HairRoots);
+    if (HairRoots.IsEmpty()) return;
+    const FVector SafeLinearVelocity = LinearVelocity.ContainsNaN() ? FVector::ZeroVector : LinearVelocity;
+    TSet<FBodyInstance*> PreparedBodies;
+    PreparedBodies.Reserve(HairRoots.Num() * 4);
+    for (int32 BoneIndex = 0; BoneIndex < SkeletalMesh.GetNumBones(); ++BoneIndex)
+    {
+        const FName BoneName = SkeletalMesh.GetBoneName(BoneIndex);
+        const bool bHairBone = HairRoots.ContainsByPredicate([&SkeletalMesh, BoneName](const FName HairRoot)
+        {
+            return SecondaryMotionRouting::IsBoneInSubtree(SkeletalMesh, BoneName, HairRoot);
+        });
+        if (!bHairBone) continue;
+        FBodyInstance* Body = SkeletalMesh.GetBodyInstance(BoneName);
+        if (!Body || !Body->IsValidBodyInstance() || !Body->IsInstanceSimulatingPhysics() || PreparedBodies.Contains(Body)) continue;
+        PreparedBodies.Add(Body);
+        Body->SetLinearVelocity(SafeLinearVelocity, false, true);
+        SkeletalMesh.SetPhysicsAngularVelocityInRadians(FVector::ZeroVector, false, BoneName);
+    }
+}
+
 void UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(USkeletalMeshComponent &SkeletalMesh)
 {
     SetBodiesBelowPhysics(SkeletalMesh, false);
@@ -590,7 +616,17 @@ void UCharacterFunctionLibrary::FinalizeRuntimePhysicsAsset(UPhysicsAsset *Physi
 
     PhysicsAsset->UpdateBodySetupIndexMap();
     PhysicsAsset->UpdateBoundsBodiesArray();
-    FV3DSimulatorEditorServices::RefreshPhysicsAsset(PhysicsAsset);
+
+#if WITH_EDITOR
+    // Editor refresh stays in the runtime module at compile time. There is no project editor DLL
+    // dependency, and packaged targets compile this block out completely.
+    if (!IsRunningCommandlet()
+        && !PhysicsAsset->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+    {
+        PhysicsAsset->InvalidateAllPhysicsMeshes();
+        PhysicsAsset->RefreshPhysicsAssetChange();
+    }
+#endif
 }
 
 void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
@@ -903,9 +939,9 @@ void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
         DefaultInstance.SetAngularSwing2Limit(AngularMotion, SwingLimitDegrees);
         DefaultInstance.SetAngularTwistLimit(AngularMotion, TwistLimitDegrees);
         DefaultInstance.SetDisableCollision(true);
-        // Keep the known working secondary-joint behavior: free angular response inside the explicit
-        // cone/twist limits with projection for error correction, but no dominance/drive that can
-        // make a light hair chain follow the parent as if it were rigid.
+        // Hair is a visual secondary chain, never a source of force for the character ragdoll.
+        DefaultInstance.ProfileInstance.bParentDominates = bHairChain;
+        if (bHairChain) DefaultInstance.ProfileInstance.ContactTransferScale = 0.0f;
         DefaultInstance.EnableProjection();
 #if WITH_EDITOR
         NewConstraint->SetDefaultProfile(DefaultInstance);

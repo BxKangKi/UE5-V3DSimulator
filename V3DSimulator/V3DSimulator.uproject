@@ -12,11 +12,6 @@
 				"Engine",
 				"CoreUObject"
 			]
-		},
-		{
-			"Name": "V3DSimulatorEditor",
-			"Type": "Editor",
-			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [

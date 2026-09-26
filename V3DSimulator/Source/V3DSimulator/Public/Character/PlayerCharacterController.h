@@ -365,6 +365,7 @@ private:
     void ResolveCentralAssets();
     /** Creates missing gameplay UI directly from the central registry and registers the loading widget with GameManager. */
     void InitializeRegistryDrivenUI();
+    bool EnsurePauseSettingsWidget();
     void BindConfiguredInputActions();
     /** Direct placement mouse buttons are intentional gameplay input, independent of Enhanced Input mappings. */
     void BindDirectMouseInputs();

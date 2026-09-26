@@ -39,7 +39,7 @@ public:
 
     /** Returns the owning MainGameMode registered for this widget. */
     UFUNCTION(BlueprintPure, Category="Start World|Actor")
-    AMainGameMode* GetMainGameMode() const { return MainGameMode.Get(); }
+    AMainGameMode* GetMainGameMode() const { return ResolveMainGameMode(); }
 
     /** Opens the world-selection screen through the owning MainGameMode. Bind this to the start button. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
@@ -83,6 +83,9 @@ public:
 
     UFUNCTION(BlueprintPure, Category="Start World|Projects")
     UProjectSelectionWidget* GetProjectSelectionWidget() const { return ProjectSelectionWidget.Get(); }
+
+    /** Creates and attaches the project browser on demand; never hides the menu on failure. */
+    bool EnsureProjectSelectionWidget();
 
     /** Internal lifecycle callback used when a project-selection widget is removed externally. */
     void HandleProjectSelectionWidgetRemoved(UProjectSelectionWidget* RemovedWidget);
@@ -210,6 +213,7 @@ protected:
     FString ServerAddress = TEXT("127.0.0.1:7777");
 
 private:
+    AMainGameMode* ResolveMainGameMode() const;
     void ApplyProjectSelectionInputMode(UUserWidget* FocusWidget) const;
 
     UPROPERTY(Transient)

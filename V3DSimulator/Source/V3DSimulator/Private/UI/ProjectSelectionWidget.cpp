@@ -14,6 +14,7 @@
 #include "UI/BuildStatusWidget.h"
 #include "UI/MenuButtonWidget.h"
 #include "System/MacroLibrary.h"
+#include "System/SimulatorFileServices.h"
 #include "System/ProjectConfig.h"
 #include "UI/StartWorldWidget.h"
 #include "World/WorldData.h"
@@ -27,13 +28,16 @@ void UProjectSelectionWidget::NativeConstruct()
 {
     Super::NativeConstruct();
     ClearFlags(RF_Transactional);
+    if (!IsValid(GetSelectionListPanel()))
+        SetSelectionListPanel(Cast<UPanelWidget>(GetWidgetFromName(TEXT("ProjectListPanel"))));
+    if (!BackButton.IsValid())
+        SetBackButton(Cast<UButton>(GetWidgetFromName(TEXT("BackButton"))));
+    if (!RefreshButton.IsValid())
+        SetRefreshButton(Cast<UButton>(GetWidgetFromName(TEXT("RefreshButton"))));
     BindNavigationButtons();
     SetCreateProjectMode(false, false);
 
-    if (IsValid(GetSelectionListPanel()))
-    {
-        RefreshProjects();
-    }
+    RefreshProjects();
 }
 
 void UProjectSelectionWidget::NativeDestruct()
@@ -324,12 +328,27 @@ void UProjectSelectionWidget::UnbindNavigationButtons()
 
 void UProjectSelectionWidget::RefreshProjects()
 {
+    // Retry the named host on every opening, not only during the first Construct.
+    if (!IsValid(GetSelectionListPanel()))
+        SetSelectionListPanel(Cast<UPanelWidget>(GetWidgetFromName(TEXT("ProjectListPanel"))));
+    if (!IsValid(GetSelectionListPanel()) && IsValid(WidgetTree))
+    {
+        TArray<UWidget*> Widgets;
+        WidgetTree->GetAllWidgets(Widgets);
+        UScrollBox* Candidate = nullptr;
+        int32 Count = 0;
+        for (UWidget* Widget : Widgets)
+            if (UScrollBox* Box = Cast<UScrollBox>(Widget)) { Candidate = Box; ++Count; }
+        if (Count == 1) SetSelectionListPanel(Candidate);
+    }
     SetCreateProjectMode(false, true);
     CreateProjectEntryWidget.Reset();
     ClearGeneratedSelectionEntries();
 
     if (!IsValid(GetSelectionListPanel()))
     {
+        FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
+            TEXT("Project host missing. Widget=%s Root=%s"), *GetClass()->GetPathName(), *GetNameSafe(GetRootWidget())));
         UE_LOG(LogTemp, Warning,
             TEXT("ProjectSelectionWidget requires SetProjectListPanel() from the derived WBP."));
         return;
@@ -351,6 +370,8 @@ void UProjectSelectionWidget::RefreshProjects()
         UE_LOG(LogTemp, Warning, TEXT("ProjectSelectionWidget could not create the project-creation entry."));
     }
     UpdateCreateProjectEntryLabel();
+    FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
+        TEXT("Project list: Host=%s CreateEntry=%s"), *GetNameSafe(GetSelectionListPanel()), *GetNameSafe(CreateEntry)));
 
     UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
     if (!IsValid(Manager))
@@ -381,6 +402,14 @@ bool UProjectSelectionWidget::CreateNewProject(const FString& ProjectName)
     UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
     if (!IsValid(Manager) || !Manager->CreateProject(ProjectName, NewProjectType))
     {
+        SetCreateProjectMode(true, false);
+        if (UMenuButtonWidget* Entry = CreateProjectEntryWidget.Get())
+        {
+            const FString Error = IsValid(Manager) ? Manager->GetLastMessage()
+                : TEXT("Project service is unavailable.");
+            Entry->ConfigureButton(CreateProjectSelectionKey,
+                FString::Printf(TEXT("Retry: %s"), *Error));
+        }
         return false;
     }
 
@@ -499,6 +528,7 @@ void UProjectSelectionWidget::OnSelectionEntryActivated(const FString& Selection
             }
 
             UE_LOG(LogTemp, Warning, TEXT("Project creation failed for '%s'."), *ProjectName);
+            return; // Keep the name and the visible error so the user can correct/retry it.
         }
 
         SetCreateProjectMode(false, true);

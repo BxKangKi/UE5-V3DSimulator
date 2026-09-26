@@ -10,6 +10,7 @@
 #include "System/StreamingMovementGateSubsystem.h"
 
 #include "Components/PrimitiveComponent.h"
+#include "Character/CharacterComponent.h"
 #include "EngineUtils.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -118,6 +119,8 @@ void UStreamingMovementGateSubsystem::Freeze(AActor* Actor)
     }
     if (!State.bCharacterMovement && !State.bWasSimulatingPhysics) return;
     FrozenActors.Add(Actor, State);
+    if (UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>())
+        CharacterState->SetStreamingMovementSuspended(true);
 }
 
 void UStreamingMovementGateSubsystem::Resume(AActor* Actor, const FFrozenState& State)
@@ -138,6 +141,10 @@ void UStreamingMovementGateSubsystem::Resume(AActor* Actor, const FFrozenState& 
         Primitive->SetPhysicsLinearVelocity(State.LinearVelocity);
         Primitive->SetPhysicsAngularVelocityInRadians(State.AngularVelocity);
     }
+    // Restore velocity first, then make that velocity the new impact baseline. This also handles
+    // resume during unregistration or subsystem teardown, not just the ordinary tick path.
+    if (UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>())
+        CharacterState->SetStreamingMovementSuspended(false);
 }
 
 void UStreamingMovementGateSubsystem::Tick(const float DeltaTime)

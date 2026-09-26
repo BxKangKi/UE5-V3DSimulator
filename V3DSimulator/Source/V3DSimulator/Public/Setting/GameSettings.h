@@ -74,23 +74,23 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ViewDistanceQuality = 2;
 
-    /** Base size-proportional streaming radius multiplier. Effective radius also follows ViewDistanceQuality. */
+    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1.0", ClampMax="512.0"))
     float StreamingDistanceMultiplier = 64.0f;
 
-    /** Hysteresis applied only while a scene/model is already resident, preventing boundary thrash. */
+    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1.0", ClampMax="2.0"))
     float StreamingUnloadDistanceMultiplier = 1.10f;
 
-    /** Base mutable-object chunk radius. Effective radius also follows ViewDistanceQuality. */
+    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="512.0", ClampMax="4096.0"))
     float ObjectStreamingRadiusMeters = 2048.0f;
 
-    /** Maximum coarse scene actors spawned per update and mesh-group stream actions activated per frame. */
+    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="32"))
     int32 StreamingSceneSpawnBudget = 32;
 
-    /** Maximum node load/unload operations scheduled by one stream action frame. */
+    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="256"))
     int32 StreamingNodeBudgetPerFrame = 256;
 
@@ -143,6 +143,11 @@ public:
 
     UFUNCTION(BlueprintPure, Category="Settings|Streaming")
     int32 GetStreamingNodeBudgetPerFrame() const;
+
+    /** Internal automatic profile values derived only from ViewDistanceQuality. */
+    float GetStreamingUpdateIntervalSeconds() const;
+    float GetStreamingFrameTimeBudgetMs() const;
+    int32 GetStreamingMeshGroupConcurrency() const;
 
     static int32 ResolveMaxTextureResolution(const UObject* WorldContextObject);
     UFUNCTION()

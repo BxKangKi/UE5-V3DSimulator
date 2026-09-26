@@ -138,6 +138,8 @@ void UWorldObjectStreamingSubsystem::Stop()
     check(IsInGameThread());
     ++Generation;
     bRunning = false;
+    bHasPriorityStreamingFocus = false;
+    PriorityStreamingFocus = FVector::ZeroVector;
     PendingLoads.Empty();
     LoadingChunks.Empty();
     DesiredChunks.Empty();
@@ -303,6 +305,53 @@ bool UWorldObjectStreamingSubsystem::IsLocationLoaded(const FVector& WorldLocati
     return LoadedChunks.Contains(ToChunk(WorldLocation));
 }
 
+bool UWorldObjectStreamingSubsystem::IsAreaLoaded(
+    const FVector& WorldLocation,
+    const float RadiusMeters) const
+{
+    check(IsInGameThread());
+    if (!bRunning) return false;
+    if (!HasPersistenceAuthority()) return true;
+    if (!FMath::IsFinite(WorldLocation.X)
+        || !FMath::IsFinite(WorldLocation.Y)
+        || !FMath::IsFinite(WorldLocation.Z))
+    {
+        return false;
+    }
+
+    const double RadiusCentimeters = RadiusMeters >= 0.0f && FMath::IsFinite(RadiusMeters)
+        ? FMath::Clamp(static_cast<double>(RadiusMeters) * 100.0,
+            ChunkSizeCentimeters, 614400.0)
+        : static_cast<double>(LoadRadiusCentimeters);
+    const int32 Radius = FMath::CeilToInt(RadiusCentimeters / ChunkSizeCentimeters);
+    const double RadiusSq = FMath::Square(RadiusCentimeters + ChunkSizeCentimeters);
+    const FWorldChunkCoordinate Center = ToChunk(WorldLocation);
+
+    for (int32 DeltaZ = -Radius; DeltaZ <= Radius; ++DeltaZ)
+    {
+        for (int32 DeltaY = -Radius; DeltaY <= Radius; ++DeltaY)
+        {
+            for (int32 DeltaX = -Radius; DeltaX <= Radius; ++DeltaX)
+            {
+                const int32 X = static_cast<int32>(FMath::Clamp<int64>(
+                    static_cast<int64>(Center.X) + DeltaX, MIN_int32, MAX_int32));
+                const int32 Y = static_cast<int32>(FMath::Clamp<int64>(
+                    static_cast<int64>(Center.Y) + DeltaY, MIN_int32, MAX_int32));
+                const int32 Z = static_cast<int32>(FMath::Clamp<int64>(
+                    static_cast<int64>(Center.Z) + DeltaZ, MIN_int32, MAX_int32));
+                const FVector ChunkCenter((X + 0.5) * ChunkSizeCentimeters,
+                    (Y + 0.5) * ChunkSizeCentimeters, (Z + 0.5) * ChunkSizeCentimeters);
+                if (FVector::DistSquared(WorldLocation, ChunkCenter) <= RadiusSq
+                    && !LoadedChunks.Contains({X, Y, Z}))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void UWorldObjectStreamingSubsystem::EnsureLocationLoaded(const FVector& WorldLocation)
 {
     check(IsInGameThread());
@@ -311,6 +360,43 @@ void UWorldObjectStreamingSubsystem::EnsureLocationLoaded(const FVector& WorldLo
     if (!LoadedChunks.Contains(Coordinate) && !LoadingChunks.Contains(Coordinate))
     {
         QueueLoad(Coordinate, true);
+        PumpLoads();
+    }
+}
+
+void UWorldObjectStreamingSubsystem::SetPriorityStreamingFocus(const FVector& WorldLocation)
+{
+    check(IsInGameThread());
+    if (!bRunning
+        || !FMath::IsFinite(WorldLocation.X)
+        || !FMath::IsFinite(WorldLocation.Y)
+        || !FMath::IsFinite(WorldLocation.Z))
+    {
+        return;
+    }
+    if (bHasPriorityStreamingFocus && PriorityStreamingFocus.Equals(WorldLocation, 1.0))
+    {
+        return;
+    }
+
+    bHasPriorityStreamingFocus = true;
+    PriorityStreamingFocus = WorldLocation;
+    if (HasPersistenceAuthority())
+    {
+        RebuildDesiredChunks();
+        PumpLoads();
+    }
+}
+
+void UWorldObjectStreamingSubsystem::ClearPriorityStreamingFocus()
+{
+    check(IsInGameThread());
+    if (!bHasPriorityStreamingFocus) return;
+    bHasPriorityStreamingFocus = false;
+    PriorityStreamingFocus = FVector::ZeroVector;
+    if (bRunning && HasPersistenceAuthority())
+    {
+        RebuildDesiredChunks();
         PumpLoads();
     }
 }
@@ -326,12 +412,12 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
     // additional players can grow normally without penalizing the dominant single-player path.
     NewDesired.Reserve(Diameter * Diameter * Diameter);
     const double RadiusSq = FMath::Square(static_cast<double>(LoadRadiusCentimeters + ChunkSizeCentimeters));
-    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    const auto AddObserver = [this, Radius, RadiusSq, &NewDesired](const FVector& Observer)
     {
-        const APlayerController* Controller = It->Get();
-        const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
-        if (!IsValid(Pawn)) continue;
-        const FVector Observer = Pawn->GetActorLocation();
+        if (!FMath::IsFinite(Observer.X) || !FMath::IsFinite(Observer.Y) || !FMath::IsFinite(Observer.Z))
+        {
+            return;
+        }
         const FWorldChunkCoordinate Center = ToChunk(Observer);
         for (int32 DeltaZ = -Radius; DeltaZ <= Radius; ++DeltaZ)
             for (int32 DeltaY = -Radius; DeltaY <= Radius; ++DeltaY)
@@ -348,7 +434,17 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
                     if (FVector::DistSquared(Observer, ChunkCenter) <= RadiusSq)
                         NewDesired.Add({X, Y, Z});
                 }
+    };
+
+    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    {
+        const APlayerController* Controller = It->Get();
+        const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+        if (IsValid(Pawn)) AddObserver(Pawn->GetActorLocation());
     }
+    // Spawn/teleport preloading is additive: keep the current player neighborhood resident while
+    // the destination is prepared, then drop the extra observer after the move completes.
+    if (bHasPriorityStreamingFocus) AddObserver(PriorityStreamingFocus);
     // Known-empty cells are installed synchronously by PumpLoads. Reserve all three containers so
     // the first 2-4 km radius does not repeatedly rehash on the game thread.
     LoadedChunks.Reserve(LoadedChunks.Num() + NewDesired.Num());
@@ -878,7 +974,7 @@ void UWorldObjectStreamingSubsystem::LoadRuntimeStateAsync(
     }
 }
 
-void UWorldObjectStreamingSubsystem::SaveRuntimeStateAsync(
+bool UWorldObjectStreamingSubsystem::SaveRuntimeStateAsync(
     const FWorldRuntimeState& State,
     FSafeFileIO::FWriteCallback Callback)
 {
@@ -893,7 +989,7 @@ void UWorldObjectStreamingSubsystem::SaveRuntimeStateAsync(
             Result.Error = TEXT("The .dat streamer is not running");
             Callback(MoveTemp(Result));
         }
-        return;
+        return false;
     }
 
     const uint64 WriteOrder = Store->ReserveRuntimeStateWrite();
@@ -915,6 +1011,7 @@ void UWorldObjectStreamingSubsystem::SaveRuntimeStateAsync(
         Result.Error = TEXT("The .dat write queue is shutting down");
         Callback(MoveTemp(Result));
     }
+    return bQueued;
 }
 
 void UWorldObjectStreamingSubsystem::UpdateObjectsAndCrossings()

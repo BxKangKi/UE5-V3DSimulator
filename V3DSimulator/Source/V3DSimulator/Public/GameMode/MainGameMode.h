@@ -16,7 +16,6 @@
 #include "UI/WorldSelectionWidget.h"
 #include "MainGameMode.generated.h"
 
-class AGameModeBase;
 struct FV3DWorldLaunchProfile;
 class UWorld;
 class UStartWorldWidget;
@@ -137,7 +136,9 @@ protected:
 
 private:
     /** Creates any missing top-level menu widgets directly from the central registry classes. */
-    void InitializeRegistryDrivenUI();
+    bool InitializeRegistryDrivenUI();
+    bool EnsureSettingsMenuWidget();
+    void TryInitializeStartScreen();
     void InitializeStartScreenAfterBlueprintBeginPlay();
     void HideAllMenuWidgets();
     void ApplyMenuInputMode(UUserWidget* FocusWidget) const;
@@ -153,7 +154,6 @@ private:
         const FString& WorldFolderName,
         bool bForHost,
         TSoftObjectPtr<UWorld>& OutWorld,
-        TSoftClassPtr<AGameModeBase>& OutGameModeOverride,
         FString& OutResolutionSource) const;
 
 private:
@@ -185,6 +185,10 @@ private:
     /** Blocks Construct-time callbacks and carried-over click/key releases after gameplay Exit. */
     UPROPERTY(Transient)
     bool bWorldSelectionReturnInputGuardActive = false;
+
+    bool bStartScreenInitialized = false;
+    int32 StartScreenInitializationAttempts = 0;
+    FTimerHandle StartScreenInitializationHandle;
 
     FTimerHandle GameplayTravelWatchdogHandle;
     FTimerHandle WorldSelectionReturnInputGuardHandle;
