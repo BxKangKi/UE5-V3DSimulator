@@ -47,23 +47,11 @@ void FV3DSimulatorModule::StartupModule()
         return;
     }
 
-    // The primary game module is loaded before the startup map. Register both paths because
-    // OnPrepareLoadingScreen covers engine-driven startup preparation, while PreLoadMap covers
-    // later OpenLevel calls made by gameplay code.
+    // Arm only for an actual map load. The global OnPrepareLoadingScreen hook
+    // also runs for startup movies; continuously re-arming it can obscure the
+    // game viewport after loading has completed on packaged launch paths.
     PreLoadMapHandle = FCoreUObjectDelegates::PreLoadMap.AddRaw(
-        this,
-        &FV3DSimulatorModule::HandlePreLoadMap);
-
-    if (IGameMoviePlayer* MoviePlayer = GetMoviePlayer())
-    {
-        PrepareLoadingScreenHandle = MoviePlayer->OnPrepareLoadingScreen().AddRaw(
-            this,
-            &FV3DSimulatorModule::PrepareLoadingScreen);
-    }
-
-    // Prepare immediately as well, so the very first game window does not wait for a map actor or
-    // UMG widget to reach BeginPlay before it has something visible to render.
-    PrepareLoadingScreen();
+        this, &FV3DSimulatorModule::HandlePreLoadMap);
 }
 
 void FV3DSimulatorModule::PrepareLoadingScreen()
@@ -88,7 +76,7 @@ void FV3DSimulatorModule::PrepareLoadingScreen()
 
     FLoadingScreenAttributes LoadingScreen;
     LoadingScreen.bAllowEngineTick = false;
-    LoadingScreen.bAllowInEarlyStartup = true;
+    LoadingScreen.bAllowInEarlyStartup = false;
     LoadingScreen.bAutoCompleteWhenLoadingCompletes = true;
     LoadingScreen.bMoviesAreSkippable = false;
     LoadingScreen.bWaitForManualStop = false;
@@ -98,6 +86,7 @@ void FV3DSimulatorModule::PrepareLoadingScreen()
     // avoids loading a UMG class, texture UObject, or project package before the startup map exists.
     LoadingScreen.WidgetLoadingScreen = FLoadingScreenAttributes::NewTestLoadingScreenWidget();
     MoviePlayer->SetupLoadingScreen(LoadingScreen);
+    bOwnsLoadingScreen = true;
 }
 
 void FV3DSimulatorModule::HandlePreLoadMap(const FString& MapName)
@@ -111,6 +100,13 @@ void FV3DSimulatorModule::HandlePreLoadMap(const FString& MapName)
 
 void FV3DSimulatorModule::HandlePostLoadMap(UWorld* World)
 {
+    // Finish only our map-loading screen. Never wait here: the engine must
+    // regain the game thread so local-player/UMG initialization can continue.
+    if (bOwnsLoadingScreen)
+    {
+        bOwnsLoadingScreen = false;
+        if (IGameMoviePlayer* MoviePlayer = GetMoviePlayer()) MoviePlayer->StopMovie();
+    }
     FSimulatorFileServices::WriteStartupLog(FString::Printf(
         TEXT("Map loaded: %s; GameInstance=%s; GameMode=%s"),
         *GetPathNameSafe(World),
@@ -131,15 +127,10 @@ void FV3DSimulatorModule::ShutdownModule()
         PreLoadMapHandle.Reset();
     }
 
-    if (PrepareLoadingScreenHandle.IsValid())
+    if (bOwnsLoadingScreen)
     {
-        // A valid handle proves that registration succeeded earlier. Remove it even if the engine's
-        // enabled flag changed during shutdown, otherwise MoviePlayer could retain a raw module pointer.
-        if (IGameMoviePlayer* MoviePlayer = GetMoviePlayer())
-        {
-            MoviePlayer->OnPrepareLoadingScreen().Remove(PrepareLoadingScreenHandle);
-        }
-        PrepareLoadingScreenHandle.Reset();
+        bOwnsLoadingScreen = false;
+        if (IGameMoviePlayer* MoviePlayer = GetMoviePlayer()) MoviePlayer->StopMovie();
     }
 
     // Stop accepting new native mesh work first, then reject queued requests. An active plugin job

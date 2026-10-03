@@ -121,6 +121,7 @@ private:
         const FString& Error);
     void BeginDecodedCapture();
     FTSTicker::FDelegateHandle NextMeshTicker;
+    FTSTicker::FDelegateHandle ParserRetryTicker;
     void CaptureNextMesh();
     void CaptureNextMeshUnderGate();
     void CaptureSkinsAndMetadata();

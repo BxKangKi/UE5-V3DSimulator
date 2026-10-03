@@ -49,6 +49,7 @@ private:
     float ImpulseStrength = 24000.0f;
     float LifeSeconds = 5.0f;
     int32 GameUpdateTickHandle = INDEX_NONE;
+    bool bHitProcessed = false;
 
     void RegisterGameUpdate();
     void UnregisterGameUpdate();

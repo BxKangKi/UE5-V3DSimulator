@@ -513,6 +513,7 @@ void AMainGameMode::ShowWorldSelectionMenu()
         return;
     }
     BuildLevelFolderNameMap();
+    if (!IsValid(WorldSelectionWidget) || !WorldSelectionWidget->IsInViewport()) return;
     HideAllMenuWidgets();
     if (IsValid(WorldSelectionWidget))
     {
@@ -538,6 +539,7 @@ void AMainGameMode::ShowMultiplayerMenu()
     }
     CancelWorldSelectionReturnInputGuard();
     BuildLevelFolderNameMap();
+    if (!IsValid(MultiplayerMenuWidget) || !MultiplayerMenuWidget->IsInViewport()) return;
     HideAllMenuWidgets();
     if (IsValid(MultiplayerMenuWidget))
     {

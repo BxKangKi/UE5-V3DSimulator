@@ -11,6 +11,7 @@
 
 #include "Components/SphereComponent.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "System/GameUpdateSubSystem.h"
 
@@ -35,10 +36,17 @@ AWeaponProjectileActor::AWeaponProjectileActor()
 void AWeaponProjectileActor::BeginPlay()
 {
     Super::BeginPlay();
+    if (!HasAuthority())
+    {
+        SetActorEnableCollision(false);
+        return; // Replicated projectiles follow the server transform.
+    }
 
     if (Collision)
     {
-        Collision->OnComponentHit.AddDynamic(this, &AWeaponProjectileActor::OnProjectileHit);
+        Collision->OnComponentHit.AddUniqueDynamic(this, &AWeaponProjectileActor::OnProjectileHit);
+        if (IsValid(GetOwner())) Collision->IgnoreActorWhenMoving(GetOwner(), true);
+        if (IsValid(GetInstigator())) Collision->IgnoreActorWhenMoving(GetInstigator(), true);
     }
 
     SetLifeSpan(FMath::Max(WeaponProjectileTuning::MinProjectileLifeSeconds, LifeSeconds));
@@ -47,18 +55,29 @@ void AWeaponProjectileActor::BeginPlay()
 
 void AWeaponProjectileActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    bHitProcessed = true;
+    if (IsValid(Collision)) Collision->OnComponentHit.RemoveDynamic(this, &AWeaponProjectileActor::OnProjectileHit);
     UnregisterGameUpdate();
     Super::EndPlay(EndPlayReason);
 }
 
 void AWeaponProjectileActor::InitProjectile(AController* InInstigatorController, float InDamage, float InImpulseStrength, float InLifeSeconds, const FVector& InLaunchVelocity)
 {
-    CachedInstigatorController = InInstigatorController;
-    Damage = FMath::Max(0.0f, InDamage);
-    ImpulseStrength = FMath::Max(0.0f, InImpulseStrength);
-    LifeSeconds = FMath::Max(WeaponProjectileTuning::MinProjectileLifeSeconds, InLifeSeconds);
-    Velocity = InLaunchVelocity;
-    SetInstigator(InInstigatorController ? InInstigatorController->GetPawn() : nullptr);
+    if (bHitProcessed || IsActorBeingDestroyed()) return;
+    CachedInstigatorController = IsValid(InInstigatorController) ? InInstigatorController : nullptr;
+    Damage = FMath::IsFinite(InDamage) ? FMath::Max(0.0f, InDamage) : 0.0f;
+    ImpulseStrength = FMath::IsFinite(InImpulseStrength) ? FMath::Max(0.0f, InImpulseStrength) : 0.0f;
+    LifeSeconds = FMath::IsFinite(InLifeSeconds)
+        ? FMath::Max(WeaponProjectileTuning::MinProjectileLifeSeconds, InLifeSeconds) : 5.0f;
+    Velocity = InLaunchVelocity.ContainsNaN() ? FVector::ZeroVector : InLaunchVelocity;
+    SetInstigator(IsValid(InInstigatorController) ? InInstigatorController->GetPawn() : nullptr);
+    if (IsValid(Collision))
+    {
+        if (IsValid(GetOwner())) Collision->IgnoreActorWhenMoving(GetOwner(), true);
+        if (IsValid(GetInstigator())) Collision->IgnoreActorWhenMoving(GetInstigator(), true);
+    }
+    // SpawnActor runs BeginPlay before this initializer on the normal weapon path.
+    if (HasAuthority() && HasActorBegunPlay()) SetLifeSpan(LifeSeconds);
 
     if (!Velocity.IsNearlyZero())
     {
@@ -68,7 +87,7 @@ void AWeaponProjectileActor::InitProjectile(AController* InInstigatorController,
 
 void AWeaponProjectileActor::RegisterGameUpdate()
 {
-    if (GameUpdateTickHandle != INDEX_NONE)
+    if (!HasAuthority() || GameUpdateTickHandle != INDEX_NONE)
     {
         return;
     }
@@ -99,14 +118,19 @@ void AWeaponProjectileActor::UnregisterGameUpdate()
 
 void AWeaponProjectileActor::UpdateProjectile(float DeltaSeconds)
 {
-    if (Velocity.IsNearlyZero() || DeltaSeconds <= 0.0f)
+    if (!HasAuthority() || bHitProcessed || IsActorBeingDestroyed()
+        || Velocity.ContainsNaN() || Velocity.IsNearlyZero()
+        || !FMath::IsFinite(DeltaSeconds) || DeltaSeconds <= 0.0f)
     {
         return;
     }
 
     const FVector NewLocation = GetActorLocation() + Velocity * DeltaSeconds;
     FHitResult Hit;
+    if (NewLocation.ContainsNaN()) { Destroy(); return; }
     SetActorLocation(NewLocation, true, &Hit, ETeleportType::None);
+    // Swept movement may already have delivered OnComponentHit and destroyed this actor.
+    if (bHitProcessed || IsActorBeingDestroyed()) return;
     SetActorRotation(Velocity.Rotation());
 
     if (Hit.bBlockingHit)
@@ -117,11 +141,11 @@ void AWeaponProjectileActor::UpdateProjectile(float DeltaSeconds)
 
 void AWeaponProjectileActor::OnProjectileHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
-    if (!IsValid(OtherActor) || OtherActor == this || OtherActor == GetInstigator())
-    {
-        Destroy();
-        return;
-    }
+    if (!HasAuthority() || bHitProcessed || IsActorBeingDestroyed()) return;
+    if (OtherActor && (OtherActor == this || OtherActor == GetOwner() || OtherActor == GetInstigator())) return;
+    // Latch before damage: a receiver can re-enter hit handling or destroy the projectile.
+    bHitProcessed = true;
+    if (!IsValid(OtherActor)) { Destroy(); return; }
 
     const FVector ShotDirection = Velocity.IsNearlyZero() ? GetActorForwardVector() : Velocity.GetSafeNormal();
     UGameplayStatics::ApplyPointDamage(OtherActor, Damage, ShotDirection, Hit, CachedInstigatorController.Get(), this, nullptr);

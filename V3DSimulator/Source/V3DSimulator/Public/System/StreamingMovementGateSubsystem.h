@@ -31,7 +31,7 @@ public:
     virtual void Deinitialize() override;
     virtual void Tick(float DeltaTime) override;
     virtual TStatId GetStatId() const override;
-    virtual bool IsTickable() const override { return !HasAnyFlags(RF_ClassDefaultObject); }
+    virtual bool IsTickable() const override { return !bDeinitializing && Super::IsTickable(); }
 
     void RegisterMovable(AActor* Actor);
     void UnregisterMovable(AActor* Actor);
@@ -56,10 +56,13 @@ private:
         FVector AngularVelocity = FVector::ZeroVector;
         TWeakObjectPtr<UPrimitiveComponent> Primitive;
         uint8 MovementMode = 0;
+        uint8 CustomMovementMode = 0;
         bool bWasSimulatingPhysics = false;
         bool bCharacterMovement = false;
     };
 
+    bool bDeinitializing = false;
+    bool bUpdating = false;
     TSet<TWeakObjectPtr<AActor>> RegisteredMovables;
     TMap<FRegionKey, FBox> UnavailableRegions;
     TMap<TWeakObjectPtr<AActor>, FFrozenState> FrozenActors;

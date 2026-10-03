@@ -161,6 +161,8 @@ private:
     struct FEntityRegistration
     {
         int32 Id = INDEX_NONE;
+        uint64 Revision = 1;
+        bool bUpdatingPhysics = false;
         FString ResourceKey;
         TWeakObjectPtr<AActor> Owner;
         TWeakObjectPtr<UPrimitiveComponent> PhysicsRoot;
@@ -199,6 +201,9 @@ private:
 
     TMap<FString, FResourceState> ResourceStates;
     TMap<int32, FEntityRegistration> Registrations;
+    TSet<int32> UnregisteringIds;
+    bool bUpdatingEntities = false;
+    bool bDeinitializing = false;
     int32 NextRegistrationId = 1;
     int32 GameUpdateHandle = INDEX_NONE;
 
@@ -211,7 +216,7 @@ private:
     float CalculateNearestObserverDistanceSquared(const FVector& Location, const TArray<FVector>& ObserverLocations) const;
     EDistanceTier ResolveDistanceTier(const FEntityRegistration& Registration, float DistanceSquared) const;
     float ResolveUpdateInterval(const FEntityRegistration& Registration, EDistanceTier Tier) const;
-    void UpdatePhysicsActivation(FEntityRegistration& Registration, bool bShouldBeActive);
+    void UpdatePhysicsActivation(int32 RegistrationId, bool bShouldBeActive);
     void ReleaseResourceIfUnused(const FString& ResourceKey);
     bool IsResourceReferenced(const FString& ResourceKey) const;
 };

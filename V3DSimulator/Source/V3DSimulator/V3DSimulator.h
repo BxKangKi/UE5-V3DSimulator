@@ -27,7 +27,7 @@ public:
     virtual void ShutdownModule() override;
 
 private:
-    /** Rebuilds the lightweight MoviePlayer screen when the engine requests one. */
+    /** Prepares the lightweight screen for a real map-load request. */
     void PrepareLoadingScreen();
 
     /** Prepares the screen before a blocking map load starts. */
@@ -36,6 +36,6 @@ private:
     FDelegateHandle PostLoadMapHandle;
 
     /** Delegate handles are removed before module shutdown to prevent callbacks into unloaded code. */
-    FDelegateHandle PrepareLoadingScreenHandle;
+    bool bOwnsLoadingScreen = false;
     FDelegateHandle PreLoadMapHandle;
 };

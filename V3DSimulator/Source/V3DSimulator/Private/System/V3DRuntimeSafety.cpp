@@ -154,6 +154,7 @@ namespace V3DRuntimeSafetyPrivate
         uint64 NextTicket = 1;
         bool bPumpingQueue = false;
         FTSTicker::FDelegateHandle WatchdogHandle;
+        TMap<uint64, FTSTicker::FDelegateHandle> DeferredCompletions;
     };
 
     FState& GetState()
@@ -195,6 +196,42 @@ namespace V3DRuntimeSafetyPrivate
     bool IsShuttingDown()
     {
         return GetState().ShuttingDownFlag.GetValue() != 0;
+    }
+
+    void QueueCompletion_GameThread(const uint64 Ticket)
+    {
+        check(IsInGameThread());
+        FState& State = GetState();
+        if (Ticket == 0 || !State.ActiveOperations.Contains(Ticket)) return;
+        // Recheck here, not on the worker: shutdown can start before its GT task runs.
+        if (IsShuttingDown())
+        {
+            FV3DRuntimeSafety::CompleteOperation(Ticket);
+            return;
+        }
+        if (State.DeferredCompletions.Contains(Ticket)) return;
+        const FTSTicker::FDelegateHandle Handle = FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateLambda([Ticket](float)
+            {
+                GetState().DeferredCompletions.Remove(Ticket);
+                FV3DRuntimeSafety::CompleteOperation(Ticket);
+                return false;
+            }), 0.0f);
+        State.DeferredCompletions.Add(Ticket, Handle);
+    }
+
+    void DrainDeferredCompletions_GameThread()
+    {
+        check(IsInGameThread());
+        // Shutdown pumps TaskGraph but there may never be another ticker frame.
+        // Detach first, so completion/cancellation cannot mutate this iteration.
+        TMap<uint64, FTSTicker::FDelegateHandle> Pending = MoveTemp(GetState().DeferredCompletions);
+        GetState().DeferredCompletions.Reset();
+        for (const TPair<uint64, FTSTicker::FDelegateHandle>& Pair : Pending)
+        {
+            FTSTicker::GetCoreTicker().RemoveTicker(Pair.Value);
+            FV3DRuntimeSafety::CompleteOperation(Pair.Key);
+        }
     }
 
     bool IsCircuitOpen(FString* OutReason = nullptr)
@@ -640,37 +677,14 @@ uint64 FV3DRuntimeSafety::EnqueueOperationInternal(
 
 void FV3DRuntimeSafety::CompleteOperation(const uint64 Ticket)
 {
+    if (Ticket == 0) return;
     if (!IsInGameThread())
     {
-        // Do not route this through FSafeFileIO: its shutdown gate intentionally rejects new
-        // dispatches. The active-ticket map itself keeps this module and both UObjects logically
-        // alive until this game-thread completion removes the ticket during the shutdown drain.
-        // During normal play, register a one-shot ticker instead of completing the operation inside
-        // a GameThread task spawned by a plugin worker. UE 5.8 propagates FAppTime through task
-        // ancestry; such a task can run on the game thread with no inherited frame-time context and
-        // then start renderer work from an invalid context. The ticker executes on a normal frame.
-        // Shutdown is different: no new native operation will be started, and the shutdown drain
-        // pumps TaskGraph but not FTSTicker, so complete directly through the pumped GameThread task.
-        if (V3DRuntimeSafetyPrivate::IsShuttingDown())
+        // The active operation retains its lifetime until this GT handoff completes.
+        AsyncTask(ENamedThreads::GameThread, [Ticket]()
         {
-            AsyncTask(ENamedThreads::GameThread, [Ticket]()
-            {
-                FV3DRuntimeSafety::CompleteOperation(Ticket);
-            });
-        }
-        else
-        {
-            AsyncTask(ENamedThreads::GameThread, [Ticket]()
-            {
-                FTSTicker::GetCoreTicker().AddTicker(
-                    FTickerDelegate::CreateLambda([Ticket](float)
-                    {
-                        FV3DRuntimeSafety::CompleteOperation(Ticket);
-                        return false;
-                    }),
-                    0.0f);
-            });
-        }
+            V3DRuntimeSafetyPrivate::QueueCompletion_GameThread(Ticket);
+        });
         return;
     }
 
@@ -678,6 +692,12 @@ void FV3DRuntimeSafety::CompleteOperation(const uint64 Ticket)
     if (Ticket == 0 || !State.ActiveOperations.Contains(Ticket))
     {
         return;
+    }
+
+    FTSTicker::FDelegateHandle DeferredHandle;
+    if (State.DeferredCompletions.RemoveAndCopyValue(Ticket, DeferredHandle))
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(DeferredHandle);
     }
 
     const V3DRuntimeSafetyPrivate::FActiveOperation* Active = State.ActiveOperations.Find(Ticket);
@@ -695,42 +715,19 @@ void FV3DRuntimeSafety::CompleteOperation(const uint64 Ticket)
 
 void FV3DRuntimeSafety::CompleteOperationAfterCallback(const uint64 Ticket)
 {
-    if (Ticket == 0)
+    if (Ticket == 0) return;
+    // Let the plugin callback unwind before releasing parser/GC ownership.
+    // On shutdown, TaskGraph is pumped after that callback has returned.
+    if (IsInGameThread() && !V3DRuntimeSafetyPrivate::IsShuttingDown())
     {
-        return;
-    }
-
-    // Always defer until the next core-ticker frame. glTFRuntime executes the project delegate
-    // before its async context calls UnregisterGCObject(); releasing the ticket inline could run
-    // ClearCache against a callback wrapper that has not finished unwinding. A ticker also preserves
-    // UE 5.8's normal frame-time context for any queued operation started by CompleteOperation().
-    if (V3DRuntimeSafetyPrivate::IsShuttingDown())
-    {
-        AsyncTask(ENamedThreads::GameThread, [Ticket]()
-        {
-            FV3DRuntimeSafety::CompleteOperation(Ticket);
-        });
-        return;
-    }
-
-    auto RegisterCompletionTicker = [Ticket]()
-    {
-        FTSTicker::GetCoreTicker().AddTicker(
-            FTickerDelegate::CreateLambda([Ticket](float)
-            {
-                FV3DRuntimeSafety::CompleteOperation(Ticket);
-                return false;
-            }),
-            0.0f);
-    };
-
-    if (IsInGameThread())
-    {
-        RegisterCompletionTicker();
+        V3DRuntimeSafetyPrivate::QueueCompletion_GameThread(Ticket);
     }
     else
     {
-        AsyncTask(ENamedThreads::GameThread, MoveTemp(RegisterCompletionTicker));
+        AsyncTask(ENamedThreads::GameThread, [Ticket]()
+        {
+            V3DRuntimeSafetyPrivate::QueueCompletion_GameThread(Ticket);
+        });
     }
 }
 
@@ -966,6 +963,7 @@ void FV3DRuntimeSafety::BeginShutdown()
         V3DRuntimeSafetyPrivate::RejectOperation(Operation, TEXT("glTFRuntime coordinator is shutting down"));
     }
 
+    V3DRuntimeSafetyPrivate::DrainDeferredCompletions_GameThread();
     ProcessPendingAssetReleases_GameThread();
     if (State.WatchdogHandle.IsValid())
     {
@@ -992,6 +990,10 @@ bool FV3DRuntimeSafety::FlushPendingOperations(const double TimeoutSeconds)
         // Plugin callbacks are marshalled to the game thread. Pump them so terminal callbacks can
         // return their tickets and finalize deferred cache releases before this module unloads.
         FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
+        if (V3DRuntimeSafetyPrivate::IsShuttingDown())
+        {
+            V3DRuntimeSafetyPrivate::DrainDeferredCompletions_GameThread();
+        }
         ProcessPendingAssetReleases_GameThread();
         FPlatformProcess::SleepNoStats(0.005f);
     }
@@ -1210,3 +1212,34 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
         }
     }
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DDeferredCompletionDrainTest,
+    "V3DSimulator.System.NativeCompletion.DrainWithoutTickerFrame",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FV3DDeferredCompletionDrainTest::RunTest(const FString& Parameters)
+{
+    if (FV3DRuntimeSafety::GetPendingOperationCount() != 0 || FV3DRuntimeSafety::IsCircuitOpen()
+        || V3DRuntimeSafetyPrivate::IsShuttingDown())
+    {
+        AddError(TEXT("Run this test in an idle editor before shutdown."));
+        return false;
+    }
+    TStrongObjectPtr<UObject> Owner(NewObject<UObject>());
+    TStrongObjectPtr<UglTFRuntimeAsset> Asset(NewObject<UglTFRuntimeAsset>());
+    const uint64 Ticket = FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Asset.Get(), TEXT("completion drain test"), [](uint64) {});
+    TestTrue(TEXT("Native ticket acquired"), Ticket != 0);
+    FV3DRuntimeSafety::CompleteOperationAfterCallback(Ticket);
+    FV3DRuntimeSafety::CompleteOperationAfterCallback(Ticket);
+    TestEqual(TEXT("Repeated notification owns only one ticker"), V3DRuntimeSafetyPrivate::GetState().DeferredCompletions.Num(), 1);
+    TestEqual(TEXT("Ticket stays alive until the callback has unwound"), FV3DRuntimeSafety::GetPendingOperationCount(), 1);
+    // Exercise the exact shutdown drain without setting the process-wide shutdown flag.
+    V3DRuntimeSafetyPrivate::DrainDeferredCompletions_GameThread();
+    TestEqual(TEXT("No engine frame is required to release the ticket"), FV3DRuntimeSafety::GetPendingOperationCount(), 0);
+    TestTrue(TEXT("No completion delegate remains after the drain"), V3DRuntimeSafetyPrivate::GetState().DeferredCompletions.IsEmpty());
+    return true;
+}
+#endif

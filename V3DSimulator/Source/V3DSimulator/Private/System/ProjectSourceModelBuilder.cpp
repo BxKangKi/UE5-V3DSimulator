@@ -502,15 +502,15 @@ void UProjectSourceModelBuilder::CompleteParserLoad(
     if (IsGarbageCollecting())
     {
         TWeakObjectPtr<UProjectSourceModelBuilder> WeakThis(this);
-        FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+        if (ParserRetryTicker.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(ParserRetryTicker);
+        ParserRetryTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
             [WeakThis, Generation, Parser, Config, Error](float)
             {
-                if (IsGarbageCollecting())
-                {
-                    return true;
-                }
+                if (FSafeFileIO::IsShuttingDown()) return false;
+                if (IsGarbageCollecting()) return true;
                 if (UProjectSourceModelBuilder* StrongThis = WeakThis.Get())
                 {
+                    StrongThis->ParserRetryTicker.Reset();
                     StrongThis->CompleteParserLoad(
                         Generation, Parser, Config, Error);
                 }
@@ -1567,6 +1567,11 @@ void UProjectSourceModelBuilder::Cancel()
     }
     bCancelled = true;
     bRunning = false;
+    if (ParserRetryTicker.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(ParserRetryTicker);
+        ParserRetryTicker.Reset();
+    }
     if (NextMeshTicker.IsValid())
     {
         FTSTicker::GetCoreTicker().RemoveTicker(NextMeshTicker);

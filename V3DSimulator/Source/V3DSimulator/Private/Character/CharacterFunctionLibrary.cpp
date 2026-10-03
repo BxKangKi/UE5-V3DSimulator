@@ -31,8 +31,11 @@ namespace SecondaryPhysicsTuning
     // One gram per hair body, independent of imported collider volume/scale.
     // Keep this strictly positive so Chaos can compute inverse mass/inertia.
     constexpr float HairBodyMassKg = 0.001f;
-    constexpr float HairSwingLimitDegrees = 38.0f;
-    constexpr float HairTwistLimitDegrees = 24.0f;
+    // Moderate damping: retain secondary motion, but settle faster after a turn.
+    constexpr float HairLinearDamping = 0.75f;
+    constexpr float HairAngularDamping = 3.0f;
+    constexpr float HairSwingLimitDegrees = 30.0f;
+    constexpr float HairTwistLimitDegrees = 18.0f;
     constexpr float DynamicSwingLimitDegrees = 32.0f;
     constexpr float DynamicTwistLimitDegrees = 20.0f;
 }
@@ -285,6 +288,13 @@ void UCharacterFunctionLibrary::ConfigureHairPhysics(USkeletalMeshComponent& Ske
         FBodyInstance* Body = SkeletalMesh.GetBodyInstance(Setup->BoneName, false);
         if (!Body || !Body->IsValidBodyInstance()) continue;
         Body->SetResponseToAllChannels(ECR_Ignore);
+        if (!FMath::IsNearlyEqual(Body->LinearDamping, SecondaryPhysicsTuning::HairLinearDamping)
+            || !FMath::IsNearlyEqual(Body->AngularDamping, SecondaryPhysicsTuning::HairAngularDamping))
+        {
+            Body->LinearDamping = SecondaryPhysicsTuning::HairLinearDamping;
+            Body->AngularDamping = SecondaryPhysicsTuning::HairAngularDamping;
+            Body->UpdateDampingProperties();
+        }
         if (!Body->bOverrideMass || !FMath::IsNearlyEqual(Body->GetMassOverride(), SecondaryPhysicsTuning::HairBodyMassKg, UE_SMALL_NUMBER))
         {
             Body->SetMassOverride(SecondaryPhysicsTuning::HairBodyMassKg, true);
@@ -300,6 +310,16 @@ void UCharacterFunctionLibrary::ConfigureHairPhysics(USkeletalMeshComponent& Ske
         if (FConstraintInstance* Joint = SkeletalMesh.FindConstraintInstance(Definition.JointName))
         {
             if (!Joint->IsParentDominatesEnabled()) Joint->EnableParentDominates();
+            // Preserve intentionally locked/free authored axes; tighten limited hair axes only.
+            if (Joint->GetAngularSwing1Motion() == ACM_Limited
+                && Joint->GetAngularSwing1Limit() > SecondaryPhysicsTuning::HairSwingLimitDegrees)
+                Joint->SetAngularSwing1Limit(ACM_Limited, SecondaryPhysicsTuning::HairSwingLimitDegrees);
+            if (Joint->GetAngularSwing2Motion() == ACM_Limited
+                && Joint->GetAngularSwing2Limit() > SecondaryPhysicsTuning::HairSwingLimitDegrees)
+                Joint->SetAngularSwing2Limit(ACM_Limited, SecondaryPhysicsTuning::HairSwingLimitDegrees);
+            if (Joint->GetAngularTwistMotion() == ACM_Limited
+                && Joint->GetAngularTwistLimit() > SecondaryPhysicsTuning::HairTwistLimitDegrees)
+                Joint->SetAngularTwistLimit(ACM_Limited, SecondaryPhysicsTuning::HairTwistLimitDegrees);
             Joint->SetContactTransferScale(0.0f);
             Joint->SetDisableCollision(true);
         }
@@ -891,8 +911,8 @@ void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
         {
             BodySetup->DefaultInstance.SetMassScale(0.02f);
         }
-        BodySetup->DefaultInstance.LinearDamping = bHairChain ? 0.35f : 0.5f;
-        BodySetup->DefaultInstance.AngularDamping = bHairChain ? 1.25f : 1.75f;
+        BodySetup->DefaultInstance.LinearDamping = bHairChain ? SecondaryPhysicsTuning::HairLinearDamping : 0.5f;
+        BodySetup->DefaultInstance.AngularDamping = bHairChain ? SecondaryPhysicsTuning::HairAngularDamping : 1.75f;
         BodySetup->DefaultInstance.InertiaTensorScale = FVector(1.0f);
         BodySetup->DefaultInstance.SleepFamily = ESleepFamily::Sensitive;
         BodySetup->DefaultInstance.bStartAwake = true;

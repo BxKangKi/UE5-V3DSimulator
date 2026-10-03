@@ -63,6 +63,7 @@ namespace SafeFileIOPrivate
         // worker can inherit an empty FAppTime context on UE 5.8.
         TQueue<FSafeFileIO::FTrackedTask, EQueueMode::Mpsc> GameThreadContinuations;
         bool bGameThreadPumpScheduled = false;
+        FTSTicker::FDelegateHandle GameThreadPumpHandle; // game-thread-owned
     };
 
     FState& GetState()
@@ -948,6 +949,8 @@ namespace SafeFileIOPrivate
         FSafeFileIO::FTrackedTask Task;
         int32 Processed = 0;
         constexpr int32 MaxCallbacksPerFrame = 256;
+        constexpr double CallbackBudgetSeconds = 0.002;
+        const double FrameStartSeconds = FPlatformTime::Seconds();
         while (Processed < MaxCallbacksPerFrame && State.GameThreadContinuations.Dequeue(Task))
         {
             if (!IsShuttingDown() && Task)
@@ -956,6 +959,8 @@ namespace SafeFileIOPrivate
             }
             Task = FSafeFileIO::FTrackedTask();
             ++Processed;
+            // A burst of mesh/file completions must yield between callbacks.
+            if (FPlatformTime::Seconds() - FrameStartSeconds >= CallbackBudgetSeconds) break;
         }
 
         bool bKeepTicker = false;
@@ -965,6 +970,7 @@ namespace SafeFileIOPrivate
             if (!bKeepTicker)
             {
                 State.bGameThreadPumpScheduled = false;
+                State.GameThreadPumpHandle.Reset();
             }
         }
         return bKeepTicker;
@@ -997,7 +1003,10 @@ namespace SafeFileIOPrivate
 
         // This task only installs the ticker. It deliberately performs no UObject/render work.
         // The queued continuation itself executes from the next normal core-ticker frame.
-        AsyncTask(ENamedThreads::GameThread, []()
+        // The installer itself contains module code and must outlive shutdown draining.
+        const TSharedRef<FTrackedOperation, ESPMode::ThreadSafe> InstallerLifetime =
+            MakeShared<FTrackedOperation, ESPMode::ThreadSafe>();
+        AsyncTask(ENamedThreads::GameThread, [InstallerLifetime]()
         {
             FState& GameState = GetState();
             if (IsShuttingDown())
@@ -1012,7 +1021,7 @@ namespace SafeFileIOPrivate
                 return;
             }
 
-            FTSTicker::GetCoreTicker().AddTicker(
+            GameState.GameThreadPumpHandle = FTSTicker::GetCoreTicker().AddTicker(
                 FTickerDelegate::CreateStatic(&TickGameThreadContinuations), 0.0f);
         });
     }
@@ -1807,14 +1816,19 @@ void FSafeFileIO::DeleteFilesAsync(
 
 void FSafeFileIO::BeginShutdown()
 {
-    if (SafeFileIOPrivate::GetState().ShutdownFlag.GetValue() == 0)
+    SafeFileIOPrivate::FState& State = SafeFileIOPrivate::GetState();
+    if (State.ShutdownFlag.GetValue() == 0) State.ShutdownFlag.Increment();
+    if (IsInGameThread() && State.GameThreadPumpHandle.IsValid())
     {
-        SafeFileIOPrivate::GetState().ShutdownFlag.Increment();
+        FTSTicker::GetCoreTicker().RemoveTicker(State.GameThreadPumpHandle);
+        State.GameThreadPumpHandle.Reset();
     }
 }
 
 bool FSafeFileIO::FlushPendingOperations(const double TimeoutSeconds)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("File I/O continuations must drain on the game thread"))) return false;
+    if (SafeFileIOPrivate::IsShuttingDown()) BeginShutdown();
     const double StartSeconds = FPlatformTime::Seconds();
     while (GetPendingOperationCount() > 0)
     {
@@ -1834,10 +1848,21 @@ bool FSafeFileIO::FlushPendingOperations(const double TimeoutSeconds)
             FSafeFileIO::FTrackedTask Dropped;
             while (State.GameThreadContinuations.Dequeue(Dropped))
             {
+                if (!SafeFileIOPrivate::IsShuttingDown() && Dropped) Dropped();
                 Dropped = FSafeFileIO::FTrackedTask();
             }
             FScopeLock StateScope(&State.StateLock);
-            State.bGameThreadPumpScheduled = false;
+            // A producer may have enqueued between the last Dequeue and this lock.
+            // Keep its ticker scheduled, especially if this flush later times out.
+            if (State.GameThreadContinuations.IsEmpty())
+            {
+                State.bGameThreadPumpScheduled = false;
+                if (State.GameThreadPumpHandle.IsValid())
+                {
+                    FTSTicker::GetCoreTicker().RemoveTicker(State.GameThreadPumpHandle);
+                    State.GameThreadPumpHandle.Reset();
+                }
+            }
         }
         FPlatformProcess::SleepNoStats(0.005f);
     }
@@ -1886,3 +1911,30 @@ void FSafeFileIO::CleanupStaleTemporaryFiles(const FString& RootDirectory, const
         IFileManager::Get().Delete(*TemporaryFile, false, true, true);
     }
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFileContinuationDrainTest,
+    "V3DSimulator.System.FileIO.ContinuationDrain",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FV3DFileContinuationDrainTest::RunTest(const FString& Parameters)
+{
+    if (FSafeFileIO::IsShuttingDown() || FSafeFileIO::GetPendingOperationCount() != 0)
+    {
+        AddError(TEXT("Run this test with no active file work."));
+        return false;
+    }
+    const TSharedRef<FThreadSafeCounter, ESPMode::ThreadSafe> Completed = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    TestTrue(TEXT("Worker accepted"), FSafeFileIO::RunTrackedWorker([Completed]()
+    {
+        FSafeFileIO::DispatchTrackedGameThread([Completed]() { Completed->Increment(); });
+    }));
+    TestTrue(TEXT("Worker and installer drain without another frame"), FSafeFileIO::FlushPendingOperations(5.0));
+    TestEqual(TEXT("A normal flush preserves the completion"), Completed->GetValue(), 1);
+    TestEqual(TEXT("No tracked work remains"), FSafeFileIO::GetPendingOperationCount(), 0);
+    TestFalse(TEXT("The continuation ticker was removed"), SafeFileIOPrivate::GetState().GameThreadPumpHandle.IsValid());
+    return true;
+}
+#endif

@@ -40,6 +40,10 @@ bool FHairPhysicsMassAndIsolationTest::RunTest(const FString& Parameters)
         TestTrue(TEXT("Hair has an explicit mass override"), bool(Body->DefaultInstance.bOverrideMass));
         TestTrue(TEXT("Each hair body is one gram"),
             FMath::IsNearlyEqual(Body->DefaultInstance.GetMassOverride(), 0.001f, UE_SMALL_NUMBER));
+        TestEqual(TEXT("Linear drag is applied to every generated hair segment"),
+            Body->DefaultInstance.LinearDamping, 0.75f);
+        TestEqual(TEXT("Angular drag damps repeated swaying"),
+            Body->DefaultInstance.AngularDamping, 3.0f);
         TestEqual(TEXT("Hair ignores physical world contacts"),
             Body->DefaultInstance.GetResponseToChannel(ECC_WorldStatic), ECR_Ignore);
         TestEqual(TEXT("Hair ignores character contacts"),
@@ -49,6 +53,9 @@ bool FHairPhysicsMassAndIsolationTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("Every hair segment including holder has a joint"), Asset->ConstraintSetup.Num(), 3);
     for (const UPhysicsConstraintTemplate* Constraint : Asset->ConstraintSetup)
     {
+        TestEqual(TEXT("Swing 1 stays within the reduced envelope"), Constraint->DefaultInstance.GetAngularSwing1Limit(), 30.0f);
+        TestEqual(TEXT("Swing 2 stays within the reduced envelope"), Constraint->DefaultInstance.GetAngularSwing2Limit(), 30.0f);
+        TestEqual(TEXT("Twist stays within the reduced envelope"), Constraint->DefaultInstance.GetAngularTwistLimit(), 18.0f);
         TestTrue(TEXT("Child hair cannot drive its parent"), bool(Constraint->DefaultInstance.ProfileInstance.bParentDominates));
         TestEqual(TEXT("No contact force transfer to the head"),
             Constraint->DefaultInstance.ProfileInstance.ContactTransferScale, 0.0f);

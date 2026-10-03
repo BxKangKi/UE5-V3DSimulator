@@ -43,7 +43,7 @@ public:
     void UnregisterOwner(const UObject* Owner);
 
     virtual void Tick(float DeltaTime) override;
-    virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Always; }
+    virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Conditional; }
     virtual bool IsTickable() const override { return !IsTemplate() && bInitialized && UpdateEntries.Num() > 0; }
     virtual TStatId GetStatId() const override { RETURN_QUICK_DECLARE_CYCLE_STAT(UGameUpdateSubSystem, STATGROUP_Tickables); }
     virtual UWorld* GetTickableGameObjectWorld() const override;

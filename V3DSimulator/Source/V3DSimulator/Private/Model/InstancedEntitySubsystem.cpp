@@ -10,6 +10,8 @@
 #include "Model/InstancedEntitySubsystem.h"
 
 #include "Async/ParallelFor.h"
+#include "Misc/ScopeExit.h"
+#include "Templates/UnrealTemplate.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Components/PrimitiveComponent.h"
 #include "Engine/World.h"
@@ -28,6 +30,7 @@ namespace
     struct FEntityInterpolationWorkItem
     {
         int32 RegistrationId = INDEX_NONE;
+        uint64 Revision = 0;
         int32 PartIndex = INDEX_NONE;
         FTransform CurrentTransform = FTransform::Identity;
         FTransform TargetTransform = FTransform::Identity;
@@ -96,6 +99,7 @@ void UInstancedEntitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     check(IsInGameThread());
     Super::Initialize(Collection);
+    bDeinitializing = false;
     // Register lazily after the first successful entity registration.
 }
 
@@ -141,6 +145,7 @@ void UInstancedEntitySubsystem::UnregisterGameUpdate()
 void UInstancedEntitySubsystem::Deinitialize()
 {
     check(IsInGameThread());
+    bDeinitializing = true;
 
     UnregisterGameUpdate();
 
@@ -151,9 +156,11 @@ void UInstancedEntitySubsystem::Deinitialize()
         UnregisterEntity(RegistrationId);
     }
 
-    for (TPair<FString, TObjectPtr<AInstancedEntityRenderActor>>& Pair : RenderActors)
+    auto RemainingRenderActors = MoveTemp(RenderActors);
+    RenderActors.Reset();
+    for (TPair<FString, TObjectPtr<AInstancedEntityRenderActor>>& Pair : RemainingRenderActors)
     {
-        if (AInstancedEntityRenderActor* Actor = Pair.Value.Get())
+        if (AInstancedEntityRenderActor* Actor = Pair.Value.Get(); IsValid(Actor))
         {
             Actor->ReleaseRuntimeResources();
             Actor->Destroy();
@@ -224,7 +231,11 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
 {
     check(IsInGameThread());
 
-    if (!IsValid(Owner) || MeshParts.Num() == 0)
+    if (bDeinitializing || !IsValid(Owner) || Owner->IsActorBeingDestroyed() || MeshParts.Num() == 0
+        || !FMath::IsFinite(Options.InterpolationSpeed) || !FMath::IsFinite(Options.TeleportDistance)
+        || !FMath::IsFinite(Options.MidDistance) || !FMath::IsFinite(Options.PhysicsSuspendDistance)
+        || !FMath::IsFinite(Options.EndCullDistance) || !FMath::IsFinite(Options.MidUpdateInterval)
+        || !FMath::IsFinite(Options.FarUpdateInterval))
     {
         return INDEX_NONE;
     }
@@ -242,7 +253,7 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
     // update wheel transforms, so registration is all-or-nothing rather than silently compacting it.
     for (const FInstancedEntityMeshPart& Part : MeshParts)
     {
-        if (Part.MeshKey == INDEX_NONE || !IsValid(Part.Mesh) || Part.LocalTransform.ContainsNaN())
+        if (Part.MeshKey == INDEX_NONE || !IsValid(Part.Mesh) || Part.LocalTransform.ContainsNaN() || !Part.LocalTransform.GetRotation().IsNormalized())
         {
             return INDEX_NONE;
         }
@@ -264,7 +275,12 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
     }
 
     FEntityRegistration Registration;
-    Registration.Id = NextRegistrationId++;
+    // Avoid signed overflow and reusing a live/removing registration on long sessions.
+    do
+    {
+        Registration.Id = NextRegistrationId;
+        NextRegistrationId = NextRegistrationId == MAX_int32 ? 1 : NextRegistrationId + 1;
+    } while (Registrations.Contains(Registration.Id) || UnregisteringIds.Contains(Registration.Id));
     Registration.ResourceKey = ResourceKey;
     Registration.Owner = Owner;
     Registration.PhysicsRoot = PhysicsRoot;
@@ -277,10 +293,14 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
     Registration.bRenderAtTarget = true;
     Registration.Parts.Reserve(MeshParts.Num());
 
-    const int32 StartCullDistance = FMath::Max(0, FMath::RoundToInt(Options.MidDistance));
-    const int32 EndCullDistance = FMath::Max(
-        StartCullDistance,
-        FMath::RoundToInt(FMath::Max(Options.EndCullDistance, Options.PhysicsSuspendDistance)));
+    // Clamp in double precision before converting an authored distance to int32.
+    const auto CullDistance = [](float Distance)
+    {
+        return FMath::RoundToInt32(FMath::Clamp(static_cast<double>(Distance), 0.0, static_cast<double>(MAX_int32)));
+    };
+    const int32 StartCullDistance = CullDistance(Options.MidDistance);
+    const int32 EndCullDistance = FMath::Max(StartCullDistance,
+        CullDistance(FMath::Max(Options.EndCullDistance, Options.PhysicsSuspendDistance)));
 
     for (const FInstancedEntityMeshPart& Part : MeshParts)
     {
@@ -504,6 +524,9 @@ void UInstancedEntitySubsystem::UnregisterEntity(int32 RegistrationId)
 {
     check(IsInGameThread());
 
+    if (UnregisteringIds.Contains(RegistrationId)) return;
+    UnregisteringIds.Add(RegistrationId);
+    ON_SCOPE_EXIT { UnregisteringIds.Remove(RegistrationId); };
     FEntityRegistration* Registration = Registrations.Find(RegistrationId);
     if (!Registration)
     {
@@ -511,15 +534,23 @@ void UInstancedEntitySubsystem::UnregisterEntity(int32 RegistrationId)
     }
 
     const FString ResourceKey = Registration->ResourceKey;
-    if (Registration->bPhysicsSuspended && Registration->Owner.IsValid())
+    if ((Registration->bPhysicsSuspended || Registration->bUpdatingPhysics) && Registration->Owner.IsValid())
     {
-        UpdatePhysicsActivation(*Registration, true);
+        // Finish restoration if unregistration happens inside a transition callback.
+        Registration->bUpdatingPhysics = false;
+        Registration->bPhysicsSuspended = true;
+        UpdatePhysicsActivation(RegistrationId, true);
     }
 
+    // Physics setters can broadcast overlaps/transforms and reallocate the registration map.
+    Registration = Registrations.Find(RegistrationId);
+    if (!Registration) return;
+    TArray<FEntityPartBinding> Parts = MoveTemp(Registration->Parts);
+    Registrations.Remove(RegistrationId);
     AInstancedEntityRenderActor* RenderActor = RenderActors.FindRef(ResourceKey).Get();
     if (IsValid(RenderActor))
     {
-        for (const FEntityPartBinding& Binding : Registration->Parts)
+        for (const FEntityPartBinding& Binding : Parts)
         {
             if (Binding.MeshKey != INDEX_NONE && Binding.InstanceIndex != INDEX_NONE)
             {
@@ -529,7 +560,6 @@ void UInstancedEntitySubsystem::UnregisterEntity(int32 RegistrationId)
         RenderActor->FlushDirtyTransforms();
     }
 
-    Registrations.Remove(RegistrationId);
     ReleaseResourceIfUnused(ResourceKey);
     if (Registrations.Num() == 0)
     {
@@ -545,7 +575,7 @@ bool UInstancedEntitySubsystem::UpdateEntityPartLocalTransform(
     const FTransform& LocalTransform)
 {
     check(IsInGameThread());
-    if (LocalTransform.ContainsNaN())
+    if (LocalTransform.ContainsNaN() || !LocalTransform.GetRotation().IsNormalized())
     {
         return false;
     }
@@ -563,6 +593,7 @@ bool UInstancedEntitySubsystem::UpdateEntityPartLocalTransform(
     }
 
     Binding.LocalTransform = LocalTransform;
+    ++Registration->Revision;
     // Keep distance-tier throttling intact. Near/always-relevant entities are due every frame,
     // while mid/far entities consume local animation changes at their configured cadence.
     Registration->bRenderAtTarget = false;
@@ -583,7 +614,7 @@ bool UInstancedEntitySubsystem::UpdateEntityPartLocalTransforms(
 
     for (int32 Index = 0; Index < LocalTransforms.Num(); ++Index)
     {
-        if (LocalTransforms[Index].ContainsNaN())
+        if (LocalTransforms[Index].ContainsNaN() || !LocalTransforms[Index].GetRotation().IsNormalized())
         {
             return false;
         }
@@ -604,6 +635,7 @@ bool UInstancedEntitySubsystem::UpdateEntityPartLocalTransforms(
         return true;
     }
 
+    ++Registration->Revision;
     // Do not bypass the distance-tier interval merely because an animated local part changed.
     Registration->bRenderAtTarget = false;
     return true;
@@ -625,10 +657,11 @@ void UInstancedEntitySubsystem::SetEntityAlwaysRelevant(int32 RegistrationId, bo
     }
 
     Registration->Options.bAlwaysRelevant = bAlwaysRelevant;
+    ++Registration->Revision;
     Registration->bForceUpdate = true;
     if (bAlwaysRelevant)
     {
-        UpdatePhysicsActivation(*Registration, true);
+        UpdatePhysicsActivation(RegistrationId, true);
     }
 }
 
@@ -745,72 +778,74 @@ float UInstancedEntitySubsystem::ResolveUpdateInterval(
     }
 }
 
-void UInstancedEntitySubsystem::UpdatePhysicsActivation(FEntityRegistration& Registration, bool bShouldBeActive)
+void UInstancedEntitySubsystem::UpdatePhysicsActivation(int32 RegistrationId, bool bShouldBeActive)
 {
-    if (!Registration.Options.bDynamic || !Registration.Options.bAllowPhysicsDistanceDeactivation)
-    {
-        return;
-    }
+    FEntityRegistration* Registration = Registrations.Find(RegistrationId);
+    if (!Registration || Registration->bUpdatingPhysics || !Registration->Options.bDynamic
+        || !Registration->Options.bAllowPhysicsDistanceDeactivation
+        || Registration->bPhysicsSuspended == !bShouldBeActive) return;
+    UPrimitiveComponent* Primitive = Registration->PhysicsRoot.Get();
+    if (!IsValid(Primitive)) return;
 
-    UPrimitiveComponent* Primitive = Registration.PhysicsRoot.Get();
-    if (!IsValid(Primitive))
+    Registration->bUpdatingPhysics = true;
+    ON_SCOPE_EXIT
     {
-        return;
+        if (FEntityRegistration* Current = Registrations.Find(RegistrationId)) Current->bUpdatingPhysics = false;
+    };
+    const auto StillRegistered = [this, RegistrationId, Primitive]()
+    {
+        const FEntityRegistration* Current = Registrations.Find(RegistrationId);
+        return Current && Current->Owner.IsValid() && IsValid(Primitive)
+            && Current->PhysicsRoot.Get() == Primitive;
+    };
+    if (!bShouldBeActive)
+    {
+        Registration->SuspendedWorldTransform = Primitive->GetComponentTransform();
+        Registration->bOriginalSimulatePhysics = Primitive->IsSimulatingPhysics();
+        Registration->OriginalCollisionEnabled = Primitive->GetCollisionEnabled();
+        Registration->SuspendedLinearVelocity = Registration->bOriginalSimulatePhysics
+            ? Primitive->GetPhysicsLinearVelocity() : FVector::ZeroVector;
+        Registration->SuspendedAngularVelocity = Registration->bOriginalSimulatePhysics
+            ? Primitive->GetPhysicsAngularVelocityInRadians() : FVector::ZeroVector;
     }
+    // Copy only the small physics state. Never carry a TMap reference across a component setter.
+    const FTransform Transform = Registration->SuspendedWorldTransform;
+    const FVector LinearVelocity = Registration->SuspendedLinearVelocity;
+    const FVector AngularVelocity = Registration->SuspendedAngularVelocity;
+    const ECollisionEnabled::Type Collision = Registration->OriginalCollisionEnabled;
+    const bool bSimulated = Registration->bOriginalSimulatePhysics;
+    Registration->bPhysicsSuspended = !bShouldBeActive;
+    Registration->bForceUpdate = true;
+    Registration->bRenderAtTarget = false;
+    ++Registration->Revision;
 
     if (bShouldBeActive)
     {
-        if (!Registration.bPhysicsSuspended)
-        {
-            return;
-        }
-
-        Primitive->SetWorldTransform(
-            Registration.SuspendedWorldTransform,
-            false,
-            nullptr,
-            ETeleportType::TeleportPhysics);
-        Primitive->SetCollisionEnabled(Registration.OriginalCollisionEnabled);
-        if (Registration.bOriginalSimulatePhysics)
+        Primitive->SetWorldTransform(Transform, false, nullptr, ETeleportType::TeleportPhysics);
+        if (!StillRegistered()) return;
+        Primitive->SetCollisionEnabled(Collision);
+        if (!StillRegistered()) return;
+        if (bSimulated)
         {
             Primitive->SetSimulatePhysics(true);
-            Primitive->SetPhysicsLinearVelocity(Registration.SuspendedLinearVelocity);
-            Primitive->SetPhysicsAngularVelocityInRadians(Registration.SuspendedAngularVelocity);
+            if (!StillRegistered()) return;
+            Primitive->SetPhysicsLinearVelocity(LinearVelocity);
+            if (!StillRegistered()) return;
+            Primitive->SetPhysicsAngularVelocityInRadians(AngularVelocity);
         }
-        Registration.bPhysicsSuspended = false;
-        Registration.bForceUpdate = true;
-        Registration.bRenderAtTarget = false;
-        return;
     }
-
-    if (Registration.bPhysicsSuspended)
+    else
     {
-        return;
+        if (bSimulated) Primitive->SetSimulatePhysics(false);
+        if (StillRegistered()) Primitive->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     }
-
-    Registration.SuspendedWorldTransform = Primitive->GetComponentTransform();
-    Registration.bOriginalSimulatePhysics = Primitive->IsSimulatingPhysics();
-    Registration.OriginalCollisionEnabled = Primitive->GetCollisionEnabled();
-    Registration.SuspendedLinearVelocity = Primitive->IsSimulatingPhysics()
-        ? Primitive->GetPhysicsLinearVelocity()
-        : FVector::ZeroVector;
-    Registration.SuspendedAngularVelocity = Primitive->IsSimulatingPhysics()
-        ? Primitive->GetPhysicsAngularVelocityInRadians()
-        : FVector::ZeroVector;
-
-    if (Primitive->IsSimulatingPhysics())
-    {
-        Primitive->SetSimulatePhysics(false);
-    }
-    Primitive->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-    Registration.bPhysicsSuspended = true;
-    Registration.bForceUpdate = true;
-    Registration.bRenderAtTarget = false;
 }
 
 void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
 {
     check(IsInGameThread());
+    if (bDeinitializing || bUpdatingEntities || !FMath::IsFinite(DeltaSeconds)) return;
+    TGuardValue<bool> UpdateGuard(bUpdatingEntities, true);
     const float SafeDeltaSeconds = FMath::Clamp(DeltaSeconds, 0.0f, 1.0f);
     if (SafeDeltaSeconds <= 0.0f)
     {
@@ -822,33 +857,42 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
     GatherObserverLocations(ObserverLocations);
 
     TArray<FEntityInterpolationWorkItem> WorkItems;
-    for (TPair<int32, FEntityRegistration>& Pair : Registrations)
+    WorkItems.Reserve(Registrations.Num());
+    TArray<int32> RegistrationIds;
+    Registrations.GetKeys(RegistrationIds);
+    for (const int32 RegistrationId : RegistrationIds)
     {
-        FEntityRegistration& Registration = Pair.Value;
-        if (!Registration.Owner.IsValid())
+        FEntityRegistration* Current = Registrations.Find(RegistrationId);
+        if (!Current) continue;
+        const FEntityRegistration& BeforePhysics = *Current;
+        if (!BeforePhysics.Owner.IsValid())
         {
-            InvalidRegistrationIds.Add(Pair.Key);
+            InvalidRegistrationIds.Add(RegistrationId);
             continue;
         }
 
-        const FTransform RootTransform = GetRegistrationRootTransform(Registration);
+        const FTransform RootTransform = GetRegistrationRootTransform(BeforePhysics);
         const float DistanceSquared = CalculateNearestObserverDistanceSquared(
             RootTransform.GetLocation(),
             ObserverLocations);
-        const EDistanceTier Tier = ResolveDistanceTier(Registration, DistanceSquared);
+        const EDistanceTier Tier = ResolveDistanceTier(BeforePhysics, DistanceSquared);
 
         bool bShouldPhysicsBeActive = true;
-        if (!Registration.Options.bAlwaysRelevant
-            && Registration.Options.bDynamic
-            && Registration.Options.bAllowPhysicsDistanceDeactivation)
+        if (!BeforePhysics.Options.bAlwaysRelevant
+            && BeforePhysics.Options.bDynamic
+            && BeforePhysics.Options.bAllowPhysicsDistanceDeactivation)
         {
-            const float SuspendDistance = FMath::Max(0.0f, Registration.Options.PhysicsSuspendDistance);
+            const float SuspendDistance = FMath::Max(0.0f, BeforePhysics.Options.PhysicsSuspendDistance);
             const float ReactivateDistance = SuspendDistance * PhysicsReactivateHysteresis;
-            bShouldPhysicsBeActive = Registration.bPhysicsSuspended
+            bShouldPhysicsBeActive = BeforePhysics.bPhysicsSuspended
                 ? DistanceSquared <= FMath::Square(ReactivateDistance)
                 : DistanceSquared <= FMath::Square(SuspendDistance);
         }
-        UpdatePhysicsActivation(Registration, bShouldPhysicsBeActive);
+        UpdatePhysicsActivation(RegistrationId, bShouldPhysicsBeActive);
+        if (bDeinitializing) return;
+        Current = Registrations.Find(RegistrationId);
+        if (!Current || !Current->Owner.IsValid()) continue;
+        FEntityRegistration& Registration = *Current;
 
         const FTransform EffectiveRootTransform = Registration.bPhysicsSuspended
             ? Registration.SuspendedWorldTransform
@@ -879,6 +923,7 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
             const FEntityPartBinding& Binding = Registration.Parts[PartIndex];
             FEntityInterpolationWorkItem& Work = WorkItems.AddDefaulted_GetRef();
             Work.RegistrationId = Registration.Id;
+            Work.Revision = Registration.Revision;
             Work.PartIndex = PartIndex;
             Work.CurrentTransform = Binding.RenderWorldTransform;
             Work.TargetTransform = Binding.LocalTransform * EffectiveRootTransform;
@@ -908,7 +953,7 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
     for (const FEntityInterpolationWorkItem& Work : WorkItems)
     {
         FEntityRegistration* Registration = Registrations.Find(Work.RegistrationId);
-        if (!Registration || !Registration->Parts.IsValidIndex(Work.PartIndex))
+        if (!Registration || Registration->Revision != Work.Revision || !Registration->Parts.IsValidIndex(Work.PartIndex))
         {
             continue;
         }
@@ -965,12 +1010,12 @@ void UInstancedEntitySubsystem::ReleaseResourceIfUnused(const FString& ResourceK
         return;
     }
 
-    TObjectPtr<AInstancedEntityRenderActor> Actor = RenderActors.FindRef(ResourceKey);
+    TObjectPtr<AInstancedEntityRenderActor> Actor;
+    RenderActors.RemoveAndCopyValue(ResourceKey, Actor);
+    ResourceStates.Remove(ResourceKey);
     if (IsValid(Actor.Get()))
     {
         Actor->ReleaseRuntimeResources();
         Actor->Destroy();
     }
-    RenderActors.Remove(ResourceKey);
-    ResourceStates.Remove(ResourceKey);
 }
