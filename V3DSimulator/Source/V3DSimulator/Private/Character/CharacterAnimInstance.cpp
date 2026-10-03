@@ -35,6 +35,7 @@ void UCharacterAnimInstance::ResetRuntimeAnimationState()
     Speed = 0.0f;
     MoveSpeed = 0.0f;
     UpSpeed = 0.0f;
+    RotationSpeed = 0.0f;
     YawAngularVelocity = 0.0f;
     PreviousActorYaw = 0.0f;
     bHasPreviousActorYaw = false;
@@ -133,23 +134,33 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
         return;
     }
 
-    // 2. Calculate signed yaw angular velocity for turn animation blending.
-    if (const AActor* Owner = GetOwningActor())
+    const float SafeDeltaSeconds = FMath::IsFinite(DeltaSeconds)
+        ? FMath::Max(0.0f, DeltaSeconds) : 0.0f;
+
+    // State-only refreshes happen during physics/recovery transitions. They must
+    // not consume the previous yaw or divide an old angle by a new frame time.
+    const AActor* AnimationOwner = GetOwningActor();
+    if (IsValid(AnimationOwner) && FMath::IsFinite(AnimationOwner->GetActorRotation().Yaw))
     {
-        const float CurrentActorYaw = Owner->GetActorRotation().Yaw;
-        YawAngularVelocity = (bHasPreviousActorYaw && DeltaSeconds > SMALL_NUMBER)
-            ? FMath::FindDeltaAngleDegrees(PreviousActorYaw, CurrentActorYaw) / DeltaSeconds
-            : 0.0f;
-        PreviousActorYaw = CurrentActorYaw;
-        bHasPreviousActorYaw = true;
+        const float CurrentActorYaw = AnimationOwner->GetActorRotation().Yaw;
+        if (!bHasPreviousActorYaw || Component->IsRagdollTransitionInProgress())
+        {
+            PreviousActorYaw = CurrentActorYaw;
+            bHasPreviousActorYaw = true;
+            YawAngularVelocity = 0.0f;
+        }
+        else if (SafeDeltaSeconds > SMALL_NUMBER)
+        {
+            YawAngularVelocity = FMath::FindDeltaAngleDegrees(PreviousActorYaw, CurrentActorYaw) / SafeDeltaSeconds;
+            PreviousActorYaw = CurrentActorYaw;
+        }
     }
     else
     {
         YawAngularVelocity = 0.0f;
         bHasPreviousActorYaw = false;
     }
-
-    RotationSpeed = FMath::Clamp(YawAngularVelocity * 0.00556f, -1.0f, 1.0f);
+    RotationSpeed = FMath::Clamp(YawAngularVelocity / 180.0f, -1.0f, 1.0f);
 
     // 3. Refresh the filtered ragdoll water snapshot before animation variables are read.
     Component->RefreshRagdollWaterStateForAnimation();
@@ -160,7 +171,7 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
 
     // 4. Compute speed values with built-in vector helpers.
     // Size2D() avoids custom XY-length code and is easier to read.
-    Velocity = CurrentVelocity;
+    Velocity = CurrentVelocity.ContainsNaN() ? FVector::ZeroVector : CurrentVelocity;
     Speed = Velocity.Size2D();
     MoveSpeed = Velocity.Size();
 
@@ -200,7 +211,7 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     bIsFlying = bMovementCurrentlyFlying;
     bIsGrounded = Movement->IsMovingOnGround() || (bRagdollLikeState && RagdollEnvironmentState.bIsOnGround && !RagdollEnvironmentState.bShouldRecoverInWater);
     bIsFalling = Movement->IsFalling() && !bIsSwimming && !bIsFlying && !bIsGrounded;
-    bIsCrouch = Movement->IsCrouching();
+    bIsCrouch = !bRagdollLikeState && Movement->IsCrouching();
     // AnimBP now handles water recovery explicitly. Keep GetUp true underwater too,
     // while bIsSwimming/bIsFalling above keep the transition out of the falling branch.
     bIsGettingUp = Component->IsGettingUp();
@@ -212,7 +223,7 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
 
     // 6. Movement intent: acceleration must be non-zero and speed must be visible.
     // Built-in IsNearlyZero keeps this branch cheap and readable.
-    bShouldMove = (!CurrentAccel.IsNearlyZero() && Speed > 3.0f);
+    bShouldMove = !bRagdollLikeState && !CurrentAccel.ContainsNaN() && !CurrentAccel.IsNearlyZero() && Speed > 3.0f;
 
     // 7. Vertical swim ratio with temporal smoothing.
     // Surface correction can clamp Velocity.Z instantly, but the animation graph
@@ -225,7 +236,7 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     const float UpSpeedInterpRate = bIsSwimming
         ? CharacterAnimTuning::SwimVerticalSpeedInterpRate
         : CharacterAnimTuning::SwimVerticalSpeedReturnInterpRate;
-    UpSpeed = FMath::FInterpTo(UpSpeed, TargetUpSpeed, DeltaSeconds, UpSpeedInterpRate);
+    UpSpeed = FMath::FInterpTo(UpSpeed, TargetUpSpeed, SafeDeltaSeconds, UpSpeedInterpRate);
     if (FMath::Abs(UpSpeed) < CharacterAnimTuning::SwimVerticalSpeedDeadZone
         && FMath::Abs(TargetUpSpeed) < CharacterAnimTuning::SwimVerticalSpeedDeadZone)
     {
@@ -240,7 +251,9 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
         // Use the already-known movement location as the trace start.
         const FVector Start = Movement->GetActorLocation();
         // End is derived from current downward speed so fast dives trace farther.
-        const FVector End = Start + (FVector::UpVector * -(Velocity.Z * DeltaSeconds + CharacterAnimTuning::MinDivingVelocity));
+        const float TraceDistance = CharacterAnimTuning::MinDivingVelocity
+            + FMath::Abs(Velocity.Z) * FMath::Min(SafeDeltaSeconds, 1.0f);
+        const FVector End = Start - FVector::UpVector * TraceDistance;
 
         // Cache CharacterOwner once for the raycast.
         if (ACharacter *Owner = Movement->GetCharacterOwner())
@@ -268,11 +281,13 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
 
 void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
+    Super::NativeUpdateAnimation(DeltaSeconds);
     RefreshCharacterAnimationState(DeltaSeconds);
 }
 
 void UCharacterAnimInstance::NativeInitializeAnimation()
 {
+    Super::NativeInitializeAnimation();
     ResetRuntimeAnimationState();
     RefreshCachedReferences();
     RefreshCharacterAnimationState(0.0f);

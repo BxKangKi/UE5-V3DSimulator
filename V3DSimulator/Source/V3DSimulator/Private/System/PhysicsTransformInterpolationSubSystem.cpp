@@ -10,6 +10,7 @@
 #include "System/PhysicsTransformInterpolationSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "Async/ParallelFor.h"
+#include "Templates/UnrealTemplate.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -25,6 +26,7 @@ namespace
     struct FPhysicsInterpolationWorkItem
     {
         int32 EntryIndex = INDEX_NONE;
+        uint64 Revision = 0;
         FTransform CurrentTransform = FTransform::Identity;
         FTransform TargetTransform = FTransform::Identity;
         FVector ResultLocation = FVector::ZeroVector;
@@ -197,7 +199,10 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
     bool bApplyScale,
     bool bCanMoveSimulatingPrimitive)
 {
-    if (!IsValid(Component) || TargetTransform.ContainsNaN())
+    if (!ensureMsgf(IsInGameThread(), TEXT("SubmitTransform must run on the game thread"))
+        || !IsValid(Component) || !Component->IsRegistered() || TargetTransform.ContainsNaN()
+        || !TargetTransform.GetRotation().IsNormalized()
+        || !FMath::IsFinite(InterpSpeed) || !FMath::IsFinite(TeleportDistance))
     {
         return;
     }
@@ -215,6 +220,7 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
                 Entry.bCanMoveSimulatingPrimitive != bCanMoveSimulatingPrimitive;
             const bool bTargetChanged = !Entry.TargetTransform.Equals(TargetTransform, 0.001f);
 
+            Entry.Revision = NextRevision++;
             Entry.TargetTransform = TargetTransform;
             Entry.InterpSpeed = SafeInterpSpeed;
             Entry.TeleportDistance = SafeTeleportDistance;
@@ -231,6 +237,7 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
 
     FInterpolatedTransformEntry NewEntry;
     NewEntry.Component = Component;
+    NewEntry.Revision = NextRevision++;
     NewEntry.TargetTransform = TargetTransform;
     NewEntry.InterpSpeed = FMath::Max(0.0f, InterpSpeed);
     NewEntry.TeleportDistance = FMath::Max(0.0f, TeleportDistance);
@@ -242,7 +249,7 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
 
 void UPhysicsTransformInterpolationSubSystem::ClearComponent(USceneComponent* Component)
 {
-    if (!Component)
+    if (!ensureMsgf(IsInGameThread(), TEXT("ClearComponent must run on the game thread")) || !Component)
     {
         return;
     }
@@ -260,7 +267,7 @@ void UPhysicsTransformInterpolationSubSystem::ClearComponent(USceneComponent* Co
 
 void UPhysicsTransformInterpolationSubSystem::ClearOwner(const UObject* Owner)
 {
-    if (!Owner)
+    if (!ensureMsgf(IsInGameThread(), TEXT("ClearOwner must run on the game thread")) || !Owner)
     {
         return;
     }
@@ -301,6 +308,12 @@ bool UPhysicsTransformInterpolationSubSystem::ShouldSkipComponent(const USceneCo
 
 void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTime)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("Interpolation must run on the game thread"))
+        || bIsUpdating || !FMath::IsFinite(DeltaTime))
+    {
+        return;
+    }
+    TGuardValue<bool> UpdateGuard(bIsUpdating, true);
     const float SafeDeltaTime = FMath::Clamp(DeltaTime, 0.0f, 1.0f);
     if (SafeDeltaTime <= 0.0f)
     {
@@ -313,7 +326,7 @@ void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTi
         return !Entry.Component.IsValid();
     }, EAllowShrinking::No);
 
-    TArray<FPhysicsInterpolationWorkItem> WorkItems;
+    TArray<FPhysicsInterpolationWorkItem, TInlineAllocator<64>> WorkItems;
     WorkItems.Reserve(Entries.Num());
     for (int32 EntryIndex = 0; EntryIndex < Entries.Num(); ++EntryIndex)
     {
@@ -332,6 +345,7 @@ void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTi
 
         FPhysicsInterpolationWorkItem& Work = WorkItems.AddDefaulted_GetRef();
         Work.EntryIndex = EntryIndex;
+        Work.Revision = Entry.Revision;
         Work.CurrentTransform = CurrentTransform;
         Work.TargetTransform = Entry.TargetTransform;
         Work.InterpSpeed = Entry.InterpSpeed;
@@ -358,45 +372,55 @@ void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTi
         }
     }
 
+    // Scene-transform setters can synchronously broadcast overlap/transform
+    // callbacks. Those callbacks may remove, swap, resubmit or append Entries.
+    // A valid array index alone does not identify the work that was calculated.
+    const auto FindCurrentEntry = [this](const FPhysicsInterpolationWorkItem& Work) -> FInterpolatedTransformEntry*
+    {
+        if (Entries.IsValidIndex(Work.EntryIndex) && Entries[Work.EntryIndex].Revision == Work.Revision)
+        {
+            return &Entries[Work.EntryIndex];
+        }
+        return Entries.FindByPredicate([&Work](const FInterpolatedTransformEntry& Candidate)
+        {
+            return Candidate.Revision == Work.Revision;
+        });
+    };
+
     for (const FPhysicsInterpolationWorkItem& Work : WorkItems)
     {
-        if (!Entries.IsValidIndex(Work.EntryIndex))
-        {
-            continue;
-        }
-
-        FInterpolatedTransformEntry& Entry = Entries[Work.EntryIndex];
-        USceneComponent* Component = Entry.Component.Get();
-        if (!IsValid(Component) || ShouldSkipComponent(Component, Entry.bCanMoveSimulatingPrimitive))
-        {
-            continue;
-        }
+        FInterpolatedTransformEntry* Entry = FindCurrentEntry(Work);
+        if (!Entry) continue;
+        const TWeakObjectPtr<USceneComponent> WeakComponent = Entry->Component;
+        USceneComponent* Component = WeakComponent.Get();
+        if (!IsValid(Component) || ShouldSkipComponent(Component, Entry->bCanMoveSimulatingPrimitive)) continue;
 
         if (Work.bShouldApply)
         {
             Component->SetWorldLocationAndRotation(
-                Work.ResultLocation,
-                Work.ResultRotation.Rotator(),
-                false,
-                nullptr,
-                ETeleportType::TeleportPhysics);
-            if (Entry.bApplyScale)
+                Work.ResultLocation, Work.ResultRotation, false, nullptr, ETeleportType::TeleportPhysics);
+
+            // Never dereference Entry or the raw component retained across a callback.
+            Entry = FindCurrentEntry(Work);
+            Component = WeakComponent.Get();
+            if (!Entry || !IsValid(Component) || !Component->IsRegistered()
+                || ShouldSkipComponent(Component, Entry->bCanMoveSimulatingPrimitive)) continue;
+            if (Work.bApplyScale)
             {
                 Component->SetWorldScale3D(Work.ResultScale);
             }
         }
-        Entry.bAtTarget = Work.bAtTarget;
+
+        Entry = FindCurrentEntry(Work);
+        if (Entry && WeakComponent.IsValid()) Entry->bAtTarget = Work.bAtTarget;
     }
 
-    bool bHasPendingInterpolation = false;
-    for (const FInterpolatedTransformEntry& Entry : Entries)
+    // Release completed/dead entries even while another target is still moving.
+    Entries.RemoveAllSwap([](const FInterpolatedTransformEntry& Entry)
     {
-        if (Entry.Component.IsValid() && !Entry.bAtTarget)
-        {
-            bHasPendingInterpolation = true;
-            break;
-        }
-    }
+        return !Entry.Component.IsValid() || !Entry.Component->IsRegistered() || Entry.bAtTarget;
+    }, EAllowShrinking::No);
+    const bool bHasPendingInterpolation = !Entries.IsEmpty();
     if (!bHasPendingInterpolation)
     {
         // Completed targets do not need to remain in a persistent GameInstance subsystem. A later

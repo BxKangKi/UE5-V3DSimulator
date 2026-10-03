@@ -27,6 +27,8 @@ class V3DSIMULATOR_API UCharacterFunctionLibrary : public UBlueprintFunctionLibr
 public:
     static void BlendRagdoll(USkeletalMeshComponent &Mesh, const float Weight, const float Threshold = 0.0f);
     static void PrepareHairForRagdoll(USkeletalMeshComponent &Mesh, const FVector &LinearVelocity);
+    /** Shared bounded ancestry test used by physics, buoyancy and ragdoll probes. */
+    static bool IsSecondaryPhysicsBone(const USkeletalMeshComponent& Mesh, FName BoneName);
     static void KeepSecondaryPhysicsBodies(USkeletalMeshComponent &Mesh);
     static void DisableRagdollPhysicsButKeepSecondary(USkeletalMeshComponent &Mesh);
     static bool HasNonSecondarySimulatingPhysicsBodies(USkeletalMeshComponent &Mesh);
@@ -50,6 +52,7 @@ public:
     static bool IsStateActive(int32 State, int32 BitFlag);
 
 private:
+    static void ConfigureHairPhysics(USkeletalMeshComponent& Mesh);
     static void SetBodiesBelowPhysics(USkeletalMeshComponent &Mesh, bool bWakeSecondaryBodies);
     static FTransform GetBoneDeltaTransform(const USkeletalMesh &MeshAsset, const int32 BoneIndex, const int32 InParentIndex);
     static void ConfigureBodyPhysics(USkeletalMeshComponent &Mesh,

@@ -28,6 +28,9 @@
 
 namespace SecondaryPhysicsTuning
 {
+    // One gram per hair body, independent of imported collider volume/scale.
+    // Keep this strictly positive so Chaos can compute inverse mass/inertia.
+    constexpr float HairBodyMassKg = 0.001f;
     constexpr float HairSwingLimitDegrees = 38.0f;
     constexpr float HairTwistLimitDegrees = 24.0f;
     constexpr float DynamicSwingLimitDegrees = 32.0f;
@@ -128,7 +131,6 @@ namespace SecondaryMotionRouting
         if (SkeletalMesh.GetBoneIndex(Canonical) != INDEX_NONE)
         {
             OutRoots.Add(Canonical);
-            return;
         }
 
         const int32 BoneCount = SkeletalMesh.GetNumBones();
@@ -160,7 +162,6 @@ namespace SecondaryMotionRouting
         if (RefSkeleton.FindBoneIndex(Canonical) != INDEX_NONE)
         {
             OutRoots.Add(Canonical);
-            return;
         }
 
         for (int32 BoneIndex = 0; BoneIndex < RefSkeleton.GetNum(); ++BoneIndex)
@@ -223,6 +224,21 @@ namespace SecondaryMotionRouting
         }
     }
 
+    static bool IsHairPhysicsBone(const USkeletalMeshComponent& SkeletalMesh, FName BoneName)
+    {
+        for (int32 Depth = 0; Depth < SkeletalMesh.GetNumBones() && BoneName != NAME_None; ++Depth)
+        {
+            if (MatchesCanonicalRoot(BoneName, BONE_HAIR_ROOT) || IsHairLikeBoneName(BoneName))
+            {
+                return true;
+            }
+            const FName Parent = SkeletalMesh.GetParentBone(BoneName);
+            if (Parent == BoneName) break;
+            BoneName = Parent;
+        }
+        return false;
+    }
+
     static bool IsSecondaryPhysicsBone(const USkeletalMeshComponent& SkeletalMesh, const FName BoneName)
     {
         if (BoneName == NAME_None)
@@ -246,6 +262,47 @@ namespace SecondaryMotionRouting
             CurrentBone = ParentBone;
         }
         return false;
+    }
+}
+
+bool UCharacterFunctionLibrary::IsSecondaryPhysicsBone(const USkeletalMeshComponent& Mesh, const FName BoneName)
+{
+    return SecondaryMotionRouting::IsSecondaryPhysicsBone(Mesh, BoneName);
+}
+
+void UCharacterFunctionLibrary::ConfigureHairPhysics(USkeletalMeshComponent& SkeletalMesh)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ConfigureHairPhysics must run on the game thread"))) return;
+    const UPhysicsAsset* Asset = SkeletalMesh.GetPhysicsAsset();
+    if (!IsValid(Asset)) return;
+
+    // Operate on this component's bodies, never mutate a shared default PhysicsAsset.
+    // Profile changes (CharacterMesh/Ragdoll) can restore blocking responses, so
+    // reapply the policy both after activation and after physics-state recreation.
+    for (const USkeletalBodySetup* Setup : Asset->SkeletalBodySetups)
+    {
+        if (!IsValid(Setup) || !SecondaryMotionRouting::IsHairPhysicsBone(SkeletalMesh, Setup->BoneName)) continue;
+        FBodyInstance* Body = SkeletalMesh.GetBodyInstance(Setup->BoneName, false);
+        if (!Body || !Body->IsValidBodyInstance()) continue;
+        Body->SetResponseToAllChannels(ECR_Ignore);
+        if (!Body->bOverrideMass || !FMath::IsNearlyEqual(Body->GetMassOverride(), SecondaryPhysicsTuning::HairBodyMassKg, UE_SMALL_NUMBER))
+        {
+            Body->SetMassOverride(SecondaryPhysicsTuning::HairBodyMassKg, true);
+            Body->UpdateMassProperties();
+        }
+    }
+
+    for (const UPhysicsConstraintTemplate* Template : Asset->ConstraintSetup)
+    {
+        if (!IsValid(Template)) continue;
+        const FConstraintInstance& Definition = Template->DefaultInstance;
+        if (!SecondaryMotionRouting::IsHairPhysicsBone(SkeletalMesh, Definition.ConstraintBone1)) continue;
+        if (FConstraintInstance* Joint = SkeletalMesh.FindConstraintInstance(Definition.JointName))
+        {
+            if (!Joint->IsParentDominatesEnabled()) Joint->EnableParentDominates();
+            Joint->SetContactTransferScale(0.0f);
+            Joint->SetDisableCollision(true);
+        }
     }
 }
 
@@ -357,6 +414,8 @@ void UCharacterFunctionLibrary::SetBodiesBelowPhysics(
         ConfigureBodyPhysics(SkeletalMesh, DynRoot, true, DYN_ROOT_WEIGHT, false);
     }
 
+    ConfigureHairPhysics(SkeletalMesh);
+
     if (bWakeSecondaryBodies)
     {
         int32 SimulatingSecondaryBodies = 0;
@@ -398,6 +457,7 @@ void UCharacterFunctionLibrary::PrepareHairForRagdoll(
     const FVector &LinearVelocity)
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("PrepareHairForRagdoll must run on the game thread"))) return;
+    ConfigureHairPhysics(SkeletalMesh);
     TArray<FName> HairRoots;
     SecondaryMotionRouting::GatherHairPhysicsRoots(SkeletalMesh, HairRoots);
     if (HairRoots.IsEmpty()) return;
@@ -822,7 +882,15 @@ void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
         BodySetup->DefaultInstance.SetResponseToAllChannels(ECR_Ignore);
         BodySetup->DefaultInstance.SetCollisionEnabled(ECollisionEnabled::PhysicsOnly);
         BodySetup->CollisionReponse = EBodyCollisionResponse::BodyCollision_Enabled;
-        BodySetup->DefaultInstance.SetMassScale(bHairChain ? 0.005f : 0.02f);
+        if (bHairChain)
+        {
+            BodySetup->DefaultInstance.SetMassScale(1.0f);
+            BodySetup->DefaultInstance.SetMassOverride(SecondaryPhysicsTuning::HairBodyMassKg, true);
+        }
+        else
+        {
+            BodySetup->DefaultInstance.SetMassScale(0.02f);
+        }
         BodySetup->DefaultInstance.LinearDamping = bHairChain ? 0.35f : 0.5f;
         BodySetup->DefaultInstance.AngularDamping = bHairChain ? 1.25f : 1.75f;
         BodySetup->DefaultInstance.InertiaTensorScale = FVector(1.0f);
@@ -853,9 +921,20 @@ void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
     // even if a later profile refresh changes the filter responses.
     for (int32 A = 0; A < SecondaryBodyIndices.Num(); ++A)
     {
-        for (int32 B = A + 1; B < SecondaryBodyIndices.Num(); ++B)
+        if (bHairChain)
         {
-            PhysicsAsset->DisableCollision(SecondaryBodyIndices[A], SecondaryBodyIndices[B]);
+            // Hair must not push the head, limbs or a different secondary chain.
+            for (int32 B = 0; B < PhysicsAsset->SkeletalBodySetups.Num(); ++B)
+            {
+                if (SecondaryBodyIndices[A] != B) PhysicsAsset->DisableCollision(SecondaryBodyIndices[A], B);
+            }
+        }
+        else
+        {
+            for (int32 B = A + 1; B < SecondaryBodyIndices.Num(); ++B)
+            {
+                PhysicsAsset->DisableCollision(SecondaryBodyIndices[A], SecondaryBodyIndices[B]);
+            }
         }
     }
 

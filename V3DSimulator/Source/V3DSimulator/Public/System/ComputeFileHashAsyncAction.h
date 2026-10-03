@@ -36,6 +36,10 @@ public:
 private:
     FString TargetFilePath;
 
+    void Complete(const FString& Result);
+    bool bActivated = false;
+    bool bCompleted = false;
+
     UPROPERTY()
-    TObjectPtr<UObject> WorldContextObject;
+    TWeakObjectPtr<UObject> WorldContextObject;
 };

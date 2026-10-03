@@ -97,7 +97,7 @@ int32 UGameUpdateSubSystem::RegisterUpdate(UObject* Owner, TFunction<void(float)
         return INDEX_NONE;
     }
 
-    if (!IsValid(Owner) || !UpdateFunction)
+    if (!bInitialized || !IsValid(Owner) || !UpdateFunction)
     {
         return INDEX_NONE;
     }
@@ -220,7 +220,7 @@ void UGameUpdateSubSystem::Tick(float DeltaTime)
         return;
     }
 
-    if (DeltaTime <= 0.0f)
+    if (!FMath::IsFinite(DeltaTime) || DeltaTime <= 0.0f)
     {
         RemoveInvalidEntries();
         return;

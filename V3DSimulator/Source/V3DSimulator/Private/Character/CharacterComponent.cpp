@@ -795,6 +795,7 @@ static void GatherRagdollProbeLocations(
         for (int32 BoneIndex = 0; BoneIndex < BoneCount; ++BoneIndex)
         {
             const FName BoneName = SkeletalMesh->GetBoneName(BoneIndex);
+            if (UCharacterFunctionLibrary::IsSecondaryPhysicsBone(*SkeletalMesh, BoneName)) continue;
             if (bCoreOnly)
             {
                 if (!IsRagdollCoreReleaseBone(BoneName))
@@ -1076,12 +1077,6 @@ void UCharacterComponent::InitializeCrouchSettings()
         Radius = Capsule->GetScaledCapsuleRadius();
     }
 
-    if (IsValid(MeshComp))
-    {
-        StandingMeshRelativeLocation = MeshComp->GetRelativeLocation();
-        StandingMeshRelativeRotation = MeshComp->GetRelativeRotation();
-    }
-
     if (IsValid(Movement))
     {
         Movement->GetNavAgentPropertiesRef().bCanCrouch = true;
@@ -1099,54 +1094,24 @@ void UCharacterComponent::InitializeCrouchSettings()
 
 void UCharacterComponent::ApplyCrouchState(bool bShouldCrouch)
 {
-    if (!IsValid(OwnerCharacter))
+    if (!IsValid(OwnerCharacter) || !IsValid(Movement))
     {
         return;
     }
 
-    UCapsuleComponent* Capsule = OwnerCharacter->GetCapsuleComponent();
-    if (!Capsule || !IsValid(Movement))
-    {
-        return;
-    }
-
-    if (StandingCapsuleHalfHeight <= KINDA_SMALL_NUMBER)
-    {
-        InitializeCrouchSettings();
-    }
-
-    MeshComp = OwnerCharacter->GetMesh();
-
+    // Crouch/UnCrouch queue intent; the movement component commits the capsule,
+    // bIsCrouched and mesh offset together after checking available headroom.
+    // Never restore a cached transform here: the request may still be pending,
+    // or standing up may be blocked. Repeated writes also teleport hair bodies.
+    // Always clear intent on release, even if a queued crouch has not run yet.
     if (bShouldCrouch)
     {
-        if (!Movement->IsCrouching())
-        {
-            OwnerCharacter->Crouch(false);
-        }
-
-        if (IsValid(MeshComp))
-        {
-            const float CurrentHalfHeight = Capsule->GetUnscaledCapsuleHalfHeight();
-            const float HalfHeightDelta = FMath::Max(0.0f, StandingCapsuleHalfHeight - CurrentHalfHeight);
-            const FVector DesiredMeshRelativeLocation = StandingMeshRelativeLocation + FVector::UpVector * HalfHeightDelta;
-            MeshComp->SetRelativeLocation(DesiredMeshRelativeLocation, false, nullptr, ETeleportType::TeleportPhysics);
-            MeshComp->SetRelativeRotation(StandingMeshRelativeRotation);
-            bCrouchVisualOffsetApplied = true;
-        }
-        return;
+        OwnerCharacter->Crouch(false);
     }
-
-    if (Movement->IsCrouching())
+    else
     {
         OwnerCharacter->UnCrouch(false);
     }
-
-    if (bCrouchVisualOffsetApplied && IsValid(MeshComp))
-    {
-        MeshComp->SetRelativeLocation(StandingMeshRelativeLocation, false, nullptr, ETeleportType::TeleportPhysics);
-        MeshComp->SetRelativeRotation(StandingMeshRelativeRotation);
-    }
-    bCrouchVisualOffsetApplied = false;
 }
 
 void UCharacterComponent::InvalidateWaterReferenceForPendingMeshLoad()
@@ -1257,7 +1222,8 @@ void UCharacterComponent::RefreshWaterReferenceOffsetFromHead()
 
 void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveInput, const int32 CharacterState, const float WaterLevel)
 {
-    if (!IsValid(OwnerCharacter) || !IsValid(Movement) || !IsValid(MeshComp))
+    if (!IsValid(OwnerCharacter) || !IsValid(Movement) || !IsValid(MeshComp)
+        || !FMath::IsFinite(DeltaTime) || DeltaTime <= 0.0f)
         return;
 
     if (bStreamingMovementSuspended)
@@ -1372,6 +1338,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     // 2. Flying mode.
     if (Movement->IsFlying())
     {
+        ApplyCrouchState(false);
         bSwimmingSurfaceCeilingLocked = false;
 
         RagdollResistance = CharacterMovementTuning::FlyingRagdollResistance;
@@ -2809,7 +2776,8 @@ void UCharacterComponent::ApplyInitialRagdollVelocity(USkeletalMeshComponent *Sk
             continue;
         }
 
-        if (!ShouldApplyInitialRagdollVelocityToBone(BoneName))
+        if (UCharacterFunctionLibrary::IsSecondaryPhysicsBone(*SkeletalMesh, BoneName)
+            || !ShouldApplyInitialRagdollVelocityToBone(BoneName))
         {
             continue;
         }

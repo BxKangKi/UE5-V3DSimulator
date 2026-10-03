@@ -36,7 +36,7 @@ public:
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     float UpSpeed = 0.0f;
 
-    /** Signed actor yaw angular velocity in degrees per second. */
+    /** Signed actor yaw rate normalized to [-1, 1] at 180 degrees/second. */
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     float RotationSpeed = 0.0f;
 

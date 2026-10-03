@@ -60,6 +60,7 @@ private:
     struct FInterpolatedTransformEntry
     {
         TWeakObjectPtr<USceneComponent> Component;
+        uint64 Revision = 0;
         FTransform TargetTransform = FTransform::Identity;
         float InterpSpeed = 14.0f;
         float TeleportDistance = 500.0f;
@@ -70,6 +71,8 @@ private:
 
     TArray<FInterpolatedTransformEntry> Entries;
     int32 GameUpdateHandle = INDEX_NONE;
+    uint64 NextRevision = 1;
+    bool bIsUpdating = false;
 
     bool ShouldSkipComponent(const USceneComponent* Component, bool bCanMoveSimulatingPrimitive) const;
     void RegisterGameUpdate();

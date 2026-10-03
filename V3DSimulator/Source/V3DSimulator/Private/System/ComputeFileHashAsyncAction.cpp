@@ -34,7 +34,14 @@ void UComputeFileHashAsyncAction::Activate()
         return;
     }
 
-    RegisterWithGameInstance(WorldContextObject);
+    if (bActivated || bCompleted) return;
+    bActivated = true;
+    if (!WorldContextObject.IsValid())
+    {
+        Complete(TEXT("Invalid Context"));
+        return;
+    }
+    RegisterWithGameInstance(WorldContextObject.Get());
     const FString FilePath = TargetFilePath;
     TWeakObjectPtr<UComputeFileHashAsyncAction> WeakThis(this);
 
@@ -51,8 +58,7 @@ void UComputeFileHashAsyncAction::Activate()
                 if (UComputeFileHashAsyncAction* StrongThis = WeakThis.Get())
                 {
                     UE_LOG(LogTemp, Warning, TEXT("Cannot hash missing file: %s"), *FilePath);
-                    StrongThis->OnCompleted.Broadcast(TEXT("File Not Found"));
-                    StrongThis->SetReadyToDestroy();
+                    StrongThis->Complete(TEXT("File Not Found"));
                 }
             }))
             {
@@ -76,8 +82,7 @@ void UComputeFileHashAsyncAction::Activate()
                 if (UComputeFileHashAsyncAction* StrongThis = WeakThis.Get())
                 {
                     UE_LOG(LogTemp, Warning, TEXT("Cannot determine file size for hashing: %s"), *FilePath);
-                    StrongThis->OnCompleted.Broadcast(TEXT("Read Error"));
-                    StrongThis->SetReadyToDestroy();
+                    StrongThis->Complete(TEXT("Read Error"));
                 }
             }))
             {
@@ -99,8 +104,7 @@ void UComputeFileHashAsyncAction::Activate()
                     if (UComputeFileHashAsyncAction* StrongThis = WeakThis.Get())
                     {
                         UE_LOG(LogTemp, Warning, TEXT("Failed while hashing file: %s"), *FilePath);
-                        StrongThis->OnCompleted.Broadcast(TEXT("Read Error"));
-                        StrongThis->SetReadyToDestroy();
+                        StrongThis->Complete(TEXT("Read Error"));
                     }
                 }))
                 {
@@ -122,8 +126,7 @@ void UComputeFileHashAsyncAction::Activate()
         {
             if (UComputeFileHashAsyncAction* StrongThis = WeakThis.Get())
             {
-                StrongThis->OnCompleted.Broadcast(HashString);
-                StrongThis->SetReadyToDestroy();
+                StrongThis->Complete(HashString);
             }
         }))
         {
@@ -134,6 +137,17 @@ void UComputeFileHashAsyncAction::Activate()
     if (!bWorkerQueued)
     {
         // Activate runs on the game thread, so an unscheduled action can be released immediately.
-        SetReadyToDestroy();
+        Complete(TEXT("Hash Unavailable"));
     }
+}
+
+void UComputeFileHashAsyncAction::Complete(const FString& Result)
+{
+    if (bCompleted) return;
+    // Latch before broadcasting: a Blueprint callback may call Activate again.
+    bCompleted = true;
+    OnCompleted.Broadcast(Result);
+    OnCompleted.Clear();
+    WorldContextObject.Reset();
+    SetReadyToDestroy();
 }

@@ -8,6 +8,7 @@
  */
 
 #include "World/BuoyancyComponent.h"
+#include "Character/CharacterFunctionLibrary.h"
 #include "World/WaterExclusionBoxComponent.h"
 #include "World/WaterActor.h"
 #include "World/WaterQuerySubsystem.h"
@@ -93,16 +94,7 @@ static bool IsSecondarySkeletalPhysicsBone(const USkeletalMeshComponent* Skeleta
         return false;
     }
 
-    FName CurrentBone = BoneName;
-    while (CurrentBone != NAME_None)
-    {
-        if (CurrentBone == FName(BONE_HAIR_ROOT) || CurrentBone == FName(BONE_DYN_ROOT))
-        {
-            return true;
-        }
-        CurrentBone = SkeletalMesh->GetParentBone(CurrentBone);
-    }
-    return false;
+    return UCharacterFunctionLibrary::IsSecondaryPhysicsBone(*SkeletalMesh, BoneName);
 }
 
 static const FSkeletalBuoyancyBoneRule* FindSkeletalBuoyancyBoneRule(const FSkeletalBuoyancySettings& Settings, const FName BoneName)

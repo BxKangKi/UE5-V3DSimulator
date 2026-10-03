@@ -88,6 +88,16 @@ ACharacterController::ACharacterController(const FObjectInitializer& ObjectIniti
         Capsule->InitCapsuleSize(35.0f, 90.0f);
     }
 
+    // ACharacter's crouch callbacks restore offsets from the class default mesh.
+    // Establish the same frame used by runtime loading/recovery before BeginPlay,
+    // animation initialization, or network smoothing caches those defaults.
+    if (USkeletalMeshComponent* MeshComponent = GetMesh())
+    {
+        MeshComponent->SetRelativeLocationAndRotation(
+            CharacterControllerTuning::MeshDefaultRelativeLocation,
+            CharacterControllerTuning::MeshDefaultRelativeRotation);
+    }
+
     if (UCharacterMovementComponent* MovementDefaults = GetCharacterMovement())
     {
         MovementDefaults->GravityScale = 1.75f;
@@ -1273,7 +1283,7 @@ void ACharacterController::ClearDryWaterState(float Level, bool bUpdateMovementM
 
 void ACharacterController::Activate(bool bValue)
 {
-    Movement->SetActive(bValue);
+    if (IsValid(Movement)) Movement->SetActive(bValue);
     GetCapsuleComponent()->SetActive(bValue);
     AWaterActor::CheckOverlappingWater(this);
     if (bValue)
@@ -1287,8 +1297,8 @@ void ACharacterController::Activate(bool bValue)
 void ACharacterController::MovementInput(const float X, const float Y)
 {
     constexpr float MovementInputDeadZone = 0.01f;
-    const float ClampedX = FMath::Clamp(X, -1.0f, 1.0f);
-    const float ClampedY = FMath::Clamp(Y, -1.0f, 1.0f);
+    const float ClampedX = FMath::IsFinite(X) ? FMath::Clamp(X, -1.0f, 1.0f) : 0.0f;
+    const float ClampedY = FMath::IsFinite(Y) ? FMath::Clamp(Y, -1.0f, 1.0f) : 0.0f;
     RawMoveInput.X = FMath::IsNearlyZero(ClampedX, MovementInputDeadZone) ? 0.0f : ClampedX;
     RawMoveInput.Y = FMath::IsNearlyZero(ClampedY, MovementInputDeadZone) ? 0.0f : ClampedY;
 
@@ -1318,12 +1328,22 @@ void ACharacterController::ClearTransientInputState()
 
 void ACharacterController::CameraInput(const float X, const float Y, const float Sensitive)
 {
+    if (!FMath::IsFinite(X) || !FMath::IsFinite(Y) || !FMath::IsFinite(Sensitive)
+        || !FMath::IsFinite(X * Sensitive) || !FMath::IsFinite(Y * Sensitive))
+    {
+        return;
+    }
     AddControllerYawInput(X * Sensitive);
     AddControllerPitchInput(Y * Sensitive);
 }
 
 void ACharacterController::Jumping(bool bDoJump)
 {
+    if (!IsValid(Movement))
+    {
+        return;
+    }
+
     if (bDoJump)
     {
         RawMoveInput.Z = 1.0f;
@@ -1351,6 +1371,11 @@ void ACharacterController::Sprinting(bool Value)
 
 void ACharacterController::Crouching(bool Value)
 {
+    if (!IsValid(Movement))
+    {
+        return;
+    }
+
     if (Value && !Movement->IsFalling())
     {
         RawMoveInput.Z = -1.0f;

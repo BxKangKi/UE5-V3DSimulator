@@ -287,11 +287,8 @@ private:
     float WaterOffset = 0.0f;
     float HalfHeight = 0.0f;
     float Radius = 0.0f;
-    FVector StandingMeshRelativeLocation = FVector(0.0f, 0.0f, -90.0f);
-    FRotator StandingMeshRelativeRotation = FRotator(0.0f, 270.0f, 0.0f);
     float StandingCapsuleHalfHeight = 0.0f;
     float StandingCapsuleRadius = 0.0f;
-    bool bCrouchVisualOffsetApplied = false;
 
     float RagdollWeight = 0.0f;
     float RagdollActiveTime = 0.0f;
