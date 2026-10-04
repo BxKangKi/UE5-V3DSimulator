@@ -21,6 +21,9 @@ class UWorld;
 class UStartWorldWidget;
 class USettingsMenuWidget;
 class UUserWidget;
+class UGameViewportClient;
+class SWidget;
+class STextBlock;
 
 /**
  * Owns the MainWorld menu flow.
@@ -139,6 +142,9 @@ private:
     bool InitializeRegistryDrivenUI();
     bool EnsureSettingsMenuWidget();
     void TryInitializeStartScreen();
+    void ShowStartupStatus(const FText& Message);
+    void ClearStartupStatus();
+    void LogStartupReadiness(double ElapsedSeconds) const;
     void InitializeStartScreenAfterBlueprintBeginPlay();
     void HideAllMenuWidgets();
     void ApplyMenuInputMode(UUserWidget* FocusWidget) const;
@@ -186,6 +192,14 @@ private:
     UPROPERTY(Transient)
     bool bWorldSelectionReturnInputGuardActive = false;
 
+    // Native Slate status remains visible if a cooked UMG class is missing. It is not a replacement menu.
+    TSharedPtr<SWidget> StartupStatusWidget;
+    TSharedPtr<STextBlock> StartupStatusText;
+    TWeakObjectPtr<UGameViewportClient> StartupStatusViewport;
+    FString LastStartScreenFailure;
+    double StartScreenInitializationStartedAt = 0.0;
+    double NextStartupLogTime = 0.0;
+    bool bStartupEnding = false;
     bool bStartScreenInitialized = false;
     int32 StartScreenInitializationAttempts = 0;
     FTimerHandle StartScreenInitializationHandle;

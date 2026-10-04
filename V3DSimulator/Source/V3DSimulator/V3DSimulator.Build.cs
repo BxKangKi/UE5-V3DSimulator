@@ -36,6 +36,7 @@ public class V3DSimulator : ModuleRules
                 "Niagara",
                 "JsonUtilities",
                 "RHI",
+                "RenderCore", // Shipping-safe PSO readiness diagnostics.
                 "ProceduralMeshComponent",
                 "PhysicsCore",
                 // MoviePlayer renders a pure-Slate loading screen while blocking map loads run.

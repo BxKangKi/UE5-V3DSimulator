@@ -11,6 +11,9 @@
 #include "V3DSimulator.h"
 
 #include "MoviePlayer.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Styling/CoreStyle.h"
 #include "System/SimulatorFileServices.h"
 #include "Engine/World.h"
 #include "Engine/GameInstance.h"
@@ -82,9 +85,17 @@ void FV3DSimulatorModule::PrepareLoadingScreen()
     LoadingScreen.bWaitForManualStop = false;
     LoadingScreen.MinimumLoadingScreenDisplayTime = 0.0f;
 
-    // Epic's built-in test widget is a pure-Slate loading indicator. Using it here deliberately
-    // avoids loading a UMG class, texture UObject, or project package before the startup map exists.
-    LoadingScreen.WidgetLoadingScreen = FLoadingScreenAttributes::NewTestLoadingScreenWidget();
+    // No UMG/material package dependency: this message can render while cooked assets are loading.
+    LoadingScreen.WidgetLoadingScreen = SNew(SBorder)
+        .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+        .BorderBackgroundColor(FLinearColor(0.035f, 0.045f, 0.065f, 1.0f))
+        .HAlign(HAlign_Center).VAlign(VAlign_Center).Padding(32.0f)
+        [
+            SNew(STextBlock)
+            .Font(FCoreStyle::GetDefaultFontStyle("Regular", 20))
+            .ColorAndOpacity(FLinearColor::White)
+            .Text(NSLOCTEXT("V3DStartup", "LoadingMap", "V3DSimulator - Loading..."))
+        ];
     MoviePlayer->SetupLoadingScreen(LoadingScreen);
     bOwnsLoadingScreen = true;
 }

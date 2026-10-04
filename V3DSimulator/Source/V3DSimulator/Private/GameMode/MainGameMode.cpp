@@ -11,6 +11,13 @@
 #include "GameMode/MainGameMode.h"
 
 #include "Engine/World.h"
+#include "Engine/GameViewportClient.h"
+#include "HAL/PlatformTime.h"
+#include "UObject/UObjectGlobals.h"
+#include "ShaderPipelineCache.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Styling/CoreStyle.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/WorldSettings.h"
 #include "InputCoreTypes.h"
@@ -276,53 +283,122 @@ void AMainGameMode::BeginPlay()
     // BeginPlay can precede local-player/viewport readiness in PIE and packaged startup.
     if (GetNetMode() != NM_DedicatedServer)
     {
+        StartScreenInitializationStartedAt = FPlatformTime::Seconds();
         TryInitializeStartScreen();
-        if (!bStartScreenInitialized)
-        {
-            GetWorldTimerManager().SetTimer(StartScreenInitializationHandle, this,
-                &AMainGameMode::TryInitializeStartScreen, 0.1f, true);
-        }
     }
 }
 
 void AMainGameMode::TryInitializeStartScreen()
 {
-    if (bStartScreenInitialized || GetNetMode() == NM_DedicatedServer)
+    if (bStartupEnding || bStartScreenInitialized || GetNetMode() == NM_DedicatedServer)
     {
         GetWorldTimerManager().ClearTimer(StartScreenInitializationHandle);
+        ClearStartupStatus();
         return;
     }
     ++StartScreenInitializationAttempts;
-    if (StartScreenInitializationAttempts == 1)
-        FSimulatorFileServices::WriteStartupLog(TEXT("Attempting start menu initialization"));
+    const double Now = FPlatformTime::Seconds();
+    const double Elapsed = FMath::Max(0.0, Now - StartScreenInitializationStartedAt);
+    ShowStartupStatus(Elapsed < 30.0
+        ? NSLOCTEXT("V3DStartup", "LoadingMenu", "Starting V3DSimulator... Loading the main menu.")
+        : NSLOCTEXT("V3DStartup", "DelayedMenu", "The main menu is taking longer than expected. See startup.log for loading details."));
     if (InitializeRegistryDrivenUI())
     {
-        FSimulatorFileServices::WriteStartupLog(TEXT("Start menu created and attached"));
+        if (bStartupEnding) return; // Widget Blueprint callbacks can initiate map travel.
+        FSimulatorFileServices::WriteStartupLog(FString::Printf(
+            TEXT("Start menu created and attached after %.2fs; PSO requests remaining=%u"),
+            FPlatformTime::Seconds() - StartScreenInitializationStartedAt,
+            FShaderPipelineCache::NumPrecompilesRemaining()));
         bStartScreenInitialized = true;
         GetWorldTimerManager().ClearTimer(StartScreenInitializationHandle);
+        ClearStartupStatus();
         InitializeStartScreenAfterBlueprintBeginPlay();
+        return;
     }
-    else if (StartScreenInitializationAttempts >= 100)
+    if (bStartupEnding) return;
+    if (Now >= NextStartupLogTime)
     {
-        FSimulatorFileServices::WriteStartupLog(TEXT("ERROR: Start menu initialization exhausted 100 attempts; check map classes, viewport and cooked widgets"));
-        GetWorldTimerManager().ClearTimer(StartScreenInitializationHandle);
-        UE_LOG(LogTemp, Error, TEXT("MainWorld menu initialization failed after 100 attempts. Check GameInstance, AssetRegistry and cooked menu classes."));
+        NextStartupLogTime = Now + 10.0;
+        LogStartupReadiness(Elapsed);
     }
+    // A repeating timer can execute many overdue callbacks after a driver/IO stall and consume the
+    // old 100-attempt budget immediately. Re-arm once, and keep recovering when the viewport arrives.
+    // PSO work is diagnostic only: never hide the menu waiting for a global shader queue to reach zero.
+    GetWorldTimerManager().SetTimer(StartScreenInitializationHandle, this,
+        &AMainGameMode::TryInitializeStartScreen, Elapsed < 5.0 ? 0.25f : 1.0f, false);
+}
+
+void AMainGameMode::ShowStartupStatus(const FText& Message)
+{
+    UWorld* World = GetWorld();
+    UGameViewportClient* Viewport = IsValid(World) ? World->GetGameViewport() : nullptr;
+    if (!IsValid(Viewport)) return;
+    if (StartupStatusViewport.Get() != Viewport) ClearStartupStatus();
+    if (!StartupStatusWidget.IsValid())
+    {
+        StartupStatusWidget = SNew(SBorder)
+            .Visibility(EVisibility::HitTestInvisible)
+            .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+            .BorderBackgroundColor(FLinearColor(0.035f, 0.045f, 0.065f, 1.0f))
+            .HAlign(HAlign_Center).VAlign(VAlign_Center).Padding(32.0f)
+            [
+                SAssignNew(StartupStatusText, STextBlock)
+                .Font(FCoreStyle::GetDefaultFontStyle("Regular", 20))
+                .ColorAndOpacity(FLinearColor::White)
+                .Justification(ETextJustify::Center).AutoWrapText(true).Text(Message)
+            ];
+        StartupStatusViewport = Viewport;
+        Viewport->AddViewportWidgetContent(StartupStatusWidget.ToSharedRef(), 10000);
+    }
+    else if (StartupStatusText.IsValid())
+    {
+        StartupStatusText->SetText(Message);
+    }
+}
+
+void AMainGameMode::ClearStartupStatus()
+{
+    if (StartupStatusWidget.IsValid())
+    {
+        if (UGameViewportClient* Viewport = StartupStatusViewport.Get())
+            Viewport->RemoveViewportWidgetContent(StartupStatusWidget.ToSharedRef());
+    }
+    StartupStatusText.Reset();
+    StartupStatusWidget.Reset();
+    StartupStatusViewport.Reset();
+}
+
+void AMainGameMode::LogStartupReadiness(double ElapsedSeconds) const
+{
+    UWorld* World = GetWorld();
+    APlayerController* Player = IsValid(World) ? UGameplayStatics::GetPlayerController(this, 0) : nullptr;
+    const UV3DSimulatorGameInstance* Instance = Cast<UV3DSimulatorGameInstance>(GetGameInstance());
+    const UV3DSimulatorAssetRegistry* Registry = IsValid(Instance) ? Instance->GetAssetRegistry() : nullptr;
+    FSimulatorFileServices::WriteStartupLog(FString::Printf(
+        TEXT("UI startup pending: elapsed=%.2fs player=%d localPlayer=%d gameViewport=%d registry=%s startClass=%s classLoaded=%d PSORemaining=%u asyncLoading=%d failure=%s"),
+        ElapsedSeconds, IsValid(Player), IsValid(Player) && Player->GetLocalPlayer() != nullptr,
+        IsValid(World) && World->GetGameViewport() != nullptr, *GetNameSafe(Registry),
+        Registry ? *Registry->StartMenuWidgetClass.ToSoftObjectPath().ToString() : TEXT("<none>"),
+        Registry && Registry->StartMenuWidgetClass.IsValid(),
+        FShaderPipelineCache::NumPrecompilesRemaining(), IsAsyncLoading(), *LastStartScreenFailure));
 }
 
 bool AMainGameMode::InitializeRegistryDrivenUI()
 {
+    LastStartScreenFailure.Reset();
     UWorld* World = GetWorld();
     APlayerController* PlayerController = IsValid(World) ? UGameplayStatics::GetPlayerController(this, 0) : nullptr;
     if (!IsValid(World) || !IsValid(PlayerController) || !PlayerController->IsLocalController()
         || !PlayerController->GetLocalPlayer() || !World->GetGameViewport())
     {
+        LastStartScreenFailure = TEXT("Local player or game viewport is not ready");
         return false;
     }
 
     UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
     if (!IsValid(Registry))
     {
+        LastStartScreenFailure = TEXT("GameInstance could not initialize AssetRegistry");
         UE_LOG(LogTemp, Error, TEXT("MainGameMode cannot initialize registry-driven UI because the central AssetRegistry is unavailable."));
         return false;
     }
@@ -335,15 +411,30 @@ bool AMainGameMode::InitializeRegistryDrivenUI()
         }
     };
 
-    if (!IsValid(StartMenuWidget) && !Registry->StartMenuWidgetClass.IsNull())
+    if (!IsValid(StartMenuWidget))
     {
-        if (UClass* WidgetClass = Registry->StartMenuWidgetClass.LoadSynchronous();
-            IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
+        UClass* WidgetClass = Registry->StartMenuWidgetClass.LoadSynchronous();
+        if (!IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
         {
-            UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
-            SetStartMenuWidget(Widget);
-            AddTopLevelWidget(Widget, 10);
+            LastStartScreenFailure = FString::Printf(
+                TEXT("StartMenu class load/validation failed: path=%s resolved=%s expectedBase=%s flags=0x%08x"),
+                *Registry->StartMenuWidgetClass.ToSoftObjectPath().ToString(),
+                *GetPathNameSafe(WidgetClass), *UStartWorldWidget::StaticClass()->GetPathName(),
+                IsValid(WidgetClass) ? static_cast<uint32>(WidgetClass->GetClassFlags()) : 0u);
+            return false;
         }
+        UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
+        if (!IsValid(Widget))
+        {
+            LastStartScreenFailure = FString::Printf(
+                TEXT("CreateWidget failed: class=%s player=%s world=%s"),
+                *WidgetClass->GetPathName(), *GetPathNameSafe(PlayerController), *GetPathNameSafe(World));
+            return false;
+        }
+        if (bStartupEnding) return false;
+        SetStartMenuWidget(Widget);
+        AddTopLevelWidget(Widget, 10);
+        if (bStartupEnding) return false;
     }
 
     if (!IsValid(WorldSelectionWidget) && !Registry->WorldSelectionWidgetClass.IsNull())
@@ -352,8 +443,10 @@ bool AMainGameMode::InitializeRegistryDrivenUI()
             IsUsableWidgetClass(WidgetClass, UWorldSelectionWidget::StaticClass()))
         {
             UWorldSelectionWidget* Widget = CreateWidget<UWorldSelectionWidget>(PlayerController, WidgetClass);
+            if (bStartupEnding) return false;
             SetWorldSelectionWidget(Widget);
             AddTopLevelWidget(Widget, 11);
+            if (bStartupEnding) return false;
         }
     }
 
@@ -363,16 +456,20 @@ bool AMainGameMode::InitializeRegistryDrivenUI()
             IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
         {
             UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
+            if (bStartupEnding) return false;
             SetMultiplayerMenuWidget(Widget);
             AddTopLevelWidget(Widget, 12);
+            if (bStartupEnding) return false;
         }
     }
 
     EnsureSettingsMenuWidget();
+    if (bStartupEnding) return false;
 
     // Use the same creation/attachment path here and when the Projects button is clicked.
     if (IsValid(StartMenuWidget))
         StartMenuWidget->EnsureProjectSelectionWidget();
+    if (bStartupEnding) return false;
 
     AddTopLevelWidget(StartMenuWidget.Get(), 10);
     AddTopLevelWidget(WorldSelectionWidget.Get(), 11);
@@ -382,16 +479,21 @@ bool AMainGameMode::InitializeRegistryDrivenUI()
         AddTopLevelWidget(StartMenuWidget->GetProjectSelectionWidget(), 30);
     if (StartScreenInitializationAttempts == 1)
     {
-        FSimulatorFileServices::WriteStartupLog(FString::Printf(TEXT("Start menu class=%s; instance=%s; viewport=%d"),
+        FSimulatorFileServices::WriteStartupLog(FString::Printf(TEXT("Start menu class=%s; instance=%s; widgetInViewport=%d"),
             *Registry->StartMenuWidgetClass.ToSoftObjectPath().ToString(), *GetNameSafe(StartMenuWidget.Get()),
             IsValid(StartMenuWidget) && StartMenuWidget->IsInViewport()));
     }
     HideAllMenuWidgets();
-    return IsValid(StartMenuWidget) && StartMenuWidget->IsInViewport();
+    const bool bMenuAttached = IsValid(StartMenuWidget) && StartMenuWidget->IsInViewport();
+    if (!bMenuAttached)
+        LastStartScreenFailure = TEXT("StartMenu was created but could not attach to the local player screen");
+    return bMenuAttached;
 }
 
 void AMainGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    bStartupEnding = true;
+    ClearStartupStatus();
     if (IsValid(SettingsWidget))
     {
         SettingsWidget->OnCloseRequested.RemoveDynamic(this, &AMainGameMode::ReturnFromSettings);
