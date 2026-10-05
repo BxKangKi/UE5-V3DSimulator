@@ -179,7 +179,7 @@ bool ModelDefinitionJson::LoadDefinition(
 
     FString VersionText;
     if (!Root->TryGetStringField(V3DSimulatorJsonMetadata::Version, VersionText)
-        || VersionText.TrimStartAndEnd().IsEmpty())
+        || VersionText != V3DSimulatorJsonMetadata::SchemaVersion)
     {
         OutError = TEXT("required Version field is missing/empty");
         return false;
@@ -260,6 +260,10 @@ bool ModelDefinitionJson::LoadDefinition(
             return false;
         }
     }
+
+    if (!FGravityFieldSettings::ReadJson(Root, OutDefinition.GravityField, OutError)) return false;
+    if (OutDefinition.ModelType == EModelDefinitionType::Character && Root->HasField(TEXT("GravityField")))
+    { OutError = TEXT("GravityField is authored on Static or Dynamic models"); return false; }
 
     OutDefinition.GlbPath = FSafeFileIO::NormalizeFilePath(ExpectedGlbPath);
     OutDefinition.JsonPath = FSafeFileIO::NormalizeFilePath(JsonPath);

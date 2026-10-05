@@ -37,6 +37,18 @@
 
 namespace WorldEnvManagerPrivate
 {
+    void ConfigureLightShadows(UDirectionalLightComponent* Light)
+    {
+        if (!IsValid(Light)) return;
+        Light->SetCastShadows(true);
+        if (!Light->CastDynamicShadows)
+        {
+            Light->CastDynamicShadows = true;
+            Light->MarkRenderStateDirty();
+        }
+        Light->SetCastRaytracedShadows(ECastRayTracedShadow::UseProjectSetting);
+    }
+
     struct FSkyLightRotations
     {
         FRotator Sun = FRotator::ZeroRotator;
@@ -138,6 +150,7 @@ AWorldEnvManager::AWorldEnvManager()
     Sun = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("Sun"));
     Sun->SetupAttachment(RootComponent);
     Sun->SetMobility(EComponentMobility::Movable);
+    WorldEnvManagerPrivate::ConfigureLightShadows(Sun);
     // SkyAtmosphere ignores an ordinary directional light when generating the sun disk and
     // aerial perspective. Explicitly reserve atmosphere-light slot zero for the sun.
     Sun->SetAtmosphereSunLight(true);
@@ -157,6 +170,7 @@ AWorldEnvManager::AWorldEnvManager()
     Moon = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("Moon"));
     Moon->SetupAttachment(RootComponent);
     Moon->SetMobility(EComponentMobility::Movable);
+    WorldEnvManagerPrivate::ConfigureLightShadows(Moon);
     // Slot one lets SkyAtmosphere render a separate moon disk without replacing the sun.
     Moon->SetAtmosphereSunLight(true);
     Moon->SetAtmosphereSunLightIndex(1);
@@ -195,6 +209,8 @@ AWorldEnvManager::AWorldEnvManager()
     Skybox->SetupAttachment(RootComponent);
     Skybox->SetWorldScale3D(FVector(8192.0f, 8192.0f, 8192.0f));
     Skybox->SetEnableGravity(false);
+    Skybox->SetCastShadow(false);
+    Skybox->SetVisibleInRayTracing(false);
 
     SkyLight = CreateDefaultSubobject<USkyLightComponent>(TEXT("SkyLight"));
     SkyLight->SetupAttachment(RootComponent);
@@ -209,6 +225,15 @@ AWorldEnvManager::AWorldEnvManager()
 void AWorldEnvManager::BeginPlay()
 {
     Super::BeginPlay();
+    // Reapply after Blueprint defaults/construction scripts have been loaded.
+    WorldEnvManagerPrivate::ConfigureLightShadows(Sun);
+    WorldEnvManagerPrivate::ConfigureLightShadows(Moon);
+    if (IsValid(Skybox))
+    {
+        Skybox->SetCastShadow(false);
+        Skybox->SetVisibleInRayTracing(false);
+    }
+
 
     SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     if (UGameManagerSubSystem* GameManager = SubSystem.Get())

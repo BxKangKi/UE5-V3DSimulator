@@ -52,6 +52,9 @@ class V3DSIMULATOR_API ADynamicActor : public AActor
     GENERATED_BODY()
 
 public:
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Gravity")
+    TObjectPtr<class UGravityFieldComponent> GravityField;
+
     ADynamicActor();
 
     /** Runtime-only load. InModelReference must resolve to an immutable .v3d member. */

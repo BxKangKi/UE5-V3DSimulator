@@ -186,6 +186,7 @@ public:
     UGameManagerSubSystem* GetGameManager();
 
 protected:
+    virtual void UpdateRotation(float DeltaTime) override;
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void SetupInputComponent() override;
@@ -417,6 +418,8 @@ private:
     bool bAnyInputMappingContextApplied = false;
     /** Prevents SetIgnoreMoveInput/SetIgnoreLookInput from accumulating an unmatched stack. */
     bool bGameplayInputSuppressed = false;
+    TWeakObjectPtr<APawn> GravityViewPawn;
+    FQuat GravityViewFrame = FQuat::Identity;
     int32 GameUpdateTickHandle = INDEX_NONE;
     double LastPrimaryInputTime = -1.0;
     double LastSecondaryInputTime = -1.0;

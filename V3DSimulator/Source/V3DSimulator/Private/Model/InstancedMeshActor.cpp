@@ -14,6 +14,7 @@
 #include "Components/SceneComponent.h"
 #include "Components/ShapeComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Model/V3DMeshRendering.h"
 
 AInstancedMeshActor::AInstancedMeshActor()
 {
@@ -27,6 +28,7 @@ AInstancedMeshActor::AInstancedMeshActor()
     MeshComponent = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("InstancedMesh"));
     MeshComponent->SetupAttachment(Root);
     MeshComponent->SetMobility(EComponentMobility::Movable);
+    V3DMeshRendering::ConfigureWorldMesh(MeshComponent);
     MeshComponent->SetGenerateOverlapEvents(false);
     MeshComponent->SetCanEverAffectNavigation(false);
     MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -178,6 +180,7 @@ UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh
         return nullptr;
     }
 
+    V3DMeshRendering::ConfigureWorldMesh(MeshComponent);
     UStaticMesh* ExistingMesh = MeshComponent->GetStaticMesh();
     if (IsValid(ExistingMesh) && ExistingMesh != Mesh && !LoadedNodes.IsEmpty())
     {

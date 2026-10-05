@@ -23,13 +23,13 @@ namespace EntityArchivePrivate
 {
     constexpr uint64 Magic = 0x32595449544E4547ull; // ASCII "GENTITY2", little endian.
     constexpr uint64 FooterMagic = 0x325254464D4F4347ull; // ASCII "GCOMFTR2", little endian.
-    constexpr uint32 Version = 2;
+    constexpr uint32 Version = 3;
     constexpr int32 HeaderBytes = 64;
     constexpr int32 CommitFooterBytes = 56;
     constexpr int32 RecoveryScanBytes = 1024 * 1024;
     constexpr uint32 ChunkPayloadMagic = 0x31484345u; // "ECH1"
     constexpr uint32 StatePayloadMagic = 0x31545345u; // "EST1"
-    constexpr uint16 PayloadVersion = 1;
+    constexpr uint16 PayloadVersion = 2;
     constexpr int32 MaxObjectsPerChunk = 1000000;
     constexpr int32 MaxPlayers = 10000;
     constexpr int32 MaxItemsPerPlayer = 65536;
@@ -328,7 +328,7 @@ namespace EntityArchivePrivate
         for (const FWorldChunkCoordinate& Coordinate : Coordinates)
         {
             Writer.I32(Coordinate.X); Writer.I32(Coordinate.Y); Writer.I32(Coordinate.Z);
-            Writer.U32(0);
+            Writer.U32(Chunks.FindChecked(Coordinate).bContainsGravitySource ? 1 : 0);
             WriteRecord(Writer, Chunks.FindChecked(Coordinate));
         }
         if (!Writer.IsOk())
@@ -360,8 +360,10 @@ namespace EntityArchivePrivate
         {
             FWorldChunkCoordinate Coordinate;
             Coordinate.X = Reader.I32(); Coordinate.Y = Reader.I32(); Coordinate.Z = Reader.I32();
-            (void)Reader.U32();
-            const FEntityArchiveStore::FRecord Record = ReadRecord(Reader);
+            const uint32 Flags = Reader.U32();
+            if (Flags > 1) { OutError = TEXT("Invalid .dat chunk flags"); return false; }
+            FEntityArchiveStore::FRecord Record = ReadRecord(Reader);
+            Record.bContainsGravitySource = Flags != 0;
             if (!Reader.IsOk() || OutChunks.Contains(Coordinate)
                 || !IsValidRecord(Record, Footer.DirectoryOffset, Footer.CommittedSize,
                     FEntityArchiveStore::MaxChunkPayloadBytes, false))
@@ -580,7 +582,7 @@ namespace EntityArchivePrivate
         for (const FWorldChunkObject& Object : Objects)
         {
             if (!Object.EntityUUID.IsValid() || !Object.ModelUUID.IsValid()
-                || SeenEntities.Contains(Object.EntityUUID)
+                || !Object.GravityField.IsValid() || SeenEntities.Contains(Object.EntityUUID)
                 || !IsFiniteVector(Object.Location) || !IsFiniteQuat(Object.Rotation)
                 || !Object.Rotation.IsNormalized() || !IsFiniteVector(Object.Scale)
                 || !IsFiniteVector(Object.Velocity) || !IsFiniteVector(Object.AngularVelocity))
@@ -596,6 +598,12 @@ namespace EntityArchivePrivate
             Writer.Vector(Object.Scale);
             Writer.Vector(Object.Velocity);
             Writer.Vector(Object.AngularVelocity);
+            Writer.U32(Object.GravityField.bEnabled ? 1 : 0);
+            Writer.U32(static_cast<uint32>(Object.GravityField.Falloff));
+            Writer.I32(Object.GravityField.Priority);
+            Writer.Double(Object.GravityField.RadiusCm);
+            Writer.Double(Object.GravityField.StrengthCmPerSecondSquared);
+            Writer.Vector(Object.GravityField.LocalCenter);
         }
         if (!Writer.IsOk() || OutBytes.Num() > FEntityArchiveStore::MaxChunkPayloadBytes)
         {
@@ -616,7 +624,7 @@ namespace EntityArchivePrivate
         (void)Reader.U16();
         const uint32 Count = Reader.U32();
         if (!Reader.IsOk() || ReadMagic != ChunkPayloadMagic || ReadVersion != PayloadVersion
-            || Count > MaxObjectsPerChunk)
+            || Count > MaxObjectsPerChunk || Count > static_cast<uint32>(FMath::Max(0, Bytes.Num() - 12) / 212))
         {
             OutError = TEXT("The entity chunk header or object count is invalid");
             return false;
@@ -634,8 +642,17 @@ namespace EntityArchivePrivate
             Object.Scale = Reader.Vector();
             Object.Velocity = Reader.Vector();
             Object.AngularVelocity = Reader.Vector();
+            const uint32 Enabled = Reader.U32();
+            const uint32 Falloff = Reader.U32();
+            if (Enabled > 1 || Falloff > 1) { OutError = TEXT("Invalid saved gravity flags"); return false; }
+            Object.GravityField.bEnabled = Enabled != 0;
+            Object.GravityField.Falloff = static_cast<EGravityFieldFalloff>(Falloff);
+            Object.GravityField.Priority = Reader.I32();
+            Object.GravityField.RadiusCm = Reader.Double();
+            Object.GravityField.StrengthCmPerSecondSquared = Reader.Double();
+            Object.GravityField.LocalCenter = Reader.Vector();
             if (!Reader.IsOk() || !Object.EntityUUID.IsValid() || !Object.ModelUUID.IsValid()
-                || SeenEntities.Contains(Object.EntityUUID)
+                || !Object.GravityField.IsValid() || SeenEntities.Contains(Object.EntityUUID)
                 || !IsFiniteVector(Object.Location) || !IsFiniteQuat(Object.Rotation)
                 || !Object.Rotation.IsNormalized() || !IsFiniteVector(Object.Scale)
                 || !IsFiniteVector(Object.Velocity) || !IsFiniteVector(Object.AngularVelocity))
@@ -964,6 +981,8 @@ TSharedPtr<FEntityArchiveStore, ESPMode::ThreadSafe> FEntityArchiveStore::Open(
         MakeShared<FEntityArchiveStore, ESPMode::ThreadSafe>();
     Result->Path = ArchivePath;
     Result->ChunkRecords = MoveTemp(BestChunks);
+    for (const auto& Pair : Result->ChunkRecords)
+        if (Pair.Value.bContainsGravitySource) Result->GravitySourceChunks.Add(Pair.Key);
     Result->RuntimeStateRecord = BestState;
     Result->Generation = BestFooter.Generation;
     Result->NextWriteOrder = BestFooter.Generation;
@@ -1035,6 +1054,7 @@ FSafeFileWriteResult FEntityArchiveStore::SaveChunks(
     }
 
     TMap<FWorldChunkCoordinate, TArray<uint8>> Payloads;
+    TSet<FWorldChunkCoordinate> Sources;
     int64 TotalPayloadBytes = 0;
     for (const TPair<FWorldChunkCoordinate, TArray<FWorldChunkObject>>& Pair : Chunks)
     {
@@ -1058,10 +1078,12 @@ FSafeFileWriteResult FEntityArchiveStore::SaveChunks(
         }
         TotalPayloadBytes += static_cast<int64>(Bytes.Num());
         Payloads.Add(Pair.Key, MoveTemp(Bytes));
+        for (const auto& Object : Pair.Value)
+            if (Object.GravityField.bEnabled) { Sources.Add(Pair.Key); break; }
     }
 
     FString Error;
-    if (!CommitChunkRecords(Payloads, WriteOrders, Error))
+    if (!CommitChunkRecords(Payloads, Sources, WriteOrders, Error))
     {
         return MakeWriteResult(Path, ESafeFileIOStatus::CommitFailed, Error);
     }
@@ -1206,6 +1228,7 @@ bool FEntityArchiveStore::CommitRuntimeState(
 
 bool FEntityArchiveStore::CommitChunkRecords(
     const TMap<FWorldChunkCoordinate, TArray<uint8>>& Payloads,
+    const TSet<FWorldChunkCoordinate>& Sources,
     const TMap<FWorldChunkCoordinate, uint64>& WriteOrders,
     FString& OutError)
 {
@@ -1273,6 +1296,7 @@ bool FEntityArchiveStore::CommitChunkRecords(
         Record.Offset = static_cast<uint64>(Cursor);
         Record.Size = static_cast<uint64>(Payload.Num());
         Record.Crc = FCrc::MemCrc32(Payload.GetData(), Payload.Num());
+        Record.bContainsGravitySource = Sources.Contains(Coordinate);
         CandidateChunks.Add(Coordinate, Record);
         Cursor += Payload.Num();
     }
@@ -1323,6 +1347,17 @@ bool FEntityArchiveStore::CommitChunkRecords(
     }
 
     ChunkRecords = MoveTemp(CandidateChunks);
+    for (const auto& Coordinate : Coordinates)
+    {
+        if (Sources.Contains(Coordinate)) GravitySourceChunks.Add(Coordinate);
+        else GravitySourceChunks.Remove(Coordinate);
+    }
     Generation = Footer.Generation;
     return true;
+}
+
+void FEntityArchiveStore::GetGravitySourceChunks(TArray<FWorldChunkCoordinate>& OutCoordinates) const
+{
+    FScopeLock Lock(&Mutex);
+    OutCoordinates = GravitySourceChunks.Array();
 }

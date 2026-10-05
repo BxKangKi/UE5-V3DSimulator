@@ -145,7 +145,7 @@ bool V3DSimulatorProjectConfig::Parse(
     OutConfig.Name.TrimStartAndEndInline();
     if (OutConfig.Name.IsEmpty()) { OutError = TEXT("Project Name is empty."); return false; }
     Json->TryGetStringField(V3DSimulatorJsonMetadata::Version, OutConfig.Version);
-    if (OutConfig.Version.IsEmpty()) { OutError = TEXT("Project config requires Version."); return false; }
+    if (OutConfig.Version != V3DSimulatorJsonMetadata::SchemaVersion) { OutError = TEXT("Unsupported project Version; use the current README schema."); return false; }
 
     if (OutConfig.ProjectType == EV3DSimulatorProjectType::World)
     {
@@ -180,21 +180,6 @@ bool V3DSimulatorProjectConfig::Load(
         return false;
     }
 
-    bool bChanged = false;
-    if (!Normalize(Loaded.JsonObject.ToSharedRef(), FolderFallback, bChanged, OutError))
-    {
-        if (OutJson) *OutJson = Loaded.JsonObject;
-        return false;
-    }
-    if (bChanged)
-    {
-        const FSafeFileWriteResult Save = FSafeFileIO::SaveJsonBlocking(Loaded.JsonObject.ToSharedRef(), ConfigPath);
-        if (!Save.IsSuccess())
-        {
-            OutError = FString::Printf(TEXT("Project config upgrade failed: %s"), *Save.Error);
-            return false;
-        }
-    }
     if (!Parse(Loaded.JsonObject, FolderFallback, OutConfig, OutError)) return false;
     if (OutJson) *OutJson = Loaded.JsonObject;
     return true;

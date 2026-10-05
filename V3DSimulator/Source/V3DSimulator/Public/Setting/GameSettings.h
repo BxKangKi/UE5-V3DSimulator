@@ -45,11 +45,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess")
     float AmbientOcclusionIntensity = 0.5f;
 
-    /** -11 = Histogram Auto Exposure. -10..20 = fixed manual EV100. */
+    /** -11 = Basic Auto Exposure. -10..20 = fixed manual EV100. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess", meta=(ClampMin="-11.0", ClampMax="20.0"))
     float Exposure = -11.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering")
+    // Requests hardware Lumen and RT shadows; unsupported renderers use raster shadows.
     bool bRayTracing = true;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|World")
@@ -73,26 +74,6 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ViewDistanceQuality = 2;
-
-    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1.0", ClampMax="512.0"))
-    float StreamingDistanceMultiplier = 64.0f;
-
-    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1.0", ClampMax="2.0"))
-    float StreamingUnloadDistanceMultiplier = 1.10f;
-
-    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="512.0", ClampMax="4096.0"))
-    float ObjectStreamingRadiusMeters = 2048.0f;
-
-    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="32"))
-    int32 StreamingSceneSpawnBudget = 32;
-
-    /** Legacy reflection compatibility only. Runtime streaming ignores this value. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="256"))
-    int32 StreamingNodeBudgetPerFrame = 256;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 AntiAliasingQuality = 2;

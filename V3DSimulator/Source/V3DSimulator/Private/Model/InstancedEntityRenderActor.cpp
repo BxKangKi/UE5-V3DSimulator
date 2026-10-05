@@ -12,6 +12,7 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Model/V3DMeshRendering.h"
 
 AInstancedEntityRenderActor::AInstancedEntityRenderActor()
 {
@@ -67,7 +68,7 @@ UInstancedStaticMeshComponent* AInstancedEntityRenderActor::FindOrCreateMeshComp
     Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     Component->SetGenerateOverlapEvents(false);
     Component->SetCanEverAffectNavigation(false);
-    Component->SetCastShadow(true);
+    V3DMeshRendering::ConfigureWorldMesh(Component);
     Component->SetStaticMesh(Mesh);
     const int32 SafeStartCull = FMath::Max(0, StartCullDistance);
     Component->SetCullDistances(SafeStartCull, FMath::Max(SafeStartCull, EndCullDistance));

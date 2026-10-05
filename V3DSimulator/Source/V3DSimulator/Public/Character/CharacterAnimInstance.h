@@ -143,7 +143,8 @@ private:
     UPROPERTY()
     TObjectPtr<UCharacterComponent> Component;
 
-    float PreviousActorYaw = 0.0f;
-    bool bHasPreviousActorYaw = false;
+    FVector PreviousActorForward = FVector::ForwardVector;
+    FVector PreviousGravityUp = FVector::UpVector;
+    bool bHasPreviousActorFrame = false;
     float YawAngularVelocity = 0.0f;
 };

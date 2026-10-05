@@ -21,6 +21,8 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Engine/Scene.h"
+#include "HAL/IConsoleManager.h"
+#include "RenderUtils.h"
 
 #define SETTING_FILE_NAME TEXT("/settings.json")
 
@@ -81,6 +83,22 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetBoolField(TEXT("bCloud"), bCloud);
         Json->TryGetNumberField(TEXT("CelShadingMode"), CelShadingMode);
         CelShadingMode = CelShadingMode >= 0.5f ? 1.0f : 0.0f;
+        ShadowQuality = FMath::Clamp(ShadowQuality, 0, 3);
+        TextureQuality = FMath::Clamp(TextureQuality, 0, 3);
+        ViewDistanceQuality = FMath::Clamp(ViewDistanceQuality, 0, 3);
+        AntiAliasingQuality = FMath::Clamp(AntiAliasingQuality, 0, 3);
+        PostProcessingQuality = FMath::Clamp(PostProcessingQuality, 0, 3);
+        EffectsQuality = FMath::Clamp(EffectsQuality, 0, 3);
+        FoliageQuality = FMath::Clamp(FoliageQuality, 0, 3);
+        ShadingQuality = FMath::Clamp(ShadingQuality, 0, 3);
+        GlobalIlluminationQuality = FMath::Clamp(GlobalIlluminationQuality, 0, 3);
+        ReflectionQuality = FMath::Clamp(ReflectionQuality, 0, 3);
+        BloomIntensity = FMath::IsFinite(BloomIntensity) ? FMath::Clamp(BloomIntensity, 0.0f, 8.0f) : 1.0f;
+        BloomThreshold = FMath::IsFinite(BloomThreshold) ? FMath::Clamp(BloomThreshold, -1.0f, 20.0f) : -1.0f;
+        AmbientOcclusionIntensity = FMath::IsFinite(AmbientOcclusionIntensity) ? FMath::Clamp(AmbientOcclusionIntensity, 0.0f, 1.0f) : 1.0f;
+        Exposure = FMath::IsFinite(Exposure) ? Exposure : 0.0f;
+        DynamicGlobalIlluminationMethod = FMath::Clamp(DynamicGlobalIlluminationMethod, 0, 2);
+        ReflectionMethod = FMath::Clamp(ReflectionMethod, 0, 2);
         return true;
     }
     return false;
@@ -289,6 +307,29 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         Settings->SaveSettings();
     }
 
+    // r.RayTracing is a startup/cook capability, not a runtime user toggle. Gate the
+    // supported effects instead, keeping raster shadows available when RT is unavailable.
+    if (!IsRunningCommandlet())
+    {
+        const bool bUseHardwareRayTracing = bRayTracing && IsRayTracingEnabled();
+        const auto SetRenderingOption = [](const TCHAR* Name, const int32 Value)
+        {
+            if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(Name))
+            {
+                // GameSetting has lower priority than RendererSettings. GameOverride is the
+                // intended UE 5.8 user override and still respects console/command-line locks.
+                if ((Variable->GetFlags() & ECVF_SetByMask) <= ECVF_SetByGameOverride
+                    && Variable->GetInt() != Value)
+                {
+                    Variable->Set(Value, ECVF_SetByGameOverride);
+                }
+            }
+        };
+        SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing"), bUseHardwareRayTracing ? 1 : 0);
+        SetRenderingOption(TEXT("r.RayTracing.Shadows"),
+            bUseHardwareRayTracing && ShadowQuality > 0 ? 1 : 0);
+    }
+
     if (IsValid(PostProcess))
     {
         FPostProcessSettings PPSettings = PostProcess->Settings;
@@ -334,6 +375,8 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
             PPSettings.AutoExposureSpeedDown = 4.0f;
         }
 
+        PPSettings.bOverride_DynamicGlobalIlluminationMethod = true;
+        PPSettings.bOverride_ReflectionMethod = true;
         PPSettings.DynamicGlobalIlluminationMethod = GetDynamicGlobalIlluminationMethod(DynamicGlobalIlluminationMethod);
         PPSettings.ReflectionMethod = GetReflectionMethod(ReflectionMethod);
         PostProcess->Settings = PPSettings;

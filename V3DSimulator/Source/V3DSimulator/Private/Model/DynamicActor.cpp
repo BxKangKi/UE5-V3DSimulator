@@ -8,6 +8,7 @@
  */
 
 #include "Model/DynamicActor.h"
+#include "Gravity/GravityFieldComponent.h"
 
 #include "Components/BoxComponent.h"
 #include "Dom/JsonObject.h"
@@ -197,6 +198,7 @@ namespace
 
 ADynamicActor::ADynamicActor()
 {
+    GravityField = CreateDefaultSubobject<UGravityFieldComponent>(TEXT("GravityField"));
     PrimaryActorTick.bCanEverTick = false;
     bReplicates = true;
     SetReplicateMovement(true);
@@ -316,6 +318,11 @@ bool ADynamicActor::LoadConfigJson(const FString& DefinitionJson)
         return false;
     }
 
+    FGravityFieldSettings FieldSettings;
+    FString FieldError;
+    if (!FGravityFieldSettings::ReadJson(RootObject, FieldSettings, FieldError)) return false;
+    GravityField->ApplyModelSettings(FieldSettings);
+
     RootObject->TryGetStringField(TEXT("DisplayName"), Config.DisplayName);
     if (Config.DisplayName.IsEmpty())
     {
@@ -323,25 +330,17 @@ bool ADynamicActor::LoadConfigJson(const FString& DefinitionJson)
     }
 
     RootObject->TryGetBoolField(TEXT("EnableCollision"), Config.bEnableCollision);
-    RootObject->TryGetBoolField(TEXT("bEnableCollision"), Config.bEnableCollision);
     RootObject->TryGetBoolField(TEXT("SimulatePhysics"), Config.bSimulatePhysics);
-    RootObject->TryGetBoolField(TEXT("bSimulatePhysics"), Config.bSimulatePhysics);
     double LoadedMassKg = Config.MassKg;
-    if ((RootObject->TryGetNumberField(TEXT("MassKg"), LoadedMassKg)
-            || RootObject->TryGetNumberField(TEXT("PhysicsMassKg"), LoadedMassKg))
+    if (RootObject->TryGetNumberField(TEXT("MassKg"), LoadedMassKg)
         && FMath::IsFinite(LoadedMassKg))
     {
         Config.MassKg = FMath::Clamp(static_cast<float>(LoadedMassKg), 0.0f, 1000000000.0f);
     }
     RootObject->TryGetStringField(TEXT("CollisionProfile"), Config.CollisionProfileName);
-    RootObject->TryGetStringField(TEXT("CollisionProfileName"), Config.CollisionProfileName);
 
     const TSharedPtr<FJsonObject>* TransformObject = nullptr;
     if (RootObject->TryGetObjectField(TEXT("Transform"), TransformObject) && TransformObject && TransformObject->IsValid())
-    {
-        Config.bOverrideLocalTransform = ReadTransformObject(*TransformObject, Config.LocalTransform);
-    }
-    else if (RootObject->TryGetObjectField(TEXT("LocalTransform"), TransformObject) && TransformObject && TransformObject->IsValid())
     {
         Config.bOverrideLocalTransform = ReadTransformObject(*TransformObject, Config.LocalTransform);
     }
@@ -554,7 +553,7 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
     bRuntimeResourcesReleased = false;
     BaseName = Model.Definition.Name;
     ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
-    LoadConfigJson(Model.DefinitionJson);
+    if (!LoadConfigJson(Model.DefinitionJson)) return false;
 
     UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
     if (!InstancedEntities)

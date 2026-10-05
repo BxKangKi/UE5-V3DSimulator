@@ -27,6 +27,19 @@ class V3DSIMULATOR_API UCharacterControllerMovementComponent : public UCharacter
 {
     GENERATED_BODY()
 
+public:
+    virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* TickFunction) override;
+    virtual float GetGravityZ() const override;
+    /** Also called before each predicted/server move, not only once per render frame. */
+    void RefreshGravity();
+protected:
+    virtual void PerformMovement(float DeltaSeconds) override;
+    virtual void SimulateMovement(float DeltaSeconds) override;
+    virtual void PhysicsRotation(float DeltaTime) override;
+private:
+    void AlignWithGravity();
+    double FieldGravityMagnitude = 0.0;
+    bool bInGravityField = false;
 protected:
     virtual void PhysSwimming(float DeltaTime, int32 Iterations) override;
     virtual void PhysicsVolumeChanged(APhysicsVolume* NewVolume) override;

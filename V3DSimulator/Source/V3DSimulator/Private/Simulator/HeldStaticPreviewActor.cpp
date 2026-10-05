@@ -6,6 +6,7 @@
  */
 
 #include "Simulator/HeldStaticPreviewActor.h"
+#include "Gravity/GravityFieldComponent.h"
 #include "Model/StaticActor.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
@@ -56,6 +57,7 @@ bool ASimulatorHeldStaticPreviewActor::InitializePreview(ACharacter* Holder, ASt
     VisualActor->SetReplicates(false); VisualActor->SetReplicateMovement(false); VisualActor->SetActorEnableCollision(false);
     VisualActor->AttachToComponent(PreviewRoot, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
     VisualActor->SetRenderOnlyStreaming(true);
+    VisualActor->GravityField->SetSettings(FGravityFieldSettings());
     if (!VisualActor->LoadStatic(ModelReference, TEXT("HeldStaticPreview")))
     {
         return false;

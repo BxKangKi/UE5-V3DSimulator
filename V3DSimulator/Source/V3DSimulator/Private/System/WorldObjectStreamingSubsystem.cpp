@@ -8,6 +8,7 @@
  */
 
 #include "System/WorldObjectStreamingSubsystem.h"
+#include "Gravity/GravityFieldComponent.h"
 
 #include "Components/PrimitiveComponent.h"
 #include "Engine/GameInstance.h"
@@ -167,7 +168,8 @@ void UWorldObjectStreamingSubsystem::Stop()
             || !A.Rotation.Equals(B.Rotation, 0.0001)
             || !A.Scale.Equals(B.Scale, 0.0001)
             || !A.Velocity.Equals(B.Velocity, 0.1)
-            || !A.AngularVelocity.Equals(B.AngularVelocity, 0.001);
+            || !A.AngularVelocity.Equals(B.AngularVelocity, 0.001)
+            || !(A.GravityField == B.GravityField);
     };
     const auto AddOrReplace = [](TArray<FWorldChunkObject>& Objects, const FWorldChunkObject& Object)
     {
@@ -445,6 +447,20 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
     // Spawn/teleport preloading is additive: keep the current player neighborhood resident while
     // the destination is prepared, then drop the extra observer after the move completes.
     if (bHasPriorityStreamingFocus) AddObserver(PriorityStreamingFocus);
+    // Field-bearing placements remain active even outside the visual streaming neighbourhood.
+    // This uses a compact persisted source index, never a scan/read of every object chunk.
+    if (Archive.IsValid())
+    {
+        TArray<FWorldChunkCoordinate> Sources;
+        Archive->GetGravitySourceChunks(Sources);
+        for (const auto& Coordinate : Sources) NewDesired.Add(Coordinate);
+    }
+    // Include uncommitted changes/moving sources before the next archive checkpoint.
+    for (const auto& Pair : LoadedChunks)
+        for (const auto& WeakActor : Pair.Value.Actors)
+            if (const AActor* Actor = WeakActor.Get())
+                if (const auto* Field = Actor->FindComponentByClass<UGravityFieldComponent>())
+                    if (Field->GetSettingsRef().bEnabled) { NewDesired.Add(Pair.Key); break; }
     // Known-empty cells are installed synchronously by PumpLoads. Reserve all three containers so
     // the first 2-4 km radius does not repeatedly rehash on the game thread.
     LoadedChunks.Reserve(LoadedChunks.Num() + NewDesired.Num());
@@ -776,6 +792,8 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
 
     if (Spawned)
     {
+        if (auto* Field = Spawned->FindComponentByClass<UGravityFieldComponent>())
+            Field->SetSettings(Object.GravityField);
         if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
         {
             Manager->TrackStreamedWorldObject(Spawned);
@@ -807,6 +825,8 @@ FWorldChunkObject UWorldObjectStreamingSubsystem::SnapshotActor(
     Result.Location = Transform.GetLocation();
     Result.Rotation = Transform.GetRotation().GetNormalized();
     Result.Scale = Transform.GetScale3D();
+    if (const auto* Field = Actor->FindComponentByClass<UGravityFieldComponent>())
+        Result.GravityField = Field->GetSettings();
     if (const UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Actor->GetRootComponent());
         IsValid(Primitive) && Primitive->IsSimulatingPhysics())
     {
@@ -1046,7 +1066,8 @@ void UWorldObjectStreamingSubsystem::UpdateObjectsAndCrossings()
                 || !Snapshot.Rotation.Equals(Chunk.Objects[Index].Rotation, 0.0001)
                 || !Snapshot.Scale.Equals(Chunk.Objects[Index].Scale, 0.0001)
                 || !Snapshot.Velocity.Equals(Chunk.Objects[Index].Velocity, 0.1)
-                || !Snapshot.AngularVelocity.Equals(Chunk.Objects[Index].AngularVelocity, 0.001))
+                || !Snapshot.AngularVelocity.Equals(Chunk.Objects[Index].AngularVelocity, 0.001)
+                || !(Snapshot.GravityField == Chunk.Objects[Index].GravityField))
             {
                 Chunk.Objects[Index] = Snapshot;
                 Chunk.bDirty = true;
@@ -1193,6 +1214,13 @@ void UWorldObjectStreamingSubsystem::RequestUnload(const FWorldChunkCoordinate& 
 
 void UWorldObjectStreamingSubsystem::FinalizeUnload(const FWorldChunkCoordinate& Coordinate)
 {
+    if (FRuntimeChunk* Existing = LoadedChunks.Find(Coordinate))
+        for (const auto& WeakActor : Existing->Actors)
+            if (const AActor* Actor = WeakActor.Get())
+                if (const auto* Field = Actor->FindComponentByClass<UGravityFieldComponent>())
+                    if (Field->GetSettingsRef().bEnabled)
+                    { Existing->bUnloadAfterSave = false; return; }
+
     FRuntimeChunk Chunk;
     if (!LoadedChunks.RemoveAndCopyValue(Coordinate, Chunk)) return;
     UWorld* const World = GetWorld();

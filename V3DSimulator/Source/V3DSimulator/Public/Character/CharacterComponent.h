@@ -388,8 +388,8 @@ private:
     FORCEINLINE float ClampGroundSpeed(const float Speed, const float Normal, const float Min);
     void ApplyMoveRightForward(ACharacterController *InOwner, const FRotator &ControlRotation, const FVector &Speed);
     bool CheckIfLieOnBack(const USkeletalMeshComponent *SkeletalMesh);
-    /** Resolves get-up yaw from the current simulated head-to-pelvis axis, with pelvis yaw fallback. */
-    float GetMeshForwardYaw(const bool Back, const USkeletalMeshComponent *SkeletalMesh, float FallbackYaw = 0.0f);
+    /** Resolves a full get-up frame on the current gravity plane. */
+    FRotator GetMeshForwardRotation(bool Back, const USkeletalMeshComponent* SkeletalMesh, const FRotator& Fallback);
     float GetRagdollReleaseSpeedSquared(USkeletalMeshComponent *SkeletalMesh) const;
     void UpdateRagdoll(const float DeltaTime, ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);
     FORCEINLINE FVector CalculateImpactVelocity(const FVector &CurrentVelocity);

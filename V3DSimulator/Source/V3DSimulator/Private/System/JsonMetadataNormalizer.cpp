@@ -6,21 +6,6 @@
 #include "System/JsonMetadata.h"
 #include "System/SafeFileIO.h"
 
-// File-specific scope prevents collisions when Unreal combines .cpp files for Unity builds.
-namespace V3DJsonMetadataNormalizerPrivate
-{
-namespace
-{
-    bool SetStringIfDifferent(const TSharedRef<FJsonObject>& Json, const TCHAR* Key, const FString& Value)
-    {
-        FString Existing;
-        if (Json->TryGetStringField(Key, Existing) && Existing == Value) return false;
-        Json->SetStringField(Key, Value);
-        return true;
-    }
-}
-} // namespace V3DJsonMetadataNormalizerPrivate
-
 bool V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
     const FString& JsonPath,
     const FString& BaseName,
@@ -42,6 +27,30 @@ bool V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
             return false;
         }
         Json = Loaded.JsonObject;
+        FString Value;
+        FGuid Id;
+        const bool ValidMetadata = Json->TryGetStringField(V3DSimulatorJsonMetadata::UUID, Value)
+            && FGuid::Parse(Value, Id) && Id.IsValid()
+            && Json->TryGetStringField(V3DSimulatorJsonMetadata::Name, Value) && !Value.TrimStartAndEnd().IsEmpty()
+            && Json->TryGetStringField(V3DSimulatorJsonMetadata::DisplayName, Value) && !Value.TrimStartAndEnd().IsEmpty()
+            && Json->TryGetStringField(V3DSimulatorJsonMetadata::Version, Value)
+            && Value == V3DSimulatorJsonMetadata::SchemaVersion
+            && Json->TryGetStringField(V3DSimulatorJsonMetadata::AssetType, Value)
+            && Value == V3DSimulatorAssetTypes::ToString(ExpectedAssetType)
+            && !Json->HasField(V3DSimulatorJsonMetadata::ProjectType);
+        if (!ValidMetadata)
+        { OutError = TEXT("Existing asset JSON must use the canonical metadata schema; no migration is performed"); return false; }
+        if (ExpectedAssetType == EAssetDefinitionType::Model)
+        {
+            EModelDefinitionType Type;
+            if (!Json->TryGetStringField(V3DSimulatorJsonMetadata::ModelType, Value)
+                || !V3DSimulatorModelTypes::TryParse(Value, Type))
+            { OutError = TEXT("Existing model JSON requires canonical ModelType"); return false; }
+        }
+        else if (Json->HasField(V3DSimulatorJsonMetadata::ModelType))
+        { OutError = TEXT("Sound JSON cannot contain ModelType"); return false; }
+        return true; // Validation-only for author-owned documents.
+
     }
     else
     {
@@ -49,73 +58,14 @@ bool V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
         bOutChanged = true;
     }
 
-    FString ExistingAssetType;
-    if (Json->TryGetStringField(V3DSimulatorJsonMetadata::AssetType, ExistingAssetType))
-    {
-        ExistingAssetType.TrimStartAndEndInline();
-        const FString Expected = V3DSimulatorAssetTypes::ToString(ExpectedAssetType);
-        if (!ExistingAssetType.IsEmpty() && !ExistingAssetType.Equals(Expected, ESearchCase::IgnoreCase))
-        {
-            OutError = FString::Printf(
-                TEXT("AssetType '%s' conflicts with this source file; expected %s."),
-                *ExistingAssetType, *Expected);
-            return false;
-        }
-    }
-
-    FString UUIDText;
-    FGuid UUID;
-    if (!Json->TryGetStringField(V3DSimulatorJsonMetadata::UUID, UUIDText)
-        || !FGuid::Parse(UUIDText, UUID) || !UUID.IsValid())
-    {
-        bOutChanged |= V3DJsonMetadataNormalizerPrivate::SetStringIfDifferent(Json.ToSharedRef(), V3DSimulatorJsonMetadata::UUID,
-            FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
-    }
-
-    FString Name;
-    Json->TryGetStringField(V3DSimulatorJsonMetadata::Name, Name);
-    Name.TrimStartAndEndInline();
-    if (Name.IsEmpty()) bOutChanged |= V3DJsonMetadataNormalizerPrivate::SetStringIfDifferent(Json.ToSharedRef(), V3DSimulatorJsonMetadata::Name, BaseName);
-
-    FString DisplayName;
-    Json->TryGetStringField(V3DSimulatorJsonMetadata::DisplayName, DisplayName);
-    DisplayName.TrimStartAndEndInline();
-    if (DisplayName.IsEmpty()) bOutChanged |= V3DJsonMetadataNormalizerPrivate::SetStringIfDifferent(Json.ToSharedRef(), V3DSimulatorJsonMetadata::DisplayName, BaseName);
-
-    bOutChanged |= V3DJsonMetadataNormalizerPrivate::SetStringIfDifferent(Json.ToSharedRef(), V3DSimulatorJsonMetadata::Version, V3DSimulatorJsonMetadata::SchemaVersion);
-    bOutChanged |= V3DJsonMetadataNormalizerPrivate::SetStringIfDifferent(Json.ToSharedRef(), V3DSimulatorJsonMetadata::AssetType, V3DSimulatorAssetTypes::ToString(ExpectedAssetType));
-
-    if (Json->HasField(V3DSimulatorJsonMetadata::ProjectType))
-    {
-        Json->RemoveField(V3DSimulatorJsonMetadata::ProjectType);
-        bOutChanged = true;
-    }
-
+    Json->SetStringField(V3DSimulatorJsonMetadata::UUID, FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+    Json->SetStringField(V3DSimulatorJsonMetadata::Name, BaseName);
+    Json->SetStringField(V3DSimulatorJsonMetadata::DisplayName, BaseName);
+    Json->SetStringField(V3DSimulatorJsonMetadata::Version, V3DSimulatorJsonMetadata::SchemaVersion);
+    Json->SetStringField(V3DSimulatorJsonMetadata::AssetType, V3DSimulatorAssetTypes::ToString(ExpectedAssetType));
     if (ExpectedAssetType == EAssetDefinitionType::Model)
-    {
-        FString ModelType;
-        Json->TryGetStringField(V3DSimulatorJsonMetadata::ModelType, ModelType);
-        ModelType.TrimStartAndEndInline();
-        if (ModelType.IsEmpty())
-        {
-            bOutChanged |= V3DJsonMetadataNormalizerPrivate::SetStringIfDifferent(Json.ToSharedRef(), V3DSimulatorJsonMetadata::ModelType,
-                V3DSimulatorModelTypes::ToString(DefaultModelType));
-        }
-    }
-    else if (Json->HasField(V3DSimulatorJsonMetadata::ModelType))
-    {
-        Json->RemoveField(V3DSimulatorJsonMetadata::ModelType);
-        bOutChanged = true;
-    }
-
-    if (bOutChanged)
-    {
-        const FSafeFileWriteResult Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), JsonPath);
-        if (!Saved.IsSuccess())
-        {
-            OutError = Saved.Error.IsEmpty() ? TEXT("Asset JSON upgrade could not be saved.") : Saved.Error;
-            return false;
-        }
-    }
+        Json->SetStringField(V3DSimulatorJsonMetadata::ModelType, V3DSimulatorModelTypes::ToString(DefaultModelType));
+    const FSafeFileWriteResult Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), JsonPath);
+    if (!Saved.IsSuccess()) { OutError = Saved.Error; return false; }
     return true;
 }

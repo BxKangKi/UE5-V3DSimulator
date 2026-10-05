@@ -10,6 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Gravity/GravityFieldTypes.h"
 #include "HAL/CriticalSection.h"
 #include "System/SafeFileIO.h"
 #include "World/PlayerData.h"
@@ -46,6 +47,7 @@ struct V3DSIMULATOR_API FWorldChunkObject
     FVector Scale = FVector::OneVector;
     FVector Velocity = FVector::ZeroVector;
     FVector AngularVelocity = FVector::ZeroVector;
+    FGravityFieldSettings GravityField;
 };
 
 /** Non-spatial dynamic state shares the same transactional .dat commit log. */
@@ -86,6 +88,7 @@ public:
      * This is a metadata-only query and never opens or reads the archive file.
      */
     bool ContainsChunk(const FWorldChunkCoordinate& Coordinate) const;
+    void GetGravitySourceChunks(TArray<FWorldChunkCoordinate>& OutCoordinates) const;
 
     bool LoadChunk(
         const FWorldChunkCoordinate& Coordinate,
@@ -118,12 +121,14 @@ public:
         uint64 Offset = 0;
         uint64 Size = 0;
         uint32 Crc = 0;
+        bool bContainsGravitySource = false;
     };
 
 private:
     FString Path;
     mutable FCriticalSection Mutex;
     TMap<FWorldChunkCoordinate, FRecord> ChunkRecords;
+    TSet<FWorldChunkCoordinate> GravitySourceChunks;
     FRecord RuntimeStateRecord;
     uint64 Generation = 0;
     uint64 NextWriteOrder = 0;
@@ -135,6 +140,7 @@ private:
         FString& OutError);
     bool CommitChunkRecords(
         const TMap<FWorldChunkCoordinate, TArray<uint8>>& Payloads,
+        const TSet<FWorldChunkCoordinate>& Sources,
         const TMap<FWorldChunkCoordinate, uint64>& WriteOrders,
         FString& OutError);
 };

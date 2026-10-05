@@ -63,7 +63,6 @@ private:
     FString SourceReference;
     FGWorldBakedStaticMeshNativeCallback StaticCallback;
     FGWorldBakedSkeletalMeshNativeCallback SkeletalCallback;
-    FDelegateHandle StaticRayTracingHandle;
 
     void FailStarted(const FString& Reason);
     void Cleanup();

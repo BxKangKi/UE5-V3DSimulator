@@ -33,15 +33,21 @@ bool FProjectConfigCanonicalizationTest::RunTest(const FString& Parameters)
     IFileManager::Get().MakeDirectory(*Root, true);
     const FString ConfigPath = FPaths::Combine(Root, TEXT("config.json"));
 
-    const TSharedRef<FJsonObject> LegacyLike = MakeShared<FJsonObject>();
-    LegacyLike->SetNumberField(TEXT("CustomValue"), 42.0);
+    const TSharedRef<FJsonObject> Seed = MakeShared<FJsonObject>();
+    Seed->SetNumberField(TEXT("CustomValue"), 42.0);
     TestTrue(TEXT("Seed config saves"),
-        FSafeFileIO::SaveJsonBlocking(LegacyLike, ConfigPath).IsSuccess());
+        FSafeFileIO::SaveJsonBlocking(Seed, ConfigPath).IsSuccess());
 
     FV3DSimulatorProjectConfig Config;
     TSharedPtr<FJsonObject> Canonical;
     FString Error;
-    TestTrue(TEXT("Config loads and canonicalizes"),
+    TestFalse(TEXT("Incomplete existing config is rejected without migration"),
+        V3DSimulatorProjectConfig::Load(ConfigPath, TEXT("ExampleWorld"), Config, &Canonical, Error));
+    bool Created = false;
+    TestTrue(TEXT("Explicit creation supplies metadata"),
+        V3DSimulatorProjectConfig::Normalize(Seed, TEXT("ExampleWorld"), Created, Error));
+    TestTrue(TEXT("Canonical document saves"), FSafeFileIO::SaveJsonBlocking(Seed, ConfigPath).IsSuccess());
+    TestTrue(TEXT("Canonical config loads unchanged"),
         V3DSimulatorProjectConfig::Load(ConfigPath, TEXT("ExampleWorld"), Config, &Canonical, Error));
     TestTrue(TEXT("Canonical DOM exists"), Canonical.IsValid());
     if (Canonical.IsValid())
@@ -81,14 +87,20 @@ bool FAssetJsonCanonicalizationTest::RunTest(const FString& Parameters)
 
     bool bChanged = false;
     FString Error;
-    TestTrue(TEXT("Existing model JSON upgrades"),
+    TestFalse(TEXT("Incomplete existing asset is rejected without migration"),
         V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
             JsonPath, TEXT("House"), EAssetDefinitionType::Model,
             EModelDefinitionType::Static, bChanged, Error));
-    TestTrue(TEXT("Upgrade reports mutation"), bChanged);
+    TestFalse(TEXT("Rejected input is not mutated"), bChanged);
+    IFileManager::Get().Delete(*JsonPath);
+    TestTrue(TEXT("Missing model JSON is created"),
+        V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
+            JsonPath, TEXT("House"), EAssetDefinitionType::Model,
+            EModelDefinitionType::Static, bChanged, Error));
+    TestTrue(TEXT("Creation reports a new document"), bChanged);
 
     const FSafeJsonLoadResult Loaded = FSafeFileIO::LoadJsonBlocking(JsonPath);
-    TestTrue(TEXT("Upgraded JSON reloads"), Loaded.IsSuccess() && Loaded.JsonObject.IsValid());
+    TestTrue(TEXT("Created JSON reloads"), Loaded.IsSuccess() && Loaded.JsonObject.IsValid());
     if (Loaded.JsonObject.IsValid())
     {
         TestTrue(TEXT("UUID exists"), Loaded.JsonObject->HasField(V3DSimulatorJsonMetadata::UUID));
@@ -96,7 +108,12 @@ bool FAssetJsonCanonicalizationTest::RunTest(const FString& Parameters)
         TestEqual(TEXT("AssetType is Model"), Loaded.JsonObject->GetStringField(V3DSimulatorJsonMetadata::AssetType), FString(TEXT("Model")));
         TestEqual(TEXT("ModelType is Static"), Loaded.JsonObject->GetStringField(V3DSimulatorJsonMetadata::ModelType), FString(TEXT("Static")));
         TestFalse(TEXT("asset JSON never contains ProjectType"), Loaded.JsonObject->HasField(V3DSimulatorJsonMetadata::ProjectType));
-        TestEqual(TEXT("Unknown authored field is preserved"), Loaded.JsonObject->GetStringField(TEXT("AuthorNote")), FString(TEXT("keep-me")));
+        Loaded.JsonObject->SetStringField(TEXT("AuthorNote"), TEXT("keep-me"));
+        FSafeFileIO::SaveJsonBlocking(Loaded.JsonObject.ToSharedRef(), JsonPath);
+        bChanged = false;
+        TestTrue(TEXT("Canonical input passes without rewriting"), V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
+            JsonPath, TEXT("House"), EAssetDefinitionType::Model, EModelDefinitionType::Static, bChanged, Error));
+        TestFalse(TEXT("Canonical document is not mutated"), bChanged);
     }
 
     const TSharedRef<FJsonObject> Conflict = MakeShared<FJsonObject>();

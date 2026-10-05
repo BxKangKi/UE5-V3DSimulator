@@ -27,15 +27,14 @@ bool FV3DMenuClassDefaultsTest::RunTest(const FString& Parameters)
     Registry->BooleanSettingWidgetClass.Reset();
     Registry->FloatSettingWidgetClass.Reset();
     Registry->EnumSettingWidgetClass.Reset();
-    Registry->ProjectSelectionWidgetClass = TSoftClassPtr<UProjectSelectionWidget>(FSoftObjectPath(
-        TEXT("/Game/Blueprints/UI/WBP_BuildSelection.WBP_BuildSelection_C")));
+    Registry->ProjectSelectionWidgetClass.Reset();
     Registry->EnsureMenuDefaults();
     TestFalse(TEXT("Missing start menu repaired"), Registry->StartMenuWidgetClass.IsNull());
     TestFalse(TEXT("Missing settings menu repaired"), Registry->SettingsMenuWidgetClass.IsNull());
     TestFalse(TEXT("Missing toggle repaired"), Registry->BooleanSettingWidgetClass.IsNull());
     TestFalse(TEXT("Missing slider repaired"), Registry->FloatSettingWidgetClass.IsNull());
     TestFalse(TEXT("Missing dropdown repaired"), Registry->EnumSettingWidgetClass.IsNull());
-    TestEqual(TEXT("Serialized legacy redirector repaired"),
+    TestEqual(TEXT("Missing project browser receives canonical default"),
         Registry->ProjectSelectionWidgetClass.ToSoftObjectPath().ToString(), CanonicalPath);
     const FSoftObjectPath CustomPath(TEXT("/Game/Custom/ProjectBrowser.ProjectBrowser_C"));
     Registry->ProjectSelectionWidgetClass = TSoftClassPtr<UProjectSelectionWidget>(CustomPath);

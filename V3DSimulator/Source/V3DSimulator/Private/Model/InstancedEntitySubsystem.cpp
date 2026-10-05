@@ -8,6 +8,7 @@
  */
 
 #include "Model/InstancedEntitySubsystem.h"
+#include "Gravity/GravityFieldComponent.h"
 
 #include "Async/ParallelFor.h"
 #include "Misc/ScopeExit.h"
@@ -877,8 +878,10 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
             ObserverLocations);
         const EDistanceTier Tier = ResolveDistanceTier(BeforePhysics, DistanceSquared);
 
+        const auto* Field = BeforePhysics.Owner->FindComponentByClass<UGravityFieldComponent>();
+        const bool GravitySource = IsValid(Field) && Field->GetSettingsRef().bEnabled;
         bool bShouldPhysicsBeActive = true;
-        if (!BeforePhysics.Options.bAlwaysRelevant
+        if (!GravitySource && !BeforePhysics.Options.bAlwaysRelevant
             && BeforePhysics.Options.bDynamic
             && BeforePhysics.Options.bAllowPhysicsDistanceDeactivation)
         {

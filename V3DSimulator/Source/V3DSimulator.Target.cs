@@ -3,8 +3,7 @@
 
 /**
  * @file V3DSimulator.Target.cs
- // UE 5.8 target configuration for V3DSimulator.
- // UE 5.8 target configuration for V3DSimulator.
+ * UE 5.8 target configuration for V3DSimulator.
  */
 
 using UnrealBuildTool;

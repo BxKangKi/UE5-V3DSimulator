@@ -36,9 +36,7 @@ void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
     if (SettingsMenuWidgetClass.IsNull())
         SettingsMenuWidgetClass = TSoftClassPtr<USettingsMenuWidget>(FSoftObjectPath(
             TEXT("/Game/Blueprints/UI/WBP_Settings.WBP_Settings_C")));
-    // Old Blueprint defaults can retain this redirector even after the native CDO changes.
-    if (ProjectSelectionWidgetClass.IsNull() || ProjectSelectionWidgetClass.ToSoftObjectPath()
-        == FSoftObjectPath(TEXT("/Game/Blueprints/UI/WBP_BuildSelection.WBP_BuildSelection_C")))
+    if (ProjectSelectionWidgetClass.IsNull())
         ProjectSelectionWidgetClass = TSoftClassPtr<UProjectSelectionWidget>(FSoftObjectPath(
             TEXT("/Game/Blueprints/UI/WBP_ProjectSelection.WBP_ProjectSelection_C")));
     if (SelectionEntryWidgetClass.IsNull())

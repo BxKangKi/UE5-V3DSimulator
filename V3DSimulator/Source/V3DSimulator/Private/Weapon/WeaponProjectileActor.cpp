@@ -8,6 +8,8 @@
  */
 
 #include "Weapon/WeaponProjectileActor.h"
+#include "Gravity/GravityFieldSubsystem.h"
+#include "Engine/World.h"
 
 #include "Components/SphereComponent.h"
 #include "GameFramework/Controller.h"
@@ -119,23 +121,29 @@ void AWeaponProjectileActor::UnregisterGameUpdate()
 void AWeaponProjectileActor::UpdateProjectile(float DeltaSeconds)
 {
     if (!HasAuthority() || bHitProcessed || IsActorBeingDestroyed()
-        || Velocity.ContainsNaN() || Velocity.IsNearlyZero()
-        || !FMath::IsFinite(DeltaSeconds) || DeltaSeconds <= 0.0f)
+        || !FMath::IsFinite(DeltaSeconds) || DeltaSeconds <= 0.0f) return;
+    if (Velocity.ContainsNaN()) { Destroy(); return; }
+    const auto* Fields = GetWorld() ? GetWorld()->GetSubsystem<UGravityFieldSubsystem>() : nullptr;
+    // Bound catch-up work after stalls; every integration segment still performs a collision sweep.
+    float Remaining = FMath::Min(DeltaSeconds, 0.25f);
+    for (int32 Step = 0; Step < 16 && Remaining > UE_SMALL_NUMBER; ++Step)
     {
-        return;
-    }
-
-    const FVector NewLocation = GetActorLocation() + Velocity * DeltaSeconds;
-    FHitResult Hit;
-    if (NewLocation.ContainsNaN()) { Destroy(); return; }
-    SetActorLocation(NewLocation, true, &Hit, ETeleportType::None);
-    // Swept movement may already have delivered OnComponentHit and destroyed this actor.
-    if (bHitProcessed || IsActorBeingDestroyed()) return;
-    SetActorRotation(Velocity.Rotation());
-
-    if (Hit.bBlockingHit)
-    {
-        OnProjectileHit(Collision.Get(), Hit.GetActor(), Hit.GetComponent(), FVector::ZeroVector, Hit);
+        const float Dt = FMath::Min(Remaining, 1.0f / 60.0f);
+        Remaining -= Dt;
+        FVector Acceleration = FVector::ZeroVector;
+        if (Fields) Fields->Sample(GetActorLocation(), this, Acceleration);
+        const FVector NewLocation = GetActorLocation() + Velocity * Dt + Acceleration * (0.5 * Dt * Dt);
+        Velocity += Acceleration * Dt;
+        if (NewLocation.ContainsNaN() || Velocity.ContainsNaN()) { Destroy(); return; }
+        FHitResult Hit;
+        SetActorLocation(NewLocation, true, &Hit, ETeleportType::None);
+        if (bHitProcessed || IsActorBeingDestroyed()) return;
+        if (!Velocity.IsNearlyZero()) SetActorRotation(Velocity.Rotation());
+        if (Hit.bBlockingHit)
+        {
+            OnProjectileHit(Collision.Get(), Hit.GetActor(), Hit.GetComponent(), FVector::ZeroVector, Hit);
+            return;
+        }
     }
 }
 

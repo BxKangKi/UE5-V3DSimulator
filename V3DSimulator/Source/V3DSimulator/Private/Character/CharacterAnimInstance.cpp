@@ -9,6 +9,7 @@
  */
 
 #include "Character/CharacterAnimInstance.h"
+#include "Gravity/GravityFieldTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "System/PhysicsHelper.h"
 #include "System/MathHelper.h"
@@ -37,8 +38,9 @@ void UCharacterAnimInstance::ResetRuntimeAnimationState()
     UpSpeed = 0.0f;
     RotationSpeed = 0.0f;
     YawAngularVelocity = 0.0f;
-    PreviousActorYaw = 0.0f;
-    bHasPreviousActorYaw = false;
+    PreviousActorForward = FVector::ForwardVector;
+    PreviousGravityUp = FVector::UpVector;
+    bHasPreviousActorFrame = false;
     bShouldMove = false;
     bIsFlying = false;
     bIsSwimming = false;
@@ -140,25 +142,31 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     // State-only refreshes happen during physics/recovery transitions. They must
     // not consume the previous yaw or divide an old angle by a new frame time.
     const AActor* AnimationOwner = GetOwningActor();
-    if (IsValid(AnimationOwner) && FMath::IsFinite(AnimationOwner->GetActorRotation().Yaw))
+    const FVector GravityUp = -Movement->GetGravityDirection();
+    if (IsValid(AnimationOwner) && !AnimationOwner->GetActorQuat().ContainsNaN())
     {
-        const float CurrentActorYaw = AnimationOwner->GetActorRotation().Yaw;
-        if (!bHasPreviousActorYaw || Component->IsRagdollTransitionInProgress())
+        const FVector Forward = V3DGravityMath::PlanarForward(AnimationOwner->GetActorQuat(), GravityUp);
+        if (!bHasPreviousActorFrame || Component->IsRagdollTransitionInProgress())
         {
-            PreviousActorYaw = CurrentActorYaw;
-            bHasPreviousActorYaw = true;
+            PreviousActorForward = Forward;
+            PreviousGravityUp = GravityUp;
+            bHasPreviousActorFrame = true;
             YawAngularVelocity = 0.0f;
         }
         else if (SafeDeltaSeconds > SMALL_NUMBER)
         {
-            YawAngularVelocity = FMath::FindDeltaAngleDegrees(PreviousActorYaw, CurrentActorYaw) / SafeDeltaSeconds;
-            PreviousActorYaw = CurrentActorYaw;
+            const FVector Transported = FQuat::FindBetweenNormals(PreviousGravityUp, GravityUp).RotateVector(PreviousActorForward);
+            const double SinAngle = FVector::DotProduct(FVector::CrossProduct(Transported, Forward), GravityUp);
+            const double CosAngle = FMath::Clamp(FVector::DotProduct(Transported, Forward), -1.0, 1.0);
+            YawAngularVelocity = FMath::RadiansToDegrees(FMath::Atan2(SinAngle, CosAngle)) / SafeDeltaSeconds;
+            PreviousActorForward = Forward;
+            PreviousGravityUp = GravityUp;
         }
     }
     else
     {
         YawAngularVelocity = 0.0f;
-        bHasPreviousActorYaw = false;
+        bHasPreviousActorFrame = false;
     }
     RotationSpeed = FMath::Clamp(YawAngularVelocity / 180.0f, -1.0f, 1.0f);
 
@@ -170,9 +178,8 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     const FVector CurrentAccel = Movement->GetCurrentAcceleration();
 
     // 4. Compute speed values with built-in vector helpers.
-    // Size2D() avoids custom XY-length code and is easier to read.
     Velocity = CurrentVelocity.ContainsNaN() ? FVector::ZeroVector : CurrentVelocity;
-    Speed = Velocity.Size2D();
+    Speed = FVector::VectorPlaneProject(Velocity, GravityUp).Size();
     MoveSpeed = Velocity.Size();
 
     // 5. Update state flags directly from CharacterMovement and the filtered ragdoll snapshot.
@@ -231,7 +238,7 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     // changes, ceiling hits, or mode transitions.
     const float MaxSwim = Movement->MaxSwimSpeed;
     const float TargetUpSpeed = (bIsSwimming && MaxSwim > KINDA_SMALL_NUMBER)
-        ? FMath::Clamp(Velocity.Z / MaxSwim, -0.9f, 0.9f)
+        ? FMath::Clamp(FVector::DotProduct(Velocity, GravityUp) / MaxSwim, -0.9f, 0.9f)
         : 0.0f;
     const float UpSpeedInterpRate = bIsSwimming
         ? CharacterAnimTuning::SwimVerticalSpeedInterpRate

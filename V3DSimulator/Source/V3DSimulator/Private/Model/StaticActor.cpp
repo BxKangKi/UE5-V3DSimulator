@@ -8,6 +8,7 @@
  */
 
 #include "Model/StaticActor.h"
+#include "Gravity/GravityFieldComponent.h"
 
 #include "Async/ParallelFor.h"
 #include "Components/SceneComponent.h"
@@ -168,6 +169,7 @@ namespace StaticActorPrivate
 
 AStaticActor::AStaticActor()
 {
+    GravityField = CreateDefaultSubobject<UGravityFieldComponent>(TEXT("GravityField"));
     PrimaryActorTick.bCanEverTick = false;
     Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
     Root->SetMobility(EComponentMobility::Movable);
@@ -470,6 +472,9 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
         : nullptr;
     const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader =
         Database ? Database->GetArchiveReaderForModel(UUID) : nullptr;
+    FGWorldModelRecord FieldRecord;
+    if (Reader.IsValid() && Reader->FindRecord(UUID, FieldRecord))
+        GravityField->ApplyModelSettings(FieldRecord.Definition.GravityField);
     const uint64 RequestSerial = ++MetadataRequestSerial;
     const FString ExpectedReference = ModelReference;
     bAsyncLoading = true;
@@ -937,7 +942,7 @@ void AStaticActor::OnStreamProgress(
 bool AStaticActor::IsPlayerInsideModelRange() const
 {
     check(IsInGameThread());
-    if (!bHasModelMetadata || ModelMetadata.Size.IsNearlyZero(0.001f))
+    if (GravityField->GetSettingsRef().bEnabled || !bHasModelMetadata || ModelMetadata.Size.IsNearlyZero(0.001f))
     {
         return true;
     }
@@ -1062,10 +1067,10 @@ FglTFRuntimeStaticMeshConfig AStaticActor::BuildStreamingMeshConfig()
     // Runtime world streaming should not retain a CPU vertex copy for every visual mesh. The
     // stream action enables CPU access only for groups that actually request complex collision.
     Config.bAllowCPUAccess = false;
-    // Runtime Lumen-card generation serializes expensive render-data work and is a major source of
-    // long hitches on large worlds. Dynamic runtime meshes remain visible to normal surface/cache
-    // paths without eagerly generating cards for every streamed group.
-    Config.bBuildLumenCards = false;
+    // glTFRuntime supplies six bounds-aligned cards per LOD. Keep this compact representation
+    // for Lumen's surface cache; screen traces alone cannot cover off-screen world geometry.
+    // Mesh builds remain shared and streaming-concurrency limited.
+    Config.bBuildLumenCards = true;
     Config.bBuildNavCollision = !bRenderOnlyStreaming;
     if (bRenderOnlyStreaming)
     {

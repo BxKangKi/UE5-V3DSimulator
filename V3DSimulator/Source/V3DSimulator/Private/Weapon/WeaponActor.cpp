@@ -8,6 +8,7 @@
  */
 
 #include "Weapon/WeaponActor.h"
+#include "Gravity/GravityFieldComponent.h"
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/V3DSimulatorAssetRegistry.h"
 
@@ -83,17 +84,9 @@ namespace
             (*VectorObject)->TryGetNumberField(TEXT("X"), X);
             (*VectorObject)->TryGetNumberField(TEXT("Y"), Y);
             (*VectorObject)->TryGetNumberField(TEXT("Z"), Z);
-            Value = FVector(X, Y, Z);
-            return true;
-        }
-
-        const TArray<TSharedPtr<FJsonValue>>* Array = nullptr;
-        if (Object->TryGetArrayField(FieldName, Array) && Array && Array->Num() >= 3)
-        {
-            Value = FVector(
-                static_cast<float>((*Array)[0]->AsNumber()),
-                static_cast<float>((*Array)[1]->AsNumber()),
-                static_cast<float>((*Array)[2]->AsNumber()));
+            const FVector Parsed(X, Y, Z);
+            if (Parsed.ContainsNaN()) return false;
+            Value = Parsed;
             return true;
         }
 
@@ -144,7 +137,9 @@ namespace
         (*TransformObject)->TryGetNumberField(TEXT("ScaleY"), ScaleY);
         (*TransformObject)->TryGetNumberField(TEXT("ScaleZ"), ScaleZ);
 
-        Value = FTransform(FRotator(Pitch, Yaw, Roll), FVector(X, Y, Z), FVector(ScaleX, ScaleY, ScaleZ));
+        const FTransform Parsed(FRotator(Pitch, Yaw, Roll), FVector(X, Y, Z), FVector(ScaleX, ScaleY, ScaleZ));
+        if (Parsed.ContainsNaN()) return false;
+        Value = Parsed;
         return true;
     }
 
@@ -152,6 +147,7 @@ namespace
 
 AWeaponActor::AWeaponActor()
 {
+    GravityField = CreateDefaultSubobject<UGravityFieldComponent>(TEXT("GravityField"));
     PrimaryActorTick.bCanEverTick = false;
     bReplicates = true;
     SetReplicateMovement(true);
@@ -228,7 +224,7 @@ bool AWeaponActor::EquipFromModel(const FString& InModelReference, USceneCompone
 
     if (bResolved)
     {
-        LoadConfigJson(Model.DefinitionJson);
+        if (!LoadConfigJson(Model.DefinitionJson)) return false;
     }
     else
     {
@@ -301,6 +297,11 @@ bool AWeaponActor::LoadConfigJson(const FString& DefinitionJson)
         return false;
     }
 
+    FGravityFieldSettings FieldSettings;
+    FString FieldError;
+    if (!FGravityFieldSettings::ReadJson(RootObject, FieldSettings, FieldError)) return false;
+    GravityField->ApplyModelSettings(FieldSettings);
+
     RootObject->TryGetStringField(V3DSimulatorJsonMetadata::Version, Config.Version);
 
     FString SocketName;
@@ -323,13 +324,13 @@ bool AWeaponActor::LoadConfigJson(const FString& DefinitionJson)
     RootObject->TryGetNumberField(TEXT("ProjectileLifeSeconds"), Config.ProjectileLifeSeconds);
     RootObject->TryGetBoolField(TEXT("bProjectile"), Config.bProjectile);
 
-    Config.Range = FMath::Max(1.0f, Config.Range);
-    Config.Damage = FMath::Max(0.0f, Config.Damage);
-    Config.ImpactImpulse = FMath::Max(0.0f, Config.ImpactImpulse);
-    Config.FireInterval = FMath::Max(0.01f, Config.FireInterval);
-    Config.TraceRadius = FMath::Max(0.0f, Config.TraceRadius);
-    Config.ProjectileSpeed = FMath::Max(100.0f, Config.ProjectileSpeed);
-    Config.ProjectileLifeSeconds = FMath::Max(0.1f, Config.ProjectileLifeSeconds);
+    Config.Range = FMath::IsFinite(Config.Range) ? FMath::Clamp(Config.Range, 1.0f, 100000000.0f) : 20000.0f;
+    Config.Damage = FMath::IsFinite(Config.Damage) ? FMath::Clamp(Config.Damage, 0.0f, 10000000.0f) : 20.0f;
+    Config.ImpactImpulse = FMath::IsFinite(Config.ImpactImpulse) ? FMath::Clamp(Config.ImpactImpulse, 0.0f, 1000000000.0f) : 24000.0f;
+    Config.FireInterval = FMath::IsFinite(Config.FireInterval) ? FMath::Clamp(Config.FireInterval, 0.01f, 3600.0f) : 0.12f;
+    Config.TraceRadius = FMath::IsFinite(Config.TraceRadius) ? FMath::Clamp(Config.TraceRadius, 0.0f, 100000.0f) : 0.0f;
+    Config.ProjectileSpeed = FMath::IsFinite(Config.ProjectileSpeed) ? FMath::Clamp(Config.ProjectileSpeed, 100.0f, 10000000.0f) : 6500.0f;
+    Config.ProjectileLifeSeconds = FMath::IsFinite(Config.ProjectileLifeSeconds) ? FMath::Clamp(Config.ProjectileLifeSeconds, 0.1f, 3600.0f) : 5.0f;
     return true;
 }
 

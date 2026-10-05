@@ -5,7 +5,7 @@
 #include "Simulator/AssetDefinitionTypes.h"
 #include "Simulator/ModelDefinitionTypes.h"
 
-/** Upgrades one sibling asset JSON in place. Existing author fields are preserved. */
+/** Creates a missing sibling JSON. Existing documents are validated without migration or mutation. */
 namespace V3DSimulatorJsonMetadataNormalizer
 {
     V3DSIMULATOR_API bool EnsureAssetJson(

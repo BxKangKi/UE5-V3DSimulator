@@ -19,7 +19,6 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "PixelFormat.h"
-#include "Runtime/Launch/Resources/Version.h"
 #include "Setting/GameSettings.h"
 #include "Simulator/RuntimeModelResolver.h"
 #include "System/SafeFileIO.h"
@@ -76,15 +75,12 @@ namespace WorldBakedModelAssetPrivate
 {
     constexpr int32 MaxTextureMips = 32;
     constexpr int64 MaxTextureMipBytes = 1024ll * 1024ll * 1024ll;
-    // A bounded strong cache makes archive I/O reuse GC-safe without turning a streaming facade
-    // into permanent storage for every texture ever visited. The weak map may still reuse a texture
-    // that remains referenced by a live mesh/material after it falls out of this recent set.
-    // Speed-first streaming cache: enough residency to stop adjacent world chunks from repeatedly
-    // reopening/decoding/uploading the same shared textures. The cache remains bounded so a long
-    // traversal cannot retain the entire world forever.
-    constexpr int32 MaxStrongTextureCacheEntries = 256;
-    constexpr int64 MaxStrongTextureCacheBytes = 512ll * 1024ll * 1024ll;
-    constexpr int32 MaxStrongMaterialCacheEntries = 256;
+    // Per-facade admission budget for optional reuse, not for live scene resources.
+    // Charge retained mip bytes twice (CPU bulk + estimated GPU copy). Materials may
+    // join this strong cache only when all their textures are already admitted here.
+    constexpr int32 MaxStrongTextureCacheEntries = 128;
+    constexpr int64 MaxStrongTextureCacheBytes = 64ll * 1024ll * 1024ll;
+    constexpr int32 MaxStrongMaterialCacheEntries = 128;
 
     uint32 BuildMaterialConfigSignature(const FglTFRuntimeMaterialsConfig& Config)
     {
@@ -315,41 +311,6 @@ namespace WorldBakedModelAssetPrivate
             MakeShared<FglTFRuntimeParser>(EmptyRoot, FMatrix::Identity, 1.0f);
         return Builder->SetParser(EmptyParser);
     }
-
-    /**
-     * Runtime world meshes are short-lived streamed geometry. Keeping every one in the hardware
-     * ray-tracing scene makes UE build BLAS + persistent SBT records for each streamed mesh and,
-     * on large worlds, quickly exhausts the Always Resident RT geometry budget. Disable RT before
-     * glTFRuntime initializes render resources; raster/Lumen screen traces continue to work.
-     */
-    struct FScopedDisableStreamedStaticMeshRayTracing final
-    {
-        FDelegateHandle Handle;
-
-        FScopedDisableStreamedStaticMeshRayTracing()
-        {
-#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5) || ENGINE_MAJOR_VERSION > 5
-            Handle = FglTFRuntimeParser::OnPreCreatedStaticMesh.AddLambda(
-                [](FglTFRuntimeStaticMeshContextRef Context)
-                {
-                    if (Context->StaticMesh)
-                    {
-                        Context->StaticMesh->bSupportRayTracing = false;
-                    }
-                });
-#endif
-        }
-
-        ~FScopedDisableStreamedStaticMeshRayTracing()
-        {
-#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5) || ENGINE_MAJOR_VERSION > 5
-            if (Handle.IsValid())
-            {
-                FglTFRuntimeParser::OnPreCreatedStaticMesh.Remove(Handle);
-            }
-#endif
-        }
-    };
 
     /**
      * Converts archive POD arrays into glTFRuntime RuntimeLODs without touching any UObject.
@@ -823,9 +784,9 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
     WeakTextureCache.Add(TextureCacheKey, Texture);
 
     int64 ApproximateResidentBytes = 0;
-    for (const FGWorldBakedTextureMip& Mip : Baked.Mips)
+    for (int32 MipIndex = FirstRuntimeMip; MipIndex < Baked.Mips.Num(); ++MipIndex)
     {
-        ApproximateResidentBytes += static_cast<int64>(Mip.Bytes.Num());
+        ApproximateResidentBytes += 2ll * Baked.Mips[MipIndex].Bytes.Num();
     }
 
     if (ApproximateResidentBytes > 0
@@ -921,9 +882,23 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     const uint64 MaterialCacheKey =
         WorldBakedModelAssetPrivate::BuildMaterialCacheKey(Baked.MaterialId, Config);
     WeakMaterialCache.Add(MaterialCacheKey, Material);
-    // Same admission-only rule as textures. Entries advertised to worker threads as skippable
-    // material.dat dependencies must remain strongly resident until the facade itself is released.
-    if (MaterialCacheKeepAlive.Num() < WorldBakedModelAssetPrivate::MaxStrongMaterialCacheEntries)
+    // A MID strongly references its textures. Admitting it by count alone would bypass the
+    // byte budget above and keep every texture of an unloaded mesh alive. Only admit a MID
+    // whose complete texture set is already covered by the non-evicting texture cache.
+    bool bDependenciesBudgeted = true;
+    for (const FGWorldBakedTextureParameter& Parameter : Baked.Textures)
+    {
+        UTexture2D* const* Texture = Textures.Find(Parameter.TextureId);
+        if (Parameter.TextureId == INDEX_NONE || !Texture
+            || !TextureCacheKeepAlive.Contains(*Texture))
+        {
+            bDependenciesBudgeted = false;
+            break;
+        }
+    }
+    // Entries advertised to worker reads must remain resident until the facade is released.
+    if (bDependenciesBudgeted
+        && MaterialCacheKeepAlive.Num() < WorldBakedModelAssetPrivate::MaxStrongMaterialCacheEntries)
     {
         MaterialCacheKeepAlive.Add(Material);
         MaterialCacheKeepAliveKeys.Add(MaterialCacheKey);
@@ -1119,13 +1094,6 @@ void UWorldBakedMeshFinalizeRequest::InitializeSkeletal(
 void UWorldBakedMeshFinalizeRequest::Cleanup()
 {
     check(IsInGameThread());
-#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5) || ENGINE_MAJOR_VERSION > 5
-    if (StaticRayTracingHandle.IsValid())
-    {
-        FglTFRuntimeParser::OnPreCreatedStaticMesh.Remove(StaticRayTracingHandle);
-        StaticRayTracingHandle.Reset();
-    }
-#endif
     if (UWorldBakedModelAsset* StrongOwner = Owner.Get())
     {
         StrongOwner->ReleaseAsyncBuildReferences(Builder.Get());
@@ -1177,13 +1145,8 @@ void UWorldBakedMeshFinalizeRequest::BeginStatic(
         FailStarted(TEXT("Could not initialize the decoded-data static mesh finalizer"));
         return;
     }
-#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5) || ENGINE_MAJOR_VERSION > 5
-    StaticRayTracingHandle = FglTFRuntimeParser::OnPreCreatedStaticMesh.AddLambda(
-        [](FglTFRuntimeStaticMeshContextRef Context)
-        {
-            if (Context->StaticMesh) Context->StaticMesh->bSupportRayTracing = false;
-        });
-#endif
+    // Keep UStaticMesh's RT support default. glTFRuntime must initialize the RT
+    // representation before InitResources; changing the flag after completion is too late.
     FglTFRuntimeStaticMeshAsync NativeCallback;
     NativeCallback.BindDynamic(this, &UWorldBakedMeshFinalizeRequest::HandleStaticMeshFinalized);
     Builder->LoadStaticMeshFromRuntimeLODsAsync(LODs, NativeCallback, Config);
@@ -1517,8 +1480,6 @@ UStaticMesh* UWorldBakedModelAsset::LoadStaticMeshLODs(
                     WorldBakedModelAssetPrivate::InitializeEmptyMeshBuilder(Builder);
                 if (bBuilderInitialized)
                 {
-                    WorldBakedModelAssetPrivate::FScopedDisableStreamedStaticMeshRayTracing
-                        DisableRayTracing;
                     Result = Builder->LoadStaticMeshFromRuntimeLODs(LODs, Config);
                     // ExecuteSynchronousOperation may pump another queued native job before it
                     // returns, so protect the newly created mesh during that re-entrant window.

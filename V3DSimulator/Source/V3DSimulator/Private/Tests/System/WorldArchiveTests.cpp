@@ -14,6 +14,7 @@
 #include "Simulator/RuntimeModelResolver.h"
 
 #include "Engine/StaticMesh.h"
+#include "StaticMeshResources.h"
 #include "HAL/FileManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
@@ -478,8 +479,30 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
         MeshConfig.Outer = GetTransientPackage();
         MeshConfig.CacheMode = EglTFRuntimeCacheMode::None;
         MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::None;
+        MeshConfig.bAllowCPUAccess = false;
+        MeshConfig.bBuildLumenCards = true;
         UStaticMesh* RuntimeMesh = RuntimeAsset->LoadStaticMesh(0, MeshConfig, &Error);
         TestNotNull(TEXT("Build native static mesh from decoded archive members"), RuntimeMesh);
+        if (RuntimeMesh)
+        {
+            TestTrue(TEXT("Runtime mesh retains RT support before resource initialization"),
+                bool(RuntimeMesh->bSupportRayTracing));
+            TestFalse(TEXT("Render-only mesh does not request retained CPU vertices"),
+                bool(RuntimeMesh->bAllowCPUAccess));
+            const FStaticMeshRenderData* RenderData = RuntimeMesh->GetRenderData();
+            if (TestNotNull(TEXT("Decoded mesh has render data"), RenderData)
+                && TestTrue(TEXT("Decoded mesh has LOD0"), RenderData->LODResources.Num() > 0))
+            {
+                const FStaticMeshLODResources& LOD = RenderData->LODResources[0];
+                TestTrue(TEXT("Runtime mesh has sections"), LOD.Sections.Num() > 0);
+                for (const FStaticMeshSection& Section : LOD.Sections)
+                {
+                    TestTrue(TEXT("Decoded primitive casts shadows"), bool(Section.bCastShadow));
+                }
+                TestNotNull(TEXT("Runtime mesh supplies Lumen card metadata"),
+                    LOD.CardRepresentationData);
+            }
+        }
     }
 
     FString RebuildPath;
@@ -522,6 +545,11 @@ bool FEntityArchiveRecoveryTest::RunTest(const FString& Parameters)
     Object.Scale = FVector(1.0, 2.0, 1.0);
     Object.Velocity = FVector(10.0, 20.0, 30.0);
     Object.AngularVelocity = FVector(0.1, 0.2, 0.3);
+    Object.GravityField.bEnabled = true;
+    Object.GravityField.RadiusCm = 250000;
+    Object.GravityField.StrengthCmPerSecondSquared = 321;
+    Object.GravityField.Priority = 7;
+    Object.GravityField.LocalCenter = FVector(1,2,3);
 
     TArray<FWorldChunkObject> Objects;
     Objects.Add(Object);
@@ -534,6 +562,9 @@ bool FEntityArchiveRecoveryTest::RunTest(const FString& Parameters)
     State.WorldTime = 42.0f;
     State.SelectedPlayer = TEXT("Player");
     TestTrue(TEXT("Commit runtime state"), Store->SaveRuntimeState(State).IsSuccess());
+    TArray<FWorldChunkCoordinate> GravityChunks;
+    Store->GetGravitySourceChunks(GravityChunks);
+    TestTrue(TEXT("Gravity source index survives a state-only commit"), GravityChunks.Contains(SourceCoordinate));
 
     // Publish both halves of a boundary move under one footer. Recovery must never expose the
     // object in both coordinates or in neither coordinate.
@@ -561,6 +592,17 @@ bool FEntityArchiveRecoveryTest::RunTest(const FString& Parameters)
         TornTail, *EntityPath, &IFileManager::Get(), FILEWRITE_Append));
 
     Store = FEntityArchiveStore::Open(Root, false, Error);
+    if (Store.IsValid())
+    {
+        Store->GetGravitySourceChunks(GravityChunks);
+        TestFalse(TEXT("Old gravity source chunk unpinned after crossing"), GravityChunks.Contains(SourceCoordinate));
+        TestTrue(TEXT("New gravity source chunk pinned after reopen"), GravityChunks.Contains(DestinationCoordinate));
+        TArray<FWorldChunkObject> Reloaded;
+        if (TestTrue(TEXT("Reload gravity-bearing placement"), Store->LoadChunk(DestinationCoordinate, Reloaded, Error))
+            && TestEqual(TEXT("One placement restored"), Reloaded.Num(), 1))
+            TestTrue(TEXT("Per-object gravity settings round-trip"), Reloaded[0].GravityField == Object.GravityField);
+    }
+
     TestTrue(TEXT("Recover preceding commit footer"), Store.IsValid());
     if (!Store.IsValid()) return false;
 

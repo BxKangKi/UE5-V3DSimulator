@@ -39,6 +39,9 @@ class V3DSIMULATOR_API AStaticActor : public AActor
     GENERATED_BODY()
 
 public:
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Gravity")
+    TObjectPtr<class UGravityFieldComponent> GravityField;
+
     AStaticActor();
 
     /** Assigns the immutable gworld:// model reference before FinishSpawning for WorldStream use. */

@@ -9,6 +9,8 @@
  */
 
 #include "Character/PlayerCharacterController.h"
+#include "Character/CharacterControllerMovementComponent.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Character/CharacterController.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -1764,4 +1766,39 @@ UGameManagerSubSystem* APlayerCharacterController::GetGameManager()
         Manager->StartClientGameplaySession(this);
     }
     return Manager;
+}
+
+void APlayerCharacterController::UpdateRotation(float DeltaTime)
+{
+    ACharacterController* ControlledCharacter = Cast<ACharacterController>(GetPawn());
+    auto* Movement = ControlledCharacter ? Cast<UCharacterControllerMovementComponent>(ControlledCharacter->GetCharacterMovement()) : nullptr;
+    if (!Movement || !FMath::IsFinite(DeltaTime))
+    {
+        GravityViewPawn.Reset();
+        GravityViewFrame = FQuat::Identity;
+        Super::UpdateRotation(DeltaTime);
+        return;
+    }
+    Movement->RefreshGravity();
+    const FVector Up = -Movement->GetGravityDirection();
+    const bool NewPawn = GravityViewPawn.Get() != ControlledCharacter;
+    const FVector PreviousUp = NewPawn ? ControlledCharacter->GetActorUpVector() : GravityViewFrame.GetUpVector();
+    if (NewPawn)
+    {
+        GravityViewPawn = ControlledCharacter;
+        GravityViewFrame = ControlledCharacter->GetActorQuat();
+    }
+    const FQuat Transport = FQuat::FindBetweenNormals(PreviousUp, Up);
+    const FQuat WorldView = (Transport * GetControlRotation().Quaternion()).GetNormalized();
+    GravityViewFrame = (Transport * GravityViewFrame).GetNormalized();
+    FRotator LocalView = (GravityViewFrame.Inverse() * WorldView).Rotator();
+    FRotator DeltaRot = RotationInput;
+    if (LocalView.ContainsNaN() || DeltaRot.ContainsNaN()) return;
+    // Pitch limits and mouse yaw operate around the current gravity frame, including at the poles.
+    if (PlayerCameraManager) PlayerCameraManager->ProcessViewRotation(DeltaTime, LocalView, DeltaRot);
+    else LocalView += DeltaRot;
+    LocalView.Roll = 0.0f;
+    const FRotator View = (GravityViewFrame * LocalView.Quaternion()).GetNormalized().Rotator();
+    SetControlRotation(View);
+    if (APawn* ViewPawn = GetPawnOrSpectator()) ViewPawn->FaceRotation(View, DeltaTime);
 }

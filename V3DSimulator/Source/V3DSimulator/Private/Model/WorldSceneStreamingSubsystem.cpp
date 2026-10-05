@@ -18,6 +18,7 @@
 #include "GameFramework/Actor.h"
 #include "HAL/PlatformTime.h"
 #include "Model/StaticActor.h"
+#include "Gravity/GravityFieldComponent.h"
 #include "Simulator/ModelDatabaseSubsystem.h"
 #include "System/ActorHelper.h"
 #include "System/SimulatorFileServices.h"
@@ -202,6 +203,7 @@ void UWorldSceneStreamingSubsystem::StartWorldStreaming(
             Record.RuntimeReference = MoveTemp(RuntimeReference);
             Record.Bounds.Center = Summary.Center;
             Record.Bounds.Size = Summary.Size;
+            Record.bHasGravityField = ResolvedDefinition.GravityField.bEnabled;
             SceneRecords.Add(MoveTemp(Record));
         }
         else if (ResolvedDefinition.ModelType == EModelDefinitionType::Character)
@@ -696,14 +698,16 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
 
         if (bHasActor)
         {
-            if (!IsInsideRange(Record.Bounds, UnloadMultiplier))
+            const UGravityFieldComponent* Field = Existing->Get()->GravityField.Get();
+            const bool bActiveField = IsValid(Field) && Field->GetSettingsRef().bEnabled;
+            if (!Record.bHasGravityField && !bActiveField && !IsInsideRange(Record.Bounds, UnloadMultiplier))
             {
                 DestroySceneActor(Record.RuntimeReference);
             }
             continue;
         }
 
-        if (IsInsideRange(Record.Bounds, 1.0f))
+        if (Record.bHasGravityField || IsInsideRange(Record.Bounds, 1.0f))
         {
             ++PendingLoadCount;
             const double CandidateDistanceSq = GetNearestObserverDistanceSq(Record.Bounds);

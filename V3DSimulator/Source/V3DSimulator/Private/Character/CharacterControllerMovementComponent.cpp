@@ -4,6 +4,9 @@
 #include "GameFramework/PhysicsVolume.h"
 #include "Character/CharacterComponent.h"
 #include "GameFramework/Character.h"
+#include "Gravity/GravityFieldSubsystem.h"
+#include "Gravity/GravityFieldTypes.h"
+#include "Engine/World.h"
 
 void UCharacterControllerMovementComponent::PhysSwimming(const float DeltaTime, const int32 Iterations)
 {
@@ -47,4 +50,72 @@ void UCharacterControllerMovementComponent::PhysicsVolumeChanged(APhysicsVolume*
     }
 
     Super::PhysicsVolumeChanged(NewVolume);
+}
+
+void UCharacterControllerMovementComponent::RefreshGravity()
+{
+    UWorld* World = GetWorld();
+    if (!World || !CharacterOwner || !UpdatedComponent) return;
+    const auto* Fields = World->GetSubsystem<UGravityFieldSubsystem>();
+    FVector GravityAcceleration;
+    bInGravityField = Fields && Fields->Sample(UpdatedComponent->GetComponentLocation(), CharacterOwner, GravityAcceleration);
+    const FVector OldDirection = GetGravityDirection();
+    FVector Direction = World->GetGravityZ() > 0.0f ? FVector::UpVector : FVector::DownVector;
+    FieldGravityMagnitude = 0.0;
+    if (bInGravityField)
+    {
+        FieldGravityMagnitude = GravityAcceleration.Size();
+        // A zero-g field/field centre has no preferred up. Retain the last valid frame.
+        Direction = FieldGravityMagnitude > UE_SMALL_NUMBER ? GravityAcceleration / FieldGravityMagnitude : OldDirection;
+    }
+    if (!Direction.Equals(OldDirection, 1.e-6))
+    {
+        SetGravityDirection(Direction);
+        bForceNextFloorCheck = true;
+        CurrentFloor.Clear();
+        // A floor that belonged to a different gravity hemisphere is no longer support.
+        if (IsMovingOnGround() && FVector::DotProduct(OldDirection, Direction) < 0.9659258)
+            SetMovementMode(MOVE_Falling);
+    }
+    // Physics interaction must use the same acceleration as locomotion after a field transition.
+    const float Magnitude = FMath::Abs(GetGravityZ());
+    StandingDownwardForceScale = Magnitude > UE_SMALL_NUMBER ? 1.0f : 0.0f;
+}
+float UCharacterControllerMovementComponent::GetGravityZ() const
+{
+    return bInGravityField ? -static_cast<float>(FieldGravityMagnitude) * FMath::Max(0.0f, GravityScale)
+        : Super::GetGravityZ();
+}
+void UCharacterControllerMovementComponent::AlignWithGravity()
+{
+    if (!HasValidData() || !UpdatedComponent) return;
+    const auto* State = CharacterOwner->FindComponentByClass<UCharacterComponent>();
+    if (State && (State->IsRagdollTransitionInProgress() || State->IsStreamingMovementSuspended())) return;
+    const FVector Up = -GetGravityDirection();
+    const FQuat Current = UpdatedComponent->GetComponentQuat();
+    const FQuat Target = (FQuat::FindBetweenNormals(Current.GetUpVector(), Up) * Current).GetNormalized();
+    if (!Current.Equals(Target, 1.e-6)) MoveUpdatedComponent(FVector::ZeroVector, Target, true);
+}
+void UCharacterControllerMovementComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* TickFunction)
+{
+    RefreshGravity();
+    AlignWithGravity();
+    Super::TickComponent(DeltaTime, TickType, TickFunction);
+}
+void UCharacterControllerMovementComponent::PerformMovement(float DeltaSeconds)
+{
+    RefreshGravity();
+    AlignWithGravity();
+    Super::PerformMovement(DeltaSeconds);
+}
+void UCharacterControllerMovementComponent::SimulateMovement(float DeltaSeconds)
+{
+    RefreshGravity();
+    AlignWithGravity();
+    Super::SimulateMovement(DeltaSeconds);
+}
+void UCharacterControllerMovementComponent::PhysicsRotation(float DeltaTime)
+{
+    Super::PhysicsRotation(DeltaTime);
+    AlignWithGravity();
 }

@@ -26,7 +26,7 @@ namespace GWorldArchivePrivate
     // Current .v3d identity. This format intentionally has no compatibility reader for older layouts.
     constexpr uint64 Magic = 0x0000444C524F5747ull; // ASCII "GWORLD\0\0", little endian.
     constexpr int32 HeaderBytes = 64;
-    constexpr uint64 FormatRevision = 3; // Canonical .v3d + AssetType + Sound members; no compatibility reader.
+    constexpr uint64 FormatRevision = 4; // Canonical directory includes per-model gravity; rebuild older archives.
     constexpr int64 PayloadAlignment = 4096;
     constexpr int32 MaxStringBytes = 64 * 1024 * 1024;
     constexpr int32 MaxNameBytes = 4096;
@@ -807,6 +807,13 @@ namespace GWorldArchivePrivate
         Writer.U8(static_cast<uint8>(Definition.ItemType));
         Writer.String(Definition.Name, MaxNameBytes);
         Writer.String(Definition.DisplayName, MaxNameBytes);
+        const FGravityFieldSettings& G = Definition.GravityField;
+        Writer.U8(G.bEnabled ? 1 : 0);
+        Writer.U8(static_cast<uint8>(G.Falloff));
+        Writer.I32(G.Priority);
+        Writer.Double(G.RadiusCm);
+        Writer.Double(G.StrengthCmPerSecondSquared);
+        Writer.Vector(G.LocalCenter);
         WriteSummary(Writer, Record.Summary);
         WriteRange(Writer, Record.DefinitionRange);
         WriteRange(Writer, Record.MetadataRange);
@@ -849,6 +856,14 @@ namespace GWorldArchivePrivate
         const uint8 ItemType = Reader.U8();
         Definition.Name = Reader.String(MaxNameBytes);
         Definition.DisplayName = Reader.String(MaxNameBytes);
+        const uint8 GravityEnabled = Reader.U8();
+        Definition.GravityField.bEnabled = GravityEnabled != 0;
+        Definition.GravityField.Falloff = static_cast<EGravityFieldFalloff>(Reader.U8());
+        Definition.GravityField.Priority = Reader.I32();
+        Definition.GravityField.RadiusCm = Reader.Double();
+        Definition.GravityField.StrengthCmPerSecondSquared = Reader.Double();
+        Definition.GravityField.LocalCenter = Reader.Vector();
+        if (GravityEnabled > 1 || !Definition.GravityField.IsValid()) return false;
         OutRecord.Summary = ReadSummary(Reader);
         OutRecord.DefinitionRange = ReadRange(Reader);
         OutRecord.MetadataRange = ReadRange(Reader);
@@ -1471,6 +1486,7 @@ namespace GWorldArchivePrivate
             if (!Model || Model->Definition.AssetType != EAssetDefinitionType::Model
                 || !Model->Definition.UUID.IsValid() || UUIDs.Contains(Model->Definition.UUID)
                 || Model->Definition.Name.IsEmpty() || Model->Definition.DisplayName.IsEmpty()
+                || !Model->Definition.GravityField.IsValid()
                 || Model->Definition.GlbPath.IsEmpty() || Model->DefinitionJson.IsEmpty()
                 || Model->SourceFileSize <= 0 || !Model->Metadata.IsSane(&Reason)
                 || !Model->BakedData.IsSane(&Reason)
@@ -1575,6 +1591,7 @@ namespace GWorldArchivePrivate
             Record.Definition.ModelType = Model->Definition.ModelType;
             Record.Definition.EntityType = Model->Definition.EntityType;
             Record.Definition.ItemType = Model->Definition.ItemType;
+            Record.Definition.GravityField = Model->Definition.GravityField;
             Record.Summary.SourceNodeCount = Model->Metadata.SourceNodeCount;
             Record.Summary.SourceMeshCount = Model->Metadata.SourceMeshCount;
             Record.Summary.SourceMaterialCount = Model->Metadata.SourceMaterialCount;

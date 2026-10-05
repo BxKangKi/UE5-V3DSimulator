@@ -75,6 +75,9 @@ class V3DSIMULATOR_API AWeaponActor : public AActor
     GENERATED_BODY()
 
 public:
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Gravity")
+    TObjectPtr<class UGravityFieldComponent> GravityField;
+
     AWeaponActor();
 
     /** Equips a model addressed by its immutable gworld:// reference. */

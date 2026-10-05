@@ -103,7 +103,7 @@ class V3DSIMULATOR_API UV3DSimulatorAssetRegistry : public UDataAsset
 public:
     UV3DSimulatorAssetRegistry(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-    /** Repairs missing built-in menu classes and the legacy project-widget redirector path. */
+    /** Supplies current built-in menu classes when a class reference is empty. */
     void EnsureMenuDefaults();
 
     // Native actor classes can be replaced by Blueprint subclasses without forcing them to load at startup.

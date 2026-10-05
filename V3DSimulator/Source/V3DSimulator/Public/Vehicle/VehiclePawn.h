@@ -10,7 +10,6 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "HAL/ThreadSafeCounter.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "VehiclePawn.generated.h"
@@ -34,6 +33,9 @@ class V3DSIMULATOR_API AVehiclePawn : public APawn
     GENERATED_BODY()
 
 public:
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Gravity")
+    TObjectPtr<class UGravityFieldComponent> GravityField;
+
     AVehiclePawn();
 
     UFUNCTION(BlueprintCallable, Category="Vehicle")
@@ -211,82 +213,11 @@ private:
     UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.0", ClampMax="30.0"))
     float MinimumWheelBodyClearance = 8.0f;
 
-    // Legacy deterministic ground solver. Disabled by default because the normal runtime path now uses
-    // force-based wheel suspension, tire friction, gravity, anti-roll, and chassis inertia without
-    // snapping the vehicle to traced ground.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability")
-    bool bUseStableGroundRideHeight = false;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability")
-    bool bLockBodyPitchAndRoll = false;
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
+    float WheelGroundContactBuffer = 0.05f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableRideHeightGroundBuffer = 0.05f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableGroundTraceUp = 260.0f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableGroundTraceDown = 520.0f;
-
-    // Stable ride mode now follows wheel-contact terrain pitch/roll, while yaw response is deliberately damped
-    // so steering does not snap the car sideways at low speed.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
-    float StableYawResponse = 5.2f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
-    float StableMaxYawRateRadians = 2.40f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableMinimumTurnSpeed = 125.0f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
-    float StableVelocityYawFollowSpeed = 5.0f;
-
-    // Prevents the deterministic wheel solver from tunneling through walls at low FPS.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.008", ClampMax="0.05"))
-    float StableMaxSimulationStepSeconds = 0.0125f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1", ClampMax="64"))
-    int32 StableMaxSimulationSubsteps = 64;
-
-    // A vertical ledge higher than this is treated as an obstacle instead of a ramp.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableMaxStepHeight = 28.0f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1.0", ClampMax="60.0"))
-    float StableMaxSlopeDegrees = 32.0f;
-
-    // Caps how quickly the chassis may rise so trace hits cannot pop the car onto a tall block.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableMaxClimbRate = 180.0f;
-
-    // Extra pitch/roll damping for the deterministic wheel-physics solver. It damps oscillation
-    // without locking the chassis flat, so ramps and uneven terrain still tilt the car naturally.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StablePitchRollDamping = 68000.0f;
-
-    // A soft terrain-attitude torque nudges the body toward the wheel-supported ground plane.
-    // It is torque-based rather than teleporting/snap-aligning the body to the floor.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableTerrainAttitudeStrength = 6200.0f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
-    float StableMaxPitchRollRateRadians = 0.38f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
-    float StableMaxVerticalSpeed = 480.0f;
-
-    // Extra vertical damping and rise-speed limiting for the deterministic wheel solver.
-    // These stop raycast suspension contacts or collision depenetration from becoming a retained jump velocity.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableGroundedVerticalDamping = 190000.0f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0"))
-    float StableMaxGroundedUpSpeed = 70.0f;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1.0"))
-    float StableSuspensionForceLimitMultiplier = 1.45f;
+    float MaxWheelStepHeight = 28.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
     float GroundedDownforceCoefficient = 0.00085f;
@@ -376,8 +307,6 @@ private:
 
     /**
      * Multiplies high-speed steering angle, front grip reservation, and understeer yaw assistance.
-     * It is intentionally a separate v3 field so older read-only JSON files also receive the safer
-     * new default unless the map author explicitly overrides it.
      */
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="2.0"))
     float HighSpeedSteeringAuthorityScale = 1.30f;
@@ -530,12 +459,6 @@ private:
 
     // The subsystem update path is the authority. Mixing Actor async physics tick with normal tick
     // caused duplicate/flickering integration on projects where Chaos async tick availability changes.
-    UPROPERTY(EditAnywhere, Category="Vehicle|Physics")
-    bool bUseAsyncVehiclePhysicsTick = false;
-
-    UPROPERTY(EditAnywhere, Category="Vehicle|Physics")
-    bool bRunVehicleForcesInAsyncPhysicsTick = false;
-
     // Chassis clearance is intentionally lower than the tire diameter. A normal car body should sit
     // roughly half a wheel radius above the road, while wheels occupy the wheel wells.
     UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.10", ClampMax="1.00"))
@@ -742,33 +665,20 @@ private:
     float SteeringInput = 0.0f;
     float SmoothedThrottleInput = 0.0f;
     float SmoothedSteeringInput = 0.0f;
-    float SmoothedStableYawRate = 0.0f;
-    FVector StablePlanarVelocity = FVector::ZeroVector;
-    float StableVerticalVelocity = 0.0f;
-    bool bStablePlanarVelocityInitialized = false;
-    FVector StablePhysicsLinearVelocity = FVector::ZeroVector;
-    FVector StablePhysicsAngularVelocity = FVector::ZeroVector;
-    bool bStablePhysicsStateInitialized = false;
-
     FVector SmoothedRoadUp = FVector::UpVector;
     bool bHasSmoothedRoadUp = false;
 
-    FThreadSafeCounter AsyncVehiclePhysicsStepCounter;
-    int32 LastObservedAsyncVehiclePhysicsStepCounter = 0;
-    bool bHasObservedAsyncVehiclePhysicsStep = false;
-    bool bApplyingAsyncVehiclePhysicsStep = false;
     bool bSkipVehicleInputSmoothingForCurrentRun = false;
     float CurrentVehiclePhysicsStepSeconds = 0.0f;
 
-    void RunVehiclePhysicsSteps(float DeltaSeconds, bool bFromAsyncPhysicsTick);
-    void StepVehiclePhysics(float DeltaSeconds, bool bFromAsyncPhysicsTick);
+    void RunVehiclePhysicsSteps(float DeltaSeconds);
+    void StepVehiclePhysics(float DeltaSeconds);
     void UpdateVehicleInputSmoothing(float DeltaSeconds);
     void ResetVehicleTuningToClassDefaults();
     bool ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& JsonObject);
     void AddVehicleForce(const FVector& Force);
     void AddVehicleForceAtLocation(const FVector& Force, const FVector& Location);
     void AddVehicleTorqueInRadians(const FVector& Torque);
-    void UpdateStableWheelVehicle(float DeltaSeconds);
     void ApplySuspensionAndDrive(float DeltaSeconds);
     void ApplyAeroDownforce(int32 GroundedWheels);
     void ApplyAerodynamicDrag();
@@ -776,14 +686,14 @@ private:
     void ApplyGroundedPitchRollDamping(int32 GroundedWheels, float DeltaSeconds);
     void ApplyChassisClearanceProtection(UWorld* World, const FTransform& BodyTransform, const FCollisionQueryParams& QueryParams);
     void ApplyVehicleBodyPhysicsSettings();
+    FVector GetGravityUp() const;
+    float GetGravityMagnitude() const;
     float GetVehicleMassScale() const;
     float GetEffectiveWheelRadius(int32 WheelIndex = INDEX_NONE) const;
     float GetPhysicsBodyGroundClearance() const;
     float GetMinimumWheelSpringLength(int32 WheelIndex = INDEX_NONE) const;
     float GetEffectiveSuspensionRestLength(int32 WheelIndex = INDEX_NONE) const;
     float GetTargetWheelSpringLength(int32 WheelIndex = INDEX_NONE) const;
-    float GetStableWheelVisualSpringLength() const;
-    void ApplyStableVehicleGrounding(float DeltaSeconds);
     FVector GetFrontAxleForceLocation() const;
     void UpdateWheelVisuals(float DeltaSeconds);
     void ClearLoadedVehicleModel();

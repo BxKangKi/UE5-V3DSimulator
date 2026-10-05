@@ -30,6 +30,7 @@ struct FWorldSceneStreamRecord
     FGuid UUID;
     FString RuntimeReference;
     FModelData Bounds;
+    bool bHasGravityField = false;
 };
 
 /** Immutable character selector. The runtime reference is a gworld:// UUID, never a file path. */

@@ -135,7 +135,7 @@ bool SoundDefinitionJson::LoadDefinition(
     }
     FString VersionText;
     if (!Root->TryGetStringField(V3DSimulatorJsonMetadata::Version, VersionText)
-        || VersionText.TrimStartAndEnd().IsEmpty())
+        || VersionText != V3DSimulatorJsonMetadata::SchemaVersion)
     {
         OutError = TEXT("Sound JSON requires Version.");
         return false;

@@ -9,6 +9,7 @@
  */
 
 #include "Character/CharacterComponent.h"
+#include "Gravity/GravityFieldTypes.h"
 #include "Character/RagdollRecoveryMath.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterFunctionLibrary.h"
@@ -131,22 +132,6 @@ namespace CharacterWaterTuning
     constexpr float WalkWaterMinSpeedMultiplier = 0.42f;
 }
 
-static FORCEINLINE FVector MakeForwardVectorFromYaw(const float YawDegrees)
-{
-    float SinYaw = 0.0f;
-    float CosYaw = 1.0f;
-    FMath::SinCos(&SinYaw, &CosYaw, FMath::DegreesToRadians(YawDegrees));
-    return FVector(CosYaw, SinYaw, 0.0f);
-}
-
-static FORCEINLINE FVector MakeRightVectorFromYaw(const float YawDegrees)
-{
-    float SinYaw = 0.0f;
-    float CosYaw = 1.0f;
-    FMath::SinCos(&SinYaw, &CosYaw, FMath::DegreesToRadians(YawDegrees));
-    return FVector(-SinYaw, CosYaw, 0.0f);
-}
-
 static FORCEINLINE void StopMovementAndSetMode(UCharacterMovementComponent* Movement, const EMovementMode NewMode)
 {
     if (!IsValid(Movement))
@@ -172,16 +157,14 @@ static FORCEINLINE void StopMovementAndDisable(UCharacterMovementComponent* Move
     Movement->DisableMovement();
 }
 
-static FRotator MakeFlatYawRotation(const float Yaw)
+static FVector CharacterGravityUp(const UCharacterMovementComponent* Movement)
 {
-    return FRotator(0.0f, FRotator::NormalizeAxis(Yaw), 0.0f);
+    return IsValid(Movement) ? -Movement->GetGravityDirection() : FVector::UpVector;
 }
 
-static FRotator MakeFlatYawRotationNear(const float DesiredYaw, const FRotator& ReferenceRotation)
+static FRotator GravityUpright(const FRotator& Rotation, const UCharacterMovementComponent* Movement)
 {
-    const float ReferenceYaw = FRotator::NormalizeAxis(ReferenceRotation.Yaw);
-    const float DeltaYaw = FMath::FindDeltaAngleDegrees(ReferenceYaw, DesiredYaw);
-    return FRotator(0.0f, ReferenceYaw + DeltaYaw, 0.0f);
+    return V3DGravityMath::UprightRotation(Rotation.Quaternion(), CharacterGravityUp(Movement)).Rotator();
 }
 
 static float ComputeExponentialDampingFactor(const float DampingRate, const float DeltaTime)
@@ -268,10 +251,10 @@ static bool TryGetSkeletalReferenceLocation(
 
 static FVector MakeSwimmingForwardVector(
     const FRotator& ControlRotation,
-    const float SurfacePlaneAlpha)
+    const float SurfacePlaneAlpha, const FVector& Up)
 {
     const FVector PitchedForward = ControlRotation.Vector();
-    const FVector FlatForward = MakeForwardVectorFromYaw(ControlRotation.Yaw);
+    const FVector FlatForward = V3DGravityMath::PlanarForward(ControlRotation.Quaternion(), Up);
     const float SafeAlpha = FMath::Clamp(SurfacePlaneAlpha, 0.0f, 1.0f);
 
     // Blend into flat-yaw motion as the stable head reference approaches the surface.
@@ -294,11 +277,11 @@ static float ComputeSwimmingSurfacePlaneAlpha(
 static FVector ComputeSwimmingInputDirection(
     const FVector& MoveInput,
     const FRotator& ControlRotation,
-    const float SurfacePlaneAlpha)
+    const float SurfacePlaneAlpha, const FVector& Up)
 {
-    const FVector FlatRight = MakeRightVectorFromYaw(ControlRotation.Yaw);
-    const FVector Forward = MakeSwimmingForwardVector(ControlRotation, SurfacePlaneAlpha);
-    const FVector DesiredDirection = FlatRight * MoveInput.X + Forward * MoveInput.Y + FVector::UpVector * MoveInput.Z;
+    const FVector FlatRight = FVector::CrossProduct(Up, V3DGravityMath::PlanarForward(ControlRotation.Quaternion(), Up));
+    const FVector Forward = MakeSwimmingForwardVector(ControlRotation, SurfacePlaneAlpha, Up);
+    const FVector DesiredDirection = FlatRight * MoveInput.X + Forward * MoveInput.Y + Up * MoveInput.Z;
 
     return DesiredDirection.GetSafeNormal();
 }
@@ -332,7 +315,7 @@ static void ApplySwimmingVelocityDamping(
     const float BaseDampingRate = FMath::Lerp(0.35f, 0.95f, SafeSubmergedAlpha);
     Velocity *= ComputeExponentialDampingFactor(BaseDampingRate, DeltaTime);
 
-    const FVector InputDirection = ComputeSwimmingInputDirection(MoveInput, ControlRotation, SurfacePlaneAlpha);
+    const FVector InputDirection = ComputeSwimmingInputDirection(MoveInput, ControlRotation, SurfacePlaneAlpha, CharacterGravityUp(Movement));
     if (InputAmount > 0.05f && !InputDirection.IsNearlyZero())
     {
         const float AlongSpeed = FVector::DotProduct(Velocity, InputDirection);
@@ -620,7 +603,7 @@ static bool IsRagdollCoreReleaseBone(const FName BoneName)
 }
 
 
-static FVector ClampInitialRagdollVelocityForActivation(const FVector& Velocity)
+static FVector ClampInitialRagdollVelocityForActivation(const FVector& Velocity, const FVector& Up)
 {
     if (Velocity.ContainsNaN())
     {
@@ -630,17 +613,11 @@ static FVector ClampInitialRagdollVelocityForActivation(const FVector& Velocity)
     // The ragdoll inherits only the previous character movement velocity.
     // Do not multiply it or reconstruct impact velocity here; extra energy makes
     // the body launch and causes visible stepping on the spring-arm target.
-    FVector Result = Velocity;
-
-    FVector PlanarVelocity(Result.X, Result.Y, 0.0f);
-    PlanarVelocity = PlanarVelocity.GetClampedToMaxSize(CharacterRagdollTuning::MaxInitialRagdollPlanarSpeed);
-
-    Result.X = PlanarVelocity.X;
-    Result.Y = PlanarVelocity.Y;
-    Result.Z = FMath::Clamp(
-        Result.Z,
-        -CharacterRagdollTuning::MaxInitialRagdollDownSpeed,
-        CharacterRagdollTuning::MaxInitialRagdollUpSpeed);
+    const FVector Planar = FVector::VectorPlaneProject(Velocity, Up).GetClampedToMaxSize(CharacterRagdollTuning::MaxInitialRagdollPlanarSpeed);
+    const double Vertical = FMath::Clamp(FVector::DotProduct(Velocity, Up),
+        -static_cast<double>(CharacterRagdollTuning::MaxInitialRagdollDownSpeed),
+        static_cast<double>(CharacterRagdollTuning::MaxInitialRagdollUpSpeed));
+    const FVector Result = Planar + Up * Vertical;
 
     return Result.GetClampedToMaxSize(CharacterRagdollTuning::MaxInitialRagdollSpeed);
 }
@@ -651,14 +628,14 @@ static FORCEINLINE bool IsUsefulInitialRagdollVelocity(const FVector& Candidate)
         && Candidate.SizeSquared() > FMath::Square(CharacterRagdollTuning::InitialRagdollVelocityDeadZone);
 }
 
-static FORCEINLINE void ConsiderInitialRagdollVelocity(FVector& BestVelocity, const FVector& Candidate)
+static FORCEINLINE void ConsiderInitialRagdollVelocity(FVector& BestVelocity, const FVector& Candidate, const FVector& Up)
 {
     if (!IsUsefulInitialRagdollVelocity(Candidate))
     {
         return;
     }
 
-    const FVector SafeCandidate = ClampInitialRagdollVelocityForActivation(Candidate);
+    const FVector SafeCandidate = ClampInitialRagdollVelocityForActivation(Candidate, Up);
     if (SafeCandidate.SizeSquared() > BestVelocity.SizeSquared())
     {
         BestVelocity = SafeCandidate;
@@ -947,20 +924,20 @@ static FORCEINLINE float GetRaisedGroundTraceStartLift(const float CapsuleRadius
     return FMath::Max(24.0f, CapsuleRadius * 0.45f + 8.0f);
 }
 
-static FORCEINLINE FVector GetRagdollGroundTraceStart(const FVector& WorldLocation, const float CapsuleRadius)
+static FORCEINLINE FVector GetRagdollGroundTraceStart(const FVector& WorldLocation, const float CapsuleRadius, const FVector& Up)
 {
-    return WorldLocation + FVector::UpVector * GetRaisedGroundTraceStartLift(CapsuleRadius);
+    return WorldLocation + Up * GetRaisedGroundTraceStartLift(CapsuleRadius);
 }
 
-static FORCEINLINE FVector GetRagdollGroundTraceEnd(const FVector& WorldLocation, const float TraceDistance)
+static FORCEINLINE FVector GetRagdollGroundTraceEnd(const FVector& WorldLocation, const float TraceDistance, const FVector& Up)
 {
-    return WorldLocation - FVector::UpVector * FMath::Max(1.0f, TraceDistance);
+    return WorldLocation - Up * FMath::Max(1.0f, TraceDistance);
 }
 
 static FORCEINLINE bool IsRagdollWalkableGroundHit(const FHitResult& Hit, const UCharacterMovementComponent* Movement)
 {
     const float WalkableZ = IsValid(Movement) ? Movement->GetWalkableFloorZ() : 0.55f;
-    return Hit.bBlockingHit && Hit.ImpactNormal.Z >= FMath::Max(0.35f, WalkableZ - 0.05f);
+    return Hit.bBlockingHit && FVector::DotProduct(Hit.ImpactNormal, CharacterGravityUp(Movement)) >= FMath::Max(0.35f, WalkableZ - 0.05f);
 }
 
 static bool IsIgnoredWaterTraceHit(const FHitResult& Hit)
@@ -1326,7 +1303,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     const bool bIsGrounded = bIsOnGround || bIsContactGround;
     const bool bIsFalling = Movement->IsFalling();
     const bool bIsCrouch = UCharacterFunctionLibrary::IsStateActive(CharacterState, STATE_CROUCH);
-    const FVector GroundNormal = bIsContactGround ? HitResult.ImpactNormal : FVector::UpVector;
+    const FVector GroundNormal = bIsContactGround ? HitResult.ImpactNormal : CharacterGravityUp(Movement.Get());
 
     // Preserve the original Blueprint-era movement behavior: any planar movement input
     // lets CharacterMovement rotate the character toward the actual movement direction.
@@ -1352,7 +1329,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
             : CharacterMovementTuning::FlyingMaxSpeed;
 
         ApplyMoveRightForward(OwnerCharacter, ControlRot, CurrentSpeed);
-        OwnerCharacter->AddMovementInput(FVector::UpVector, CurrentSpeed.Z);
+        OwnerCharacter->AddMovementInput(CharacterGravityUp(Movement.Get()), CurrentSpeed.Z);
     }
     // 3. Swimming and ground movement modes.
     else
@@ -1472,13 +1449,13 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
             const float ForwardSurfacePlaneAlpha = bIsSprint ? SurfacePlaneAlpha : 1.0f;
             ApplySwimmingVelocityDamping(Movement, SwimMoveInput, ControlRot, DeltaTime, CharacterSubmergedAlpha, ForwardSurfacePlaneAlpha, bAtVisibleSurfaceCeiling);
 
-            const FVector SwimForward = MakeSwimmingForwardVector(ControlRot, ForwardSurfacePlaneAlpha);
-            OwnerCharacter->AddMovementInput(MakeRightVectorFromYaw(ControlRot.Yaw), CurrentSpeed.X);
+            const FVector SwimForward = MakeSwimmingForwardVector(ControlRot, ForwardSurfacePlaneAlpha, CharacterGravityUp(Movement.Get()));
+            OwnerCharacter->AddMovementInput(FVector::CrossProduct(CharacterGravityUp(Movement.Get()), V3DGravityMath::PlanarForward(ControlRot.Quaternion(), CharacterGravityUp(Movement.Get()))), CurrentSpeed.X);
             OwnerCharacter->AddMovementInput(SwimForward, CurrentSpeed.Y);
 
             if (CurrentSpeed.Z < 0.0f || !bAtVisibleSurfaceCeiling)
             {
-                OwnerCharacter->AddMovementInput(FVector::UpVector, CurrentSpeed.Z);
+                OwnerCharacter->AddMovementInput(CharacterGravityUp(Movement.Get()), CurrentSpeed.Z);
             }
         }
         else
@@ -1511,7 +1488,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
                     ? CharacterMovementTuning::GroundSprintSpeed
                     : CharacterMovementTuning::GroundWalkSpeed;
                 TargetMaxSpeed *= GetGroundedWaterWalkSpeedMultiplier(EffectiveWaterLevel);
-                Movement->MaxWalkSpeed = ClampGroundSpeed(TargetMaxSpeed, GroundNormal.Z, Movement->GetWalkableFloorZ());
+                Movement->MaxWalkSpeed = ClampGroundSpeed(TargetMaxSpeed, FVector::DotProduct(GroundNormal, CharacterGravityUp(Movement.Get())), Movement->GetWalkableFloorZ());
             }
             ApplyMoveRightForward(OwnerCharacter, ControlRot, CurrentSpeed);
         }
@@ -1801,8 +1778,8 @@ bool UCharacterComponent::TraceCharacterWalkableGroundFromAbove(FHitResult& OutH
     const float StartLift = GetRaisedGroundTraceStartLift(CapsuleRadius);
     const float DefaultBelowCapsuleReach = FMath::Max(10.0f, CapsuleRadius * 0.30f);
     const float DownReach = CapsuleHalfHeight + DefaultBelowCapsuleReach + FMath::Max(0.0f, ExtraDownDistance);
-    const FVector Start = ActorLocation + FVector::UpVector * StartLift;
-    const FVector End = ActorLocation - FVector::UpVector * DownReach;
+    const FVector Start = ActorLocation + CharacterGravityUp(Movement.Get()) * StartLift;
+    const FVector End = ActorLocation - CharacterGravityUp(Movement.Get()) * DownReach;
 
     FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(CharacterGroundCheck), true, OwnerCharacter);
     AddCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
@@ -2128,7 +2105,7 @@ FCharacterRagdollEnvironmentState UCharacterComponent::UpdateRagdollEnvironmentS
         const FVector HipsLocation = UCharacterFunctionLibrary::GetBoneLocation(*MeshComp, BONE_HIPS);
         const FVector RagdollActorLocation = GetRagdollRecoveryActorLocationFromHips(HipsLocation);
         RagdollCharacterProbeLocations.Add(RagdollActorLocation);
-        RagdollCharacterProbeLocations.Add(RagdollActorLocation - FVector::UpVector * FMath::Max(1.0f, HalfHeight));
+        RagdollCharacterProbeLocations.Add(RagdollActorLocation - CharacterGravityUp(Movement.Get()) * FMath::Max(1.0f, HalfHeight));
         RagdollCharacterProbeLocations.Add(State.RagdollReferenceLocation);
         State.bIsInWater = ProbeRagdollWaterLevelFromLocations(this, RagdollCharacterProbeLocations, State.WaterLevel);
     }
@@ -2240,7 +2217,7 @@ bool UCharacterComponent::FindRagdollWaterLevel(float &OutWaterLevel) const
 FVector UCharacterComponent::GetRagdollRecoveryActorLocationFromHips(const FVector& HipsLocation) const
 {
     const float ActorZOffsetFromHips = HalfHeight - Radius * 0.33333f;
-    return HipsLocation + FVector(0.0f, 0.0f, ActorZOffsetFromHips);
+    return HipsLocation + CharacterGravityUp(Movement.Get()) * ActorZOffsetFromHips;
 }
 
 FVector UCharacterComponent::GetWaterRagdollRecoveryActorLocation(float WaterLevel) const
@@ -2285,8 +2262,8 @@ FVector UCharacterComponent::ResolveRagdollRecoveryGroundPenetration(const FVect
     }
 
     const float CapsuleHalfHeight = FMath::Max(1.0f, Capsule->GetScaledCapsuleHalfHeight());
-    const FVector Start = DesiredActorLocation + FVector::UpVector * (CapsuleHalfHeight + CharacterRagdollTuning::LandRecoveryGroundProbeUp);
-    const FVector End = DesiredActorLocation - FVector::UpVector * (CapsuleHalfHeight + CharacterRagdollTuning::LandRecoveryGroundProbeDown);
+    const FVector Start = DesiredActorLocation + CharacterGravityUp(Movement.Get()) * (CapsuleHalfHeight + CharacterRagdollTuning::LandRecoveryGroundProbeUp);
+    const FVector End = DesiredActorLocation - CharacterGravityUp(Movement.Get()) * (CapsuleHalfHeight + CharacterRagdollTuning::LandRecoveryGroundProbeDown);
 
     FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(CharacterRagdollRecoveryGroundLift), true, OwnerCharacter);
     AddCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
@@ -2298,8 +2275,8 @@ FVector UCharacterComponent::ResolveRagdollRecoveryGroundPenetration(const FVect
         return DesiredActorLocation;
     }
 
-    const float CurrentCapsuleBottomZ = DesiredActorLocation.Z - CapsuleHalfHeight;
-    const float MinimumCapsuleBottomZ = GroundHit.ImpactPoint.Z + CharacterRagdollTuning::LandRecoveryGroundClearance;
+    const float CurrentCapsuleBottomZ = FVector::DotProduct(DesiredActorLocation, CharacterGravityUp(Movement.Get())) - CapsuleHalfHeight;
+    const float MinimumCapsuleBottomZ = FVector::DotProduct(GroundHit.ImpactPoint, CharacterGravityUp(Movement.Get())) + CharacterRagdollTuning::LandRecoveryGroundClearance;
     if (CurrentCapsuleBottomZ >= MinimumCapsuleBottomZ)
     {
         return DesiredActorLocation;
@@ -2308,7 +2285,7 @@ FVector UCharacterComponent::ResolveRagdollRecoveryGroundPenetration(const FVect
     // Lift the owning capsule just enough to clear the floor. Foot IK can polish
     // the visible pose later, but root/capsule penetration must be solved here.
     FVector AdjustedLocation = DesiredActorLocation;
-    AdjustedLocation.Z += MinimumCapsuleBottomZ - CurrentCapsuleBottomZ;
+    AdjustedLocation += CharacterGravityUp(Movement.Get()) * (MinimumCapsuleBottomZ - CurrentCapsuleBottomZ);
     return AdjustedLocation;
 }
 
@@ -2511,8 +2488,8 @@ bool UCharacterComponent::IsRagdollTouchingWalkableGround(float TraceDistance, b
 
     for (const FVector& RagdollLocation : RagdollGroundProbeLocations)
     {
-        const FVector TraceStart = GetRagdollGroundTraceStart(RagdollLocation, Radius);
-        const FVector TraceEnd = GetRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance);
+        const FVector TraceStart = GetRagdollGroundTraceStart(RagdollLocation, Radius, CharacterGravityUp(Movement.Get()));
+        const FVector TraceEnd = GetRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance, CharacterGravityUp(Movement.Get()));
         if (TraceWalkableGroundByChannel(World, TraceStart, TraceEnd, Movement.Get(), QueryParams))
         {
             return true;
@@ -2568,8 +2545,8 @@ void UCharacterComponent::RequestAsyncRagdollReleaseGroundTrace()
 
         World->AsyncLineTraceByChannel(
             EAsyncTraceType::Multi,
-            GetRagdollGroundTraceStart(RagdollLocation, Radius),
-            GetRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance),
+            GetRagdollGroundTraceStart(RagdollLocation, Radius, CharacterGravityUp(Movement.Get())),
+            GetRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance, CharacterGravityUp(Movement.Get())),
             ECC_Visibility,
             QueryParams,
             FCollisionResponseParams::DefaultResponseParam,
@@ -2631,8 +2608,10 @@ void UCharacterComponent::ApplyMoveRightForward(ACharacterController *InOwner, c
 {
     if (!InOwner)
         return;
-    InOwner->AddMovementInput(MakeRightVectorFromYaw(ControlRotation.Yaw), Speed.X);
-    InOwner->AddMovementInput(MakeForwardVectorFromYaw(ControlRotation.Yaw), Speed.Y);
+    const FVector Up = CharacterGravityUp(InOwner->GetCharacterMovement());
+    const FVector Forward = V3DGravityMath::PlanarForward(ControlRotation.Quaternion(), Up);
+    InOwner->AddMovementInput(FVector::CrossProduct(Up, Forward), Speed.X);
+    InOwner->AddMovementInput(Forward, Speed.Y);
 }
 
 inline float UCharacterComponent::ClampGroundSpeed(const float MaxSpeed, const float NormalZ, const float WalkableZ)
@@ -2659,11 +2638,11 @@ void UCharacterComponent::UpdateRagdollVelocityHistory(float DeltaTime, const FV
     }
 
     FVector BestVelocity = FVector::ZeroVector;
-    ConsiderInitialRagdollVelocity(BestVelocity, CurrentVelocity);
+    ConsiderInitialRagdollVelocity(BestVelocity, CurrentVelocity, CharacterGravityUp(Movement.Get()));
     if (IsValid(Movement))
     {
-        ConsiderInitialRagdollVelocity(BestVelocity, Movement->Velocity);
-        ConsiderInitialRagdollVelocity(BestVelocity, Movement->GetLastUpdateVelocity());
+        ConsiderInitialRagdollVelocity(BestVelocity, Movement->Velocity, CharacterGravityUp(Movement.Get()));
+        ConsiderInitialRagdollVelocity(BestVelocity, Movement->GetLastUpdateVelocity(), CharacterGravityUp(Movement.Get()));
     }
 
     if (ShouldPreserveCachedPreRagdollVelocity(LastPreRagdollVelocity, LastPreRagdollVelocityAge, BestVelocity))
@@ -2678,7 +2657,7 @@ void UCharacterComponent::UpdateRagdollVelocityHistory(float DeltaTime, const FV
 
     if (IsUsefulInitialRagdollVelocity(BestVelocity))
     {
-        LastPreRagdollVelocity = ClampInitialRagdollVelocityForActivation(BestVelocity);
+        LastPreRagdollVelocity = ClampInitialRagdollVelocityForActivation(BestVelocity, CharacterGravityUp(Movement.Get()));
         LastPreRagdollVelocityAge = 0.0f;
         return;
     }
@@ -2714,26 +2693,26 @@ FVector UCharacterComponent::CapturePreRagdollVelocity(ACharacterController *InO
     // LastPreRagdollVelocity still contains the real velocity from the previous game tick.
     if (CharacterMovement)
     {
-        ConsiderInitialRagdollVelocity(BestVelocity, CharacterMovement->Velocity);
-        ConsiderInitialRagdollVelocity(BestVelocity, CharacterMovement->GetLastUpdateVelocity());
+        ConsiderInitialRagdollVelocity(BestVelocity, CharacterMovement->Velocity, CharacterGravityUp(Movement.Get()));
+        ConsiderInitialRagdollVelocity(BestVelocity, CharacterMovement->GetLastUpdateVelocity(), CharacterGravityUp(Movement.Get()));
     }
 
     if (InOwner)
     {
-        ConsiderInitialRagdollVelocity(BestVelocity, InOwner->GetVelocity());
+        ConsiderInitialRagdollVelocity(BestVelocity, InOwner->GetVelocity(), CharacterGravityUp(Movement.Get()));
     }
 
     if (LastPreRagdollVelocityAge <= CharacterRagdollTuning::PreRagdollVelocityGraceSeconds)
     {
-        ConsiderInitialRagdollVelocity(BestVelocity, LastPreRagdollVelocity);
+        ConsiderInitialRagdollVelocity(BestVelocity, LastPreRagdollVelocity, CharacterGravityUp(Movement.Get()));
     }
 
     // PrevVelocity is the last value used by impact detection. It is a fallback only,
     // but considering the largest valid candidate prevents a low same-frame value from
     // making the ragdoll appear to stop at activation.
-    ConsiderInitialRagdollVelocity(BestVelocity, PrevVelocity);
+    ConsiderInitialRagdollVelocity(BestVelocity, PrevVelocity, CharacterGravityUp(Movement.Get()));
 
-    return ClampInitialRagdollVelocityForActivation(BestVelocity);
+    return ClampInitialRagdollVelocityForActivation(BestVelocity, CharacterGravityUp(Movement.Get()));
 }
 
 FVector UCharacterComponent::GetInitialRagdollActivationVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement, USkeletalMeshComponent *SkeletalMesh) const
@@ -2749,7 +2728,7 @@ void UCharacterComponent::ApplyInitialRagdollVelocity(USkeletalMeshComponent *Sk
         return;
     }
 
-    const FVector SafeInitialVelocity = ClampInitialRagdollVelocityForActivation(InitialVelocity);
+    const FVector SafeInitialVelocity = ClampInitialRagdollVelocityForActivation(InitialVelocity, CharacterGravityUp(Movement.Get()));
     if (!IsUsefulInitialRagdollVelocity(SafeInitialVelocity))
     {
         return;
@@ -2978,7 +2957,7 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     LastPreRagdollVelocity = InitialRagdollVelocity;
     LastPreRagdollVelocityAge = 0.0f;
     const bool bKeepWaterIntent = bRagdollInWater || bRagdollRecoveryWantsSwimming;
-    const FRotator ActorRotationBeforeRagdoll = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
+    const FRotator ActorRotationBeforeRagdoll = GravityUpright(InOwner->GetActorRotation(), Movement.Get());
 
     // If a new ragdoll starts during a land/water recovery blend, discard that recovery state.
     // The new ragdoll must start with a fresh physics pose and full ragdoll weight.
@@ -3038,10 +3017,8 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
     CapturedMeshLocation = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
     CapturedMeshRotation = UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS);
     bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
-    const FRotator CurrentActorYaw = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
-    const FRotator CurrentPoseRecoveryRotation = MakeFlatYawRotationNear(
-        GetMeshForwardYaw(bIsLieOnBack, SkeletalMesh, CurrentActorYaw.Yaw),
-        CurrentActorYaw);
+    const FRotator CurrentActorYaw = GravityUpright(InOwner->GetActorRotation(), Movement.Get());
+    const FRotator CurrentPoseRecoveryRotation = GetMeshForwardRotation(bIsLieOnBack, SkeletalMesh, CurrentActorYaw);
     ActorTargetRotation = CurrentPoseRecoveryRotation;
 
     const FTransform SnapshotMeshWorld = SkeletalMesh->GetComponentTransform();
@@ -3077,11 +3054,8 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         GetUpActiveTime = 0.0f;
         WaterRagdollRecoveryElapsed = 0.0f;
 
-        const FRotator RecoveryStartRotation = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
         WaterRecoveryActorTargetLocation = GetWaterRagdollRecoveryActorLocation(ReleaseEnvironmentState.WaterLevel);
-        WaterRecoveryActorTargetRotation = MakeFlatYawRotationNear(
-            CurrentPoseRecoveryRotation.Yaw,
-            RecoveryStartRotation);
+        WaterRecoveryActorTargetRotation = GravityUpright(CurrentPoseRecoveryRotation, Movement.Get());
 
         SkeletalMesh->SetCollisionProfileName(TEXT("CharacterMesh"));
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
@@ -3345,18 +3319,17 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
             && (bRagdollInWater || bRagdollRecoveryWantsSwimming || RagdollEnvironmentState.bShouldRecoverInWater || RagdollEnvironmentState.bIsInWater);
         if (bUseStableWaterYaw)
         {
-            const FRotator CurrentActorYaw = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
-            const FRotator DesiredStableYaw = MakeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, CurrentActorYaw);
+            const FRotator CurrentActorYaw = GravityUpright(InOwner->GetActorRotation(), Movement.Get());
+            const FRotator DesiredStableYaw = GravityUpright(RagdollPrePhysicsActorRotation, Movement.Get());
             const float YawBlendSpeed = FMath::Max(0.0f, CharacterRagdollTuning::WaterStableYawBlendSpeed);
             ActorTargetRotation = YawBlendSpeed > KINDA_SMALL_NUMBER
                 ? FMath::RInterpTo(CurrentActorYaw, DesiredStableYaw, DeltaTime, YawBlendSpeed)
                 : DesiredStableYaw;
-            ActorTargetRotation.Pitch = 0.0f;
-            ActorTargetRotation.Roll = 0.0f;
+            ActorTargetRotation = GravityUpright(ActorTargetRotation, Movement.Get());
         }
         else
         {
-            ActorTargetRotation = FRotator(0.0f, GetMeshForwardYaw(bIsLieOnBack, SkeletalMesh), 0.0f);
+            ActorTargetRotation = GetMeshForwardRotation(bIsLieOnBack, SkeletalMesh, InOwner->GetActorRotation());
         }
         const FVector Location = GetRagdollRecoveryActorLocationFromHips(UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS));
         // The actor is only a camera/control anchor during active ragdoll. Keep it location-only
@@ -3385,11 +3358,8 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
             if (!bWaterRecoveryTransformInitialized)
             {
                 bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
-                const FRotator RecoveryStartRotation = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
-                WaterRecoveryActorTargetLocation = GetWaterRagdollRecoveryActorLocation(RagdollEnvironmentState.WaterLevel);
-                WaterRecoveryActorTargetRotation = MakeFlatYawRotationNear(
-                    ActorTargetRotation.Yaw,
-                    RecoveryStartRotation);
+                        WaterRecoveryActorTargetLocation = GetWaterRagdollRecoveryActorLocation(RagdollEnvironmentState.WaterLevel);
+                WaterRecoveryActorTargetRotation = GravityUpright(ActorTargetRotation, Movement.Get());
                 if (SkeletalMesh->GetAttachParent() != InOwner->GetCapsuleComponent())
                 {
                     FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
@@ -3594,40 +3564,24 @@ bool UCharacterComponent::CheckIfLieOnBack(const USkeletalMeshComponent *Skeleta
     FVector RightPos = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_RIGHT_UPPER_LEG);
     FVector HipsPos = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
 
-    FVector LeftRelative = (LeftPos - HipsPos).GetSafeNormal2D();
-    FVector RightRelative = (RightPos - HipsPos).GetSafeNormal2D();
+    FVector LeftRelative = FVector::VectorPlaneProject(LeftPos - HipsPos, CharacterGravityUp(Movement.Get())).GetSafeNormal();
+    FVector RightRelative = FVector::VectorPlaneProject(RightPos - HipsPos, CharacterGravityUp(Movement.Get())).GetSafeNormal();
 
-    FQuat Q = FQuat::FindBetweenVectors(LeftRelative, FVector(0.f, 1.f, 0.f));
-    FVector T = Q.RotateVector(RightRelative);
-    return T.X < 0.0f;
+    return FVector::DotProduct(FVector::CrossProduct(LeftRelative, RightRelative), CharacterGravityUp(Movement.Get())) > 0.0;
 }
 
-float UCharacterComponent::GetMeshForwardYaw(
-    const bool Back,
-    const USkeletalMeshComponent *SkeletalMesh,
-    const float FallbackYaw)
+FRotator UCharacterComponent::GetMeshForwardRotation(
+    const bool Back, const USkeletalMeshComponent* SkeletalMesh, const FRotator& Fallback)
 {
-    if (!SkeletalMesh)
-        return FRotator::NormalizeAxis(FallbackYaw);
+    const FVector Up = CharacterGravityUp(Movement.Get());
+    if (!SkeletalMesh) return GravityUpright(Fallback, Movement.Get());
     const FVector Head = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HEAD);
     const FVector Hips = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
-    FVector Direction = (Head - Hips).GetSafeNormal2D();
-
-    // A nearly vertical pose has an unstable horizontal head-to-pelvis projection. Use the
-    // current simulated pelvis orientation before falling back to the actor's current yaw.
+    FVector Direction = FVector::VectorPlaneProject(Head - Hips, Up).GetSafeNormal();
     if (Direction.IsNearlyZero())
-    {
-        Direction = UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS)
-            .Vector()
-            .GetSafeNormal2D();
-    }
-    if (Direction.IsNearlyZero() || Direction.ContainsNaN())
-    {
-        return FRotator::NormalizeAxis(FallbackYaw);
-    }
-
-    const float Result = FMath::RadiansToDegrees(FMath::Atan2(Direction.Y, Direction.X));
-    return FRotator::NormalizeAxis(Back ? Result + 180.0f : Result);
+        Direction = FVector::VectorPlaneProject(UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS).Vector(), Up).GetSafeNormal();
+    if (Direction.IsNearlyZero() || Direction.ContainsNaN()) return GravityUpright(Fallback, Movement.Get());
+    return FRotationMatrix::MakeFromXZ(Back ? -Direction : Direction, Up).Rotator();
 }
 
 void UCharacterComponent::SetSkeletalMeshLocationAndRotation(USkeletalMeshComponent *SkeletalMesh, const FVector &Location, const FRotator &Rotation)

@@ -20,7 +20,13 @@ const FSimulatorGripPoint* FSimulatorEquipmentInteractionConfig::GetGrip(const E
 
 void FSimulatorEquipmentInteractionConfig::Sanitize()
 {
-    HeldPreviewLongestDimensionCm = FMath::Clamp(HeldPreviewLongestDimensionCm, 1.0f, 100.0f);
+    HeldPreviewLongestDimensionCm = FMath::IsFinite(HeldPreviewLongestDimensionCm)
+        ? FMath::Clamp(HeldPreviewLongestDimensionCm, 1.0f, 100.0f) : 18.0f;
+    for (FSimulatorGripPoint* Grip : { &RightGrip, &LeftGrip })
+    {
+        if (Grip->AttachmentOffset.ContainsNaN()) Grip->AttachmentOffset = FTransform::Identity;
+        Grip->AttachmentOffset.NormalizeRotation();
+    }
     RightGrip.Hand = ESimulatorHand::Right;
     LeftGrip.Hand = ESimulatorHand::Left;
 }

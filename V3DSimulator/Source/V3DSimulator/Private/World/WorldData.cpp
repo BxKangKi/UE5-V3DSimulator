@@ -110,13 +110,13 @@ bool FLevelWeatherSettings::FromJson(const TSharedPtr<FJsonObject>& Json)
     double LoadedMinTicks = MinDurationTicks;
     if (Json->TryGetNumberField(TEXT("MinDurationTicks"), LoadedMinTicks) && FMath::IsFinite(LoadedMinTicks))
     {
-        MinDurationTicks = FMath::Clamp(FMath::RoundToInt(LoadedMinTicks), 1, 100000000);
+        MinDurationTicks = FMath::Clamp(FMath::RoundToInt(FMath::Clamp(LoadedMinTicks, 1.0, 100000000.0)), 1, 100000000);
     }
 
     double LoadedMaxTicks = MaxDurationTicks;
     if (Json->TryGetNumberField(TEXT("MaxDurationTicks"), LoadedMaxTicks) && FMath::IsFinite(LoadedMaxTicks))
     {
-        MaxDurationTicks = FMath::Clamp(FMath::RoundToInt(LoadedMaxTicks), MinDurationTicks, 100000000);
+        MaxDurationTicks = FMath::Clamp(FMath::RoundToInt(FMath::Clamp(LoadedMaxTicks, 1.0, 100000000.0)), MinDurationTicks, 100000000);
     }
     MaxDurationTicks = FMath::Max(MinDurationTicks, MaxDurationTicks);
 

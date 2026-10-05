@@ -8,6 +8,7 @@
 #include "Simulator/InteractionJsonLibrary.h"
 
 #include "JsonObjectConverter.h"
+#include "System/SafeFileIO.h"
 
 namespace
 {
@@ -43,8 +44,17 @@ namespace
             return false;
         }
 
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = 1024 * 1024;
+        Limits.MaxDepth = 16;
+        Limits.MaxValues = 8192;
+        Limits.MaxContainerEntries = 1024;
+        Limits.MaxStringCharacters = 32768;
+        Limits.bAllowBackupRecovery = false;
+        const FSafeJsonLoadResult Loaded = FSafeFileIO::ParseJsonText(Json, TEXT("Interaction"), Limits);
+        if (!Loaded.IsSuccess()) { OutError = Loaded.Error; return false; }
         StructType Parsed{};
-        if (!FJsonObjectConverter::JsonObjectStringToUStruct(Json, &Parsed, 0, 0))
+        if (!FJsonObjectConverter::JsonObjectToUStruct(Loaded.JsonObject.ToSharedRef(), &Parsed, 0, 0))
         {
             OutError = TEXT("Failed to parse interaction JSON. Check property names, enum values, and value types.");
             return false;

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Gravity/GravityFieldTypes.h"
 #include "Simulator/AssetDefinitionTypes.h"
 #include "Simulator/ModelDefinitionTypes.h"
 #include "System/ProjectTypes.h"
@@ -25,6 +26,7 @@ struct V3DSIMULATOR_API FModelDefinition
     EModelEntityType EntityType = EModelEntityType::None;
     EModelItemType ItemType = EModelItemType::None;
     TMap<FString, FString> Bones;
+    FGravityFieldSettings GravityField;
 
     bool IsLoadable() const
     {
@@ -44,8 +46,8 @@ struct V3DSIMULATOR_API FModelDefinition
 namespace ModelDefinitionJson
 {
     /**
-     * Creates or upgrades the sibling JSON for every recursively discovered GLB.
-     * Required metadata is persisted to disk before validation, and the default ModelType comes
+     * Creates missing sibling JSON for every recursively discovered GLB.
+     * New metadata is persisted to disk before validation, and the default ModelType comes
      * from ProjectBuildPolicy. Existing author-owned fields are preserved.
      * OutDiscoveredGlbFiles receives the exact normalized, de-duplicated source snapshot.
      *

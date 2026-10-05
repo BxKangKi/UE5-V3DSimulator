@@ -820,19 +820,19 @@ void ACharacterController::RefreshMassAwarePhysicsInteraction(bool bForce)
         0.0f,
         CharacterControllerTuning::MaxPushTractionCoefficient);
 
+    const float GravityAcceleration = FMath::IsFinite(Movement->GetGravityZ())
+        ? FMath::Abs(Movement->GetGravityZ()) : CharacterControllerTuning::DefaultGravityAccelerationCm;
     const bool bSettingsChanged = !FMath::IsNearlyEqual(CharacterMassKg, NewMassKg, 0.01f)
         || !FMath::IsNearlyEqual(CharacterPushTractionCoefficient, NewTractionCoefficient, 0.001f);
     if (!bForce && !bSettingsChanged)
     {
+        CharacterPushForceLimit = CharacterMassKg * GravityAcceleration * CharacterPushTractionCoefficient;
+        Movement->PushForceFactor = CharacterPushForceLimit;
         return;
     }
 
     CharacterMassKg = NewMassKg;
     CharacterPushTractionCoefficient = NewTractionCoefficient;
-    const UWorld* World = GetWorld();
-    const float GravityAcceleration = World && FMath::IsFinite(World->GetGravityZ())
-        ? FMath::Max(1.0f, FMath::Abs(World->GetGravityZ()))
-        : CharacterControllerTuning::DefaultGravityAccelerationCm;
 
     // A walking character is a kinematic controller, so the stock 750,000 push force is not tied
     // to body mass and can accelerate a one-ton vehicle far too easily. Derive the sustained force
@@ -904,10 +904,11 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
         PushDirection = (-HitNormal).GetSafeNormal();
     }
 
-    FVector HorizontalDirection(PushDirection.X, PushDirection.Y, 0.0f);
+    const FVector GravityUp = -Movement->GetGravityDirection();
+    FVector HorizontalDirection = FVector::VectorPlaneProject(PushDirection, GravityUp);
     if (!HorizontalDirection.Normalize())
     {
-        HorizontalDirection = FVector(-HitNormal.X, -HitNormal.Y, 0.0f);
+        HorizontalDirection = FVector::VectorPlaneProject(-HitNormal, GravityUp);
         if (!HorizontalDirection.Normalize())
         {
             return;
@@ -964,7 +965,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     const float UpwardVelocity = FMath::Clamp(ImpactSpeed * CharacterControllerTuning::PhysicsObjectImpactUpwardRatio, 0.0f, CharacterControllerTuning::MaxPhysicsObjectImpactUpwardVelocity);
     if (UpwardVelocity > 0.0f)
     {
-        VelocityDelta.Z = UpwardVelocity;
+        VelocityDelta += GravityUp * UpwardVelocity;
     }
 
     if (!VelocityDelta.IsNearlyZero())
@@ -977,7 +978,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 
 void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    if (!IsValid(Component.Get()))
+    if (!IsValid(Component.Get()) || !IsValid(Movement))
     {
         return;
     }
@@ -993,7 +994,7 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
         RefreshMassAwarePhysicsInteraction(false);
     }
 
-    if (GetVelocity().Z <= 0.0f)
+    if (FVector::DotProduct(GetVelocity(), -Movement->GetGravityDirection()) <= 0.0f)
     {
         CharacterStateBit &= ~STATE_JUMPING;
     }
@@ -1726,7 +1727,7 @@ FVector ACharacterController::GetBottomLocation()
     const FVector Location = GetActorLocation();
     const float HalfHeight = GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
     // Move only the Z value down by half the capsule height.
-    return FVector(Location.X, Location.Y, Location.Z - HalfHeight);
+    return Location - GetActorUpVector() * HalfHeight;
 }
 
 void ACharacterController::SetFirstPersonEnabled(bool bEnabled)
@@ -1779,8 +1780,8 @@ void ACharacterController::TriggerFootstepTrace(EControllerHand FootSide)
 
     // 1. Pick the foot bone that should be traced.
     FName BoneName = (FootSide == EControllerHand::Left) ? BONE_LEFT_FOOT : BONE_RIGHT_FOOT;
-    FVector Start = GetMesh()->GetBoneLocation(BoneName) + FVector(0.0f, 0.0f, 10.0f);
-    FVector End = Start - FVector(0.0f, 0.0f, 50.0f);
+    FVector Start = GetMesh()->GetBoneLocation(BoneName) + GetActorUpVector() * 10.0f;
+    FVector End = Start - GetActorUpVector() * 50.0f;
 
     FCollisionQueryParams Params;
     // Use complex tracing so the hit result can return the physical material.
