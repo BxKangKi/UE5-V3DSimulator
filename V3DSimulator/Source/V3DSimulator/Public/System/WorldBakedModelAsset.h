@@ -86,6 +86,22 @@ struct FGWorldBakedAsyncBuildReferences
     TArray<TObjectPtr<UObject>> References;
 };
 
+/** Request-scoped pins; config references also survive admission/native queue waits. */
+USTRUCT()
+struct FGWorldBakedReadReferences
+{
+    GENERATED_BODY()
+    uint64 Id = 0;
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<UObject>> References;
+
+    UPROPERTY(Transient)
+    FglTFRuntimeStaticMeshConfig StaticConfig;
+
+    UPROPERTY(Transient)
+    FglTFRuntimeSkeletalMeshConfig SkeletalConfig;
+};
+
 /**
  * Runtime facade over one baked model.
  *
@@ -166,6 +182,7 @@ public:
 
 private:
     friend class UWorldBakedMeshFinalizeRequest;
+    friend class FV3DBakedRequestReferencesTest;
 
     FGuid UUID;
     FString Reference;
@@ -177,33 +194,28 @@ private:
     UPROPERTY(Transient)
     TArray<FglTFRuntimeNode> Nodes;
 
-    /**
-     * Runtime texture cache for this baked-model facade. The weak map provides O(1) lookup while
-     * a bounded reflected keep-alive set makes it safe for worker reads to omit recently used
-     * texture.dat members that have already been reconstructed on the game thread. The strong set
-     * is capped by count and decoded byte size so world streaming cannot retain every visited texture.
-     */
-    // Key packs baked texture id + active max-resolution setting so changing the texture cap
-    // cannot accidentally reuse a larger runtime texture from an earlier streaming request.
+    // Weak-only reuse: unloading the last mesh/material permits normal GC immediately.
     TMap<uint64, TWeakObjectPtr<UTexture2D>> WeakTextureCache;
-
-    UPROPERTY(Transient)
-    TArray<TObjectPtr<UTexture2D>> TextureCacheKeepAlive;
-    TArray<uint64> TextureCacheKeepAliveKeys;
-    TArray<int64> TextureCacheKeepAliveBytes;
-    int64 TextureCacheKeepAliveTotalBytes = 0;
-
-    /**
-     * Reuses immutable runtime MIDs across mesh groups of the same baked model. The cache key
-     * includes the material-config signature, so a changed override/material setup never reuses an
-     * incompatible instance. A bounded reflected set lets worker bundle reads skip material.dat
-     * and all of its texture dependencies while the material is guaranteed resident.
-     */
     TMap<uint64, TWeakObjectPtr<UMaterialInterface>> WeakMaterialCache;
-
+    // Learned from verified archive members. No mesh/pixel arrays or UObject references here.
+    TMap<int32, TArray<int32>> MeshMaterialDependencies;
+    TMap<int32, TArray<int32>> MaterialTextureDependencies;
     UPROPERTY(Transient)
-    TArray<TObjectPtr<UMaterialInterface>> MaterialCacheKeepAlive;
-    TArray<uint64> MaterialCacheKeepAliveKeys;
+    TArray<FGWorldBakedReadReferences> PendingReadReferences;
+    uint64 NextReadId = 1;
+
+    uint64 RetainReadReferences(const FWorldBakedBuildReferenceGuard& Guard);
+    uint64 RetainRequestConfig(const FglTFRuntimeStaticMeshConfig& Config);
+    uint64 RetainRequestConfig(const FglTFRuntimeSkeletalMeshConfig& Config);
+    void ReleaseReadReferences(uint64 Id);
+    int64 EstimateLoadBytes(const TArray<int32>& MeshIndices, bool bMaterials, int32 SkinIndex,
+        int32 TextureLimit, uint32 MaterialSignature) const;
+    void RememberDependencies(const FGWorldBakedAssetBundle& Bundle);
+    void PrepareDependenciesAsync(const TArray<int32>& MeshIndices, TFunction<void(bool)> Completion);
+    void LoadStaticMeshLODsAdmitted(const TArray<int32>& MeshIndices,
+        FGWorldBakedStaticMeshNativeCallback Callback, const FglTFRuntimeStaticMeshConfig& Config);
+    void LoadSkeletalMeshAdmitted(int32 MeshIndex, int32 SkinIndex,
+        FGWorldBakedSkeletalMeshNativeCallback Callback, const FglTFRuntimeSkeletalMeshConfig& Config);
 
     /**
      * Pending/active decoded-data finalizers. Archive I/O and RuntimeLOD conversion are completed
@@ -235,14 +247,14 @@ private:
     void CompleteSharedRenderMeshRequest(const FString& CacheKey, UStaticMesh* Mesh);
 
     bool BuildRuntimeLODs(
-        const FGWorldBakedAssetBundle& Bundle,
+        FGWorldBakedAssetBundle& Bundle,
         const FglTFRuntimeMaterialsConfig& MaterialsConfig,
         int32 SkinIndex,
         FWorldBakedBuildReferenceGuard& ReferenceGuard,
         TArray<FglTFRuntimeMeshLOD>& OutLODs,
         FString& OutError);
     bool AttachRuntimeMaterials(
-        const FGWorldBakedAssetBundle& Bundle,
+        FGWorldBakedAssetBundle& Bundle,
         const FglTFRuntimeMaterialsConfig& MaterialsConfig,
         const TArray<TArray<int32>>& MaterialIds,
         FWorldBakedBuildReferenceGuard& ReferenceGuard,
@@ -267,21 +279,20 @@ private:
     void RemoveFinalizeRequest(UWorldBakedMeshFinalizeRequest* Request);
 
     UglTFRuntimeAsset* CreateMeshBuilder(FString& OutError);
-    void CollectCachedTextureIds(TSet<int32>& OutTextureIds);
-    void CollectCachedMaterialIds(
-        const FglTFRuntimeMaterialsConfig& MaterialsConfig,
-        TSet<int32>& OutMaterialIds);
+    void CollectCachedDependencies(const TArray<int32>& MeshIndices,
+        const FglTFRuntimeMaterialsConfig& Config, TSet<int32>& OutTextureIds,
+        TSet<int32>& OutMaterialIds, FWorldBakedBuildReferenceGuard& Guard, int32 TextureLimit);
     UMaterialInterface* FindCachedMaterial(
         int32 MaterialId,
         const FglTFRuntimeMaterialsConfig& MaterialsConfig,
         FWorldBakedBuildReferenceGuard& ReferenceGuard);
     UTexture2D* FindCachedTexture(
         int32 TextureId,
-        FWorldBakedBuildReferenceGuard& ReferenceGuard);
+        FWorldBakedBuildReferenceGuard& ReferenceGuard, int32 TextureLimit);
     UTexture2D* CreateTexture(
-        const FGWorldBakedTexture& Baked,
+        FGWorldBakedTexture& Baked,
         FWorldBakedBuildReferenceGuard& ReferenceGuard,
-        FString& OutError);
+        FString& OutError, int32 TextureLimit);
     UMaterialInterface* CreateMaterial(
         const FGWorldBakedMaterial& Baked,
         const TMap<int32, UTexture2D*>& Textures,

@@ -953,7 +953,7 @@ namespace SafeFileIOPrivate
         const double FrameStartSeconds = FPlatformTime::Seconds();
         while (Processed < MaxCallbacksPerFrame && State.GameThreadContinuations.Dequeue(Task))
         {
-            if (!IsShuttingDown() && Task)
+            if (Task)
             {
                 Task();
             }
@@ -1014,6 +1014,7 @@ namespace SafeFileIOPrivate
                 FSafeFileIO::FTrackedTask Dropped;
                 while (GameState.GameThreadContinuations.Dequeue(Dropped))
                 {
+                    if (Dropped) Dropped(); // Wrappers suppress ordinary work; cleanup can drain.
                     Dropped = FSafeFileIO::FTrackedTask();
                 }
                 FScopeLock StateScope(&GameState.StateLock);
@@ -1040,7 +1041,7 @@ namespace SafeFileIOPrivate
                 OperationLifetime = MoveTemp(OperationLifetime)]() mutable
             {
                 // Holding OperationLifetime keeps module shutdown from unloading callback code while
-                // this continuation is still queued. The ticker suppresses it after shutdown starts.
+                // this continuation is still queued. This wrapper suppresses it after shutdown starts.
                 if (!IsShuttingDown())
                 {
                     Callback(MoveTemp(Result));
@@ -1089,7 +1090,7 @@ namespace SafeFileIOPrivate
     }
 }
 
-bool FSafeFileIO::RunTrackedWorker(FTrackedTask Task)
+bool FSafeFileIO::RunTrackedWorker(FTrackedTask Task, const bool bCompleteDuringShutdown)
 {
     if (!Task || SafeFileIOPrivate::IsShuttingDown())
     {
@@ -1100,9 +1101,9 @@ bool FSafeFileIO::RunTrackedWorker(FTrackedTask Task)
     const TSharedRef<SafeFileIOPrivate::FTrackedOperation, ESPMode::ThreadSafe> TrackedOperation =
         MakeShared<SafeFileIOPrivate::FTrackedOperation, ESPMode::ThreadSafe>();
     Async(EAsyncExecution::ThreadPool,
-        [Task = MoveTemp(Task), TrackedOperation]() mutable
+        [Task = MoveTemp(Task), TrackedOperation, bCompleteDuringShutdown]() mutable
         {
-            if (!SafeFileIOPrivate::IsShuttingDown())
+            if (bCompleteDuringShutdown || !SafeFileIOPrivate::IsShuttingDown())
             {
                 Task();
             }
@@ -1110,9 +1111,9 @@ bool FSafeFileIO::RunTrackedWorker(FTrackedTask Task)
     return true;
 }
 
-bool FSafeFileIO::DispatchTrackedGameThread(FTrackedTask Task)
+bool FSafeFileIO::DispatchTrackedGameThread(FTrackedTask Task, const bool bCompleteDuringShutdown)
 {
-    if (!Task || SafeFileIOPrivate::IsShuttingDown())
+    if (!Task || (!bCompleteDuringShutdown && SafeFileIOPrivate::IsShuttingDown()))
     {
         return false;
     }
@@ -1126,9 +1127,9 @@ bool FSafeFileIO::DispatchTrackedGameThread(FTrackedTask Task)
     }
 
     SafeFileIOPrivate::QueueGameThreadContinuation(
-        [Task = MoveTemp(Task), TrackedOperation]() mutable
+        [Task = MoveTemp(Task), TrackedOperation, bCompleteDuringShutdown]() mutable
         {
-            if (!SafeFileIOPrivate::IsShuttingDown())
+            if (bCompleteDuringShutdown || !SafeFileIOPrivate::IsShuttingDown())
             {
                 Task();
             }
@@ -1843,12 +1844,13 @@ bool FSafeFileIO::FlushPendingOperations(const double TimeoutSeconds)
         {
             FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
             // Shutdown may occur before another engine frame ticks. Drain queued continuations here
-            // so their lifetime trackers can release without executing user callbacks after shutdown.
+            // so their lifetime trackers can release. Wrappers suppress ordinary user callbacks;
+            // explicitly opted-in terminal cleanup still runs on this thread.
             SafeFileIOPrivate::FState& State = SafeFileIOPrivate::GetState();
             FSafeFileIO::FTrackedTask Dropped;
             while (State.GameThreadContinuations.Dequeue(Dropped))
             {
-                if (!SafeFileIOPrivate::IsShuttingDown() && Dropped) Dropped();
+                if (Dropped) Dropped(); // Ordinary callbacks self-suppress; terminal cleanup still runs.
                 Dropped = FSafeFileIO::FTrackedTask();
             }
             FScopeLock StateScope(&State.StateLock);
@@ -1914,6 +1916,36 @@ void FSafeFileIO::CleanupStaleTemporaryFiles(const FString& RootDirectory, const
 
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFileShutdownCleanupTest,
+    "V3DSimulator.System.FileIO.ShutdownCleanup",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DFileShutdownCleanupTest::RunTest(const FString&)
+{
+    if (FSafeFileIO::IsShuttingDown() || FSafeFileIO::GetPendingOperationCount() != 0)
+    {
+        AddError(TEXT("Run this test with no active file work."));
+        return false;
+    }
+    auto Cleanup = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    auto Ordinary = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    TestTrue(TEXT("Worker owns a guaranteed terminal continuation"), FSafeFileIO::RunTrackedWorker(
+        [Cleanup, Ordinary]()
+        {
+            FSafeFileIO::DispatchTrackedGameThread([Ordinary]() { Ordinary->Increment(); });
+            FSafeFileIO::DispatchTrackedGameThread([Cleanup]() { Cleanup->Increment(); }, true);
+        }, true));
+    FSafeFileIO::BeginShutdown();
+    // Only this idle-state test temporarily changes the shutdown flag; production never restarts it.
+    ON_SCOPE_EXIT { SafeFileIOPrivate::GetState().ShutdownFlag.Reset(); };
+    TestTrue(TEXT("Accepted worker and terminal cleanup drain during shutdown"),
+        FSafeFileIO::FlushPendingOperations(5.0));
+    TestEqual(TEXT("Terminal ownership cleanup runs exactly once"), Cleanup->GetValue(), 1);
+    TestEqual(TEXT("Ordinary work is suppressed"), Ordinary->GetValue(), 0);
+    TestEqual(TEXT("All lifetimes released before module unload"), FSafeFileIO::GetPendingOperationCount(), 0);
+    return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFileContinuationDrainTest,
     "V3DSimulator.System.FileIO.ContinuationDrain",

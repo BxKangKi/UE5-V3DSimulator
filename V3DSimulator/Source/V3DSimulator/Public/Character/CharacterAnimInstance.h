@@ -130,6 +130,8 @@ public:
     void RefreshCharacterAnimationState(float DeltaSeconds = 0.0f);
 
 private:
+    virtual FAnimInstanceProxy* CreateAnimInstanceProxy() override;
+    virtual void DestroyAnimInstanceProxy(FAnimInstanceProxy* InProxy) override;
     virtual void NativeUpdateAnimation(float DeltaSeconds) override;
     virtual void NativeInitializeAnimation() override;
 

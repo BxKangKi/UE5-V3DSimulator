@@ -84,8 +84,14 @@ float4 UnderWaterShaft(
     float Exposure,
     float WaterLevel,
     float NoiseScale,
-    float RefractionStrength)
+    float RefractionStrength,
+    float Activation)
 {
+    [branch] if (Activation < 0.5f)
+    {
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    }
+
     float3 L = normalize(SunDir);
 
     float3 V = normalize(ResolvedView.ViewForward);

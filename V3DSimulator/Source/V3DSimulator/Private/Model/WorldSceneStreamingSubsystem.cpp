@@ -8,9 +8,12 @@
  */
 
 #include "Model/WorldSceneStreamingSubsystem.h"
+#include "System/V3DStreamingBudget.h"
+#include "System/V3DStreamingPolicy.h"
 
 #include "Character/CharacterController.h"
 #include "Camera/CameraComponent.h"
+#include "GameFramework/PlayerController.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "CoreGlobals.h"
 #include "Engine/GameInstance.h"
@@ -29,7 +32,6 @@
 
 namespace
 {
-    constexpr float SceneDistanceScale = 64.0f;
     constexpr float StreamPollIntervalSeconds = 0.10f;
     constexpr double PlayerActorWaitTimeoutSeconds = 30.0;
     constexpr double PlayerLoadTimeoutSeconds = 120.0;
@@ -500,7 +502,7 @@ void UWorldSceneStreamingSubsystem::GetStreamingObserverLocations(TArray<FVector
 {
     check(IsInGameThread());
     OutLocations.Reset();
-    OutLocations.Reserve(2);
+    OutLocations.Reserve(3);
 
     // Destination preloading must be additive. Put the destination first so bounded spawn/build
     // budgets favor it, but retain the live player observer until the teleport actually commits.
@@ -514,6 +516,15 @@ void UWorldSceneStreamingSubsystem::GetStreamingObserverLocations(TArray<FVector
         && (!bHasPriorityStreamingFocus || !LivePlayerLocation.Equals(PriorityStreamingFocus, 1.0)))
     {
         OutLocations.Add(LivePlayerLocation);
+    }
+
+    // Include the rendered camera as well as the collision/pawn and preload destination.
+    if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+    {
+        FVector CameraLocation;
+        FRotator CameraRotation;
+        PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
+        if (IsFiniteVector(CameraLocation)) OutLocations.AddUnique(CameraLocation);
     }
 
     if (OutLocations.IsEmpty())
@@ -573,15 +584,7 @@ bool UWorldSceneStreamingSubsystem::IsLocationReady(const FVector& WorldLocation
     if (!bActive) return true;
     if (!IsValid(OwnerActor) || !IsFiniteVector(WorldLocation)) return false;
 
-    float DistanceMultiplier = SceneDistanceScale;
-    if (const UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(OwnerActor.Get()))
-    {
-        if (const UGameSettings* Settings = Manager->GetGameSettings())
-        {
-            DistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
-        }
-    }
-    const double SafeDistanceMultiplier = static_cast<double>(FMath::Max(1.0f, DistanceMultiplier));
+    const double ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
 
     for (const FWorldSceneStreamRecord& Record : SceneRecords)
@@ -591,12 +594,8 @@ bool UWorldSceneStreamingSubsystem::IsLocationReady(const FVector& WorldLocation
             && IsFiniteVector(Record.Bounds.Size)
             && !Record.Bounds.Size.IsNearlyZero(0.001f))
         {
-            const double Radius = FMath::Max3(Record.Bounds.Size.X, Record.Bounds.Size.Y, Record.Bounds.Size.Z)
-                * SafeDistanceMultiplier;
-            if (!FMath::IsFinite(Radius)) return false;
-            const FVector WorldCenter = OwnerTransform.TransformPosition(Record.Bounds.Center);
-            bInside = FVector::DistSquared(WorldLocation, WorldCenter)
-                <= FMath::Square(FMath::Max(1.0, Radius));
+            bInside = V3DStreamingPolicy::SceneInRange(Record.Bounds.Center, Record.Bounds.Size,
+                OwnerTransform, WorldLocation, ScreenDistance);
         }
         if (!bInside) continue;
 
@@ -620,14 +619,12 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
 
     int32 SpawnBudget = 2;
     float UnloadMultiplier = 1.10f;
-    float DistanceMultiplier = SceneDistanceScale;
     if (const UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(OwnerActor.Get()))
     {
         if (const UGameSettings* Settings = Manager->GetGameSettings())
         {
             SpawnBudget = Settings->GetStreamingSceneSpawnBudget();
             UnloadMultiplier = Settings->GetStreamingUnloadDistanceMultiplier();
-            DistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
         }
     }
     SpawnBudget = FMath::Max(1, SpawnBudget);
@@ -646,13 +643,13 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     TArray<FVector> StreamingObservers;
     GetStreamingObserverLocations(StreamingObservers);
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
-    const double SafeDistanceMultiplier = static_cast<double>(FMath::Max(1.0f, DistanceMultiplier));
+    const double ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
 
     // UpdateStreaming can scan thousands of compact directory records. Snapshot both observers
     // once. A priority destination is additive, so current-area actors stay resident until the
     // destination has completed and the teleport/spawn transaction clears its extra focus.
     const auto IsInsideRange =
-        [&OwnerTransform, &StreamingObservers, SafeDistanceMultiplier](
+        [&OwnerTransform, &StreamingObservers, ScreenDistance](
             const FModelData& Bounds, const float RadiusMultiplier)
         {
             if (!IsFiniteVector(Bounds.Center) || !IsFiniteVector(Bounds.Size)
@@ -661,18 +658,10 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
                 return true;
             }
 
-            const double Radius = FMath::Max3(Bounds.Size.X, Bounds.Size.Y, Bounds.Size.Z)
-                * SafeDistanceMultiplier
-                * static_cast<double>(FMath::Clamp(RadiusMultiplier, 1.0f, 2.0f));
-            if (!FMath::IsFinite(Radius))
-            {
-                return false;
-            }
-            const FVector WorldCenter = OwnerTransform.TransformPosition(Bounds.Center);
-            const double RadiusSq = FMath::Square(FMath::Max(1.0, Radius));
             for (const FVector& Observer : StreamingObservers)
             {
-                if (FVector::DistSquared(Observer, WorldCenter) <= RadiusSq) return true;
+                if (V3DStreamingPolicy::SceneInRange(Bounds.Center, Bounds.Size, OwnerTransform,
+                    Observer, ScreenDistance, RadiusMultiplier)) return true;
             }
             return false;
         };
@@ -893,6 +882,7 @@ void UWorldSceneStreamingSubsystem::DestroySceneActor(const FString& RuntimeRefe
         Existing->Get()->Destroy();
     }
     ActiveSceneActors.Remove(RuntimeReference);
+    FV3DStreamingBudget::NotifyUnloaded();
 }
 
 void UWorldSceneStreamingSubsystem::BeginInitialPlayerStreamingIfNeeded()

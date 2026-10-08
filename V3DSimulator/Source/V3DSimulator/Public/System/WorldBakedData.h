@@ -165,6 +165,9 @@ struct V3DSIMULATOR_API FGWorldBakedModel
 /** Only the members needed for one requested mesh (or LOD set) are read into this bundle. */
 struct V3DSIMULATOR_API FGWorldBakedAssetBundle
 {
+    int32 MaxTextureResolution = 0; // Request snapshot, never serialized.
+    // Native IDs only. Survive geometry conversion so GT can learn exact read dependencies.
+    TMap<int32, TArray<int32>> MeshMaterialDependencies;
     TArray<FGWorldBakedMesh> Meshes;
     TArray<FGWorldBakedSkin> Skins;
     TArray<FGWorldBakedMaterial> Materials;

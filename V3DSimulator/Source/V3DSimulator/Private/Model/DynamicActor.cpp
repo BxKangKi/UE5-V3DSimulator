@@ -105,6 +105,7 @@ namespace
                 MeshConfig.MaterialsConfig);
         }
         MeshConfig.bAllowCPUAccess = false;
+        MeshConfig.bGenerateStaticMeshDescription = false;
         MeshConfig.bBuildLumenCards = true;
         MeshConfig.bBuildSimpleCollision = false;
         MeshConfig.bBuildComplexCollision = false;

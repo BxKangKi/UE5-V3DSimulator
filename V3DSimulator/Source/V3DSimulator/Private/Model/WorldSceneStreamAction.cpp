@@ -9,6 +9,8 @@
  */
 
 #include "Model/WorldSceneStreamAction.h"
+#include "System/V3DStreamingPolicy.h"
+#include "System/V3DStreamingBudget.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -186,11 +188,11 @@ namespace
             const FModelMeshData* MeshPtr = Plan.MeshMap.Find(Info.MeshName);
             if (!MeshPtr) continue;
 
-            const float MeshSize = MeshPtr->Size.Size();
-            const float LoadRadius = MeshSize + MeshSize * Distance;
-            const float LoadRadiusSq = FMath::Square(LoadRadius);
-            const float UnloadRadiusSq = FMath::Square(LoadRadius * SafeUnloadMultiplier);
             const FTransform WorldTransform = Info.Transform * OwnerWorldTransform;
+            const double LoadRadius = V3DStreamingPolicy::LoadRadius(MeshPtr->Size,
+                WorldTransform.GetScale3D().GetAbs().GetMax(), Distance);
+            const double LoadRadiusSq = FMath::Square(LoadRadius);
+            const double UnloadRadiusSq = FMath::Square(LoadRadius * SafeUnloadMultiplier);
             const double CurrentDist = NearestObserverDistanceSq(WorldTransform.GetLocation());
             NodeDistanceSqCache.Add(NodePair.Key, CurrentDist);
             const bool bIsLoaded = LoadedMeshNodes.Contains(NodePair.Key);
@@ -329,6 +331,10 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
         return nullptr;
     }
 
+    // Legacy distance arguments remain source/Blueprint compatible; the shared camera policy
+    // now controls node selection, bucket discovery and readiness at the same 5% threshold.
+    InDistance = V3DStreamingPolicy::GetScreenSizeDistance(Actor);
+
     auto* Action = NewObject<UWorldSceneStreamAction>();
     Action->WorldContextObject = WorldContextObject;
     Action->OwnerActor = Actor;
@@ -354,9 +360,9 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
             const FModelMeshData* MeshData = Actor->GetAllMeshMapRef().Find(MeshName);
             if (!MeshData) return nullptr;
             Action->MeshMap.Add(MeshName, *MeshData);
-            const float MeshSize = MeshData->Size.Size();
-            MaxWorldRadius = FMath::Max(
-                MaxWorldRadius, MeshSize + MeshSize * FMath::Max(0.0f, InDistance));
+            MaxWorldRadius = FMath::Max(MaxWorldRadius, float(V3DStreamingPolicy::LoadRadius(
+                MeshData->Size, InMeshActor->GetMaxNodeScale()
+                    * Actor->GetActorScale3D().GetAbs().GetMax(), InDistance)));
         }
 
         // Build the union of the hierarchical 8192 m -> 512 m buckets around every observer.
@@ -518,6 +524,13 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
     const float PlanningUnloadMultiplier = UnloadDistanceMultiplier;
     const uint32 Serial = ++PreparationSerial;
     bPreparationInFlight = true;
+    if (Plan.NodeMap.IsEmpty() && Plan.WaterNodeMap.IsEmpty() && LoadedMeshNodes.IsEmpty())
+    {
+        // No I/O/UObject work exists for this group. Do not spend a worker dispatch and a
+        // whole frame occupying a planning slot just to return an empty plan.
+        ApplyPreparedPlan(MoveTemp(Plan), Serial);
+        return;
+    }
     TWeakObjectPtr<UWorldSceneStreamAction> WeakThis(this);
 
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
@@ -591,12 +604,10 @@ void UWorldSceneStreamAction::ApplyPreparedPlan(FWorldSceneStreamPlan&& Plan, co
         + PendingLoadWaterNodes.Num() + PendingUnloadWaterNodes.Num();
     TotalOperationCount = Plan.OriginalNodeWorkCount;
     TotalSkippedOperationCount = FMath::Max(0, TotalOperationCount - PendingOperationCount);
-    CurrentSkippedOperationIndex = 0;
-    constexpr int32 DesiredSkippedProgressUpdates = 16;
-    const int32 SkippedNodesPerUpdate = TotalSkippedOperationCount > 0
-        ? (TotalSkippedOperationCount + DesiredSkippedProgressUpdates - 1) / DesiredSkippedProgressUpdates
-        : 1;
-    SkippedProgressChunkSize = FMath::Max(1, SkippedNodesPerUpdate);
+    // No-op nodes were already evaluated by the worker. UI smoothing must not hold readiness
+    // or a pipeline slot for 16 extra frames when there is no remaining resource work.
+    CurrentSkippedOperationIndex = TotalSkippedOperationCount;
+    SkippedProgressChunkSize = 1;
     bIsLoading = false;
     BroadcastProgress();
     ProcessChunk();
@@ -658,7 +669,17 @@ void UWorldSceneStreamAction::ProcessChunk()
     if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::ProcessChunk"))) return;
     if (bAbortRequested || !IsValid(OwnerActor)) { AbortAndRelease(); return; }
     const double SliceStartSeconds = FPlatformTime::Seconds();
-    const double SliceBudgetSeconds = static_cast<double>(FMath::Clamp(FrameTimeBudgetMs, 0.25f, 4.0f)) * 0.001;
+    const double SliceBudgetSeconds = FMath::Min(
+        static_cast<double>(FMath::Clamp(FrameTimeBudgetMs, 0.25f, 4.0f)) * 0.001,
+        FV3DStreamingBudget::RemainingSceneSeconds());
+    if (SliceBudgetSeconds <= 0.0)
+    {
+        if (UWorld* World = OwnerActor->GetWorld())
+            ProcessTimerHandle = World->GetTimerManager().SetTimerForNextTick(
+                FTimerDelegate::CreateUObject(this, &UWorldSceneStreamAction::ProcessChunk));
+        return;
+    }
+    ON_SCOPE_EXIT { FV3DStreamingBudget::ChargeSceneSeconds(FPlatformTime::Seconds() - SliceStartSeconds); };
     int32 OperationsThisSlice = 0;
     bool bProgressChanged = false;
     const auto HasSliceBudget = [&]()
@@ -671,7 +692,7 @@ void UWorldSceneStreamAction::ProcessChunk()
         bProgressChanged = true;
     }
     const bool bHasPendingLoads = CurrentLoadIndex < PendingLoadNodes.Num() || CurrentLoadWaterIndex < PendingLoadWaterNodes.Num();
-    const int32 UnloadQuota = bHasPendingLoads ? FMath::Max(0, ChunkSize / 3) : ChunkSize;
+    const int32 UnloadQuota = bHasPendingLoads ? FMath::Max(1, ChunkSize / 2) : ChunkSize;
     int32 UnloadsThisSlice = 0;
     while (CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
     { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true; }
@@ -685,9 +706,9 @@ void UWorldSceneStreamAction::ProcessChunk()
     }
     while (!bIsLoading && CurrentLoadWaterIndex < PendingLoadWaterNodes.Num() && HasSliceBudget())
     { ProcessLoadWaterNode(PendingLoadWaterNodes[CurrentLoadWaterIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
-    while (!bIsLoading && CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && HasSliceBudget())
+    while (CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && HasSliceBudget())
     { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
-    while (!bIsLoading && CurrentUnloadIndex < PendingUnloadNodes.Num() && HasSliceBudget())
+    while (CurrentUnloadIndex < PendingUnloadNodes.Num() && HasSliceBudget())
     { ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
     if (IsValid(MeshActor)) MeshActor->FlushInstanceRenderUpdates();
     if (bProgressChanged) BroadcastProgress();
@@ -1107,6 +1128,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     // access while it is built; simple collision does not require retaining the render vertices.
     Config.bBuildNavCollision = !bRenderOnly && bNeedsCollision && Config.bBuildNavCollision;
     Config.bAllowCPUAccess = !bRenderOnly && bBuildComplexCollision;
+    Config.bGenerateStaticMeshDescription = false;
     Config.CollisionComplexity = bBuildComplexCollision
         ? ECollisionTraceFlag::CTF_UseComplexAsSimple
         : ECollisionTraceFlag::CTF_UseDefault;

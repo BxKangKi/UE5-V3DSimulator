@@ -6,6 +6,7 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "System/StreamingMovementGateSubsystem.h"
 #include "UObject/StrongObjectPtr.h"
+#include "Components/BoxComponent.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DStreamingMovementModeRestoreTest,
     "V3DSimulator.World.StreamingGate.RestoreCustomMovement",
@@ -45,6 +46,43 @@ bool FV3DStreamingMovementModeRestoreTest::RunTest(const FString& Parameters)
     Gate->Tick(1.0f / 60.0f);
     Gate->UnregisterMovable(Character);
     TestTrue(TEXT("Unregistration also restores custom movement"), Movement->MovementMode == MOVE_Custom && Movement->CustomMovementMode == 7);
+    Gate->ClearModelRegions(RegionOwner.Get());
+
+    // A character's root does not simulate; its independently moving child bodies still must
+    // freeze, and movement must be suspended at the same time (not an else-if alternative).
+    UBoxComponent* BodyA = NewObject<UBoxComponent>(Character);
+    UBoxComponent* BodyB = NewObject<UBoxComponent>(Character);
+    for (UBoxComponent* Body : {BodyA, BodyB})
+    {
+        Character->AddInstanceComponent(Body);
+        Body->SetBoxExtent(FVector(10));
+        Body->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        Body->SetCollisionResponseToAllChannels(ECR_Ignore);
+        Body->RegisterComponent();
+        Body->SetSimulatePhysics(true);
+    }
+    const FVector SpeedA(320, 15, -80), SpeedB(-40, 210, -10);
+    const FVector SpinA(1, 2, 3), SpinB(3, 1, 2);
+    BodyA->SetPhysicsLinearVelocity(SpeedA);
+    BodyB->SetPhysicsLinearVelocity(SpeedB);
+    BodyA->SetPhysicsAngularVelocityInRadians(SpinA);
+    BodyB->SetPhysicsAngularVelocityInRadians(SpinB);
+    Gate->SetModelRegionAvailable(RegionOwner.Get(), TEXT("bodies"), Bounds, false);
+    Gate->Tick(1.0f / 60.0f);
+    TestFalse(TEXT("First body paused"), BodyA->IsSimulatingPhysics());
+    TestFalse(TEXT("Second body paused"), BodyB->IsSimulatingPhysics());
+    TestTrue(TEXT("Movement also paused while physics bodies exist"), Movement->MovementMode == MOVE_None);
+    Gate->SetModelRegionAvailable(RegionOwner.Get(), TEXT("bodies"), Bounds, true);
+    Gate->Tick(1.0f / 60.0f);
+    TestTrue(TEXT("First independent velocity restored"), BodyA->GetPhysicsLinearVelocity().Equals(SpeedA, 0.01));
+    TestTrue(TEXT("Second independent velocity restored"), BodyB->GetPhysicsLinearVelocity().Equals(SpeedB, 0.01));
+    TestTrue(TEXT("First independent spin restored"), BodyA->GetPhysicsAngularVelocityInRadians().Equals(SpinA, 0.01));
+    TestTrue(TEXT("Second independent spin restored"), BodyB->GetPhysicsAngularVelocityInRadians().Equals(SpinB, 0.01));
+    Gate->SetModelRegionAvailable(RegionOwner.Get(), TEXT("bodies"), Bounds, false);
+    Gate->Tick(1.0f / 60.0f);
+    BodyB->DestroyComponent();
+    Gate->UnregisterMovable(Character);
+    TestTrue(TEXT("Surviving body resumes after sibling destruction"), BodyA->IsSimulatingPhysics());
     Gate->ClearModelRegions(RegionOwner.Get());
     World->DestroyWorld(false);
     return true;

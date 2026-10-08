@@ -9,11 +9,15 @@
 #include "System/GameManagerSubSystem.h"
 #include "System/WorldArchive.h"
 #include "System/WorldBakedModelAsset.h"
+#include "System/WorldBakedTexture.h"
 #include "System/WorldObjectStreamingSubsystem.h"
 #include "Simulator/ModelDefinitionJson.h"
 #include "Simulator/RuntimeModelResolver.h"
 
 #include "Engine/StaticMesh.h"
+#include "RenderingThread.h"
+#include "Misc/App.h"
+#include "UObject/StrongObjectPtr.h"
 #include "StaticMeshResources.h"
 #include "HAL/FileManager.h"
 #include "Misc/AutomationTest.h"
@@ -424,11 +428,24 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
 
     FGWorldBakedAssetBundle Bundle;
     const TArray<int32> RequestedMeshes{0};
+    TestTrue(TEXT("Dependency query reads material links without geometry or pixels"), Reader->ReadMeshBundle(
+        Model.Definition.UUID, Manifest, RequestedMeshes, INDEX_NONE, true, Bundle, Error,
+        nullptr, nullptr, 0, true));
+    TestEqual(TEXT("Dependency query retains no decoded mesh"), Bundle.Meshes.Num(), 0);
+    TestEqual(TEXT("Dependency query retains no pixel buffers"), Bundle.Textures.Num(), 0);
+    TestEqual(TEXT("Dependency query identifies one material"), Bundle.Materials.Num(), 1);
+    const TArray<int32>* DiscoveredIds = Bundle.MeshMaterialDependencies.Find(0);
+    TestTrue(TEXT("Dependency query returns exact mesh material IDs"),
+        DiscoveredIds && DiscoveredIds->Num() == 1 && (*DiscoveredIds)[0] == 0);
+    Bundle.Reset();
     TestTrue(TEXT("Range-read one mesh and only its dependencies"), Reader->ReadMeshBundle(
         Model.Definition.UUID, Manifest, RequestedMeshes, INDEX_NONE, true, Bundle, Error));
     TestEqual(TEXT("One decoded mesh was loaded"), Bundle.Meshes.Num(), 1);
     TestEqual(TEXT("Referenced material was loaded"), Bundle.Materials.Num(), 1);
     TestEqual(TEXT("Referenced texture was loaded"), Bundle.Textures.Num(), 1);
+    const TArray<int32>* MeshDependencies = Bundle.MeshMaterialDependencies.Find(0);
+    TestTrue(TEXT("Native dependency IDs survive the read independently of geometry"),
+        MeshDependencies && MeshDependencies->Num() == 1 && (*MeshDependencies)[0] == 0);
     if (Bundle.Meshes.Num() == 1 && Bundle.Meshes[0].Primitives.Num() == 1)
     {
         TestEqual(TEXT("Decoded vertex count round-trips"),
@@ -453,6 +470,9 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
         Model.Definition.UUID, Manifest, RequestedMeshes, INDEX_NONE, false, Bundle, Error));
     TestEqual(TEXT("Skipped material table stays empty"), Bundle.Materials.Num(), 0);
     TestEqual(TEXT("Skipped texture table stays empty"), Bundle.Textures.Num(), 0);
+    MeshDependencies = Bundle.MeshMaterialDependencies.Find(0);
+    TestTrue(TEXT("Collision-only read still learns material dependency IDs"),
+        MeshDependencies && MeshDependencies->Contains(0));
 
     // Runtime must remain independent from authoring source files after a verified build exists.
     TestTrue(TEXT("Delete source GLB after build"), IFileManager::Get().Delete(*GlbPath));
@@ -475,6 +495,7 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
     TestNotNull(TEXT("Create baked runtime facade without source GLB"), RuntimeAsset);
     if (IsValid(RuntimeAsset))
     {
+        TStrongObjectPtr<UWorldBakedModelAsset> FacadeGuard(RuntimeAsset);
         FglTFRuntimeStaticMeshConfig MeshConfig;
         MeshConfig.Outer = GetTransientPackage();
         MeshConfig.CacheMode = EglTFRuntimeCacheMode::None;
@@ -485,6 +506,7 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
         TestNotNull(TEXT("Build native static mesh from decoded archive members"), RuntimeMesh);
         if (RuntimeMesh)
         {
+            TStrongObjectPtr<UStaticMesh> MeshGuard(RuntimeMesh);
             TestTrue(TEXT("Runtime mesh retains RT support before resource initialization"),
                 bool(RuntimeMesh->bSupportRayTracing));
             TestFalse(TEXT("Render-only mesh does not request retained CPU vertices"),
@@ -501,6 +523,62 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
                 }
                 TestNotNull(TEXT("Runtime mesh supplies Lumen card metadata"),
                     LOD.CardRepresentationData);
+            }
+            // Test the provider independently of RHI, then exercise ordinary UTexture2D recreation.
+            // DefaultMaterial has no texture parameter, so use the fixture's 1x1 member directly.
+            TStrongObjectPtr<UTexture2D> Texture(NewObject<UTexture2D>());
+            UWorldBakedTextureMipProvider* Provider = NewObject<UWorldBakedTextureMipProvider>(Texture.Get());
+            Texture->AddAssetUserData(Provider);
+            FGWorldBakedTexture Initial;
+            const FGWorldArchiveRange& TextureRange = Manifest.TextureRanges.FindChecked(0);
+            TestTrue(TEXT("Read initial provider fixture"), Reader->ReadTextureRange(TextureRange, Initial, Error, 768));
+            TestTrue(TEXT("Attach immutable archive source"), Provider->InitializeArchiveSource(Reader, TextureRange, Initial, 0, 768));
+            TestTrue(TEXT("Provider consumes decoder arrays"), Initial.Mips.IsEmpty());
+            TestEqual(TEXT("One initial pixel is prepared"), Provider->GetRetainedMipBytes(), int64(4));
+            TestFalse(TEXT("Short output view is rejected before consuming pixels"),
+                Provider->GetInitialMipData(0, TArrayView<void*>(), TArrayView<int64>(), FStringView()));
+            TestEqual(TEXT("Invalid request preserves initial payload"), Provider->GetRetainedMipBytes(), int64(4));
+            void* FirstPixels[1] = {nullptr};
+            void* SecondPixels[1] = {nullptr};
+            int64 Sizes[1] = {0};
+            TestTrue(TEXT("Initial mip ownership transfers to caller"),
+                Provider->GetInitialMipData(0, MakeArrayView(FirstPixels), MakeArrayView(Sizes), FStringView()));
+            TestEqual(TEXT("Pixel byte count is exact"), Sizes[0], int64(4));
+            TestEqual(TEXT("Provider retains no uploaded pixels"), Provider->GetRetainedMipBytes(), int64(0));
+            TestTrue(TEXT("Next request restores from checksummed archive"),
+                Provider->GetInitialMipData(0, MakeArrayView(SecondPixels), MakeArrayView(Sizes), FStringView()));
+            if (FirstPixels[0] && SecondPixels[0])
+            {
+                TestTrue(TEXT("Recreation allocates independent render-owned memory"), FirstPixels[0] != SecondPixels[0]);
+                TestTrue(TEXT("Recreated pixels are identical"), FMemory::Memcmp(FirstPixels[0], SecondPixels[0], 4) == 0);
+            }
+            FMemory::Free(FirstPixels[0]);
+            FMemory::Free(SecondPixels[0]);
+            TestEqual(TEXT("Restore retains no pixel copy"), Provider->GetRetainedMipBytes(), int64(0));
+
+            FTexturePlatformData* Data = new FTexturePlatformData();
+            Data->SizeX = Data->SizeY = 1;
+            Data->PixelFormat = PF_B8G8R8A8;
+            FTexture2DMipMap* Mip = new FTexture2DMipMap();
+            Mip->SizeX = Mip->SizeY = 1;
+            Data->Mips.Add(Mip);
+            Texture->SetPlatformData(Data);
+            Texture->NeverStream = true;
+            const FStreamableRenderResourceState State = Provider->GetResourcePostInitState(Texture.Get(), true);
+            TestFalse(TEXT("Engine mip streaming is disabled for archive textures"), bool(State.bSupportsStreaming));
+            TestEqual(TEXT("All selected mips are resident"), int32(State.NumResidentLODs), 1);
+            TestTrue(TEXT("Texture itself is the exported engine class"), Texture->GetClass() == UTexture2D::StaticClass());
+            if (FApp::CanEverRender())
+            {
+                Texture->UpdateResource();
+                FlushRenderingCommands(); // Test only: production streaming never flushes.
+                TestNotNull(TEXT("Ordinary Texture2D creates its resource through the provider"), Texture->GetResource());
+                TestEqual(TEXT("Upload leaves no provider pixel copy"), Provider->GetRetainedMipBytes(), int64(0));
+                TestFalse(TEXT("PlatformData never duplicates CPU pixels"), Mip->BulkData.IsBulkDataLoaded());
+                Texture->UpdateResource();
+                FlushRenderingCommands();
+                TestNotNull(TEXT("Texture survives resource recreation"), Texture->GetResource());
+                TestEqual(TEXT("Recreation leaves no provider pixel copy"), Provider->GetRetainedMipBytes(), int64(0));
             }
         }
     }

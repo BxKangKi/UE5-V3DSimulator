@@ -131,15 +131,19 @@ public:
     /**
      * Runs a pure-data task on the shared worker pool while keeping the game module alive.
      * Worker code must not access UObjects and should marshal results with DispatchTrackedGameThread.
+     * bCompleteDuringShutdown guarantees an already accepted pure-data task reaches its completion;
+     * use it only with a continuation that rejects resource creation and releases ownership on shutdown.
      */
-    static bool RunTrackedWorker(FTrackedTask Task);
+    static bool RunTrackedWorker(FTrackedTask Task, bool bCompleteDuringShutdown = false);
 
     /**
      * Queues a continuation for the normal game-thread ticker frame so UE 5.8 inherited time
      * context remains valid for UObject/render work. Its lifetime is included in shutdown draining.
      * Returns false when shutdown has already started and the continuation was suppressed.
+     * bCompleteDuringShutdown is reserved for terminal ownership cleanup; its callback MUST branch
+     * on IsShuttingDown() and avoid starting UObject/render resource creation during the drain.
      */
-    static bool DispatchTrackedGameThread(FTrackedTask Task);
+    static bool DispatchTrackedGameThread(FTrackedTask Task, bool bCompleteDuringShutdown = false);
 
     /** Returns true after BeginShutdown has stopped new asynchronous work. */
     static bool IsShuttingDown();

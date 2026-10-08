@@ -491,6 +491,8 @@ void FGWorldBakedModel::Reset()
 
 void FGWorldBakedAssetBundle::Reset()
 {
+    MaxTextureResolution = 0;
+    MeshMaterialDependencies.Reset();
     Meshes.Reset();
     Skins.Reset();
     Materials.Reset();

@@ -15,6 +15,8 @@
 #include "StreamingMovementGateSubsystem.generated.h"
 
 class UPrimitiveComponent;
+class USkeletalMeshComponent;
+class UBodySetupCore;
 
 /**
  * Stops a player or physics object before it enters unavailable chunk/mesh data. Each machine
@@ -50,15 +52,31 @@ private:
         }
     };
 
-    struct FFrozenState
+    struct FFrozenBody
     {
+        FName Bone = NAME_None;
+        FTransform Transform;
         FVector LinearVelocity = FVector::ZeroVector;
         FVector AngularVelocity = FVector::ZeroVector;
         TWeakObjectPtr<UPrimitiveComponent> Primitive;
+        TWeakObjectPtr<UBodySetupCore> Setup;
+        bool bWasAwake = true;
+    };
+    struct FFrozenMesh
+    {
+        TWeakObjectPtr<USkeletalMeshComponent> Mesh;
+        bool bPauseAnims = false;
+        bool bNoSkeletonUpdate = false;
+    };
+    struct FFrozenState
+    {
+        TArray<FFrozenBody> Bodies;
+        TArray<FFrozenMesh> Meshes;
+        FVector LinearVelocity = FVector::ZeroVector;
         uint8 MovementMode = 0;
         uint8 CustomMovementMode = 0;
-        bool bWasSimulatingPhysics = false;
         bool bCharacterMovement = false;
+        bool bRagdoll = false;
     };
 
     bool bDeinitializing = false;

@@ -205,6 +205,12 @@ namespace WorldArchiveCodecPrivate
             if (Count > 0) FMemory::Memcpy(Destination, Bytes.GetData() + Offset, Count);
             Offset += Count; return true;
         }
+        bool Skip(const int32 Count)
+        {
+            if (!Need(Count)) return false;
+            Offset += Count;
+            return true;
+        }
     private:
         bool Need(const int32 Count)
         {
@@ -337,44 +343,52 @@ namespace WorldArchiveCodec
         return Finish(W, Out, Error);
     }
 
-    bool DeserializeMesh(const TArray<uint8>& Bytes, FGWorldBakedMesh& Out, FString& Error)
+    bool DeserializeMesh(const TArray<uint8>& Bytes, FGWorldBakedMesh& Out, FString& Error, const bool bDependenciesOnly)
     {
         Out = FGWorldBakedMesh(); FReader R(Bytes); if (!Header(R, 0x4853454d, Error)) return false;
         Out.MeshIndex = R.I32(); Out.Name = R.String(MaxNameBytes);
+        const auto ReadMeshArray = [&R, bDependenciesOnly](auto& Values,
+            const uint32 Limit, const int32 MinBytes, auto&& ReadOne)
+        {
+            if (!bDependenciesOnly) return ReadArray(R, Values, Limit, MinBytes, ReadOne);
+            const uint32 Count = R.Count(Limit, MinBytes);
+            const uint64 ByteCount = uint64(Count) * uint64(MinBytes);
+            return R.Ok() && ByteCount <= uint64(MAX_int32) && R.Skip(int32(ByteCount));
+        };
         const uint8 HasNormals = R.U8(); const uint8 HasTangents = R.U8();
         const uint8 HasUv = R.U8(); const uint8 HasVertexColors = R.U8();
         if (HasNormals > 1 || HasTangents > 1 || HasUv > 1 || HasVertexColors > 1)
         { Error = TEXT("mesh.dat contains an invalid boolean flag"); return false; }
         Out.bHasNormals = HasNormals != 0; Out.bHasTangents = HasTangents != 0;
         Out.bHasUV = HasUv != 0; Out.bHasVertexColors = HasVertexColors != 0;
-        if (!ReadArray(R, Out.AdditionalTransforms, MaxAdditionalTransforms, 80,
+        if (!ReadMeshArray(Out.AdditionalTransforms, MaxAdditionalTransforms, 80,
                 [&R]() { return R.Transform(); })) return false;
         const uint32 PrimitiveCount = R.Count(MaxPrimitives, 4); if (!R.Ok()) return false;
         Out.Primitives.Reserve(PrimitiveCount);
         for (uint32 PrimitiveIndex = 0; PrimitiveIndex < PrimitiveCount; ++PrimitiveIndex)
         {
             FGWorldBakedPrimitive& P = Out.Primitives.AddDefaulted_GetRef();
-            if (!ReadArray(R, P.Positions, MaxVertices, 12, [&R]() { return R.V3(); })
-                || !ReadArray(R, P.Normals, MaxVertices, 12, [&R]() { return R.V3(); })
-                || !ReadArray(R, P.Tangents, MaxVertices, 16, [&R]() { return R.V4(); })) return false;
+            if (!ReadMeshArray(P.Positions, MaxVertices, 12, [&R]() { return R.V3(); })
+                || !ReadMeshArray(P.Normals, MaxVertices, 12, [&R]() { return R.V3(); })
+                || !ReadMeshArray(P.Tangents, MaxVertices, 16, [&R]() { return R.V4(); })) return false;
             const uint32 UvCount = R.Count(MaxChannels, 4); if (!R.Ok()) return false; P.UVs.SetNum(UvCount);
             for (uint32 I = 0; I < UvCount; ++I)
-                if (!ReadArray(R, P.UVs[I], MaxVertices, 8, [&R]() { return R.V2(); })) return false;
-            if (!ReadArray(R, P.Indices, MaxIndices, 4, [&R]() { return R.U32(); })) return false;
+                if (!ReadMeshArray(P.UVs[I], MaxVertices, 8, [&R]() { return R.V2(); })) return false;
+            if (!ReadMeshArray(P.Indices, MaxIndices, 4, [&R]() { return R.U32(); })) return false;
             const uint32 JointSetCount = R.Count(MaxJointSets, 4); if (!R.Ok()) return false; P.Joints.SetNum(JointSetCount);
             for (uint32 I = 0; I < JointSetCount; ++I)
-                if (!ReadArray(R, P.Joints[I], MaxVertices, 8, [&R]()
+                if (!ReadMeshArray(P.Joints[I], MaxVertices, 8, [&R]()
                     { FGWorldBakedJoint4 X; X.X=R.U16(); X.Y=R.U16(); X.Z=R.U16(); X.W=R.U16(); return X; })) return false;
             const uint32 WeightSetCount = R.Count(MaxJointSets, 4); if (!R.Ok()) return false; P.Weights.SetNum(WeightSetCount);
             for (uint32 I = 0; I < WeightSetCount; ++I)
-                if (!ReadArray(R, P.Weights[I], MaxVertices, 16, [&R]() { return R.V4(); })) return false;
-            if (!ReadArray(R, P.Colors, MaxVertices, 16, [&R]() { return R.V4(); })) return false;
+                if (!ReadMeshArray(P.Weights[I], MaxVertices, 16, [&R]() { return R.V4(); })) return false;
+            if (!ReadMeshArray(P.Colors, MaxVertices, 16, [&R]() { return R.V4(); })) return false;
             const uint32 MorphCount = R.Count(MaxMorphTargets, 12); if (!R.Ok()) return false; P.MorphTargets.Reserve(MorphCount);
             for (uint32 I = 0; I < MorphCount; ++I)
             {
                 FGWorldBakedMorphTarget& M = P.MorphTargets.AddDefaulted_GetRef(); M.Name = R.String(MaxNameBytes);
-                if (!ReadArray(R, M.Positions, MaxVertices, 12, [&R]() { return R.V3(); })
-                    || !ReadArray(R, M.Normals, MaxVertices, 12, [&R]() { return R.V3(); })) return false;
+                if (!ReadMeshArray(M.Positions, MaxVertices, 12, [&R]() { return R.V3(); })
+                    || !ReadMeshArray(M.Normals, MaxVertices, 12, [&R]() { return R.V3(); })) return false;
             }
             const uint32 BoneCount = R.Count(MaxBones, 8); if (!R.Ok()) return false;
             for (uint32 I = 0; I < BoneCount; ++I)
@@ -384,7 +398,7 @@ namespace WorldArchiveCodec
             {
                 const FString Key = R.String(MaxNameBytes); TArray<float> Values;
                 if (Key.IsEmpty() || P.WeightMaps.Contains(Key)
-                    || !ReadArray(R, Values, MaxVertices, 4, [&R]() { return R.Float(); })) return false;
+                    || !ReadMeshArray(Values, MaxVertices, 4, [&R]() { return R.Float(); })) return false;
                 P.WeightMaps.Add(Key, MoveTemp(Values));
             }
             P.MaterialName = R.String(MaxNameBytes); P.MaterialId = R.I32(); P.Mode = R.I32();
@@ -396,6 +410,13 @@ namespace WorldArchiveCodec
             P.bHasMaterial=HasMaterial!=0;P.bHighPrecisionUVs=HighPrecisionUvs!=0;
             P.bHighPrecisionWeights=HighPrecisionWeights!=0;P.bDisableShadows=DisableShadows!=0;
             P.bHasIndices=HasIndices!=0;
+        }
+        if (bDependenciesOnly)
+        {
+            if (!R.End() || Out.MeshIndex < 0)
+            { Error = TEXT("mesh.dat dependency layout is malformed"); Out = {}; return false; }
+            Error.Reset();
+            return true;
         }
         // IsSane also checks full-model contiguous IDs. Temporarily normalize this member's ID and
         // move (never copy) its potentially large arrays into the validation model.
@@ -660,14 +681,12 @@ namespace WorldArchiveCodec
     bool DeserializeTexture(
         const TArray<uint8>& Bytes,
         FGWorldBakedTexture& Out,
-        FString& Error)
+        FString& Error,
+        const int32 MaxResolution)
     {
         Out = FGWorldBakedTexture();
         FReader R(Bytes);
-        if (!Header(R, 0x52584554, Error))
-        {
-            return false;
-        }
+        if (!Header(R, 0x52584554, Error)) return false;
         Out.TextureId = R.I32();
         Out.Name = R.String(MaxNameBytes);
         Out.SizeX = R.I32();
@@ -681,55 +700,42 @@ namespace WorldArchiveCodec
         Out.bSRGB = Srgb != 0;
         (void)R.U8();
         (void)R.U16();
-
         const uint32 MipCount = R.Count(MaxMips, 16);
-        if (!R.Ok())
-        {
-            Error = TEXT("texture.dat mip count is invalid or truncated");
-            return false;
-        }
-        Out.Mips.Reserve(MipCount);
-        for (uint32 Index = 0; Index < MipCount; ++Index)
-        {
-            FGWorldBakedTextureMip& Mip = Out.Mips.AddDefaulted_GetRef();
-            Mip.SizeX = R.I32();
-            Mip.SizeY = R.I32();
-            Mip.SizeZ = R.I32();
-            // Prove the bytes exist before SetNumUninitialized. A forged length must never turn a
-            // short member into a gigabyte-scale allocation attempt.
-            const uint32 ByteCount = R.Count(MaxMipBytes, 1);
-            if (!R.Ok())
-            {
-                Error = TEXT("texture.dat mip size is invalid");
-                Out = FGWorldBakedTexture();
-                return false;
-            }
-            Mip.Bytes.SetNumUninitialized(static_cast<int32>(ByteCount));
-            if (!R.Raw(Mip.Bytes.GetData(), Mip.Bytes.Num()))
-            {
-                Error = TEXT("texture.dat mip bytes are truncated");
-                Out = FGWorldBakedTexture();
-                return false;
-            }
-        }
-
-        bool bMipsValid = !Out.Mips.IsEmpty();
+        bool bValid = R.Ok() && MipCount > 0 && Out.SizeX > 0 && Out.SizeY > 0;
         int32 ExpectedX = Out.SizeX;
         int32 ExpectedY = Out.SizeY;
-        for (const FGWorldBakedTextureMip& Mip : Out.Mips)
+        Out.Mips.Reserve(MipCount);
+        for (uint32 Index = 0; bValid && Index < MipCount; ++Index)
         {
-            bMipsValid = bMipsValid && Mip.SizeX == ExpectedX && Mip.SizeY == ExpectedY
-                && Mip.SizeZ == 1 && !Mip.Bytes.IsEmpty();
+            const int32 X = R.I32();
+            const int32 Y = R.I32();
+            const int32 Z = R.I32();
+            const uint32 ByteCount = R.Count(MaxMipBytes, 1);
+            bValid = R.Ok() && X == ExpectedX && Y == ExpectedY && Z == 1 && ByteCount > 0;
+            if (!bValid) break;
             ExpectedX = FMath::Max(1, ExpectedX >> 1);
             ExpectedY = FMath::Max(1, ExpectedY >> 1);
+            // Validate skipped mip metadata and bounds too. CRC still covers the whole member.
+            // Retain the final mip even for legacy archives with an incomplete mip chain.
+            if (MaxResolution > 0 && (X > MaxResolution || Y > MaxResolution) && Index + 1 < MipCount)
+            {
+                bValid = R.Skip(static_cast<int32>(ByteCount));
+                continue;
+            }
+            FGWorldBakedTextureMip& Mip = Out.Mips.AddDefaulted_GetRef();
+            Mip.SizeX = X; Mip.SizeY = Y; Mip.SizeZ = Z;
+            Mip.Bytes.SetNumUninitialized(static_cast<int32>(ByteCount));
+            bValid = R.Raw(Mip.Bytes.GetData(), Mip.Bytes.Num());
         }
-        if (!R.End() || Out.TextureId < 0 || Out.Name.IsEmpty()
-            || Out.SizeX <= 0 || Out.SizeY <= 0 || Srgb > 1 || !bMipsValid)
+        if (!bValid || !R.End() || Out.TextureId < 0 || Out.Name.IsEmpty()
+            || Srgb > 1 || Out.Mips.IsEmpty())
         {
-            Error = TEXT("texture.dat is malformed");
+            Error = TEXT("texture.dat is malformed or truncated");
             Out = FGWorldBakedTexture();
             return false;
         }
+        Out.SizeX = Out.Mips[0].SizeX;
+        Out.SizeY = Out.Mips[0].SizeY;
         Error.Reset();
         return true;
     }

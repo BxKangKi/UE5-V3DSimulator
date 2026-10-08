@@ -8,6 +8,7 @@
  */
 
 #include "Model/InstancedMeshActor.h"
+#include "System/V3DStreamingBudget.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LightComponent.h"
@@ -47,6 +48,14 @@ bool AInstancedMeshActor::InitializeGroup(
 
     GroupName = InGroupName;
     NodeMap = MoveTemp(InData.Nodes);
+    MaxNodeScale = 0.0;
+    NodeBounds = FBox(ForceInit);
+    for (const auto& Pair : NodeMap)
+    {
+        const FVector Scale = Pair.Value.Transform.GetScale3D().GetAbs();
+        MaxNodeScale = FMath::Max(MaxNodeScale, double(Scale.GetMax()));
+        NodeBounds += Pair.Value.Transform.GetLocation();
+    }
     SpatialChunks = MoveTemp(InData.SpatialChunks);
     AlwaysLoadedNodeNames = MoveTemp(InData.AlwaysLoadedNodeNames);
     ReferencedMeshNames = MoveTemp(InData.ReferencedMeshNames);
@@ -271,6 +280,7 @@ bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
     {
         MeshComponent->ClearInstances();
         MeshComponent->SetStaticMesh(nullptr);
+        FV3DStreamingBudget::NotifyUnloaded();
         NodeInstanceIndices.Empty();
         FreeInstanceIndices.Empty();
         bInstanceRenderStateDirty = false;
@@ -353,6 +363,7 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
             MeshComponent->SetMaterial(Index, nullptr);
         }
         MeshComponent->SetStaticMesh(nullptr);
+        FV3DStreamingBudget::NotifyUnloaded();
     }
     NodeMap.Empty();
     SpatialChunks.Empty();

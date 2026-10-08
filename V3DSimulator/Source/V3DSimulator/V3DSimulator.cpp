@@ -21,6 +21,7 @@
 #include "Framework/Application/SlateApplication.h"
 #include "System/SafeFileIO.h"
 #include "System/V3DRuntimeSafety.h"
+#include "System/V3DStreamingBudget.h"
 #include "UObject/UObjectGlobals.h"
 
 namespace
@@ -147,6 +148,7 @@ void FV3DSimulatorModule::ShutdownModule()
     // Stop accepting new native mesh work first, then reject queued requests. An active plugin job
     // is allowed to reach its terminal callback because interrupting it could free parser memory
     // while a glTFRuntime worker still references it.
+    FV3DStreamingBudget::Shutdown();
     FV3DRuntimeSafety::BeginShutdown();
 
     // Stop new disk transactions and wait for already accepted atomic saves to finish. This greatly

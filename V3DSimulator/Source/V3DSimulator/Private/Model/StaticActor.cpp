@@ -8,6 +8,8 @@
  */
 
 #include "Model/StaticActor.h"
+#include "System/V3DStreamingPolicy.h"
+#include "HAL/PlatformTime.h"
 #include "Gravity/GravityFieldComponent.h"
 
 #include "Async/ParallelFor.h"
@@ -255,16 +257,7 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
         return false;
     }
 
-    float EffectiveDistanceMultiplier = FMath::Max(1.0f, StreamDistance + 1.0f);
-    if (const UGameManagerSubSystem* Manager =
-            UGameManagerSubSystem::GetSubSystem(const_cast<AStaticActor*>(this)))
-    {
-        if (const UGameSettings* Settings = Manager->GetGameSettings())
-        {
-            EffectiveDistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
-        }
-    }
-    const float EffectiveStreamDistance = FMath::Max(0.0f, EffectiveDistanceMultiplier - 1.0f);
+    const float EffectiveStreamDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
     const FTransform OwnerTransform = GetActorTransform();
 
     for (const TPair<FName, TObjectPtr<AInstancedMeshActor>>& GroupPair : OwnedInstancedMeshActors)
@@ -277,9 +270,9 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
         {
             const FModelMeshData* MeshData = AllMeshMap.Find(MeshName);
             if (!MeshData) return false;
-            const float MeshSize = MeshData->Size.Size();
-            MaxWorldRadius = FMath::Max(
-                MaxWorldRadius, MeshSize + MeshSize * EffectiveStreamDistance);
+            MaxWorldRadius = FMath::Max(MaxWorldRadius, float(V3DStreamingPolicy::LoadRadius(
+                MeshData->Size, Group->GetMaxNodeScale()
+                    * OwnerTransform.GetScale3D().GetAbs().GetMax(), EffectiveStreamDistance)));
         }
 
         TMap<FName, FModelNodeData> CandidateNodes;
@@ -292,9 +285,10 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
             const FModelNodeData& Node = NodePair.Value;
             const FModelMeshData* MeshData = AllMeshMap.Find(Node.MeshName);
             if (!MeshData) return false;
-            const float MeshSize = MeshData->Size.Size();
-            const float LoadRadius = MeshSize + MeshSize * EffectiveStreamDistance;
-            const FVector NodeWorldLocation = (Node.Transform * OwnerTransform).GetLocation();
+            const FTransform NodeWorldTransform = Node.Transform * OwnerTransform;
+            const double LoadRadius = V3DStreamingPolicy::LoadRadius(MeshData->Size,
+                NodeWorldTransform.GetScale3D().GetAbs().GetMax(), EffectiveStreamDistance);
+            const FVector NodeWorldLocation = NodeWorldTransform.GetLocation();
             const bool bRequired = Node.bAlwaysLoaded
                 || FVector::DistSquared(WorldLocation, NodeWorldLocation) <= FMath::Square(LoadRadius);
             if (bRequired && !LoadedNodes.Contains(NodePair.Key)) return false;
@@ -782,19 +776,14 @@ void AStaticActor::BuildInstancedMeshActorsStep()
         return;
     }
 
-    int32 SpawnBudget = 2;
-    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
-    {
-        if (const UGameSettings* Settings = Manager->GetGameSettings())
-        {
-            SpawnBudget = Settings->GetStreamingSceneSpawnBudget();
-        }
-    }
-
-    const int32 EndIndex = FMath::Min(
-        PendingInstancedGroupIndex + FMath::Max(1, SpawnBudget),
-        PendingInstancedGroupNames.Num());
-    for (; PendingInstancedGroupIndex < EndIndex; ++PendingInstancedGroupIndex)
+    // These are lightweight group actors; payload concurrency is governed separately.
+    // Fill a time slice instead of delaying every few cheap groups by an entire frame.
+    const double Deadline = FPlatformTime::Seconds() + 0.002;
+    const int32 BeginIndex = PendingInstancedGroupIndex;
+    const int32 EndIndex = FMath::Min(PendingInstancedGroupIndex + 32, PendingInstancedGroupNames.Num());
+    for (; PendingInstancedGroupIndex < EndIndex
+        && (PendingInstancedGroupIndex == BeginIndex || FPlatformTime::Seconds() < Deadline);
+        ++PendingInstancedGroupIndex)
     {
         const FName GroupName = PendingInstancedGroupNames[PendingInstancedGroupIndex];
         FInstancedMeshGroupInitData* GroupData = PendingInstancedGroups.Find(GroupName);
@@ -960,25 +949,11 @@ bool AStaticActor::IsPlayerInsideModelRange() const
         ObserverLocations.Add(Manager->GetPlayerLocation());
     }
     if (ObserverLocations.IsEmpty()) ObserverLocations.Add(FVector::ZeroVector);
-    float DistanceMultiplier = 64.0f;
-    if (UGameManagerSubSystem* Manager =
-            UGameManagerSubSystem::GetSubSystem(const_cast<AStaticActor*>(this)))
-    {
-        if (const UGameSettings* Settings = Manager->GetGameSettings())
-        {
-            DistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
-        }
-    }
-    const float Radius = FMath::Max3(
-        ModelMetadata.Size.X,
-        ModelMetadata.Size.Y,
-        ModelMetadata.Size.Z) * FMath::Max(1.0f, DistanceMultiplier);
-    const FVector WorldCenter =
-        GetActorTransform().TransformPosition(ModelMetadata.Center);
-    const double RadiusSq = FMath::Square(FMath::Max(1.0f, Radius));
+    const float ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
     for (const FVector& Observer : ObserverLocations)
     {
-        if (FVector::DistSquared(Observer, WorldCenter) <= RadiusSq) return true;
+        if (V3DStreamingPolicy::SceneInRange(ModelMetadata.Center, ModelMetadata.Size,
+            GetActorTransform(), Observer, ScreenDistance)) return true;
     }
     return false;
 }
@@ -1067,6 +1042,7 @@ FglTFRuntimeStaticMeshConfig AStaticActor::BuildStreamingMeshConfig()
     // Runtime world streaming should not retain a CPU vertex copy for every visual mesh. The
     // stream action enables CPU access only for groups that actually request complex collision.
     Config.bAllowCPUAccess = false;
+    Config.bGenerateStaticMeshDescription = false;
     // glTFRuntime supplies six bounds-aligned cards per LOD. Keep this compact representation
     // for Lumen's surface cache; screen traces alone cannot cover off-screen world geometry.
     // Mesh builds remain shared and streaming-concurrency limited.
@@ -1119,9 +1095,33 @@ void AStaticActor::StartStreamingStep()
     bIsLoaded = false;
     PendingStreamGroupNames.Empty();
     OwnedInstancedMeshActors.GetKeys(PendingStreamGroupNames);
-    PendingStreamGroupNames.Sort([](const FName A, const FName B)
+    TArray<FVector> PriorityObservers;
+    if (UWorldSceneStreamingSubsystem* Streamer = UWorldSceneStreamingSubsystem::Get(this))
+        Streamer->GetStreamingObserverLocations(PriorityObservers);
+    if (PriorityObservers.IsEmpty())
+        if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+            PriorityObservers.Add(Manager->GetPlayerLocation());
+    TMap<FName, double> GroupDistances;
+    for (const FName Name : PendingStreamGroupNames)
     {
-        return A.LexicalLess(B);
+        const auto* Group = OwnedInstancedMeshActors.FindChecked(Name).Get();
+        double Best = TNumericLimits<double>::Max();
+        if (IsValid(Group))
+        {
+            if (Group->HasAlwaysLoadedNodes()) Best = 0.0;
+            else if (Group->GetNodeBounds().IsValid)
+            {
+                const FBox WorldBounds = Group->GetNodeBounds().TransformBy(GetActorTransform());
+                for (const FVector& Observer : PriorityObservers)
+                    Best = FMath::Min(Best, WorldBounds.ComputeSquaredDistanceToPoint(Observer));
+            }
+        }
+        GroupDistances.Add(Name, Best);
+    }
+    PendingStreamGroupNames.Sort([&GroupDistances](const FName A, const FName B)
+    {
+        const double DA = GroupDistances.FindChecked(A), DB = GroupDistances.FindChecked(B);
+        return DA == DB ? A.LexicalLess(B) : DA < DB;
     });
     PendingStreamGroupIndex = 0;
     bPendingWaterStream = !WaterNodeMap.IsEmpty();
@@ -1155,13 +1155,10 @@ void AStaticActor::LaunchNextStreamingBatch()
 
     TArray<FVector> ObserverLocations;
     int32 SafeChunkSize = FMath::Max(1, ChunkSize);
-    // Keep the number of decoded-but-not-yet-finalized bundles bounded by the same limit that
-    // protects glTFRuntime's native mesh finalizers. The old scene-spawn budget could be 32, which
-    // allowed dozens of texture/material bundles to become resident while only a handful could
-    // enter the native finalizer, increasing RAM without improving throughput.
-    int32 GroupBudget = FV3DRuntimeSafety::GetMeshBuildConcurrencyLimit();
+    // Actions hold planning metadata while waiting. Actual payloads have a global byte/count
+    // admission limit; tying planning slots to native builds leaves disk workers idle.
+    int32 GroupBudget = 12;
     float UnloadDistanceMultiplier = 1.10f;
-    float EffectiveDistanceMultiplier = FMath::Max(1.0f, StreamDistance + 1.0f);
     if (UWorldSceneStreamingSubsystem* Streamer = UWorldSceneStreamingSubsystem::Get(this))
     {
         Streamer->GetStreamingObserverLocations(ObserverLocations);
@@ -1179,7 +1176,6 @@ void AStaticActor::LaunchNextStreamingBatch()
             GroupBudget = FMath::Min(
                 GroupBudget, Settings->GetStreamingMeshGroupConcurrency());
             UnloadDistanceMultiplier = Settings->GetStreamingUnloadDistanceMultiplier();
-            EffectiveDistanceMultiplier = Settings->GetEffectiveStreamingDistanceMultiplier();
         }
     }
     if (ObserverLocations.IsEmpty()) ObserverLocations.Add(FVector::ZeroVector);
@@ -1187,9 +1183,8 @@ void AStaticActor::LaunchNextStreamingBatch()
     const int32 AvailableSlots = FMath::Max(
         0, GroupBudget - ActiveStreamActions.Num());
 
-    // UWorldSceneStreamAction's historical formula is MeshSize + MeshSize * Distance, so pass
-    // multiplier-1 to make the setting itself represent the intuitive final size multiplier.
-    const float EffectiveStreamDistance = FMath::Max(0.0f, EffectiveDistanceMultiplier - 1.0f);
+    // Both readiness and stream planning use the same bounded, world-scale-aware policy.
+    const float EffectiveStreamDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
     const FglTFRuntimeStaticMeshConfig MeshConfig = BuildStreamingMeshConfig();
 
     const auto StartGroup =
@@ -1226,8 +1221,11 @@ void AStaticActor::LaunchNextStreamingBatch()
         };
 
     int32 LaunchedThisBatch = 0;
+    int32 ExaminedThisBatch = 0;
+    const double LaunchDeadline = FPlatformTime::Seconds() + 0.0015;
     TArray<FName> FailedGroups;
-    while (LaunchedThisBatch < AvailableSlots
+    while (LaunchedThisBatch < AvailableSlots && ExaminedThisBatch++ < 64
+        && FPlatformTime::Seconds() < LaunchDeadline
         && PendingStreamGroupIndex < PendingStreamGroupNames.Num())
     {
         const FName GroupName = PendingStreamGroupNames[PendingStreamGroupIndex++];
@@ -1241,7 +1239,7 @@ void AStaticActor::LaunchNextStreamingBatch()
             StreamGroupProgress.FindOrAdd(GroupName) = 1.0f;
             continue;
         }
-        ++LaunchedThisBatch;
+        if (ActiveStreamActions.Contains(GroupName)) ++LaunchedThisBatch;
     }
     for (const FName GroupName : FailedGroups)
     {

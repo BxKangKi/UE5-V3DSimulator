@@ -102,34 +102,10 @@ namespace
         return Transform;
     }
 
-    // UE perspective rendering is normally not governed by one finite far-clip distance, so derive
-    // a practical ocean radius from this project's visible-world controls instead. 8192 m at High
-    // tracks the intended long-range scene view; quality scales it to 4/6/8/12 km, while the object
-    // streaming radius can raise the floor. Overscan hides square-plane corners during camera yaw.
-    constexpr float OceanReferenceViewRadiusMeters = 8192.0f;
-    constexpr float OceanRenderOverscan = 1.125f;
-
-    // Keep a single plane below a 16.384 km half-width. This is deliberately much smaller than the
-    // previous giant transform while still exceeding the normal visible range. Camera-following makes
-    // the ocean effectively unbounded without feeding unnecessarily large coordinates into MI_Water.
+    // Always use the full supported single-plane footprint: 16.384 km from the camera
+    // in every horizontal direction (at least 32.768 km across). View Distance quality
+    // and object streaming settings must not shrink the ocean surface.
     constexpr float OceanMaterialSafeMaxRadiusCm = 1638400.0f;
-
-    float ResolveGlobalOceanRenderRadiusCm(const UGameSettings* Settings)
-    {
-        float ViewScale = 1.0f;
-        float ObjectRadiusMeters = 2048.0f;
-        if (IsValid(Settings))
-        {
-            ViewScale = Settings->GetViewDistanceScale();
-            ObjectRadiusMeters = Settings->GetEffectiveObjectStreamingRadiusMeters();
-        }
-
-        const float ViewRadiusMeters = OceanReferenceViewRadiusMeters
-            * FMath::Max(0.5f, ViewScale);
-        const float DesiredRadiusCm = FMath::Max(ViewRadiusMeters, ObjectRadiusMeters)
-            * OceanRenderOverscan * 100.0f;
-        return FMath::Clamp(DesiredRadiusCm, 100000.0f, OceanMaterialSafeMaxRadiusCm);
-    }
 
 
     /** Resolves the current world JSON play-mode key. Accepted values are exact and versionless. */
@@ -1175,7 +1151,7 @@ void UGameManagerSubSystem::ContinueWorldStartupAfterDatabase()
     {
         const float ObjectRadiusMeters = IsValid(GameSettings)
             ? GameSettings->GetEffectiveObjectStreamingRadiusMeters()
-            : 2048.0f;
+            : 512.0f;
         Chunks->Start(GetWorldRootPath(), ObjectRadiusMeters);
     }
     InitializeRuntimeWorldState();
@@ -2853,7 +2829,7 @@ void UGameManagerSubSystem::SpawnOcean()
         if (AWaterActor* WaterActor = Cast<AWaterActor>(OceanActor))
         {
             WaterActor->SetGlobalOceanRenderRadius(
-                ResolveGlobalOceanRenderRadiusCm(GetGameSettings()));
+                OceanMaterialSafeMaxRadiusCm);
         }
         UE_LOG(LogTemp, Display,
             TEXT("Global ocean spawned. Height-based water detection enabled. Class=%s Location=%s Scale=%s"),
@@ -2898,10 +2874,10 @@ void UGameManagerSubSystem::UpdateOceanFollow()
 
     if (AWaterActor* WaterActor = Cast<AWaterActor>(OceanActor))
     {
-        // The call is cheap after the first application and also makes a live View Distance /
-        // streaming-radius setting change resize the surface without recreating the ocean actor.
+        // Keep the maximum footprint, and retry if the mesh was unavailable at spawn.
+        // SetGlobalOceanRenderRadius skips work once this radius has been applied.
         WaterActor->SetGlobalOceanRenderRadius(
-            ResolveGlobalOceanRenderRadiusCm(GetGameSettings()));
+            OceanMaterialSafeMaxRadiusCm);
     }
 
     FVector DesiredLocation = OceanActor->GetActorLocation();

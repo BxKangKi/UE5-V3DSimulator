@@ -177,7 +177,8 @@ public:
         FGWorldModelManifest& OutManifest,
         FString& OutError) const;
 
-    /** Reads requested LODs and, unless skipped, only their transitive material/texture dependencies. */
+    /** Reads requested LODs and their dependencies. Dependency-only queries return IDs/materials,
+     * without vertex arrays, skin data or pixels; normal payload reads perform full validation. */
     bool ReadMeshBundle(
         const FGuid& UUID,
         const FGWorldModelManifest& Manifest,
@@ -187,7 +188,13 @@ public:
         FGWorldBakedAssetBundle& OutBundle,
         FString& OutError,
         const TSet<int32>* SkipTextureIds = nullptr,
-        const TSet<int32>* SkipMaterialIds = nullptr) const;
+        const TSet<int32>* SkipMaterialIds = nullptr,
+        int32 MaxTextureResolution = 0,
+        bool bDependenciesOnly = false) const;
+
+    /** Re-read one validated immutable texture member for resource recreation. */
+    bool ReadTextureRange(const FGWorldArchiveRange& Range, FGWorldBakedTexture& OutTexture,
+        FString& OutError, int32 MaxResolution = 0) const;
 
 private:
     FString Path;

@@ -10,6 +10,10 @@
 #include "System/StreamingMovementGateSubsystem.h"
 
 #include "Components/PrimitiveComponent.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "PhysicsEngine/BodyInstance.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/SkeletalBodySetup.h"
 #include "Templates/UnrealTemplate.h"
 #include "Character/CharacterComponent.h"
 #include "EngineUtils.h"
@@ -20,14 +24,31 @@
 
 namespace
 {
-    UPrimitiveComponent* FindSimulatingPrimitive(AActor* Actor)
+    template<typename Visitor>
+    void VisitSimulatingBodies(AActor* Actor, Visitor&& Visit)
     {
-        if (!IsValid(Actor)) return nullptr;
+        if (!IsValid(Actor)) return;
         TInlineComponentArray<UPrimitiveComponent*> Primitives(Actor);
         for (UPrimitiveComponent* Primitive : Primitives)
-            if (IsValid(Primitive) && Primitive->IsSimulatingPhysics()) return Primitive;
-        return nullptr;
+        {
+            if (!IsValid(Primitive)) continue;
+            if (USkeletalMeshComponent* Mesh = Cast<USkeletalMeshComponent>(Primitive))
+            {
+                // SetAllBodiesSimulatePhysics does not set the component's simulation flag.
+                // Root-bone/component IsSimulatingPhysics therefore misses many ragdolls.
+                for (FBodyInstance* Body : Mesh->Bodies)
+                    if (Body && Body->IsValidBodyInstance() && Body->IsInstanceSimulatingPhysics()
+                        && Body->BodySetup.IsValid())
+                        Visit(Primitive, Body, Body->BodySetup->BoneName);
+            }
+            else if (FBodyInstance* Body = Primitive->GetBodyInstance())
+            {
+                if (Body->IsValidBodyInstance() && Body->IsInstanceSimulatingPhysics())
+                    Visit(Primitive, Body, NAME_None);
+            }
+        }
     }
+
 }
 
 void UStreamingMovementGateSubsystem::Deinitialize()
@@ -96,18 +117,15 @@ bool UStreamingMovementGateSubsystem::IsDestinationAvailable(const FVector& Dest
 void UStreamingMovementGateSubsystem::Freeze(AActor* Actor)
 {
     if (bDeinitializing || !IsValid(Actor) || Actor->IsActorBeingDestroyed() || FrozenActors.Contains(Actor)) return;
+    // Complete any in-flight bone evaluation before freezing its pose and individual bodies.
+    TInlineComponentArray<USkeletalMeshComponent*> EvaluatingMeshes(Actor);
+    for (USkeletalMeshComponent* Mesh : EvaluatingMeshes)
+        if (IsValid(Mesh)) Mesh->HandleExistingParallelEvaluationTask(true, true);
+    if (!IsValid(Actor) || Actor->IsActorBeingDestroyed() || FrozenActors.Contains(Actor)) return;
     FFrozenState State;
-    // Simulated bodies take priority, including a ragdoll mesh below an ACharacter root capsule.
-    // Storing both velocity vectors before disabling simulation prevents solver drift at the gate.
-    if (UPrimitiveComponent* Primitive = FindSimulatingPrimitive(Actor))
-    {
-        State.Primitive = Primitive;
-        State.bWasSimulatingPhysics = true;
-        State.LinearVelocity = Primitive->GetPhysicsLinearVelocity();
-        State.AngularVelocity = Primitive->GetPhysicsAngularVelocityInRadians();
-    }
-    else if (ACharacter* Character = Cast<ACharacter>(Actor))
-    {
+    if (UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>())
+        State.bRagdoll = CharacterState->IsRagdollActive();
+    if (ACharacter* Character = Cast<ACharacter>(Actor))
         if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
         {
             State.bCharacterMovement = true;
@@ -115,48 +133,86 @@ void UStreamingMovementGateSubsystem::Freeze(AActor* Actor)
             State.CustomMovementMode = Movement->CustomMovementMode;
             State.LinearVelocity = Movement->Velocity;
         }
-    }
-    if (!State.bCharacterMovement && !State.bWasSimulatingPhysics) return;
+
+    VisitSimulatingBodies(Actor, [&State](UPrimitiveComponent* Primitive, FBodyInstance* Body, const FName Bone)
+    {
+        FFrozenBody& Saved = State.Bodies.AddDefaulted_GetRef();
+        Saved.Primitive = Primitive;
+        Saved.Setup = Body->BodySetup;
+        Saved.Bone = Bone;
+        Saved.Transform = Body->GetUnrealWorldTransform();
+        Saved.LinearVelocity = Body->GetUnrealWorldVelocity();
+        Saved.AngularVelocity = Body->GetUnrealWorldAngularVelocityInRadians();
+        Saved.bWasAwake = Body->IsInstanceAwake();
+    });
+    if (!State.bCharacterMovement && State.Bodies.IsEmpty()) return;
+    TInlineComponentArray<USkeletalMeshComponent*> Meshes(Actor);
+    for (USkeletalMeshComponent* Mesh : Meshes)
+        if (IsValid(Mesh))
+        {
+            FFrozenMesh& Saved = State.Meshes.AddDefaulted_GetRef();
+            Saved.Mesh = Mesh;
+            Saved.bPauseAnims = Mesh->bPauseAnims;
+            Saved.bNoSkeletonUpdate = Mesh->bNoSkeletonUpdate;
+        }
+
+    // Publish the complete restoration state before any movement/overlap callbacks can run.
     FrozenActors.Add(Actor, State);
     if (UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>())
         CharacterState->SetStreamingMovementSuspended(true);
-    // Publish restoration data before a setter can emit an overlap/movement callback.
-    if (UPrimitiveComponent* Primitive = State.Primitive.Get())
-    {
-        Primitive->SetPhysicsLinearVelocity(FVector::ZeroVector);
-        Primitive->SetPhysicsAngularVelocityInRadians(FVector::ZeroVector);
-        Primitive->SetSimulatePhysics(false);
-    }
-    else if (ACharacter* Character = Cast<ACharacter>(Actor))
-    {
+    for (const FFrozenMesh& Saved : State.Meshes)
+        if (USkeletalMeshComponent* Mesh = Saved.Mesh.Get())
+        {
+            Mesh->bPauseAnims = true;
+            Mesh->bNoSkeletonUpdate = true;
+        }
+    for (const FFrozenBody& Saved : State.Bodies)
+        if (UPrimitiveComponent* Primitive = Saved.Primitive.Get())
+            if (FBodyInstance* Body = Primitive->GetBodyInstance(Saved.Bone))
+                if (Body->IsValidBodyInstance() && Body->BodySetup == Saved.Setup)
+                {
+                    Body->SetLinearVelocity(FVector::ZeroVector, false, false);
+                    Body->SetAngularVelocityInRadians(FVector::ZeroVector, false, false);
+                    Body->SetInstanceSimulatePhysics(false, true, true);
+                }
+    if (ACharacter* Character = Cast<ACharacter>(Actor))
         if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
         {
             Movement->StopMovementImmediately();
             if (IsValid(Movement) && FrozenActors.Contains(Actor)) Movement->DisableMovement();
         }
-    }
 }
 
 void UStreamingMovementGateSubsystem::Resume(AActor* Actor, const FFrozenState& State)
 {
     if (!IsValid(Actor) || Actor->IsActorBeingDestroyed()) return;
+    // Reacquire by weak component + bone + setup identity. Never retain raw Chaos body pointers
+    // across a streaming wait, during which the actor/mesh/physics asset may be replaced.
+    for (const FFrozenBody& Saved : State.Bodies)
+        if (UPrimitiveComponent* Primitive = Saved.Primitive.Get())
+            if (FBodyInstance* Body = Primitive->GetBodyInstance(Saved.Bone))
+                if (Body->IsValidBodyInstance() && Saved.Setup.IsValid() && Body->BodySetup == Saved.Setup)
+                {
+                    Body->SetInstanceSimulatePhysics(true, true, true);
+                    Body->SetBodyTransform(Saved.Transform, ETeleportType::TeleportPhysics, false);
+                    Body->SetLinearVelocity(Saved.LinearVelocity, false, false);
+                    Body->SetAngularVelocityInRadians(Saved.AngularVelocity, false, false);
+                    if (Saved.bWasAwake) Body->WakeInstance();
+                    else Body->PutInstanceToSleep();
+                }
+    for (const FFrozenMesh& Saved : State.Meshes)
+        if (USkeletalMeshComponent* Mesh = Saved.Mesh.Get())
+        {
+            Mesh->bPauseAnims = Saved.bPauseAnims;
+            Mesh->bNoSkeletonUpdate = Saved.bNoSkeletonUpdate;
+        }
     if (State.bCharacterMovement)
-    {
         if (ACharacter* Character = Cast<ACharacter>(Actor))
             if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
             {
                 Movement->SetMovementMode(static_cast<EMovementMode>(State.MovementMode), State.CustomMovementMode);
                 if (IsValid(Movement)) Movement->Velocity = State.LinearVelocity;
             }
-    }
-    else if (UPrimitiveComponent* Primitive = State.Primitive.Get(); IsValid(Primitive) && State.bWasSimulatingPhysics)
-    {
-        Primitive->SetSimulatePhysics(true);
-        if (IsValid(Primitive)) Primitive->SetPhysicsLinearVelocity(State.LinearVelocity);
-        if (IsValid(Primitive)) Primitive->SetPhysicsAngularVelocityInRadians(State.AngularVelocity);
-    }
-    // Restore velocity first, then make that velocity the new impact baseline. This also handles
-    // resume during unregistration or subsystem teardown, not just the ordinary tick path.
     if (IsValid(Actor))
         if (UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>())
             CharacterState->SetStreamingMovementSuspended(false);
@@ -187,11 +243,42 @@ void UStreamingMovementGateSubsystem::Tick(const float DeltaTime)
             RegisteredMovables.Remove(WeakActor);
             continue;
         }
-        const FFrozenState* Frozen = FrozenActors.Find(WeakActor);
+        const FFrozenState* FoundFrozen = FrozenActors.Find(WeakActor);
+        const FFrozenState FrozenSnapshot = FoundFrozen ? *FoundFrozen : FFrozenState();
+        const FFrozenState* Frozen = FoundFrozen ? &FrozenSnapshot : nullptr;
         const FVector Velocity = Frozen ? Frozen->LinearVelocity : Actor->GetVelocity();
         const FVector Destination = Actor->GetActorLocation() + Velocity * FMath::Clamp(DeltaTime, 0.0f, 0.25f);
         if (Destination.ContainsNaN()) continue;
-        const bool bAvailable = IsDestinationAvailable(Destination);
+        bool bAvailable = IsDestinationAvailable(Destination);
+        if (bDeinitializing || !WeakActor.IsValid() || !RegisteredMovables.Contains(WeakActor)) continue;
+        const UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>();
+        const bool bProbePhysics = Frozen ? Frozen->bRagdoll || !Frozen->bCharacterMovement
+            : !Cast<ACharacter>(Actor) || (CharacterState && CharacterState->IsRagdollActive());
+        const float LookAhead = FMath::Clamp(DeltaTime * 2.0f, 0.05f, 0.25f);
+        if (bAvailable && bProbePhysics)
+        {
+            if (Frozen)
+            {
+                // Copy before destination queries; EnsureLocationLoaded can re-enter the gate.
+                const TArray<FFrozenBody> Bodies = Frozen->Bodies;
+                for (const FFrozenBody& Body : Bodies)
+                {
+                    const FVector Next = Body.Transform.GetLocation() + Body.LinearVelocity * LookAhead;
+                    if (!Next.ContainsNaN() && !IsDestinationAvailable(Next)) bAvailable = false;
+                }
+            }
+            else
+            {
+                TArray<FVector, TInlineAllocator<32>> Destinations;
+                VisitSimulatingBodies(Actor, [&Destinations, LookAhead](UPrimitiveComponent*, FBodyInstance* Body, FName)
+                {
+                    const FVector Next = Body->GetUnrealWorldTransform().GetLocation() + Body->GetUnrealWorldVelocity() * LookAhead;
+                    if (!Next.ContainsNaN()) Destinations.Add(Next);
+                });
+                for (const FVector& Next : Destinations)
+                    if (!IsDestinationAvailable(Next)) bAvailable = false;
+            }
+        }
         // EnsureLocationLoaded can synchronously change world/actor ownership.
         if (bDeinitializing || !WeakActor.IsValid() || !RegisteredMovables.Contains(WeakActor)) continue;
         if (!bAvailable) Freeze(Actor);

@@ -128,11 +128,11 @@ float UGameSettings::GetEffectiveStreamingDistanceMultiplier() const
 {
     switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
     {
-    case 0: return 40.0f;
-    case 1: return 52.0f;
-    case 3: return 88.0f;
+    case 0: return 12.0f;
+    case 1: return 16.0f;
+    case 3: return 28.0f;
     case 2:
-    default: return 64.0f;
+    default: return 20.0f;
     }
 }
 
@@ -140,11 +140,11 @@ float UGameSettings::GetEffectiveObjectStreamingRadiusMeters() const
 {
     switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
     {
-    case 0: return 1024.0f;
-    case 1: return 1536.0f;
-    case 3: return 3072.0f;
+    case 0: return 256.0f;
+    case 1: return 384.0f;
+    case 3: return 768.0f;
     case 2:
-    default: return 2048.0f;
+    default: return 512.0f;
     }
 }
 
@@ -152,11 +152,11 @@ float UGameSettings::GetStreamingUnloadDistanceMultiplier() const
 {
     switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
     {
-    case 0: return 1.20f;
-    case 1: return 1.17f;
-    case 3: return 1.12f;
+    case 0: return 1.10f;
+    case 1: return 1.10f;
+    case 3: return 1.08f;
     case 2:
-    default: return 1.14f;
+    default: return 1.08f;
     }
 }
 
@@ -212,11 +212,11 @@ int32 UGameSettings::GetStreamingMeshGroupConcurrency() const
 {
     switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
     {
-    case 0: return 1;
-    case 1: return 2;
-    case 3: return 4;
+    case 0: return 4;
+    case 1: return 6;
+    case 3: return 12;
     case 2:
-    default: return 3;
+    default: return 8;
     }
 }
 

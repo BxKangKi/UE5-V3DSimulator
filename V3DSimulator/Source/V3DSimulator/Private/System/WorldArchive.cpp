@@ -2636,6 +2636,24 @@ bool FGWorldArchiveReader::ReadModelManifest(
     return true;
 }
 
+bool FGWorldArchiveReader::ReadTextureRange(
+    const FGWorldArchiveRange& Range, FGWorldBakedTexture& OutTexture,
+    FString& OutError, const int32 MaxResolution) const
+{
+    OutTexture = FGWorldBakedTexture();
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*Path));
+    TArray<uint8> Bytes;
+    if (!Handle.IsValid() || Handle->Size() != FileSize)
+    {
+        OutError = TEXT("Texture backing archive changed or is unavailable");
+        return false;
+    }
+    return GWorldArchivePrivate::ReadChecksummedRange(*Handle, FileSize, DataEndOffset, Range,
+        FGWorldArchive::MaxDatMemberBytes, Bytes, OutError)
+        && WorldArchiveCodec::DeserializeTexture(Bytes, OutTexture, OutError, MaxResolution);
+}
+
 bool FGWorldArchiveReader::ReadMeshBundle(
     const FGuid& UUID,
     const FGWorldModelManifest& Manifest,
@@ -2645,10 +2663,13 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     FGWorldBakedAssetBundle& OutBundle,
     FString& OutError,
     const TSet<int32>* SkipTextureIds,
-    const TSet<int32>* SkipMaterialIds) const
+    const TSet<int32>* SkipMaterialIds,
+    const int32 MaxTextureResolution,
+    const bool bDependenciesOnly) const
 {
     using namespace GWorldArchivePrivate;
     OutBundle.Reset();
+    OutBundle.MaxTextureResolution = MaxTextureResolution;
     OutError.Reset();
     const FGWorldModelRecord* Record = Records.Find(UUID);
     const bool bManifestCountsMatch = Record
@@ -2730,7 +2751,7 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     MeshSuccess.Init(0, UniqueMeshes.Num());
 
     ParallelReadShards(UniqueMeshes.Num(),
-        [this, &Manifest, &UniqueMeshes, &MeshResults, &MeshErrors, &MeshSuccess, &ReadMemberBytes](
+        [this, &Manifest, &UniqueMeshes, &MeshResults, &MeshErrors, &MeshSuccess, &ReadMemberBytes, bDependenciesOnly](
             const int32 Index, IFileHandle* Handle, const FString& OpenError)
     {
         const int32 MeshIndex = UniqueMeshes[Index];
@@ -2744,7 +2765,7 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         FGWorldBakedMesh Mesh;
         FString Error = OpenError;
         if (!ReadMemberBytes(Handle, *Range, Bytes, Error)
-            || !WorldArchiveCodec::DeserializeMesh(Bytes, Mesh, Error)
+            || !WorldArchiveCodec::DeserializeMesh(Bytes, Mesh, Error, bDependenciesOnly)
             || Mesh.MeshIndex != MeshIndex)
         {
             MeshErrors[Index] = Error.IsEmpty()
@@ -2765,6 +2786,7 @@ bool FGWorldArchiveReader::ReadMeshBundle(
             OutBundle.Reset();
             return false;
         }
+        TSet<int32> MeshDependencies;
         for (const FGWorldBakedPrimitive& Primitive : MeshResults[Index].Primitives)
         {
             if (Primitive.MaterialId == INDEX_NONE)
@@ -2777,14 +2799,17 @@ bool FGWorldArchiveReader::ReadMeshBundle(
                 OutError = TEXT("Requested mesh.dat refers to a missing material member");
                 return false;
             }
+            MeshDependencies.Add(Primitive.MaterialId);
             if (bLoadMaterialDependencies
                 && (!SkipMaterialIds || !SkipMaterialIds->Contains(Primitive.MaterialId)))
             {
                 MaterialIds.Add(Primitive.MaterialId);
             }
         }
+        OutBundle.MeshMaterialDependencies.Add(MeshResults[Index].MeshIndex, MeshDependencies.Array());
     }
-    OutBundle.Meshes = MoveTemp(MeshResults);
+    if (!bDependenciesOnly) OutBundle.Meshes = MoveTemp(MeshResults);
+    else MeshResults.Empty();
 
     TArray<int32> SortedMaterials = MaterialIds.Array();
     SortedMaterials.Sort();
@@ -2860,6 +2885,9 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         }
     }
 
+    // Dependency discovery validates IDs/material members without allocating or reading pixels.
+    // The later admitted payload read still performs the full texture CRC/layout validation.
+    if (bDependenciesOnly) TextureIds.Reset();
     TArray<int32> SortedTextures = TextureIds.Array();
     SortedTextures.Sort();
     TArray<FGWorldBakedTexture> TextureResults;
@@ -2870,7 +2898,7 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     TextureSuccess.Init(0, SortedTextures.Num());
 
     ParallelReadShards(SortedTextures.Num(),
-        [this, &Manifest, &SortedTextures, &TextureResults, &TextureErrors, &TextureSuccess, &ReadMemberBytes](
+        [this, &Manifest, &SortedTextures, &TextureResults, &TextureErrors, &TextureSuccess, &ReadMemberBytes, MaxTextureResolution](
             const int32 Index, IFileHandle* Handle, const FString& OpenError)
     {
         const int32 TextureId = SortedTextures[Index];
@@ -2884,7 +2912,7 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         FGWorldBakedTexture Texture;
         FString Error = OpenError;
         if (!ReadMemberBytes(Handle, *Range, Bytes, Error)
-            || !WorldArchiveCodec::DeserializeTexture(Bytes, Texture, Error)
+            || !WorldArchiveCodec::DeserializeTexture(Bytes, Texture, Error, MaxTextureResolution)
             || Texture.TextureId != TextureId)
         {
             TextureErrors[Index] = Error.IsEmpty()
@@ -2907,7 +2935,7 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     }
     OutBundle.Textures = MoveTemp(TextureResults);
 
-    if (SkinIndex != INDEX_NONE)
+    if (!bDependenciesOnly && SkinIndex != INDEX_NONE)
     {
         const FGWorldArchiveRange* Range = Manifest.SkinRanges.Find(SkinIndex);
         if (!Range)

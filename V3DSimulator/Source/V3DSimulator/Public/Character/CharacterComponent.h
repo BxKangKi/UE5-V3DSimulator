@@ -13,6 +13,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Engine/EngineTypes.h"
+#include "Character/SwimmingSurfaceMath.h"
 #include "CharacterComponent.generated.h"
 
 // Character state bit flags used by controller input and movement code.
@@ -121,6 +122,12 @@ public:
     /** Clears only the transient water-surface clamp without stopping all movement. */
     void ClearSwimmingSurfaceConstraintState();
 
+    /** Suppresses vertical locomotion at the surface, independently of physical forces. */
+    bool IsSwimmingSurfaceHeld() const { return bSwimmingSurfaceCorrectionEnabled; }
+
+    /** Swept after physics, using a stable reference derived from the evaluated head. */
+    bool GetSwimmingSurfaceCorrection(float DeltaSeconds, float& OutDeltaZ) const;
+
     /** Clears any cached waterline reference while a new mesh is still loading. */
     void InvalidateWaterReferenceForPendingMeshLoad();
 
@@ -147,6 +154,10 @@ public:
 
     UFUNCTION(BlueprintCallable)
     float GetRagdollWeight() const { return RagdollWeight; }
+
+    // Native final-pose blend; land keeps its existing AnimBP get-up sequence after
+    // a short continuity bridge. Water blends the whole recovery to the swimming pose.
+    float GetRecoveryPoseBlendWeight() const;
 
     UFUNCTION(BlueprintCallable)
     bool IsRagdollActive() const { return bIsRagdoll; }
@@ -264,7 +275,7 @@ private:
     float LastPreRagdollVelocityAge = TNumericLimits<float>::Max();
 
 
-    /** Stable capsule-local head/fallback offset sampled only after the final runtime mesh has loaded. */
+    /** Stable entry reference; surface swimming uses the evaluated head bone instead. */
     FVector WaterReferenceOffsetFromCapsule = FVector::ZeroVector;
 
     /** True after WaterReferenceOffsetFromCapsule has been initialized from loaded-mesh head/capsule fallback data. */
@@ -273,8 +284,12 @@ private:
     /** True only after the final mesh-load completion path authorizes waterline sampling. */
     bool bWaterReferenceMeshLoadComplete = false;
 
-    /** Latched while the stable head reference is at the visible surface ceiling, so held upward input cannot punch through the cap. */
+    /** Latched near the evaluated head's surface target; explicit diving releases it. */
     bool bSwimmingSurfaceCeilingLocked = false;
+
+    bool bSwimmingSurfaceCorrectionEnabled = false;
+
+    SwimmingSurfaceMath::FHeadReference SwimmingSurfaceHeadReference;
 
     // Swimming surface thresholds are fixed native constants in CharacterComponent.cpp.
     // They are intentionally not UPROPERTY values because they are gameplay invariants
@@ -296,8 +311,6 @@ private:
     float GetUpActiveTime = 0.0f;
     float RagdollRecoverySwimLockTime = 0.0f;
     float WaterRagdollRecoveryElapsed = 0.0f;
-    FVector WaterRecoveryActorTargetLocation = FVector::ZeroVector;
-    FRotator WaterRecoveryActorTargetRotation = FRotator::ZeroRotator;
     FRotator RagdollPrePhysicsActorRotation = FRotator::ZeroRotator;
     float RagdollCameraStabilizeRemainingTime = 0.0f;
     bool bSavedRagdollCameraState = false;
@@ -320,7 +333,6 @@ private:
     bool bFixedRotation = false;
     bool bRagdollInWater = false;
     bool bRagdollRecoveryWantsSwimming = false;
-    bool bWaterRecoveryTransformInitialized = false;
     bool bForceLandRagdollRecoveryOnce = false;
     bool bLandRagdollRecoveryOverridesWater = false;
     bool bHasRagdollPrePhysicsActorRotation = false;
@@ -348,6 +360,7 @@ private:
     void SetMovementModeAfterRagdollRecovery(UCharacterMovementComponent* CharacterMovement, const FCharacterRagdollEnvironmentState& RecoveryEnvironmentState) const;
     void ResetRagdollRecoveryState(bool bKeepWaterIntent);
     bool TryGetHeadWaterReferenceLocation(FVector& OutLocation) const;
+    float GetSwimmingSurfaceImmersionDepth(float InWaterLevel) const;
     float GetDirectWaterCapsuleImmersionDepth(float InWaterLevel) const;
     float GetStableHeadEmergenceHeight() const;
     float GetSwimEntryReferenceDepth() const;
@@ -365,8 +378,8 @@ private:
     void OnAsyncRagdollReleaseGroundTraceCompleted(const FTraceHandle& TraceHandle, FTraceDatum& TraceDatum);
     void FinishAsyncRagdollReleaseGroundTrace(bool bWalkableGround);
     FVector GetRagdollRecoveryActorLocationFromHips(const FVector& HipsLocation) const;
-    FVector GetWaterRagdollRecoveryActorLocation(float WaterLevel) const;
-    FVector ResolveRagdollRecoveryGroundPenetration(const FVector& DesiredActorLocation) const;
+    FVector GetWaterRagdollRecoveryActorLocation(const FVector& HipsLocation, const FRotator& RecoveryRotation) const;
+    FVector ResolveRagdollRecoveryGroundPenetration(const FVector& DesiredActorLocation, bool* OutFits = nullptr) const;
     bool ShouldUseRagdollWaterRecoveryForState(const FCharacterRagdollEnvironmentState& State) const;
     void UpdateRagdollVelocityHistory(float DeltaTime, const FVector& CurrentVelocity);
     FVector CapturePreRagdollVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement) const;

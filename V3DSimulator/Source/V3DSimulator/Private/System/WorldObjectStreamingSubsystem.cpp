@@ -8,6 +8,7 @@
  */
 
 #include "System/WorldObjectStreamingSubsystem.h"
+#include "System/V3DStreamingBudget.h"
 #include "Gravity/GravityFieldComponent.h"
 
 #include "Components/PrimitiveComponent.h"
@@ -16,6 +17,7 @@
 #include "GameFramework/PlayerController.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
+#include "Templates/UnrealTemplate.h"
 #include "Model/DynamicActor.h"
 #include "Model/StaticActor.h"
 #include "System/V3DSimulatorGameInstance.h"
@@ -80,9 +82,9 @@ void UWorldObjectStreamingSubsystem::Start(const FString& InWorldRoot, const flo
     if (!HasPersistenceAuthority())
     {
         const float RequestedRadiusMeters = FMath::IsFinite(InLoadRadiusMeters)
-            ? InLoadRadiusMeters : 2048.0f;
+            ? InLoadRadiusMeters : 512.0f;
         LoadRadiusCentimeters = FMath::Clamp(
-            RequestedRadiusMeters * 100.0f, 51200.0f, 614400.0f);
+            RequestedRadiusMeters * 100.0f, 12800.0f, 204800.0f);
         ++Generation;
         bRunning = true;
         DesiredRefreshAccumulator = 0.0f;
@@ -99,12 +101,12 @@ void UWorldObjectStreamingSubsystem::Start(const FString& InWorldRoot, const flo
         WorldRoot.Reset();
         return;
     }
-    // Bound configuration-derived fan-out. At 512 m chunks the 4 km cap is at most 17^3 keys;
+    // Bound configuration-derived fan-out. At 512 m chunks the 2 km cap is at most 9^3 keys;
     // allowing an unbounded/NaN radius could otherwise enqueue billions of empty range requests.
     const float RequestedRadiusMeters = FMath::IsFinite(InLoadRadiusMeters)
-        ? InLoadRadiusMeters : 2048.0f;
+        ? InLoadRadiusMeters : 512.0f;
     LoadRadiusCentimeters = FMath::Clamp(
-        RequestedRadiusMeters * 100.0f, 51200.0f, 614400.0f);
+        RequestedRadiusMeters * 100.0f, 12800.0f, 204800.0f);
     ++Generation;
     bRunning = true;
     // Rebuild once now, then wait a full interval instead of repeating the same radius scan on the
@@ -118,9 +120,9 @@ void UWorldObjectStreamingSubsystem::SetLoadRadiusMeters(const float InLoadRadiu
 {
     check(IsInGameThread());
     const float RequestedRadiusMeters = FMath::IsFinite(InLoadRadiusMeters)
-        ? InLoadRadiusMeters : 2048.0f;
+        ? InLoadRadiusMeters : 512.0f;
     const float NewRadiusCentimeters = FMath::Clamp(
-        RequestedRadiusMeters * 100.0f, 51200.0f, 614400.0f);
+        RequestedRadiusMeters * 100.0f, 12800.0f, 204800.0f);
     if (FMath::IsNearlyEqual(NewRadiusCentimeters, LoadRadiusCentimeters, 1.0f))
     {
         return;
@@ -304,7 +306,8 @@ void UWorldObjectStreamingSubsystem::Deinitialize()
 bool UWorldObjectStreamingSubsystem::IsLocationLoaded(const FVector& WorldLocation) const
 {
     if (bRunning && !HasPersistenceAuthority()) return true;
-    return LoadedChunks.Contains(ToChunk(WorldLocation));
+    const FRuntimeChunk* Chunk = LoadedChunks.Find(ToChunk(WorldLocation));
+    return Chunk && !Chunk->bSpawnInFlight && Chunk->PendingSpawnIndices.IsEmpty();
 }
 
 bool UWorldObjectStreamingSubsystem::IsAreaLoaded(
@@ -323,10 +326,10 @@ bool UWorldObjectStreamingSubsystem::IsAreaLoaded(
 
     const double RadiusCentimeters = RadiusMeters >= 0.0f && FMath::IsFinite(RadiusMeters)
         ? FMath::Clamp(static_cast<double>(RadiusMeters) * 100.0,
-            ChunkSizeCentimeters, 614400.0)
+            12800.0, 204800.0)
         : static_cast<double>(LoadRadiusCentimeters);
     const int32 Radius = FMath::CeilToInt(RadiusCentimeters / ChunkSizeCentimeters);
-    const double RadiusSq = FMath::Square(RadiusCentimeters + ChunkSizeCentimeters);
+    const double RadiusSq = FMath::Square(RadiusCentimeters);
     const FWorldChunkCoordinate Center = ToChunk(WorldLocation);
 
     for (int32 DeltaZ = -Radius; DeltaZ <= Radius; ++DeltaZ)
@@ -343,8 +346,10 @@ bool UWorldObjectStreamingSubsystem::IsAreaLoaded(
                     static_cast<int64>(Center.Z) + DeltaZ, MIN_int32, MAX_int32));
                 const FVector ChunkCenter((X + 0.5) * ChunkSizeCentimeters,
                     (Y + 0.5) * ChunkSizeCentimeters, (Z + 0.5) * ChunkSizeCentimeters);
-                if (FVector::DistSquared(WorldLocation, ChunkCenter) <= RadiusSq
-                    && !LoadedChunks.Contains({X, Y, Z}))
+                const FRuntimeChunk* Chunk = LoadedChunks.Find({X, Y, Z});
+                if (FBox(ChunkCenter - FVector(ChunkSizeCentimeters * 0.5),
+                    ChunkCenter + FVector(ChunkSizeCentimeters * 0.5)).ComputeSquaredDistanceToPoint(WorldLocation) <= RadiusSq
+                    && (!Chunk || Chunk->bSpawnInFlight || !Chunk->PendingSpawnIndices.IsEmpty()))
                 {
                     return false;
                 }
@@ -413,7 +418,7 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
     // Reserve the one-observer cube up front. The spherical distance check will use less, and
     // additional players can grow normally without penalizing the dominant single-player path.
     NewDesired.Reserve(Diameter * Diameter * Diameter);
-    const double RadiusSq = FMath::Square(static_cast<double>(LoadRadiusCentimeters + ChunkSizeCentimeters));
+    const double RadiusSq = FMath::Square(static_cast<double>(LoadRadiusCentimeters));
     const auto AddObserver = [this, Radius, RadiusSq, &NewDesired](const FVector& Observer)
     {
         if (!FMath::IsFinite(Observer.X) || !FMath::IsFinite(Observer.Y) || !FMath::IsFinite(Observer.Z))
@@ -433,7 +438,8 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
                         static_cast<int64>(Center.Z) + DeltaZ, MIN_int32, MAX_int32));
                     const FVector ChunkCenter((X + 0.5) * ChunkSizeCentimeters,
                         (Y + 0.5) * ChunkSizeCentimeters, (Z + 0.5) * ChunkSizeCentimeters);
-                    if (FVector::DistSquared(Observer, ChunkCenter) <= RadiusSq)
+                    if (FBox(ChunkCenter - FVector(ChunkSizeCentimeters * 0.5),
+                        ChunkCenter + FVector(ChunkSizeCentimeters * 0.5)).ComputeSquaredDistanceToPoint(Observer) <= RadiusSq)
                         NewDesired.Add({X, Y, Z});
                 }
     };
@@ -538,6 +544,14 @@ void UWorldObjectStreamingSubsystem::PumpLoads()
         const FWorldChunkCoordinate Coordinate = Request.Coordinate;
         const bool bTransient = Request.bTransientBoundaryLoad;
 
+        const bool bHasPendingPlacement = PendingRegistrations.ContainsByPredicate(
+            [&Coordinate](const FPendingRegistration& Value) { return Value.Coordinate == Coordinate; });
+        if (!bTransient && !DesiredChunks.Contains(Coordinate) && !bHasPendingPlacement)
+        {
+            LoadingChunks.Remove(Coordinate);
+            continue;
+        }
+
         if (!Store.IsValid())
         {
             const double RetryAt = FPlatformTime::Seconds() + FailedLoadRetryDelaySeconds;
@@ -621,10 +635,10 @@ void UWorldObjectStreamingSubsystem::InstallLoadedChunk(
     Chunk.Objects = MoveTemp(Entities);
     Chunk.Actors.SetNum(Chunk.Objects.Num());
     Chunk.bTransientBoundaryLoad = bTransient && !DesiredChunks.Contains(Coordinate);
-    for (int32 Index = 0; Index < Chunk.Objects.Num(); ++Index)
-    {
-        Chunk.Actors[Index] = SpawnObject(Chunk.Objects[Index]);
-    }
+    Chunk.InstallId = NextInstallId++;
+    Chunk.PendingSpawnIndices.Reserve(Chunk.Objects.Num());
+    for (int32 Index = Chunk.Objects.Num() - 1; Index >= 0; --Index)
+        Chunk.PendingSpawnIndices.Add(Index);
 
     UWorld* const World = GetWorld();
     UStreamingMovementGateSubsystem* const Gate = World
@@ -678,12 +692,20 @@ void UWorldObjectStreamingSubsystem::FinishLoad(
     }
 
     FailedLoadRetryAt.Remove(Coordinate);
+    const bool bHasPendingPlacement = PendingRegistrations.ContainsByPredicate(
+        [&Coordinate](const FPendingRegistration& Value) { return Value.Coordinate == Coordinate; });
+    if (!bTransient && !DesiredChunks.Contains(Coordinate) && !bHasPendingPlacement)
+    {
+        PumpLoads(); // The immutable disk row remains authoritative; no actor needs to be created.
+        return;
+    }
     InstallLoadedChunk(Coordinate, bTransient, MoveTemp(Entities));
     PumpLoads();
 }
 
 AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Object)
 {
+    const uint64 Session = Generation;
     UWorld* World = GetWorld();
     UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
     UModelDatabaseSubsystem* Database = GameInstance ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
@@ -716,18 +738,31 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
             && !Candidate->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)
             ? Candidate : Fallback;
     };
+    const auto SpawnForSession = [this, World, Session, &Transform, &Params](UClass* Class) -> AActor*
+    {
+        if (!bRunning || Generation != Session) return nullptr;
+        AActor* Actor = World->SpawnActor<AActor>(Class, Transform, Params);
+        // Construction/BeginPlay can synchronously stop this session and start another world.
+        if (!bRunning || Generation != Session)
+        {
+            if (IsValid(Actor)) Actor->Destroy();
+            return nullptr;
+        }
+        return Actor;
+    };
 
     if (Definition.ModelType == EModelDefinitionType::Static)
     {
         UClass* Candidate = Registry ? Registry->StaticActorClass.LoadSynchronous() : nullptr;
         UClass* SpawnClass = ResolveClass(Candidate, AStaticActor::StaticClass(), AStaticActor::StaticClass());
-        AStaticActor* Static = World->SpawnActor<AStaticActor>(SpawnClass, Transform, Params);
+        AStaticActor* Static = Cast<AStaticActor>(SpawnForSession(SpawnClass));
+        if (!bRunning || Generation != Session) return nullptr;
         if (!IsValid(Static) && SpawnClass != AStaticActor::StaticClass())
         {
             UE_LOG(LogTemp, Warning,
                 TEXT("Configured Static actor class failed during chunk restore; retrying native AStaticActor. Class=%s"),
                 *GetNameSafe(SpawnClass));
-            Static = World->SpawnActor<AStaticActor>(AStaticActor::StaticClass(), Transform, Params);
+            Static = Cast<AStaticActor>(SpawnForSession(AStaticActor::StaticClass()));
         }
         if (IsValid(Static))
         {
@@ -747,13 +782,14 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
     {
         UClass* Candidate = Registry ? Registry->VehiclePawnClass.LoadSynchronous() : nullptr;
         UClass* SpawnClass = ResolveClass(Candidate, AVehiclePawn::StaticClass(), AVehiclePawn::StaticClass());
-        AVehiclePawn* Vehicle = World->SpawnActor<AVehiclePawn>(SpawnClass, Transform, Params);
+        AVehiclePawn* Vehicle = Cast<AVehiclePawn>(SpawnForSession(SpawnClass));
+        if (!bRunning || Generation != Session) return nullptr;
         if (!IsValid(Vehicle) && SpawnClass != AVehiclePawn::StaticClass())
         {
             UE_LOG(LogTemp, Warning,
                 TEXT("Configured vehicle class failed during chunk restore; retrying native AVehiclePawn. Class=%s"),
                 *GetNameSafe(SpawnClass));
-            Vehicle = World->SpawnActor<AVehiclePawn>(AVehiclePawn::StaticClass(), Transform, Params);
+            Vehicle = Cast<AVehiclePawn>(SpawnForSession(AVehiclePawn::StaticClass()));
         }
         if (IsValid(Vehicle) && Vehicle->LoadVehicleModel(RuntimeReference, Definition.Name))
         {
@@ -768,13 +804,14 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
     {
         UClass* Candidate = Registry ? Registry->DynamicActorClass.LoadSynchronous() : nullptr;
         UClass* SpawnClass = ResolveClass(Candidate, ADynamicActor::StaticClass(), ADynamicActor::StaticClass());
-        ADynamicActor* Entity = World->SpawnActor<ADynamicActor>(SpawnClass, Transform, Params);
+        ADynamicActor* Entity = Cast<ADynamicActor>(SpawnForSession(SpawnClass));
+        if (!bRunning || Generation != Session) return nullptr;
         if (!IsValid(Entity) && SpawnClass != ADynamicActor::StaticClass())
         {
             UE_LOG(LogTemp, Warning,
                 TEXT("Configured Dynamic actor class failed during chunk restore; retrying native ADynamicActor. Class=%s"),
                 *GetNameSafe(SpawnClass));
-            Entity = World->SpawnActor<ADynamicActor>(ADynamicActor::StaticClass(), Transform, Params);
+            Entity = Cast<ADynamicActor>(SpawnForSession(ADynamicActor::StaticClass()));
         }
         if (IsValid(Entity))
         {
@@ -790,7 +827,12 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
         }
     }
 
-    if (Spawned)
+    if (!bRunning || Generation != Session)
+    {
+        if (IsValid(Spawned)) Spawned->Destroy();
+        return nullptr;
+    }
+    if (IsValid(Spawned))
     {
         if (auto* Field = Spawned->FindComponentByClass<UGravityFieldComponent>())
             Field->SetSettings(Object.GravityField);
@@ -921,8 +963,7 @@ void UWorldObjectStreamingSubsystem::UnregisterObject(AActor* Actor, const bool 
                         Chunk.Objects[Index].ModelUUID);
                 else
                 {
-                    Chunk.Actors.RemoveAtSwap(Index, 1, EAllowShrinking::No);
-                    Chunk.Objects.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+                    Chunk.RemoveRowAtSwap(Index);
                 }
                 Chunk.bDirty = true;
                 ++Chunk.Revision;
@@ -1094,8 +1135,7 @@ void UWorldObjectStreamingSubsystem::UpdateObjectsAndCrossings()
             From->Objects[Index].EntityUUID,
             From->Objects[Index].ModelUUID));
         To->Actors.Add(Actor);
-        From->Actors.RemoveAtSwap(Index, 1, EAllowShrinking::No);
-        From->Objects.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+        From->RemoveRowAtSwap(Index);
         From->bDirty = To->bDirty = true;
         ++From->Revision; ++To->Revision;
         // Both halves must enter the same batch this tick even if their ordinary one-second save
@@ -1232,20 +1272,84 @@ void UWorldObjectStreamingSubsystem::FinalizeUnload(const FWorldChunkCoordinate&
             if (Gate) Gate->UnregisterMovable(Actor);
             Actor->Destroy();
         }
+    FV3DStreamingBudget::NotifyUnloaded();
+}
+
+bool UWorldObjectStreamingSubsystem::HasPendingSpawns() const
+{
+    for (const auto& Pair : LoadedChunks)
+        if (Pair.Value.bSpawnInFlight || !Pair.Value.PendingSpawnIndices.IsEmpty()) return true;
+    return false;
+}
+
+void UWorldObjectStreamingSubsystem::PumpSpawns()
+{
+    check(IsInGameThread());
+    TArray<FWorldChunkCoordinate> Ready;
+    for (const auto& Pair : LoadedChunks)
+        if (!Pair.Value.bUnloadAfterSave && !Pair.Value.PendingSpawnIndices.IsEmpty()) Ready.Add(Pair.Key);
+    if (Ready.IsEmpty()) return;
+    const uint64 Session = Generation;
+    const double Deadline = FPlatformTime::Seconds() + 0.002;
+    int32 Spawned = 0;
+    // Round robin across chunks: file reads and independent actor loads keep overlapping while
+    // UObject creation yields every frame. A single native SpawnObject call cannot be preempted.
+    while (!Ready.IsEmpty() && Spawned < 16 && FPlatformTime::Seconds() < Deadline)
+    {
+        SpawnRoundRobin %= Ready.Num();
+        const FWorldChunkCoordinate Coordinate = Ready[SpawnRoundRobin];
+        FRuntimeChunk* Chunk = LoadedChunks.Find(Coordinate);
+        if (!Chunk || Chunk->bUnloadAfterSave || Chunk->PendingSpawnIndices.IsEmpty())
+        {
+            Ready.RemoveAtSwap(SpawnRoundRobin, 1, EAllowShrinking::No);
+            continue;
+        }
+        const int32 Index = Chunk->PendingSpawnIndices.Pop(EAllowShrinking::No);
+        if (Chunk->PendingSpawnIndices.IsEmpty()) Chunk->PendingSpawnIndices.Empty();
+        if (!Chunk->Objects.IsValidIndex(Index) || !Chunk->Actors.IsValidIndex(Index)) continue;
+        if (Chunk->Actors[Index].IsValid()) continue;
+        const FWorldChunkObject Object = Chunk->Objects[Index];
+        const uint64 InstallId = Chunk->InstallId;
+        Chunk->bSpawnInFlight = true;
+        AActor* Actor = SpawnObject(Object);
+        ++Spawned;
+        // Spawn/BeginPlay can re-enter registration, unload, or Stop/Start. Do not keep a TMap
+        // element/reference across that call; resolve both session and row identity again.
+        Chunk = LoadedChunks.Find(Coordinate);
+        if (!bRunning || Generation != Session || !Chunk || Chunk->InstallId != InstallId)
+        {
+            if (IsValid(Actor)) Actor->Destroy();
+            if (!bRunning || Generation != Session) return;
+            continue;
+        }
+        Chunk->bSpawnInFlight = false;
+        int32 Row = Index;
+        if (!Chunk->Objects.IsValidIndex(Row) || Chunk->Objects[Row].EntityUUID != Object.EntityUUID)
+            Row = Chunk->Objects.IndexOfByPredicate([&Object](const FWorldChunkObject& Value)
+                { return Value.EntityUUID == Object.EntityUUID; });
+        if (Chunk->Actors.IsValidIndex(Row)) Chunk->Actors[Row] = Actor;
+        else if (IsValid(Actor)) Actor->Destroy();
+        ++SpawnRoundRobin;
+    }
 }
 
 void UWorldObjectStreamingSubsystem::Tick(float DeltaTime)
 {
     check(IsInGameThread());
-    if (!bRunning || !HasPersistenceAuthority()) return;
+    if (!bRunning || bTickInProgress || !HasPersistenceAuthority()) return;
+    TGuardValue<bool> TickGuard(bTickInProgress, true);
+    const uint64 Session = Generation;
     DesiredRefreshAccumulator -= FMath::Max(0.0f, DeltaTime);
     if (DesiredRefreshAccumulator <= 0.0f)
     {
         RebuildDesiredChunks();
+        if (!bRunning || Generation != Session) return;
         // Boundary-crossing prefetch still runs every tick; the expensive radius-set rebuild only
         // needs a quarter-second cadence for 512 m cells and their one-cell safety margin.
         DesiredRefreshAccumulator = DesiredRefreshIntervalSeconds;
     }
+    PumpSpawns();
+    if (!bRunning || Generation != Session) return;
     UpdateObjectsAndCrossings();
     PumpLoads();
 

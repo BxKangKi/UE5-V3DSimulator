@@ -86,7 +86,7 @@ public:
     int32 ChunkSize = 256;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Streaming", meta=(ClampMin="1.0"))
-    float StreamDistance = 64.0f;
+    float StreamDistance = 19.0f;
 
     UPROPERTY(Transient, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<UMaterialInterface> DecalLight;

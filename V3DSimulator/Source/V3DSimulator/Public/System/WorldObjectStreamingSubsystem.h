@@ -34,7 +34,7 @@ public:
     virtual TStatId GetStatId() const override;
     virtual bool IsTickable() const override { return bRunning && !HasAnyFlags(RF_ClassDefaultObject); }
 
-    void Start(const FString& InWorldRoot, float InLoadRadiusMeters = 2048.0f);
+    void Start(const FString& InWorldRoot, float InLoadRadiusMeters = 512.0f);
     /** Applies a new settings-derived radius without reopening the .dat archive. */
     void SetLoadRadiusMeters(float InLoadRadiusMeters);
     void Stop();
@@ -44,7 +44,7 @@ public:
         // A failed range remains non-ready while its throttled retry loop is active; reporting ready
         // here could let shutdown save over state that was never successfully restored.
         return bRunning && ActiveLoads == 0 && PendingLoads.IsEmpty()
-            && LoadingChunks.IsEmpty() && FailedLoadRetryAt.IsEmpty();
+            && LoadingChunks.IsEmpty() && FailedLoadRetryAt.IsEmpty() && !HasPendingSpawns();
     }
     bool IsLocationLoaded(const FVector& WorldLocation) const;
     /** True only when every chunk in the configured streaming radius around WorldLocation is resident. */
@@ -75,6 +75,19 @@ private:
     {
         TArray<FWorldChunkObject> Objects;
         TArray<TWeakObjectPtr<AActor>> Actors;
+        // Only not-yet-spawned rows are queued. Entries remain durable while work is sliced.
+        TArray<int32> PendingSpawnIndices;
+        uint64 InstallId = 0;
+        bool bSpawnInFlight = false;
+        void RemoveRowAtSwap(int32 Index)
+        {
+            const int32 Last = Objects.Num() - 1;
+            PendingSpawnIndices.RemoveSingleSwap(Index, EAllowShrinking::No);
+            if (Index != Last)
+                for (int32& Pending : PendingSpawnIndices) if (Pending == Last) Pending = Index;
+            Actors.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+            Objects.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+        }
         uint64 Revision = 0;
         uint64 SavingRevision = 0;
         double NextPeriodicSaveAt = 0.0;
@@ -98,11 +111,18 @@ private:
         FWorldChunkCoordinate Coordinate;
     };
 
+    bool HasPendingSpawns() const;
+    void PumpSpawns();
+    uint64 NextInstallId = 1;
+    int32 SpawnRoundRobin = 0;
+
     FString WorldRoot;
     TSharedPtr<FEntityArchiveStore, ESPMode::ThreadSafe> Archive;
-    float LoadRadiusCentimeters = 204800.0f;
+    float LoadRadiusCentimeters = 51200.0f;
     uint64 Generation = 0;
     bool bRunning = false;
+    // Keep across Stop/Start: a nested session must wait for the current tick stack to unwind.
+    bool bTickInProgress = false;
     bool bHasPriorityStreamingFocus = false;
     FVector PriorityStreamingFocus = FVector::ZeroVector;
     float DesiredRefreshAccumulator = 0.0f;

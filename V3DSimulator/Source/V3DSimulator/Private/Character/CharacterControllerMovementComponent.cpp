@@ -3,6 +3,7 @@
 #include "Character/CharacterControllerMovementComponent.h"
 #include "GameFramework/PhysicsVolume.h"
 #include "Character/CharacterComponent.h"
+#include "Character/SwimmingSurfaceMath.h"
 #include "GameFramework/Character.h"
 #include "Gravity/GravityFieldSubsystem.h"
 #include "Gravity/GravityFieldTypes.h"
@@ -26,6 +27,15 @@ void UCharacterControllerMovementComponent::PhysSwimming(const float DeltaTime, 
         return;
     }
 
+    if (State && State->IsSwimmingSurfaceHeld())
+    {
+        // Final input gate also catches acceleration queued before surface capture.
+        // Forces, impulses and root motion affect Velocity separately and survive.
+        Acceleration.Z = 0.0f;
+    }
+    const double BeforeZ = UpdatedComponent ? UpdatedComponent->GetComponentLocation().Z : 0.0;
+    const float BeforeVelocityZ = static_cast<float>(Velocity.Z);
+
     // UCharacterMovementComponent::PhysSwimming ultimately uses the current
     // PhysicsVolume's bWaterVolume flag (including inside Swim()) to decide that
     // the character has left water. V3DSimulator water is intentionally queried
@@ -37,6 +47,19 @@ void UCharacterControllerMovementComponent::PhysSwimming(const float DeltaTime, 
     // MOVE_Swimming, therefore GetMaxSpeed()/GetMaxBrakingDeceleration() continue
     // to use MaxSwimSpeed and BrakingDecelerationSwimming rather than flying values.
     PhysFlying(DeltaTime, Iterations);
+
+    float SurfaceDeltaZ = 0.0f;
+    if (HasValidData() && MovementMode == MOVE_Swimming && IsValid(State)
+        && SwimmingSurfaceMath::CanCorrectHeight(BeforeVelocityZ, static_cast<float>(Velocity.Z),
+            UpdatedComponent->GetComponentLocation().Z - BeforeZ)
+        && State->GetSwimmingSurfaceCorrection(DeltaTime, SurfaceDeltaZ))
+    {
+        FHitResult SurfaceHit;
+        // WaterActor defines a horizontal world-Z plane even with custom gravity.
+        // Sweep the capsule so surfacing cannot teleport through a low ceiling.
+        SafeMoveUpdatedComponent(FVector(0.0f, 0.0f, SurfaceDeltaZ),
+            UpdatedComponent->GetComponentQuat(), true, SurfaceHit, ETeleportType::None);
+    }
 }
 
 void UCharacterControllerMovementComponent::PhysicsVolumeChanged(APhysicsVolume* NewVolume)
@@ -98,24 +121,50 @@ void UCharacterControllerMovementComponent::AlignWithGravity()
 }
 void UCharacterControllerMovementComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* TickFunction)
 {
+    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    if (State && State->IsStreamingMovementSuspended())
+    {
+        StopMovementImmediately();
+        ClearAccumulatedForces();
+        ConsumeInputVector();
+        return;
+    }
     RefreshGravity();
     AlignWithGravity();
     Super::TickComponent(DeltaTime, TickType, TickFunction);
 }
 void UCharacterControllerMovementComponent::PerformMovement(float DeltaSeconds)
 {
+    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    if (State && State->IsStreamingMovementSuspended())
+    {
+        StopMovementImmediately();
+        ClearAccumulatedForces();
+        ConsumeInputVector();
+        return;
+    }
     RefreshGravity();
     AlignWithGravity();
     Super::PerformMovement(DeltaSeconds);
 }
 void UCharacterControllerMovementComponent::SimulateMovement(float DeltaSeconds)
 {
+    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    if (State && State->IsStreamingMovementSuspended())
+    {
+        StopMovementImmediately();
+        ClearAccumulatedForces();
+        ConsumeInputVector();
+        return;
+    }
     RefreshGravity();
     AlignWithGravity();
     Super::SimulateMovement(DeltaSeconds);
 }
 void UCharacterControllerMovementComponent::PhysicsRotation(float DeltaTime)
 {
+    const auto* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    if (State && (State->IsRagdollTransitionInProgress() || State->IsStreamingMovementSuspended())) return;
     Super::PhysicsRotation(DeltaTime);
     AlignWithGravity();
 }

@@ -16,13 +16,15 @@
 namespace WorldArchiveCodec
 {
     bool SerializeMesh(const FGWorldBakedMesh& Value, TArray<uint8>& Out, FString& Error);
-    bool DeserializeMesh(const TArray<uint8>& Bytes, FGWorldBakedMesh& Out, FString& Error);
+    // Dependency-only mode walks bounded records without allocating vertex arrays. Its output
+    // is metadata only; the normal payload read still validates every geometry value.
+    bool DeserializeMesh(const TArray<uint8>& Bytes, FGWorldBakedMesh& Out, FString& Error, bool bDependenciesOnly = false);
     bool SerializeSkin(const FGWorldBakedSkin& Value, TArray<uint8>& Out, FString& Error);
     bool DeserializeSkin(const TArray<uint8>& Bytes, FGWorldBakedSkin& Out, FString& Error);
     bool SerializeMaterial(const FGWorldBakedMaterial& Value, TArray<uint8>& Out, FString& Error);
     bool DeserializeMaterial(const TArray<uint8>& Bytes, FGWorldBakedMaterial& Out, FString& Error);
     bool SerializeTexture(const FGWorldBakedTexture& Value, TArray<uint8>& Out, FString& Error);
-    bool DeserializeTexture(const TArray<uint8>& Bytes, FGWorldBakedTexture& Out, FString& Error);
+    bool DeserializeTexture(const TArray<uint8>& Bytes, FGWorldBakedTexture& Out, FString& Error, int32 MaxResolution = 0);
     bool SerializeManifest(const FGWorldModelManifest& Value, TArray<uint8>& Out, FString& Error);
     bool DeserializeManifest(const TArray<uint8>& Bytes, FGWorldModelManifest& Out, FString& Error);
 }

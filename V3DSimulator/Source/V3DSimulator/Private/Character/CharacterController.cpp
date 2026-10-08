@@ -982,6 +982,7 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
     {
         return;
     }
+    if (Component->IsStreamingMovementSuspended()) return;
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);

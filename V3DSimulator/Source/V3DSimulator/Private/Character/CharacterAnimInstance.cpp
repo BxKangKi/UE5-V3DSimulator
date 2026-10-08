@@ -19,6 +19,99 @@
 #include "System/GameManagerSubSystem.h"
 #include "Weapon/WeaponActor.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Animation/AnimInstanceProxy.h"
+#include "Animation/AnimNodeBase.h"
+#include "Animation/PoseSnapshot.h"
+#include "Engine/SkeletalMesh.h"
+
+namespace
+{
+    // Final output blending does not require an AnimBP snapshot node on the water branch.
+    // PreEvaluate copies only value types on the game thread; Evaluate never reads UObjects
+    // or the mutable named snapshot while animation runs on a worker.
+    class FCharacterRecoveryAnimProxy final : public FAnimInstanceProxy
+    {
+    public:
+        explicit FCharacterRecoveryAnimProxy(UAnimInstance* Instance) : FAnimInstanceProxy(Instance) {}
+
+    protected:
+        virtual void PreEvaluateAnimation(UAnimInstance* Instance) override
+        {
+            FAnimInstanceProxy::PreEvaluateAnimation(Instance);
+            check(IsInGameThread());
+            SnapshotWeight = 0.0f;
+            AActor* Owner = IsValid(Instance) ? Instance->GetOwningActor() : nullptr;
+            const UCharacterComponent* State = IsValid(Owner)
+                ? Owner->FindComponentByClass<UCharacterComponent>() : nullptr;
+            const float Weight = State ? State->GetRecoveryPoseBlendWeight() : 0.0f;
+            const USkeletalMeshComponent* Mesh = Instance ? Instance->GetSkelMeshComponent() : nullptr;
+            const USkeletalMesh* Asset = IsValid(Mesh) ? Mesh->GetSkeletalMeshAsset() : nullptr;
+            const FPoseSnapshot* Snapshot = Instance && Weight > 0.0f
+                ? Instance->GetPoseSnapshot(FName(TEXT("RagdollPose"))) : nullptr;
+            if (!IsValid(Asset) || !Snapshot || !Snapshot->bIsValid)
+            {
+                LocalPoseByMeshBone.Empty();
+                return;
+            }
+            LocalPoseByMeshBone.Reset();
+            const FReferenceSkeleton& Ref = Asset->GetRefSkeleton();
+            const int32 Count = FMath::Min(Snapshot->BoneNames.Num(), Snapshot->LocalTransforms.Num());
+            for (int32 I = 0; I < Count; ++I)
+            {
+                const int32 Bone = Ref.FindBoneIndex(Snapshot->BoneNames[I]);
+                if (Bone != INDEX_NONE && !Snapshot->LocalTransforms[I].ContainsNaN())
+                    LocalPoseByMeshBone.Add(Bone, Snapshot->LocalTransforms[I]);
+            }
+            SnapshotWeight = FMath::Clamp(Weight, 0.0f, 1.0f);
+        }
+
+        virtual bool Evaluate(FPoseContext& Output) override
+        {
+            if (SnapshotWeight <= 0.0f) return false;
+            EvaluateAnimationNode(Output);
+            BlendRecovery(Output);
+            return true;
+        }
+
+        virtual bool Evaluate_WithRoot(FPoseContext& Output, FAnimNode_Base* Root) override
+        {
+            if (SnapshotWeight <= 0.0f) return false;
+            EvaluateAnimationNode_WithRoot(Output, Root);
+            BlendRecovery(Output);
+            return true;
+        }
+
+    private:
+        void BlendRecovery(FPoseContext& Output) const
+        {
+            const FBoneContainer& Bones = Output.Pose.GetBoneContainer();
+            for (FCompactPoseBoneIndex Index : Output.Pose.ForEachBoneIndex())
+            {
+                const int32 MeshIndex = Bones.MakeMeshPoseIndex(Index).GetInt();
+                if (const FTransform* Saved = LocalPoseByMeshBone.Find(MeshIndex))
+                {
+                    FTransform Blended;
+                    Blended.Blend(Output.Pose[Index], *Saved, SnapshotWeight);
+                    Blended.NormalizeRotation();
+                    Output.Pose[Index] = Blended;
+                }
+            }
+        }
+
+        float SnapshotWeight = 0.0f;
+        TMap<int32, FTransform> LocalPoseByMeshBone;
+    };
+}
+
+FAnimInstanceProxy* UCharacterAnimInstance::CreateAnimInstanceProxy()
+{
+    return new FCharacterRecoveryAnimProxy(this);
+}
+
+void UCharacterAnimInstance::DestroyAnimInstanceProxy(FAnimInstanceProxy* InProxy)
+{
+    delete InProxy;
+}
 
 
 namespace CharacterAnimTuning
@@ -219,10 +312,13 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     bIsGrounded = Movement->IsMovingOnGround() || (bRagdollLikeState && RagdollEnvironmentState.bIsOnGround && !RagdollEnvironmentState.bShouldRecoverInWater);
     bIsFalling = Movement->IsFalling() && !bIsSwimming && !bIsFlying && !bIsGrounded;
     bIsCrouch = !bRagdollLikeState && Movement->IsCrouching();
-    // AnimBP now handles water recovery explicitly. Keep GetUp true underwater too,
-    // while bIsSwimming/bIsFalling above keep the transition out of the falling branch.
+    // ABP_Humanoid has only one exit from Ragdoll: bIsGettingUp -> GetUp.
+    // GetUp itself selects AS_Treading_Water with bIsSwimming. Suppressing this
+    // flag underwater leaves the native blend targeting Ragdoll's AS_Falling pose.
     bIsGettingUp = Component->IsGettingUp();
-    bGetUpTrigger = bIsGettingUp && Component->GetRagdollWeight() < (CharacterConstants::MaxRagdollWeight - CharacterAnimTuning::GetUpDelay);
+    bGetUpTrigger = bIsGettingUp && (bWaterRagdollRecovery
+        || Component->GetRagdollWeight()
+            < (CharacterConstants::MaxRagdollWeight - CharacterAnimTuning::GetUpDelay));
     IsLieOnBack = Component->IsLieOnBack() ? 1.0f: 0.0f;
     CapturedMeshLocation = Component->GetCapturedMeshLocation();
     CapturedMeshRotation = Component->GetCapturedMeshRotation();

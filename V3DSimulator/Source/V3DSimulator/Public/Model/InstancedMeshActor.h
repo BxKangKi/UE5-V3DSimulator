@@ -37,6 +37,9 @@ public:
         FInstancedMeshGroupInitData&& InData);
 
     FName GetGroupName() const { return GroupName; }
+    double GetMaxNodeScale() const { return MaxNodeScale; }
+    const FBox& GetNodeBounds() const { return NodeBounds; }
+    bool HasAlwaysLoadedNodes() const { return !AlwaysLoadedNodeNames.IsEmpty(); }
     const TMap<FName, FModelNodeData>& GetNodeMapRef() const { return NodeMap; }
     const TArray<FName>& GetReferencedMeshNames() const { return ReferencedMeshNames; }
     /** Copies only nearby 8192m/512m buckets plus loaded/always-loaded rows for one stream pass. */
@@ -66,6 +69,8 @@ protected:
     virtual void Destroyed() override;
 
 private:
+    double MaxNodeScale = 1.0;
+    FBox NodeBounds = FBox(ForceInit);
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USceneComponent> Root;
 
