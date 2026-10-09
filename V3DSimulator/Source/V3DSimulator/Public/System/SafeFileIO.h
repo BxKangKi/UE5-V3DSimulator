@@ -13,7 +13,7 @@
  * @brief Bounded, asynchronous, crash-resilient file and JSON I/O used by runtime data systems.
  *
  * This utility deliberately keeps raw disk access and JSON parsing away from the game thread.
- * JSON saves use a same-directory temporary file plus a recoverable backup so a process exit
+ * JSON saves use a same-directory temporary file plus a transient rollback journal so a process exit
  * cannot leave the only valid copy half-written.
  */
 #pragma once
@@ -171,7 +171,7 @@ public:
         FJsonLoadCallback Callback,
         const FSafeJsonLimits& Limits = FSafeJsonLimits());
 
-    /** Serializes and atomically commits JSON through temp + backup files. */
+    /** Atomically commits JSON through a verified temp file; no persistent .bak is created. */
     static FSafeFileWriteResult SaveJsonBlocking(
         const TSharedRef<FJsonObject>& JsonObject,
         const FString& Path,

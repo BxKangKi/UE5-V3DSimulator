@@ -38,7 +38,10 @@ enum class ESettingsField : uint8
     ReflectionQuality UMETA(DisplayName="Reflection Quality"),
     DynamicGlobalIlluminationMethod UMETA(DisplayName="GI Method"),
     ReflectionMethod UMETA(DisplayName="Reflection Method"),
-    Exposure UMETA(DisplayName="Exposure")
+    Exposure UMETA(DisplayName="Exposure"),
+    // Append fields to preserve serialized Blueprint enum values.
+    MaxRenderDistanceMeters UMETA(DisplayName="Max Render Distance"),
+    QualityProfile UMETA(DisplayName="Quality Profile")
 };
 
 UENUM(BlueprintType)

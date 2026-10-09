@@ -10,6 +10,7 @@ namespace V3DSimulatorPaths
     V3DSIMULATOR_API FString ProjectsRoot();
     V3DSIMULATOR_API FString ResourcesRoot();
     V3DSIMULATOR_API FString WorldsRoot();
+    V3DSIMULATOR_API FString DataRoot();
     V3DSIMULATOR_API FString LogsRoot();
     V3DSIMULATOR_API FString SettingsPath();
 }

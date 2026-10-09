@@ -849,7 +849,7 @@ FString FEntityArchiveStore::MakeArchivePath(const FString& WorldRoot)
     const FString WorldName = FPaths::GetCleanFilename(Normalized);
     const FString WorldsRoot = FPaths::GetPath(Normalized);
     return WorldName.IsEmpty() ? FString()
-        : FPaths::Combine(WorldsRoot, TEXT("Data"), WorldName + TEXT(".dat"));
+        : FPaths::Combine(FPaths::GetPath(WorldsRoot), TEXT("Data"), WorldName + TEXT(".dat"));
 }
 
 TSharedPtr<FEntityArchiveStore, ESPMode::ThreadSafe> FEntityArchiveStore::Open(
@@ -885,6 +885,21 @@ TSharedPtr<FEntityArchiveStore, ESPMode::ThreadSafe> FEntityArchiveStore::Open(
     }
 
     IFileManager& FileManager = IFileManager::Get();
+    // Migrate on first access under the same registry lock as store creation. Never overwrite
+    // a new-layout archive or silently start an empty world when migration fails.
+    const FString NormalizedRoot = FSafeFileIO::NormalizeFilePath(WorldRoot);
+    const FString LegacyPath = FPaths::Combine(FPaths::GetPath(NormalizedRoot),
+        TEXT("Data"), FPaths::GetCleanFilename(NormalizedRoot) + TEXT(".dat"));
+    if (!FileManager.FileExists(*ArchivePath) && FileManager.FileExists(*LegacyPath))
+    {
+        if (!FileManager.MakeDirectory(*FPaths::GetPath(ArchivePath), true)
+            || !FPlatformFileManager::Get().GetPlatformFile().MoveFile(*ArchivePath, *LegacyPath))
+        {
+            OutError = FString::Printf(TEXT("Cannot move legacy world data from %s to %s"),
+                *LegacyPath, *ArchivePath);
+            return nullptr;
+        }
+    }
     if (!FileManager.FileExists(*ArchivePath))
     {
         if (!bCreateIfMissing || !FileManager.MakeDirectory(*FPaths::GetPath(ArchivePath), true))

@@ -594,6 +594,7 @@ void UGameManagerSubSystem::UpdateSettings()
     {
         WorldEnvManagerActor->RefreshRuntimeSettings();
     }
+    GameSettings->SaveSettingsData();
 }
 
 UGameManagerSubSystem *UGameManagerSubSystem::GetSubSystem(AActor *InActor)
@@ -1809,13 +1810,12 @@ bool UGameManagerSubSystem::CheckWorldSystemsLoaded()
     // nodes. Map that complete node graph into 0..96%, leaving one truthful final restoration node.
     const bool bSystemsReady = StreamSubSystem->IsInitialWorldReady();
     const float Percent = StreamSubSystem->GetLoadingStatus();
-    const bool bVisibleProgressComplete = Percent >= 1.0f - KINDA_SMALL_NUMBER;
     constexpr float RuntimeProgressStart = 0.70f;
     SetLoadingStatus(FMath::Lerp(
         RuntimeProgressStart,
         EntityRestoreProgressStart,
         FMath::Clamp(Percent, 0.0f, 1.0f)));
-    return bSystemsReady && bVisibleProgressComplete;
+    return bSystemsReady;
 }
 
 void UGameManagerSubSystem::LoadWorldData()
@@ -3139,11 +3139,8 @@ void UGameManagerSubSystem::RefreshBuiltModelLists()
     Database->GetDefinitions(Definitions);
     for (const FModelDefinition& Definition : Definitions)
     {
-        if (Definition.ModelType == EModelDefinitionType::Static)
-        {
-            StaticReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
-            continue;
-        }
+        // Static definitions are authored world scenes. Only dynamic models become items;
+        // automatic world streaming still reads static definitions directly from the database.
         if (Definition.ModelType != EModelDefinitionType::Dynamic)
         {
             continue;
@@ -3208,15 +3205,6 @@ void UGameManagerSubSystem::BuildAvailableItems()
                 EToolbarItemKind::Vehicle,
                 GetAssetDisplayName(VehicleReferences[Index]),
                 VehicleReferences[Index],
-                Index));
-        }
-
-        for (int32 Index = 0; Index < StaticReferences.Num(); ++Index)
-        {
-            AvailableItems.Add(MakeToolbarItem(
-                EToolbarItemKind::Static,
-                GetAssetDisplayName(StaticReferences[Index]),
-                StaticReferences[Index],
                 Index));
         }
 
@@ -3286,6 +3274,12 @@ void UGameManagerSubSystem::ReconcileToolbarSlotsWithAvailableItems()
     for (int32 Slot = 0; Slot < ToolbarSlotCount; ++Slot)
     {
         FToolbarItem& SlotItem = ToolbarSlots[Slot];
+        // Drop legacy static entries instead of leaving a clickable, unavailable world scene.
+        if (SlotItem.Kind == EToolbarItemKind::Static)
+        {
+            SlotItem = FToolbarItem();
+            continue;
+        }
         const int32 MatchingIndex = FindAvailableItemIndexMatching(SlotItem);
         if (AvailableItems.IsValidIndex(MatchingIndex))
         {
@@ -3438,12 +3432,8 @@ void UGameManagerSubSystem::ApplySelectedToolbarItem(bool bBroadcastChange)
     switch (Item.Kind)
     {
     case EToolbarItemKind::Static:
-        if (Item.bAvailable && StaticReferences.IsValidIndex(Item.ModelIndex))
-        {
-            CurrentStaticIndex = Item.ModelIndex;
-        }
-        CurrentMode = EToolMode::PlaceStatic;
-        LastSaveMessage = FString::Printf(TEXT("Static selected: %s"), *GetCurrentStaticName());
+        CurrentMode = EToolMode::None;
+        LastSaveMessage = TEXT("Static world models cannot be placed as items.");
         break;
     case EToolbarItemKind::Vehicle:
         CurrentMode = EToolMode::PlaceVehicle;
@@ -3598,8 +3588,9 @@ void UGameManagerSubSystem::SelectStaticPlacementTool()
 {
     RefreshBuiltModelLists();
     BuildAvailableItems();
-    CurrentMode = EToolMode::PlaceStatic;
-    LastSaveMessage = TEXT("Static tool: left-click to place the current Static at the center crosshair.");
+    // Keep this Blueprint entry point for old input bindings without enabling placement.
+    CurrentMode = EToolMode::None;
+    LastSaveMessage = TEXT("Static world models are loaded automatically and cannot be placed as items.");
     NotifyStateChanged();
 }
 
@@ -4173,14 +4164,8 @@ void UGameManagerSubSystem::InputPrimaryPressed()
     switch (Item.Kind)
     {
     case EToolbarItemKind::Static:
-        if (bHasPlacementLocation)
-        {
-            PlaceCurrentStatic(Location);
-        }
-        else
-        {
-            LastSaveMessage = TEXT("Could not resolve the center-crosshair location for Static placement.");
-        }
+        CurrentMode = EToolMode::None;
+        LastSaveMessage = TEXT("Static world models cannot be placed as items.");
         break;
     case EToolbarItemKind::Vehicle:
         if (bHasPlacementLocation)
@@ -4205,9 +4190,9 @@ void UGameManagerSubSystem::InputPrimaryPressed()
         break;
     case EToolbarItemKind::None:
     default:
-        if (CurrentMode == EToolMode::PlaceStatic && bHasPlacementLocation)
+        if (CurrentMode == EToolMode::PlaceStatic)
         {
-            PlaceCurrentStatic(Location);
+            CurrentMode = EToolMode::None;
         }
         else if (CurrentMode == EToolMode::PlaceVehicle && bHasPlacementLocation)
         {
@@ -4295,78 +4280,11 @@ void UGameManagerSubSystem::ConfirmCurrentPendingLocation()
     InputPrimaryPressed();
 }
 
-void UGameManagerSubSystem::PlaceCurrentStatic(const FVector& Location)
+void UGameManagerSubSystem::PlaceCurrentStatic(const FVector& /*Location*/)
 {
-    UWorld* const World = GetWorld();
-    if (!IsValid(World) || !World->IsGameWorld())
-    {
-        LastSaveMessage = TEXT("Static placement was skipped because no active game world is available.");
-        return;
-    }
-
-    RefreshBuiltModelLists();
-    if (!StaticReferences.IsValidIndex(CurrentStaticIndex))
-    {
-        LastSaveMessage = TEXT("No built Static models are available.");
-        return;
-    }
-
-    UModelDatabaseSubsystem* Database = GetGameInstance()
-        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-    FGuid UUID;
-    FModelDefinition Definition;
-    FString ModelReference;
-    if (!Database || !Database->FindUUIDForReference(StaticReferences[CurrentStaticIndex], UUID)
-        || !Database->ResolveLoadable(UUID, Definition, ModelReference)
-        || Definition.ModelType != EModelDefinitionType::Static)
-    {
-        LastSaveMessage = TEXT("The built Static model reference is invalid.");
-        return;
-    }
-
-    const FString BaseName = Definition.Name;
-    const FString ObjectName = MakeObjectName(BaseName, EPlacedObjectKind::Static);
-
-    FActorSpawnParameters Params;
-    Params.Owner = SessionOwner.Get();
-    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    APlayerController* const PlayerController = World->GetFirstPlayerController();
-    const FRotator SpawnRot(0.0f,
-        PlayerController ? PlayerController->GetControlRotation().Yaw : 0.0f,
-        0.0f);
-    UClass* StaticSpawnClass = StaticActorClass ? StaticActorClass.Get() : AStaticActor::StaticClass();
-    AStaticActor* Actor = World->SpawnActor<AStaticActor>(
-        StaticSpawnClass, FTransform(SpawnRot, Location), Params);
-    if (!IsValid(Actor) && StaticSpawnClass != AStaticActor::StaticClass())
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("Configured Static actor class failed to spawn; retrying with native AStaticActor. Class=%s"),
-            *GetNameSafe(StaticSpawnClass));
-        Actor = World->SpawnActor<AStaticActor>(
-            AStaticActor::StaticClass(), FTransform(SpawnRot, Location), Params);
-    }
-    if (IsValid(Actor))
-    {
-        Actor->SetRenderOnlyStreaming(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
-    }
-    if (IsValid(Actor) && Actor->LoadStatic(ModelReference, ObjectName))
-    {
-        UWorldObjectStreamingSubsystem* Chunks =
-            World->GetSubsystem<UWorldObjectStreamingSubsystem>();
-        if (!Chunks || !Chunks->RegisterPlacedObject(Actor, UUID))
-        {
-            Actor->Destroy();
-            LastSaveMessage = TEXT("Placement was deferred because the target chunk or model UUID is not ready yet.");
-            return;
-        }
-        SpawnedStatics.Add(TWeakObjectPtr<AStaticActor>(Actor));
-        LastSaveMessage = FString::Printf(TEXT("Placed: %s"), *ObjectName);
-    }
-    else if (IsValid(Actor))
-    {
-        Actor->Destroy();
-        LastSaveMessage = TEXT("Static load failed");
-    }
+    // Defense in depth for legacy callers. World restoration/streaming uses its own spawn path.
+    CurrentMode = EToolMode::None;
+    LastSaveMessage = TEXT("Static world models cannot be placed as items.");
 }
 
 void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString& ModelReference)

@@ -77,6 +77,9 @@ namespace StaticActorPrivate
 
             FStaticPreparedGroup& Group = PreparedGroups.FindOrAdd(*GroupName);
             Group.MeshNames.Add(Node.MeshName);
+            Group.Data.NodeBounds += Node.Transform.GetLocation();
+            Group.Data.MaxNodeScale = FMath::Max(Group.Data.MaxNodeScale,
+                static_cast<double>(Node.Transform.GetScale3D().GetAbs().GetMax()));
             if (Node.bAlwaysLoaded
                 || Node.FineChunk.X < 0 || Node.FineChunk.X >= 16
                 || Node.FineChunk.Y < 0 || Node.FineChunk.Y >= 16
@@ -245,6 +248,9 @@ void AStaticActor::RequestStreamingRefresh()
         // StartStreamingStep early and accidentally treat an unfinished empty group set as ready.
         return;
     }
+    StreamingEvaluation.Invalidate();
+    bIsLoaded = false;
+    NextStreamingUpdateSeconds = 0.0;
     StartStreamingStep();
 }
 
@@ -252,12 +258,14 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
 {
     check(IsInGameThread());
     if (bIsDestroyed || !bHasModelMetadata || !IsValid(BakedAsset)
+        || (bAsyncLoading && !StreamingEvaluation.HasSnapshot())
         || WorldLocation.ContainsNaN())
     {
         return false;
     }
 
     const float EffectiveStreamDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
     const FTransform OwnerTransform = GetActorTransform();
 
     for (const TPair<FName, TObjectPtr<AInstancedMeshActor>>& GroupPair : OwnedInstancedMeshActors)
@@ -272,7 +280,7 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
             if (!MeshData) return false;
             MaxWorldRadius = FMath::Max(MaxWorldRadius, float(V3DStreamingPolicy::LoadRadius(
                 MeshData->Size, Group->GetMaxNodeScale()
-                    * OwnerTransform.GetScale3D().GetAbs().GetMax(), EffectiveStreamDistance)));
+                    * OwnerTransform.GetScale3D().GetAbs().GetMax(), EffectiveStreamDistance, MaxDistanceCm)));
         }
 
         TMap<FName, FModelNodeData> CandidateNodes;
@@ -286,11 +294,8 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
             const FModelMeshData* MeshData = AllMeshMap.Find(Node.MeshName);
             if (!MeshData) return false;
             const FTransform NodeWorldTransform = Node.Transform * OwnerTransform;
-            const double LoadRadius = V3DStreamingPolicy::LoadRadius(MeshData->Size,
-                NodeWorldTransform.GetScale3D().GetAbs().GetMax(), EffectiveStreamDistance);
-            const FVector NodeWorldLocation = NodeWorldTransform.GetLocation();
-            const bool bRequired = Node.bAlwaysLoaded
-                || FVector::DistSquared(WorldLocation, NodeWorldLocation) <= FMath::Square(LoadRadius);
+            const bool bRequired = V3DStreamingPolicy::MeshInRange(MeshData->Size,
+                NodeWorldTransform, WorldLocation, EffectiveStreamDistance, MaxDistanceCm, Node.bAlwaysLoaded);
             if (bRequired && !LoadedNodes.Contains(NodePair.Key)) return false;
         }
     }
@@ -301,7 +306,8 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
         const FVector WaterWorldLocation =
             (WaterPair.Value.Transform * OwnerTransform).GetLocation();
         const float LoadRadius = FMath::Max(WaterPair.Value.StreamRadius, WaterDistanceRadius);
-        if (FVector::DistSquared(WorldLocation, WaterWorldLocation) <= FMath::Square(LoadRadius)
+        const double RenderRadius = MaxDistanceCm + WaterPair.Value.StreamRadius * OwnerTransform.GetScale3D().GetAbs().GetMax();
+        if (FVector::DistSquared(WorldLocation, WaterWorldLocation) <= FMath::Square(FMath::Min(double(LoadRadius), RenderRadius))
             && !LoadedWaterNodes.Contains(WaterPair.Key))
         {
             return false;
@@ -329,6 +335,7 @@ void AStaticActor::BeginPlay()
     MetadataRequestSerial = 0;
     ActiveStreamActions.Empty();
     StreamGroupProgress.Empty();
+    StreamGroupProgressSum = 0.0;
     AllNodeMap.Empty();
     AllMeshMap.Empty();
     WaterNodeMap.Empty();
@@ -376,6 +383,9 @@ void AStaticActor::StartBuiltLoad()
         return;
     }
 
+    StreamingEvaluation.Reset();
+    NextStreamingUpdateSeconds = 0.0;
+    bIsLoaded = false;
     ModelReference = StaticActorPrivate::NormalizeReference(ModelReference);
     FGuid UUID;
     FString CanonicalReference;
@@ -431,6 +441,7 @@ void AStaticActor::ReleaseRuntimeResourcesForWorldExit()
         }
     }
 
+    StreamingEvaluation.Reset();
     bIsDestroyed = true;
     bAsyncLoading = false;
     bIsLoaded = false;
@@ -455,6 +466,7 @@ void AStaticActor::ReleaseRuntimeResourcesForWorldExit()
     bHasModelMetadata = false;
     ModelReference.Reset();
     StreamGroupProgress.Empty();
+    StreamGroupProgressSum = 0.0;
 }
 
 void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
@@ -908,24 +920,22 @@ void AStaticActor::PruneUnreferencedMeshMetadata()
     }
 }
 
-void AStaticActor::OnStreamProgress(
-    const FName GroupName,
-    const float Progress)
+void AStaticActor::SetStreamGroupProgress(const FName GroupName, const float Progress)
+{
+    float& Previous = StreamGroupProgress.FindOrAdd(GroupName);
+    const float Current = FMath::Clamp(Progress, 0.0f, 1.0f);
+    StreamGroupProgressSum += static_cast<double>(Current) - Previous;
+    Previous = Current;
+    const float BatchProgress = StreamGroupProgress.IsEmpty() ? 1.0f
+        : static_cast<float>(StreamGroupProgressSum / StreamGroupProgress.Num());
+    LoadingStatus = FMath::Max(LoadingStatus,
+        FMath::Clamp(0.5f + BatchProgress * 0.5f, 0.5f, 1.0f));
+}
+
+void AStaticActor::OnStreamProgress(const FName GroupName, const float Progress)
 {
     check(IsInGameThread());
-    StreamGroupProgress.FindOrAdd(GroupName) =
-        FMath::Clamp(Progress, 0.0f, 1.0f);
-    float Sum = 0.0f;
-    for (const TPair<FName, float>& Pair : StreamGroupProgress)
-    {
-        Sum += Pair.Value;
-    }
-    const float BatchProgress = StreamGroupProgress.IsEmpty()
-        ? 1.0f
-        : Sum / static_cast<float>(StreamGroupProgress.Num());
-    LoadingStatus = FMath::Max(
-        LoadingStatus,
-        FMath::Clamp(0.5f + BatchProgress * 0.5f, 0.5f, 1.0f));
+    SetStreamGroupProgress(GroupName, Progress);
 }
 
 bool AStaticActor::IsPlayerInsideModelRange() const
@@ -950,10 +960,11 @@ bool AStaticActor::IsPlayerInsideModelRange() const
     }
     if (ObserverLocations.IsEmpty()) ObserverLocations.Add(FVector::ZeroVector);
     const float ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
     for (const FVector& Observer : ObserverLocations)
     {
         if (V3DStreamingPolicy::SceneInRange(ModelMetadata.Center, ModelMetadata.Size,
-            GetActorTransform(), Observer, ScreenDistance)) return true;
+            GetActorTransform(), Observer, ScreenDistance, 1.0, MaxDistanceCm)) return true;
     }
     return false;
 }
@@ -1057,6 +1068,25 @@ FglTFRuntimeStaticMeshConfig AStaticActor::BuildStreamingMeshConfig()
     return Config;
 }
 
+FV3DStreamingEvaluationInputs AStaticActor::GetStreamingEvaluationInputs() const
+{
+    FV3DStreamingEvaluationInputs Inputs;
+    if (UWorldSceneStreamingSubsystem* Streamer = UWorldSceneStreamingSubsystem::Get(GetWorld()))
+        Streamer->GetStreamingObserverLocations(Inputs.Observers);
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(GetWorld()))
+    {
+        if (Inputs.Observers.IsEmpty()) Inputs.Observers.Add(Manager->GetPlayerLocation());
+        if (const UGameSettings* Settings = Manager->GetGameSettings())
+            Inputs.UnloadMultiplier = Settings->GetStreamingUnloadDistanceMultiplier();
+    }
+    if (Inputs.Observers.IsEmpty()) Inputs.Observers.Add(FVector::ZeroVector);
+    Inputs.OwnerTransform = GetActorTransform();
+    Inputs.ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    Inputs.MaxRenderDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
+    Inputs.bRenderOnly = bRenderOnlyStreaming;
+    return Inputs;
+}
+
 void AStaticActor::StartStreamingStep()
 {
     check(IsInGameThread());
@@ -1066,6 +1096,8 @@ void AStaticActor::StartStreamingStep()
         UnregisterGameUpdate();
         return;
     }
+    // Metadata/group construction and active payload work own this cycle until completion.
+    if (bAsyncLoading) return;
     if (!IsValid(BakedAsset))
     {
         bAsyncLoading = false;
@@ -1084,23 +1116,26 @@ void AStaticActor::StartStreamingStep()
         UnregisterGameUpdate();
         return;
     }
-    if (bAsyncLoading)
-    {
-        return;
-    }
 
-    // Begin one streaming evaluation cycle. Creating/activating hundreds of async actions in one
-    // frame caused visible stalls on dense models, so group activation itself is now budgeted.
+    const double Now = FPlatformTime::Seconds();
+    if (Now < NextStreamingUpdateSeconds) return;
+    double UpdateInterval = 0.08;
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+        if (const UGameSettings* Settings = Manager->GetGameSettings())
+            UpdateInterval = Settings->GetStreamingUpdateIntervalSeconds();
+    NextStreamingUpdateSeconds = Now + UpdateInterval;
+
+    FV3DStreamingEvaluationInputs Inputs = GetStreamingEvaluationInputs();
+    if (!StreamingEvaluation.NeedsEvaluation(Inputs)) return;
+    StreamingEvaluation.Capture(MoveTemp(Inputs));
+
+    // Keep completed scenes ready while other scenes load. An unchanged view cannot gain new
+    // candidates in immutable metadata, so re-queuing every mesh group would only delay startup.
     bAsyncLoading = true;
     bIsLoaded = false;
     PendingStreamGroupNames.Empty();
     OwnedInstancedMeshActors.GetKeys(PendingStreamGroupNames);
-    TArray<FVector> PriorityObservers;
-    if (UWorldSceneStreamingSubsystem* Streamer = UWorldSceneStreamingSubsystem::Get(this))
-        Streamer->GetStreamingObserverLocations(PriorityObservers);
-    if (PriorityObservers.IsEmpty())
-        if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
-            PriorityObservers.Add(Manager->GetPlayerLocation());
+    const TArray<FVector>& PriorityObservers = StreamingEvaluation.GetInputs().Observers;
     TMap<FName, double> GroupDistances;
     for (const FName Name : PendingStreamGroupNames)
     {
@@ -1126,6 +1161,7 @@ void AStaticActor::StartStreamingStep()
     PendingStreamGroupIndex = 0;
     bPendingWaterStream = !WaterNodeMap.IsEmpty();
     StreamGroupProgress.Empty();
+    StreamGroupProgressSum = 0.0;
     for (const FName GroupName : PendingStreamGroupNames)
     {
         StreamGroupProgress.Add(GroupName, 0.0f);
@@ -1152,6 +1188,11 @@ void AStaticActor::LaunchNextStreamingBatch()
     {
         return;
     }
+
+    // Batches can observe A -> B -> A during a long pass. Remember the intermediate
+    // change even when B only skipped/unloaded groups and no mesh callback was involved.
+    if (StreamingEvaluation.NeedsEvaluation(GetStreamingEvaluationInputs()))
+        StreamingEvaluation.Invalidate();
 
     TArray<FVector> ObserverLocations;
     int32 SafeChunkSize = FMath::Max(1, ChunkSize);
@@ -1185,15 +1226,47 @@ void AStaticActor::LaunchNextStreamingBatch()
 
     // Both readiness and stream planning use the same bounded, world-scale-aware policy.
     const float EffectiveStreamDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
     const FglTFRuntimeStaticMeshConfig MeshConfig = BuildStreamingMeshConfig();
 
     const auto StartGroup =
-        [this, &ObserverLocations, &MeshConfig, SafeChunkSize, EffectiveStreamDistance, UnloadDistanceMultiplier](
+        [this, &ObserverLocations, &MeshConfig, SafeChunkSize, EffectiveStreamDistance, UnloadDistanceMultiplier, MaxDistanceCm](
             AInstancedMeshActor* InstancedActor,
             const bool bWaterGroup)
         {
             const FName GroupName = bWaterGroup
                 ? NAME_None : InstancedActor->GetGroupName();
+            // Unloaded groups outside a conservative bound need no action/snapshot/worker.
+            // Loaded groups must still run so instances leaving the range can be released.
+            if (!bWaterGroup && !InstancedActor->HasLoadedNodes()
+                && InstancedActor->GetNodeBounds().IsValid)
+            {
+                const FTransform OwnerTransform = GetActorTransform();
+                const double MaxScale = InstancedActor->GetMaxNodeScale()
+                    * OwnerTransform.GetScale3D().GetAbs().GetMax();
+                double Radius = 0.0;
+                for (const FName MeshName : InstancedActor->GetReferencedMeshNames())
+                {
+                    if (const FModelMeshData* Mesh = AllMeshMap.Find(MeshName))
+                    {
+                        const double MeshRadius = InstancedActor->HasAlwaysLoadedNodes()
+                            ? MaxDistanceCm + 0.5 * Mesh->Size.GetAbs().Size() * MaxScale
+                            : V3DStreamingPolicy::LoadRadius(Mesh->Size, MaxScale,
+                                EffectiveStreamDistance, MaxDistanceCm);
+                        Radius = FMath::Max(Radius, MeshRadius);
+                    }
+                }
+                const FBox WorldBounds = InstancedActor->GetNodeBounds().TransformBy(OwnerTransform);
+                bool bInRange = false;
+                for (const FVector& Observer : ObserverLocations)
+                    if (WorldBounds.ComputeSquaredDistanceToPoint(Observer) <= FMath::Square(Radius))
+                    { bInRange = true; break; }
+                if (!bInRange)
+                {
+                    SetStreamGroupProgress(GroupName, 1.0f);
+                    return true;
+                }
+            }
             UWorldSceneStreamAction* Action =
                 UWorldSceneStreamAction::StreamAsyncForObservers(
                     this,
@@ -1211,7 +1284,7 @@ void AStaticActor::LaunchNextStreamingBatch()
                 return false;
             }
             ActiveStreamActions.Add(GroupName, Action);
-            StreamGroupProgress.FindOrAdd(GroupName) = 0.0f;
+            SetStreamGroupProgress(GroupName, 0.0f);
             Action->Completed.AddDynamic(
                 this, &AStaticActor::OnStreamCompleted);
             Action->Progress.AddDynamic(
@@ -1236,7 +1309,7 @@ void AStaticActor::LaunchNextStreamingBatch()
             || !StartGroup(InstancedActor, false))
         {
             FailedGroups.Add(GroupName);
-            StreamGroupProgress.FindOrAdd(GroupName) = 1.0f;
+            SetStreamGroupProgress(GroupName, 1.0f);
             continue;
         }
         if (ActiveStreamActions.Contains(GroupName)) ++LaunchedThisBatch;
@@ -1254,7 +1327,7 @@ void AStaticActor::LaunchNextStreamingBatch()
             WaterNodeMap.Empty();
             LoadedWaterNodes.Empty();
             WaterActorMap.Empty();
-            StreamGroupProgress.FindOrAdd(NAME_None) = 1.0f;
+            SetStreamGroupProgress(NAME_None, 1.0f);
         }
         else
         {
@@ -1287,10 +1360,14 @@ void AStaticActor::FinishStreamingCycle()
     PendingStreamGroupNames.Empty();
     PendingStreamGroupIndex = 0;
     bPendingWaterStream = false;
-    bIsLoaded = true;
+    // A settings/focus request or late callback rejection may invalidate an in-flight pass.
+    // Do not publish readiness until the current observer set has actually been evaluated.
+    bIsLoaded = !StreamingEvaluation.NeedsEvaluation(GetStreamingEvaluationInputs());
+    if (!bIsLoaded) NextStreamingUpdateSeconds = 0.0;
     bAsyncLoading = false;
     LoadingStatus = 1.0f;
     StreamGroupProgress.Empty();
+    StreamGroupProgressSum = 0.0;
 }
 
 void AStaticActor::OnStreamCompleted(
@@ -1298,7 +1375,7 @@ void AStaticActor::OnStreamCompleted(
 {
     check(IsInGameThread());
     ActiveStreamActions.Remove(Result.GroupName);
-    StreamGroupProgress.FindOrAdd(Result.GroupName) = 1.0f;
+    SetStreamGroupProgress(Result.GroupName, 1.0f);
     if (bIsDestroyed)
     {
         return;

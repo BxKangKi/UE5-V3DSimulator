@@ -16,7 +16,7 @@
 #include "WorldObjectStreamingSubsystem.generated.h"
 
 /**
- * Owns Worlds/Data/WorldName.dat. Disk work uses immutable snapshots on tracked workers; actor
+ * Owns Data/WorldName.dat. Disk work uses immutable snapshots on tracked workers; actor
  * creation/destruction and maps stay game-thread-only. Periodic writes are coalesced to one-second
  * checkpoints; unload/stop still flush immediately. A change made during a commit advances its
  * revision so a newer snapshot follows it.

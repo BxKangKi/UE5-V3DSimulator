@@ -48,13 +48,18 @@ bool AInstancedMeshActor::InitializeGroup(
 
     GroupName = InGroupName;
     NodeMap = MoveTemp(InData.Nodes);
-    MaxNodeScale = 0.0;
-    NodeBounds = FBox(ForceInit);
-    for (const auto& Pair : NodeMap)
+    NodeBounds = InData.NodeBounds;
+    MaxNodeScale = InData.MaxNodeScale;
+    if (!NodeBounds.IsValid)
     {
-        const FVector Scale = Pair.Value.Transform.GetScale3D().GetAbs();
-        MaxNodeScale = FMath::Max(MaxNodeScale, double(Scale.GetMax()));
-        NodeBounds += Pair.Value.Transform.GetLocation();
+        // Compatibility for callers that supply nodes without precomputed worker bounds.
+        MaxNodeScale = 0.0;
+        for (const auto& Pair : NodeMap)
+        {
+            MaxNodeScale = FMath::Max(MaxNodeScale,
+                static_cast<double>(Pair.Value.Transform.GetScale3D().GetAbs().GetMax()));
+            NodeBounds += Pair.Value.Transform.GetLocation();
+        }
     }
     SpatialChunks = MoveTemp(InData.SpatialChunks);
     AlwaysLoadedNodeNames = MoveTemp(InData.AlwaysLoadedNodeNames);

@@ -30,6 +30,11 @@ FString V3DSimulatorPaths::WorldsRoot()
     return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("Worlds")));
 }
 
+FString V3DSimulatorPaths::DataRoot()
+{
+    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("Data")));
+}
+
 FString V3DSimulatorPaths::LogsRoot()
 {
     return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("Logs")));

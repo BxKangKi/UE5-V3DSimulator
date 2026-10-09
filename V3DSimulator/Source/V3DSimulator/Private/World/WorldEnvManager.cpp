@@ -451,17 +451,20 @@ void AWorldEnvManager::RefreshShaderLibraryParameters()
         : 0.0f;
 
     float CelShadingMode = 1.0f;
+    float MaxDistanceCm = GetDefault<UGameSettings>()->GetMaxRenderDistanceCentimeters();
     if (UGameManagerSubSystem* GameManager = SubSystem.Get())
     {
         if (const UGameSettings* Settings = GameManager->GetGameSettings())
         {
             CelShadingMode = Settings->CelShadingMode >= 0.5f ? 1.0f : 0.0f;
+            MaxDistanceCm = Settings->GetMaxRenderDistanceCentimeters();
         }
     }
 
     Parameters->SetScalarParameterValue(TEXT("OceanHeight"), OceanHeight);
     Parameters->SetScalarParameterValue(TEXT("OceanEnabled"), bOceanEnabled ? 1.0f : 0.0f);
     Parameters->SetScalarParameterValue(TEXT("CelShadingMode"), CelShadingMode);
+    Parameters->SetScalarParameterValue(TEXT("MaxRenderDistance"), MaxDistanceCm);
 }
 
 void AWorldEnvManager::EndPlay(const EEndPlayReason::Type EndPlayReason)

@@ -292,6 +292,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleMaxTextureResolutionFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleMaxRenderDistanceMetersFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleQualityProfileFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleViewDistanceQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleStreamingDistanceMultiplierFromUI();
@@ -396,6 +400,10 @@ private:
     int32 PendingTextureQuality = 2;
     int32 PendingMaxTextureResolution = 768;
     int32 PendingViewDistanceQuality = 2;
+    int32 PendingMaxRenderDistanceMeters = 8192;
+    bool bRefreshingControls = false;
+    int32 GetPendingQualityProfileIndex() const;
+    void SetPendingQualityProfile(int32 Quality);
     float PendingStreamingDistanceMultiplier = 64.0f;
     float PendingStreamingUnloadDistanceMultiplier = 1.10f;
     float PendingObjectStreamingRadiusMeters = 2048.0f;

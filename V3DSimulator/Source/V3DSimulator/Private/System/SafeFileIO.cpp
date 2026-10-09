@@ -781,8 +781,7 @@ namespace SafeFileIOPrivate
         const TArray<uint8>& Data,
         const FString& Path,
         const int64 MaxOutputBytes,
-        const uint64 WriteSequence = 0,
-        const bool bKeepPersistentBackup = true)
+        const uint64 WriteSequence = 0)
     {
         FSafeFileWriteResult Result;
         Result.Path = Path;
@@ -910,25 +909,8 @@ namespace SafeFileIOPrivate
 
         if (bTargetExisted && PlatformFile.FileExists(*PreviousTargetPath))
         {
-            if (!bKeepPersistentBackup)
-            {
-                // Binary state keeps only its verified primary. The previous generation is a
-                // short-lived rollback journal and is removed after the new commit succeeds.
-                PlatformFile.DeleteFile(*PreviousTargetPath);
-            }
-            else
-            {
-                // JSON may opt into persistent recovery. Rotate only after the new primary exists.
-                const FString BackupPath = GetBackupPath(Path);
-                PlatformFile.DeleteFile(*BackupPath);
-                if (!PlatformFile.MoveFile(*BackupPath, *PreviousTargetPath))
-                {
-                    UE_LOG(LogTemp, Warning,
-                        TEXT("Committed primary data but could not rotate its previous generation to backup. Path=%s Journal=%s"),
-                        *Path,
-                        *PreviousTargetPath);
-                }
-            }
+            // JSON and binary state retain only the verified primary after a successful commit.
+            PlatformFile.DeleteFile(*PreviousTargetPath);
         }
         Result.Status = ESafeFileIOStatus::Success;
         Result.BytesWritten = Data.Num();
@@ -1391,9 +1373,8 @@ FSafeFileWriteResult FSafeFileIO::CreateJsonIfMissingBlocking(
         return Result;
     }
 
-    // CommitBytesUnlocked only rotates a backup when a target existed before this transaction.
-    // The existence check is protected by the same per-path lock, so template creation never
-    // overwrites external JSON and therefore never creates a JSON .bak generation.
+    // The existence check and commit share a per-path lock; template creation never
+    // overwrites an existing author file.
     return SafeFileIOPrivate::CommitBytesUnlocked(
         Bytes, NormalizedPath, MaxOutputBytes, WriteSequence);
 }
@@ -1550,7 +1531,7 @@ FSafeFileWriteResult FSafeFileIO::SaveBinaryBlocking(
         SafeFileIOPrivate::GetPathLock(NormalizedPath);
     FScopeLock ScopeLock(&PathLock.Get());
     return SafeFileIOPrivate::CommitBytesUnlocked(
-        Data, NormalizedPath, MaxOutputBytes, WriteSequence, false);
+        Data, NormalizedPath, MaxOutputBytes, WriteSequence);
 }
 
 void FSafeFileIO::SaveBinaryAsync(
@@ -1599,7 +1580,7 @@ void FSafeFileIO::SaveBinaryAsync(
                 SafeFileIOPrivate::GetPathLock(NormalizedPath);
             FScopeLock ScopeLock(&PathLock.Get());
             FSafeFileWriteResult Result = SafeFileIOPrivate::CommitBytesUnlocked(
-                Data, NormalizedPath, MaxOutputBytes, WriteSequence, false);
+                Data, NormalizedPath, MaxOutputBytes, WriteSequence);
             SafeFileIOPrivate::DispatchWriteCallback(
                 MoveTemp(Callback), MoveTemp(Result), TrackedOperation);
         });

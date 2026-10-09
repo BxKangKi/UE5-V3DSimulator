@@ -222,6 +222,7 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialParameterCollection> ShaderLibraryMPC;
 
+
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Environment")
     TSoftObjectPtr<UStaticMesh> SkyboxMesh;
 

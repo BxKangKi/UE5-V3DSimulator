@@ -58,6 +58,7 @@ namespace
     const TArray<ESettingsField>& GetDefaultSettingsFields()
     {
         static const TArray<ESettingsField> Fields = {
+            ESettingsField::QualityProfile,
             ESettingsField::BloomIntensity,
             ESettingsField::BloomThreshold,
             ESettingsField::AmbientOcclusionIntensity,
@@ -70,6 +71,7 @@ namespace
             ESettingsField::TextureQuality,
             ESettingsField::MaxTextureResolution,
             ESettingsField::ViewDistanceQuality,
+            ESettingsField::MaxRenderDistanceMeters,
             ESettingsField::AntiAliasingQuality,
             ESettingsField::PostProcessingQuality,
             ESettingsField::EffectsQuality,
@@ -185,6 +187,7 @@ namespace
     {
         switch (Field)
         {
+        case ESettingsField::QualityProfile: return TEXT("QualityProfile");
         case ESettingsField::BloomIntensity: return TEXT("BloomIntensity");
         case ESettingsField::BloomThreshold: return TEXT("BloomThreshold");
         case ESettingsField::AmbientOcclusionIntensity: return TEXT("AmbientOcclusionIntensity");
@@ -197,6 +200,7 @@ namespace
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
         case ESettingsField::MaxTextureResolution: return TEXT("MaxTextureResolution");
         case ESettingsField::ViewDistanceQuality: return TEXT("ViewDistanceQuality");
+        case ESettingsField::MaxRenderDistanceMeters: return TEXT("MaxRenderDistanceMeters");
         case ESettingsField::StreamingDistanceMultiplier: return TEXT("StreamingDistanceMultiplier");
         case ESettingsField::StreamingUnloadDistanceMultiplier: return TEXT("StreamingUnloadDistanceMultiplier");
         case ESettingsField::ObjectStreamingRadiusMeters: return TEXT("ObjectStreamingRadiusMeters");
@@ -287,9 +291,9 @@ void USettingsControlBinding::HandleSliderValueChanged(const float Value)
 }
 
 void USettingsControlBinding::HandleDropdownSelectionChanged(
-    FString SelectedItem, ESelectInfo::Type /*SelectionType*/)
+    FString SelectedItem, ESelectInfo::Type SelectionType)
 {
-    if (IsValid(OwnerWidget))
+    if (SelectionType != ESelectInfo::Direct && IsValid(OwnerWidget))
     {
         OwnerWidget->SetSettingFromDropdownSelection(Field, SelectedItem);
     }
@@ -816,6 +820,7 @@ float USettingsMenuWidget::GetPendingNumericSettingValue(ESettingsField Field) c
 
 void USettingsMenuWidget::SetSettingFromSliderValue(ESettingsField Field, const float Value)
 {
+    if (bRefreshingControls) return;
     switch (Field)
     {
     case ESettingsField::BloomIntensity:
@@ -837,12 +842,13 @@ void USettingsMenuWidget::SetSettingFromSliderValue(ESettingsField Field, const 
     default:
         return;
     }
-    RefreshSettingsValues();
+    ApplyAndSaveSettingsFromUI();
 }
 
 void USettingsMenuWidget::SetSettingFromDropdownSelection(
     ESettingsField Field, const FString& SelectedOption)
 {
+    if (bRefreshingControls) return;
     const TArray<FText> Options = GetSettingOptionTexts(Field);
     int32 SelectedIndex = INDEX_NONE;
     for (int32 Index = 0; Index < Options.Num(); ++Index)
@@ -875,7 +881,11 @@ void USettingsMenuWidget::SetSettingFromDropdownSelection(
         PendingReflectionMethod = FMath::Clamp(SelectedIndex, 0, 2); break;
     case ESettingsField::ShadowQuality: PendingShadowQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::TextureQuality: PendingTextureQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
+    case ESettingsField::QualityProfile:
+        if (SelectedIndex >= 4) return;
+        SetPendingQualityProfile(SelectedIndex); break;
     case ESettingsField::ViewDistanceQuality: PendingViewDistanceQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
+    case ESettingsField::MaxRenderDistanceMeters: PendingMaxRenderDistanceMeters = (FMath::Clamp(SelectedIndex, 0, 31) + 1) * 1024; break;
     case ESettingsField::AntiAliasingQuality: PendingAntiAliasingQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::PostProcessingQuality: PendingPostProcessingQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::EffectsQuality: PendingEffectsQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
@@ -885,11 +895,12 @@ void USettingsMenuWidget::SetSettingFromDropdownSelection(
     case ESettingsField::ReflectionQuality: PendingReflectionQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
     default: return;
     }
-    RefreshSettingsValues();
+    ApplyAndSaveSettingsFromUI();
 }
 
 void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
 {
+    if (bRefreshingControls) return;
     switch (Field)
     {
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
@@ -898,7 +909,7 @@ void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
     case ESettingsField::CelShadingMode: PendingCelShadingMode = PendingCelShadingMode >= 0.5f ? 0.0f : 1.0f; break;
     default: return;
     }
-    RefreshSettingsValues();
+    ApplyAndSaveSettingsFromUI();
 }
 
 UGameSettings* USettingsMenuWidget::GetEditableSettings() const
@@ -1085,6 +1096,14 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI);
         break;
+    case ESettingsField::QualityProfile:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleQualityProfileFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleQualityProfileFromUI);
+        break;
+    case ESettingsField::MaxRenderDistanceMeters:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxRenderDistanceMetersFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleMaxRenderDistanceMetersFromUI);
+        break;
     case ESettingsField::ViewDistanceQuality:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI);
@@ -1177,6 +1196,8 @@ void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Butto
     case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
     case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
     case ESettingsField::MaxTextureResolution: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI); break;
+    case ESettingsField::QualityProfile: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleQualityProfileFromUI); break;
+    case ESettingsField::MaxRenderDistanceMeters: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxRenderDistanceMetersFromUI); break;
     case ESettingsField::ViewDistanceQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI); break;
     case ESettingsField::StreamingDistanceMultiplier: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleStreamingDistanceMultiplierFromUI); break;
     case ESettingsField::StreamingUnloadDistanceMultiplier: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleStreamingUnloadDistanceMultiplierFromUI); break;
@@ -1227,6 +1248,7 @@ float USettingsMenuWidget::GetPendingNumericValue(ESettingsField Field) const
 
 void USettingsMenuWidget::RefreshRegisteredControls()
 {
+    TGuardValue<bool> RefreshGuard(bRefreshingControls, true);
     for (USettingsControlBinding* Binding : ControlBindings)
     {
         if (!IsValid(Binding)) continue;
@@ -1277,6 +1299,7 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
     PendingMaxTextureResolution = FMath::Clamp(Settings->MaxTextureResolution, TextureResolutionMin, TextureResolutionMax);
     PendingViewDistanceQuality = FMath::Clamp(Settings->ViewDistanceQuality, QualityMin, QualityMax);
+    PendingMaxRenderDistanceMeters = Settings->GetClampedMaxRenderDistanceMeters();
     PendingAntiAliasingQuality = FMath::Clamp(Settings->AntiAliasingQuality, QualityMin, QualityMax);
     PendingPostProcessingQuality = FMath::Clamp(Settings->PostProcessingQuality, QualityMin, QualityMax);
     PendingEffectsQuality = FMath::Clamp(Settings->EffectsQuality, QualityMin, QualityMax);
@@ -1307,6 +1330,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->TextureQuality = PendingTextureQuality;
     Settings->MaxTextureResolution = PendingMaxTextureResolution;
     Settings->ViewDistanceQuality = PendingViewDistanceQuality;
+    Settings->MaxRenderDistanceMeters = PendingMaxRenderDistanceMeters;
     Settings->AntiAliasingQuality = PendingAntiAliasingQuality;
     Settings->PostProcessingQuality = PendingPostProcessingQuality;
     Settings->EffectsQuality = PendingEffectsQuality;
@@ -1320,6 +1344,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
 
 void USettingsMenuWidget::RefreshSettingsValues()
 {
+    TGuardValue<bool> RefreshGuard(bRefreshingControls, true);
     for (int32 Index = 0; Index < ValueTextBlocks.Num() && Index < ValueFields.Num(); ++Index)
     {
         if (UTextBlock* TextBlock = ValueTextBlocks[Index].Get())
@@ -1341,9 +1366,10 @@ void USettingsMenuWidget::RefreshSettingsValues()
 
 void USettingsMenuWidget::CycleSettingValueFromUI(ESettingsField Field, int32 Direction)
 {
+    if (bRefreshingControls) return;
     if (IsAutomaticStreamingField(Field)) return;
     CyclePendingValue(Field, Direction);
-    RefreshSettingsValues();
+    ApplyAndSaveSettingsFromUI();
 }
 
 void USettingsMenuWidget::CycleSettingByNameFromUI(FName FieldNameValue, int32 Direction)
@@ -1371,11 +1397,11 @@ void USettingsMenuWidget::CycleSettingByButtonTextFromUI(UButton* SourceButton, 
 
 void USettingsMenuWidget::ApplyAndSaveSettingsFromUI()
 {
+    if (bRefreshingControls) return;
     if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
     {
         ApplyPendingToSettings(SubSystem->GetGameSettings());
         SubSystem->UpdateSettings();
-        SubSystem->SaveSettings();
     }
 
     RefreshSettingsValues();
@@ -1420,6 +1446,8 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
     case ESettingsField::MaxTextureResolution: return FText::FromString(TEXT("Max Texture Resolution"));
     case ESettingsField::ViewDistanceQuality: return FText::FromString(TEXT("Render Distance Quality"));
+    case ESettingsField::MaxRenderDistanceMeters: return FText::FromString(TEXT("Max Render Distance"));
+    case ESettingsField::QualityProfile: return FText::FromString(TEXT("Quality Profile"));
     case ESettingsField::StreamingDistanceMultiplier: return FText::FromString(TEXT("Streaming Distance Multiplier"));
     case ESettingsField::StreamingUnloadDistanceMultiplier: return FText::FromString(TEXT("Streaming Unload Multiplier"));
     case ESettingsField::ObjectStreamingRadiusMeters: return FText::FromString(TEXT("Object Streaming Radius"));
@@ -1499,6 +1527,14 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
             Options.Add(GetReflectionMethodText(Value));
         }
         break;
+    case ESettingsField::QualityProfile:
+        for (int32 Quality = 0; Quality <= 3; ++Quality) Options.Add(GetQualityText(Quality));
+        Options.Add(FText::FromString(TEXT("Custom")));
+        break;
+    case ESettingsField::MaxRenderDistanceMeters:
+        for (int32 Value = 1024; Value <= 32768; Value += 1024)
+            Options.Add(FText::FromString(FString::Printf(TEXT("%d m"), Value)));
+        break;
     case ESettingsField::MaxTextureResolution:
         {
             static const int32 OptionsPx[] = {256, 512, 768, 1024, 1536, 2048, 4096};
@@ -1570,7 +1606,22 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::MaxTextureResolution: CycleTextureResolution(PendingMaxTextureResolution, Direction); break;
+    case ESettingsField::QualityProfile:
+        {
+            int32 Quality = GetPendingQualityProfileIndex();
+            if (Quality == INDEX_NONE) Quality = Direction < 0 ? 0 : -1;
+            CycleInt(Quality, 0, 3, Direction);
+            SetPendingQualityProfile(Quality);
+        }
+        break;
     case ESettingsField::ViewDistanceQuality: CycleInt(PendingViewDistanceQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::MaxRenderDistanceMeters:
+        {
+            int32 Step = PendingMaxRenderDistanceMeters / 1024;
+            CycleInt(Step, 1, 32, Direction);
+            PendingMaxRenderDistanceMeters = Step * 1024;
+        }
+        break;
     case ESettingsField::StreamingDistanceMultiplier: CycleFloat(PendingStreamingDistanceMultiplier, StreamingDistanceMin, StreamingDistanceMax, StreamingDistanceStep, Direction); break;
     case ESettingsField::StreamingUnloadDistanceMultiplier: CycleFloat(PendingStreamingUnloadDistanceMultiplier, StreamingUnloadMin, StreamingUnloadMax, StreamingUnloadStep, Direction); break;
     case ESettingsField::ObjectStreamingRadiusMeters: CycleFloat(PendingObjectStreamingRadiusMeters, ObjectRadiusMin, ObjectRadiusMax, ObjectRadiusStep, Direction); break;
@@ -1623,7 +1674,13 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
     case ESettingsField::MaxTextureResolution: return FText::FromString(FString::Printf(TEXT("%d px"), PendingMaxTextureResolution));
+    case ESettingsField::QualityProfile:
+        {
+            const int32 Profile = GetPendingQualityProfileIndex();
+            return Profile == INDEX_NONE ? FText::FromString(TEXT("Custom")) : GetQualityText(Profile);
+        }
     case ESettingsField::ViewDistanceQuality: return GetQualityText(PendingViewDistanceQuality);
+    case ESettingsField::MaxRenderDistanceMeters: return FText::FromString(FString::Printf(TEXT("%d m"), PendingMaxRenderDistanceMeters));
     case ESettingsField::StreamingDistanceMultiplier: return FText::FromString(FString::Printf(TEXT("%.0fx"), PendingStreamingDistanceMultiplier));
     case ESettingsField::StreamingUnloadDistanceMultiplier: return FText::FromString(FString::Printf(TEXT("%.2fx"), PendingStreamingUnloadDistanceMultiplier));
     case ESettingsField::ObjectStreamingRadiusMeters: return FText::FromString(FString::Printf(TEXT("%.0f m"), PendingObjectStreamingRadiusMeters));
@@ -1697,6 +1754,32 @@ void USettingsMenuWidget::CycleCelShadingModeFromUI() { CycleSettingValueFromUI(
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
 void USettingsMenuWidget::CycleMaxTextureResolutionFromUI() { CycleSettingValueFromUI(ESettingsField::MaxTextureResolution); }
+int32 USettingsMenuWidget::GetPendingQualityProfileIndex() const
+{
+    const int32 Q = FMath::Clamp(PendingViewDistanceQuality, 0, 3);
+    const bool bMatches = PendingViewDistanceQuality == Q && PendingShadowQuality == Q
+        && PendingTextureQuality == Q && PendingAntiAliasingQuality == Q
+        && PendingPostProcessingQuality == Q && PendingEffectsQuality == Q
+        && PendingFoliageQuality == Q && PendingShadingQuality == Q
+        && PendingGlobalIlluminationQuality == Q && PendingReflectionQuality == Q
+        && PendingMaxTextureResolution == 256 * (Q + 1)
+        && PendingMaxRenderDistanceMeters == (1024 << Q)
+        && bPendingRayTracing == (Q >= 2) && bPendingCloud == (Q >= 1) && bPendingHeightFog
+        && PendingDynamicGlobalIlluminationMethod == (Q >= 2 ? 1 : 0)
+        && PendingReflectionMethod == (Q >= 2 ? 1 : (Q == 1 ? 2 : 0));
+    return bMatches ? Q : INDEX_NONE;
+}
+
+void USettingsMenuWidget::SetPendingQualityProfile(const int32 Quality)
+{
+    UGameSettings* Snapshot = NewObject<UGameSettings>();
+    ApplyPendingToSettings(Snapshot);
+    Snapshot->ApplyQualityProfile(static_cast<EQualitySettings>(FMath::Clamp(Quality, 0, 3)));
+    CopySettingsToPending(Snapshot);
+}
+
+void USettingsMenuWidget::CycleQualityProfileFromUI() { CycleSettingValueFromUI(ESettingsField::QualityProfile); }
+void USettingsMenuWidget::CycleMaxRenderDistanceMetersFromUI() { CycleSettingValueFromUI(ESettingsField::MaxRenderDistanceMeters); }
 void USettingsMenuWidget::CycleViewDistanceQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ViewDistanceQuality); }
 void USettingsMenuWidget::CycleStreamingDistanceMultiplierFromUI() { /* automatic from ViewDistanceQuality */ }
 void USettingsMenuWidget::CycleStreamingUnloadDistanceMultiplierFromUI() { /* automatic from ViewDistanceQuality */ }

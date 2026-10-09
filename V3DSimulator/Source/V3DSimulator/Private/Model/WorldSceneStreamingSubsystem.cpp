@@ -390,21 +390,22 @@ float UWorldSceneStreamingSubsystem::GetLoadingStatus() const
         return 1.0f;
     }
 
-    double ProgressSum = 0.0;
-    double ProgressCount = 0.0;
-    for (const FWorldSceneStreamRecord& Record : SceneRecords)
+    // Completed work closes the loading screen immediately, independent of UI smoothing.
+    const bool bReady = AreInitialModelsReady() && IsPlayerLoaded();
+    if (bReady)
     {
-        float Progress = bInitialScenePassComplete ? 1.0f : 0.0f;
-        if (const TObjectPtr<AStaticActor>* Actor = ActiveSceneActors.Find(Record.RuntimeReference))
-        {
-            if (IsValid(Actor->Get()))
-            {
-                Progress = FMath::Clamp(Actor->Get()->GetLoadingStatus(), 0.0f, 1.0f);
-            }
-        }
-        ProgressSum += Progress;
-        ProgressCount += 1.0;
+        LastReportedLoadingStatus = 1.0f;
+        LastLoadingProgressFrame = GFrameCounter;
+        return 1.0f;
     }
+
+    const float DefaultProgress = bInitialScenePassComplete ? 1.0f : 0.0f;
+    double ProgressSum = static_cast<double>(SceneRecords.Num()) * DefaultProgress;
+    double ProgressCount = SceneRecords.Num();
+    // Out-of-range summaries all have the same contribution. Visit only resident scenes.
+    for (const auto& Pair : ActiveSceneActors)
+        if (IsValid(Pair.Value))
+            ProgressSum += FMath::Clamp(Pair.Value->GetLoadingStatus(), 0.0f, 1.0f) - DefaultProgress;
 
     float PlayerProgress = 0.0f;
     if (bInitialPlayerLoadComplete && !bWaitingForPlayerLoad)
@@ -428,8 +429,7 @@ float UWorldSceneStreamingSubsystem::GetLoadingStatus() const
 
     const float RawProgress = ProgressCount > 0.0
         ? static_cast<float>(ProgressSum / ProgressCount) : 0.0f;
-    const float Target = AreInitialModelsReady() && IsPlayerLoaded()
-        ? 1.0f : FMath::Min(RawProgress, 0.99f);
+    const float Target = FMath::Min(RawProgress, 0.99f);
 
     if (LastLoadingProgressFrame != GFrameCounter)
     {
@@ -585,17 +585,17 @@ bool UWorldSceneStreamingSubsystem::IsLocationReady(const FVector& WorldLocation
     if (!IsValid(OwnerActor) || !IsFiniteVector(WorldLocation)) return false;
 
     const double ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
 
     for (const FWorldSceneStreamRecord& Record : SceneRecords)
     {
         bool bInside = true;
         if (IsFiniteVector(Record.Bounds.Center)
-            && IsFiniteVector(Record.Bounds.Size)
-            && !Record.Bounds.Size.IsNearlyZero(0.001f))
+            && IsFiniteVector(Record.Bounds.Size))
         {
             bInside = V3DStreamingPolicy::SceneInRange(Record.Bounds.Center, Record.Bounds.Size,
-                OwnerTransform, WorldLocation, ScreenDistance);
+                OwnerTransform, WorldLocation, ScreenDistance, 1.0, MaxDistanceCm);
         }
         if (!bInside) continue;
 
@@ -644,16 +644,16 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     GetStreamingObserverLocations(StreamingObservers);
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
     const double ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
 
     // UpdateStreaming can scan thousands of compact directory records. Snapshot both observers
     // once. A priority destination is additive, so current-area actors stay resident until the
     // destination has completed and the teleport/spawn transaction clears its extra focus.
     const auto IsInsideRange =
-        [&OwnerTransform, &StreamingObservers, ScreenDistance](
+        [&OwnerTransform, &StreamingObservers, ScreenDistance, MaxDistanceCm](
             const FModelData& Bounds, const float RadiusMultiplier)
         {
-            if (!IsFiniteVector(Bounds.Center) || !IsFiniteVector(Bounds.Size)
-                || Bounds.Size.IsNearlyZero(0.001f))
+            if (!IsFiniteVector(Bounds.Center) || !IsFiniteVector(Bounds.Size))
             {
                 return true;
             }
@@ -661,7 +661,7 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
             for (const FVector& Observer : StreamingObservers)
             {
                 if (V3DStreamingPolicy::SceneInRange(Bounds.Center, Bounds.Size, OwnerTransform,
-                    Observer, ScreenDistance, RadiusMultiplier)) return true;
+                    Observer, ScreenDistance, RadiusMultiplier, MaxDistanceCm)) return true;
             }
             return false;
         };

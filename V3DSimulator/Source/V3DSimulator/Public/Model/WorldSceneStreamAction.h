@@ -152,6 +152,7 @@ private:
     bool bIsLoading = false;
     bool bAbortRequested = false;
     bool bStaticMeshLoadInFlight = false;
+    bool bWaitingForMeshCallback = false;
     bool bPreparationInFlight = false;
     uint32 PreparationSerial = 0;
 
@@ -179,7 +180,11 @@ private:
     FTimerHandle ProcessTimerHandle;
     FglTFRuntimeStaticMeshConfig StaticMeshConfig;
     TArray<FVector> ObserverLocations;
+    TArray<FVector> CurrentRenderObservers;
+    FTransform CurrentRenderOwnerTransform = FTransform::Identity;
+    double CurrentMaxRenderDistanceCm = 819200.0;
     float Distance;
+    double MaxRenderDistanceCm = 819200.0;
     float UnloadDistanceMultiplier = 1.0f;
 
     UFUNCTION()
@@ -194,6 +199,9 @@ private:
     void AddTransform(const FName &Name);
     void ProcessUnloadNode(const FName &Name);
     bool ProcessLoadNode(const FName &Name);
+    void RefreshRenderRangeSnapshot();
+    bool IsNodeWithinCurrentRenderRange(const FName& Name) const;
+    bool IsWaterWithinCurrentRenderRange(const FWaterStreamNodeData& Water) const;
     void ProcessUnloadWaterNode(const FName &Name);
     void ProcessLoadWaterNode(const FName &Name);
 

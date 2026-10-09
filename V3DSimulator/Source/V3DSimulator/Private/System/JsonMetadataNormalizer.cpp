@@ -65,7 +65,7 @@ bool V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
     Json->SetStringField(V3DSimulatorJsonMetadata::AssetType, V3DSimulatorAssetTypes::ToString(ExpectedAssetType));
     if (ExpectedAssetType == EAssetDefinitionType::Model)
         Json->SetStringField(V3DSimulatorJsonMetadata::ModelType, V3DSimulatorModelTypes::ToString(DefaultModelType));
-    const FSafeFileWriteResult Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), JsonPath);
+    const FSafeFileWriteResult Saved = FSafeFileIO::CreateJsonIfMissingBlocking(Json.ToSharedRef(), JsonPath);
     if (!Saved.IsSuccess()) { OutError = Saved.Error; return false; }
     return true;
 }

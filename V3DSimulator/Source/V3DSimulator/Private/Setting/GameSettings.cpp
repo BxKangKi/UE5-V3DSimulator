@@ -9,6 +9,10 @@
  */
 
 #include "Setting/GameSettings.h"
+#include "System/SafeFileIO.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "System/V3DStreamingPolicy.h"
 #include "System/SimulatorFileServices.h"
 #include "System/SimulatorPaths.h"
 #include "System/JsonMetadata.h"
@@ -38,6 +42,7 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetNumberField(TEXT("TextureQuality"), TextureQuality);
     Json->SetNumberField(TEXT("MaxTextureResolution"), GetClampedMaxTextureResolution());
     Json->SetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
+    Json->SetNumberField(TEXT("MaxRenderDistanceMeters"), GetClampedMaxRenderDistanceMeters());
     Json->SetNumberField(TEXT("AntiAliasingQuality"), AntiAliasingQuality);
     Json->SetNumberField(TEXT("PostProcessingQuality"), PostProcessingQuality);
     Json->SetNumberField(TEXT("EffectsQuality"), EffectsQuality);
@@ -67,6 +72,8 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(TEXT("TextureQuality"), TextureQuality);
         Json->TryGetNumberField(TEXT("MaxTextureResolution"), MaxTextureResolution);
         MaxTextureResolution = GetClampedMaxTextureResolution();
+        Json->TryGetNumberField(TEXT("MaxRenderDistanceMeters"), MaxRenderDistanceMeters);
+        MaxRenderDistanceMeters = GetClampedMaxRenderDistanceMeters();
         Json->TryGetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
         ViewDistanceQuality = FMath::Clamp(ViewDistanceQuality, 0, 3);
         Json->TryGetNumberField(TEXT("AntiAliasingQuality"), AntiAliasingQuality);
@@ -110,6 +117,51 @@ int32 UGameSettings::GetClampedMaxTextureResolution() const
     // Runtime texture decode cost grows quadratically with resolution. Keep a
     // native clamp even when settings.json is edited by hand.
     return FMath::Clamp(MaxTextureResolution, 64, 8192);
+}
+
+namespace
+{
+    constexpr int32 ProfileTextureLimits[] = {256, 512, 768, 1024};
+    constexpr int32 ProfileRenderDistances[] = {1024, 2048, 4096, 8192};
+}
+
+void UGameSettings::ApplyQualityProfile(const EQualitySettings Profile)
+{
+    const int32 Quality = FMath::Clamp(static_cast<int32>(Profile), 0, 3);
+    ShadowQuality = TextureQuality = ViewDistanceQuality = AntiAliasingQuality = Quality;
+    PostProcessingQuality = EffectsQuality = FoliageQuality = ShadingQuality = Quality;
+    GlobalIlluminationQuality = ReflectionQuality = Quality;
+    MaxTextureResolution = ProfileTextureLimits[Quality];
+    MaxRenderDistanceMeters = ProfileRenderDistances[Quality];
+    bRayTracing = Quality >= 2;
+    bCloud = Quality >= 1;
+    bHeightFog = true;
+    DynamicGlobalIlluminationMethod = Quality >= 2 ? 1 : 0;
+    ReflectionMethod = Quality >= 2 ? 1 : (Quality == 1 ? 2 : 0);
+}
+
+int32 UGameSettings::GetQualityProfileIndex() const
+{
+    const int32 Q = FMath::Clamp(ViewDistanceQuality, 0, 3);
+    const bool bMatches = ViewDistanceQuality == Q && ShadowQuality == Q && TextureQuality == Q && AntiAliasingQuality == Q
+        && PostProcessingQuality == Q && EffectsQuality == Q && FoliageQuality == Q
+        && ShadingQuality == Q && GlobalIlluminationQuality == Q && ReflectionQuality == Q
+        && GetClampedMaxTextureResolution() == ProfileTextureLimits[Q]
+        && GetClampedMaxRenderDistanceMeters() == ProfileRenderDistances[Q]
+        && bRayTracing == (Q >= 2) && bCloud == (Q >= 1) && bHeightFog
+        && DynamicGlobalIlluminationMethod == (Q >= 2 ? 1 : 0)
+        && ReflectionMethod == (Q >= 2 ? 1 : (Q == 1 ? 2 : 0));
+    return bMatches ? Q : INDEX_NONE;
+}
+
+int32 UGameSettings::GetClampedMaxRenderDistanceMeters() const
+{
+    return V3DStreamingPolicy::NormalizeMaxRenderDistanceMeters(MaxRenderDistanceMeters);
+}
+
+float UGameSettings::GetMaxRenderDistanceCentimeters() const
+{
+    return static_cast<float>(GetClampedMaxRenderDistanceMeters()) * 100.0f;
 }
 
 float UGameSettings::GetViewDistanceScale() const
@@ -271,17 +323,45 @@ void UGameSettings::LoadSettingsData()
         UE_LOG(LogTemp, Log, TEXT("Setting file doesn't exist. Generate new one."));
         SaveSettingsData();
     }
+    else
+    {
+        LastRequestedSaveSnapshot = MakeSaveSnapshot(Serialization());
+    }
+}
+
+FString UGameSettings::MakeSaveSnapshot(const TSharedRef<FJsonObject>& Json)
+{
+    FString Snapshot;
+    const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Snapshot);
+    FJsonSerializer::Serialize(Json, Writer);
+    return Snapshot;
 }
 
 void UGameSettings::SaveSettingsData()
 {
-    TSharedRef<FJsonObject> Json = Serialization();
-    FString Path = V3DSimulatorPaths::SettingsPath();
-    FSimulatorFileServices::SaveJsonAsync(Json, Path);
+    check(IsInGameThread());
+    const TSharedRef<FJsonObject> Json = Serialization();
+    const FString Snapshot = MakeSaveSnapshot(Json);
+    if (Snapshot == LastRequestedSaveSnapshot) return;
+    LastRequestedSaveSnapshot = Snapshot;
+    const uint64 Revision = ++SaveRequestRevision;
+    const TWeakObjectPtr<UGameSettings> WeakThis(this);
+    FSafeFileIO::SaveJsonAsync(Json, V3DSimulatorPaths::SettingsPath(),
+        [WeakThis, Revision](FSafeFileWriteResult Result)
+        {
+            if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::Superseded)
+            {
+                if (UGameSettings* Self = WeakThis.Get(); Self && Self->SaveRequestRevision == Revision)
+                    Self->LastRequestedSaveSnapshot.Reset(); // A failed write can be retried.
+                UE_LOG(LogTemp, Warning, TEXT("Settings save failed: %s"), *Result.Error);
+            }
+        });
 }
 
 void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
 {
+    MaxRenderDistanceMeters = GetClampedMaxRenderDistanceMeters();
     if (!IsValid(GEngine))
         return;
 

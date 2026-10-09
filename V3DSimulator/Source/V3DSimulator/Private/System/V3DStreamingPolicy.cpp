@@ -1,5 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/V3DStreamingPolicy.h"
+#include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
+
 #include "Camera/PlayerCameraManager.h"
 #include "CoreGlobals.h"
 #include "Engine/GameViewportClient.h"
@@ -7,6 +10,14 @@
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "SceneView.h"
+
+double V3DStreamingPolicy::GetMaxRenderDistanceCm(const UObject* WorldContext)
+{
+    check(IsInGameThread());
+    const UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContext);
+    const UGameSettings* Settings = Manager ? Manager->GetGameSettings() : nullptr;
+    return Settings ? Settings->GetMaxRenderDistanceCentimeters() : DefaultMaxRenderDistanceCm;
+}
 
 float V3DStreamingPolicy::GetScreenSizeDistance(const UObject* WorldContext)
 {

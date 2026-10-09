@@ -48,6 +48,7 @@ public:
         const FTransform& OwnerWorldTransform,
         float WorldRadius,
         TMap<FName, FModelNodeData>& OutNodes) const;
+    bool HasLoadedNodes() const { return !LoadedNodes.IsEmpty(); }
     bool IsNodeLoaded(FName NodeName) const { return LoadedNodes.Contains(NodeName); }
     /** Game-thread snapshot used by pure worker-side stream planning. */
     void GetLoadedNodeSnapshot(TSet<FName>& OutLoadedNodes) const;

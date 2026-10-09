@@ -12,6 +12,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Model/ModelData.h"
+#include "System/V3DStreamingEvaluation.h"
 #include "glTFRuntimeParser.h"
 #include "StaticActor.generated.h"
 
@@ -148,6 +149,7 @@ private:
     FModelData ModelMetadata;
 
     TMap<FName, float> StreamGroupProgress;
+    double StreamGroupProgressSum = 0.0;
     FString ModelReference;
     FString ObjectName;
     FString BaseName;
@@ -156,6 +158,8 @@ private:
     float LoadingStatus = 0.0f;
     bool bIsLoaded = false;
     bool bAsyncLoading = false;
+    double NextStreamingUpdateSeconds = 0.0;
+    FV3DStreamingEvaluation StreamingEvaluation;
     bool bRenderOnlyStreaming = false;
     bool bHasModelMetadata = false;
     bool bIsDestroyed = false;
@@ -178,6 +182,8 @@ private:
     void UnregisterGameUpdate();
     void UpdateStreaming(float DeltaSeconds);
     void StartStreaming();
+    FV3DStreamingEvaluationInputs GetStreamingEvaluationInputs() const;
+    void SetStreamGroupProgress(FName GroupName, float Progress);
     void StartStreamingStep();
     void LaunchNextStreamingBatch();
     void FinishStreamingCycle();

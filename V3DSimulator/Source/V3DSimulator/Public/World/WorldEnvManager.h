@@ -144,6 +144,7 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UMaterialParameterCollection> ShaderLibraryMPC;
 
+
     TSharedPtr<FStreamableHandle> EnvironmentAssetLoadHandle;
 
     /** Non-owning reference: the game-instance subsystem outlives this world actor. */

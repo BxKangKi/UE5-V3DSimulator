@@ -53,10 +53,12 @@ bool V3DSimulatorProjectWorkspace::EnsureWorkspaceRoots()
     const FString Projects = ProjectsRoot();
     const FString Resources = V3DSimulatorPaths::ResourcesRoot();
     const FString Worlds = V3DSimulatorPaths::WorldsRoot();
+    const FString Data = V3DSimulatorPaths::DataRoot();
     return !Projects.IsEmpty() && !Resources.IsEmpty() && !Worlds.IsEmpty()
         && Files.MakeDirectory(*Projects, true)
         && Files.MakeDirectory(*Resources, true)
-        && Files.MakeDirectory(*Worlds, true);
+        && Files.MakeDirectory(*Worlds, true)
+        && !Data.IsEmpty() && Files.MakeDirectory(*Data, true);
 }
 
 bool V3DSimulatorProjectWorkspace::EnsureProjectDirectories(const FString& ProjectName)

@@ -27,6 +27,9 @@ UV3DSimulatorAssetRegistry::UV3DSimulatorAssetRegistry(const FObjectInitializer&
 
 void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
 {
+    if (ShaderLibraryMPC.IsNull())
+        ShaderLibraryMPC = TSoftObjectPtr<UMaterialParameterCollection>(FSoftObjectPath(
+            TEXT("/ShaderLibrary/MPC_ShaderLibrary.MPC_ShaderLibrary")));
     if (StartMenuWidgetClass.IsNull())
         StartMenuWidgetClass = TSoftClassPtr<UStartWorldWidget>(FSoftObjectPath(
             TEXT("/Game/Blueprints/UI/WBP_StartMenu.WBP_StartMenu_C")));

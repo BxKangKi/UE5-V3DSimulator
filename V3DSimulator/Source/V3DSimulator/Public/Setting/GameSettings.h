@@ -75,6 +75,18 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ViewDistanceQuality = 2;
 
+    /** Absolute camera range in metres, independent of quality; snapped to 1024 m steps. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering", meta=(ClampMin="1024", ClampMax="32768", UIMin="1024", UIMax="32768", Delta="1024", Units="m"))
+    int32 MaxRenderDistanceMeters = 8192;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Rendering")
+    int32 GetClampedMaxRenderDistanceMeters() const;
+
+    /** Unreal world units (centimetres), also written to ShaderLibraryMPC.MaxRenderDistance. */
+    UFUNCTION(BlueprintPure, Category="Settings|Rendering")
+    float GetMaxRenderDistanceCentimeters() const;
+
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 AntiAliasingQuality = 2;
 
@@ -101,6 +113,14 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering", meta=(ClampMin="0", ClampMax="2"))
     int32 ReflectionMethod = 1;
+
+    /** Sets all quality fields and the texture/distance budget. UpdateSettings applies and saves them. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Quality")
+    void ApplyQualityProfile(EQualitySettings Profile);
+
+    /** Returns 0..3 for a matching preset, or INDEX_NONE for customized settings. */
+    UFUNCTION(BlueprintPure, Category="Settings|Quality")
+    int32 GetQualityProfileIndex() const;
 
     static UGameSettings *CreateSettingsData(UObject *Onwer = nullptr);
     static int32 GetDefaultMaxTextureResolution() { return 768; }
@@ -139,6 +159,9 @@ public:
     void UpdateSettings(UPostProcessComponent *PostProcess);
 
 private:
+    FString LastRequestedSaveSnapshot;
+    uint64 SaveRequestRevision = 0;
+    static FString MakeSaveSnapshot(const TSharedRef<FJsonObject>& Json);
     EDynamicGlobalIlluminationMethod::Type GetDynamicGlobalIlluminationMethod(const int &Value);
     EReflectionMethod::Type GetReflectionMethod(const int &Value);
 };

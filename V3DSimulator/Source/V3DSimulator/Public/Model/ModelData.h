@@ -162,7 +162,7 @@ struct FModelNodeData
     UPROPERTY()
     FIntVector FineChunk = FIntVector::ZeroValue;
 
-    /** A single transformed mesh larger than 8192 m is retained for the scene lifetime. */
+    /** Oversized mesh bypasses spatial buckets/screen-size culling, but never the maximum render distance. */
     UPROPERTY()
     bool bAlwaysLoaded = false;
 };
@@ -170,6 +170,8 @@ struct FModelNodeData
 /** Pure native instanced-group payload prepared on a worker before UObject publication. */
 struct V3DSIMULATOR_API FInstancedMeshGroupInitData
 {
+    FBox NodeBounds = FBox(ForceInit);
+    double MaxNodeScale = 0.0;
     TMap<FName, FModelNodeData> Nodes;
     TMap<FIntVector, TMap<FIntVector, TArray<FName>>> SpatialChunks;
     TArray<FName> AlwaysLoadedNodeNames;

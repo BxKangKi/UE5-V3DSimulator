@@ -8,6 +8,7 @@
  */
 
 #include "Vehicle/VehiclePawn.h"
+#include "Vehicle/V3DVehicleSuspensionPolicy.h"
 #include "Gravity/GravityFieldComponent.h"
 #include "Gravity/GravityFieldSubsystem.h"
 #include "Simulator/NodeTokenLibrary.h"
@@ -82,6 +83,9 @@ struct FVehicleWheelVisual
 {
     FglTFRuntimeNode Node;
     FTransform Transform = FTransform::Identity;
+    FVector Center = FVector::ZeroVector;
+    float GroundRadius = 1.0f;
+    int32 AxleOrder = 0;
 };
 
 namespace
@@ -1633,6 +1637,16 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
             FVehicleWheelVisual& WheelVisual = WheelNodes.AddDefaulted_GetRef();
             WheelVisual.Node = Node;
             WheelVisual.Transform = NodeWorldTransform;
+            const FBox MeshBounds = Mesh->GetBoundingBox();
+            WheelVisual.Center = NodeWorldTransform.TransformPosition(
+                MeshBounds.IsValid ? MeshBounds.GetCenter() : FVector::ZeroVector);
+            const FBox WheelBounds = TransformVehicleBounds(MeshBounds, NodeWorldTransform);
+            const double CenterToBottom = WheelBounds.IsValid
+                ? WheelVisual.Center.Z - WheelBounds.Min.Z : 0.0;
+            WheelVisual.GroundRadius = FMath::IsFinite(CenterToBottom) && CenterToBottom > 0.0
+                ? FMath::Max(1.0f, static_cast<float>(CenterToBottom))
+                : FMath::Max(1.0f, WheelRadius);
+            RuntimeWheelRadius = FMath::Max(RuntimeWheelRadius, WheelVisual.GroundRadius);
             continue;
         }
 
@@ -1667,22 +1681,41 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
             for (FVehicleWheelVisual& WheelVisual : WheelNodes)
             {
                 WheelVisual.Transform.AddToTranslation(ModelToPhysicsOffset);
+                WheelVisual.Center += ModelToPhysicsOffset;
             }
             LoadedBodyVisualBounds.Min += ModelToPhysicsOffset;
             LoadedBodyVisualBounds.Max += ModelToPhysicsOffset;
         }
     }
 
+    // glTF pivots can be shared by every wheel. Use actual mesh centres and a strict total
+    // order, then group nearby X positions into axles for front-to-back, right-to-left JSON slots.
     WheelNodes.Sort([](const FVehicleWheelVisual& A, const FVehicleWheelVisual& B)
     {
-        const FVector AL = A.Transform.GetLocation();
-        const FVector BL = B.Transform.GetLocation();
-        if (!FMath::IsNearlyEqual(AL.X, BL.X, 1.0f))
-        {
-            return AL.X > BL.X;
-        }
-        return AL.Y > BL.Y;
+        return A.Center.X == B.Center.X ? A.Node.Index < B.Node.Index : A.Center.X > B.Center.X;
     });
+    int32 AxleOrder = 0;
+    double AxleX = WheelNodes.IsEmpty() ? 0.0 : WheelNodes[0].Center.X;
+    const double AxleTolerance = FMath::Max(1.0, static_cast<double>(RuntimeWheelRadius) * 0.5);
+    for (FVehicleWheelVisual& Wheel : WheelNodes)
+    {
+        if (AxleX - Wheel.Center.X > AxleTolerance)
+        {
+            ++AxleOrder;
+            AxleX = Wheel.Center.X;
+        }
+        Wheel.AxleOrder = AxleOrder;
+    }
+    WheelNodes.Sort([](const FVehicleWheelVisual& A, const FVehicleWheelVisual& B)
+    {
+        if (A.AxleOrder != B.AxleOrder) return A.AxleOrder < B.AxleOrder;
+        return A.Center.Y == B.Center.Y ? A.Node.Index < B.Node.Index : A.Center.Y > B.Center.Y;
+    });
+    // Compute once from the complete radius set. Re-reading the accumulating target array here
+    // used to apply RideHeightOffset repeatedly and produce different left/right spring mounts.
+    const float VisualRestLength = V3DVehicleSuspensionPolicy::AuthoredRestLength(
+        GetEffectiveWheelRadius(INDEX_NONE), SuspensionRestLength, MaxWheelCompressionTravel,
+        MaxWheelDroopTravel, LoadedWheelVisualRestLengthRatio);
 
     for (const FVehicleWheelVisual& WheelNode : WheelNodes)
     {
@@ -1707,21 +1740,13 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
 
         const FVector AuthoredWheelCenter = WheelNode.Transform.TransformPosition(MeshCenterOffset);
         const FBox WheelBodyBounds = TransformVehicleBounds(MeshBounds, WheelNode.Transform);
-        float GroundRadius = FMath::Max(1.0f, WheelRadius);
         if (WheelBodyBounds.IsValid)
         {
             LoadedWheelVisualRestBounds += WheelBodyBounds.Min;
             LoadedWheelVisualRestBounds += WheelBodyBounds.Max;
-            const float CenterToBottom = AuthoredWheelCenter.Z - WheelBodyBounds.Min.Z;
-            if (FMath::IsFinite(CenterToBottom) && CenterToBottom > 0.0f)
-            {
-                GroundRadius = FMath::Max(1.0f, CenterToBottom);
-            }
         }
-        LoadedWheelGroundRadii.Add(GroundRadius);
-        RuntimeWheelRadius = FMath::Max(RuntimeWheelRadius, GroundRadius);
+        LoadedWheelGroundRadii.Add(WheelNode.GroundRadius);
 
-        const float VisualRestLength = GetTargetWheelSpringLength(INDEX_NONE);
         WheelOffsets.Add(AuthoredWheelCenter + FVector(0.0f, 0.0f, VisualRestLength));
         WheelTargetSpringLengths.Add(VisualRestLength);
     }
@@ -2857,8 +2882,10 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             (TargetRideSpringLength - ForceSpringLength) / FMath::Max(1.0f, TargetRideSpringLength),
             0.0f,
             1.0f);
-        const float WheelGroundBottomOutDepth = !0.0f;
-        const float StepCompressionDepth = !0.0f;
+        const float WheelGroundBottomOutDepth = V3DVehicleSuspensionPolicy::BottomOutDepth(
+            MinSpringLength, UnclampedSpringLength);
+        const float StepCompressionDepth = V3DVehicleSuspensionPolicy::StepCompressionDepth(
+            TargetRideSpringLength, ForceSpringLength);
         const bool bDeepStepCompression = StepCompressionDepth > KINDA_SMALL_NUMBER
             && (bSuspensionCompressingIntoGround || !bWasGrounded || DeepCompressionAlpha > 0.05f);
         const float NeutralSpringRate = RequiredSupportForcePerWheel / NeutralCompression;

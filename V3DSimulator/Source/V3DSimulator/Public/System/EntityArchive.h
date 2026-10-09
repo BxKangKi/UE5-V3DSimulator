@@ -59,7 +59,7 @@ struct V3DSIMULATOR_API FWorldRuntimeState
 };
 
 /**
- * Thread-safe append-only store for Worlds/Data/WorldName.dat.
+ * Thread-safe append-only store for Data/WorldName.dat.
  *
  * Only the compact directory is read during Open(). Each entity chunk is range-read on demand.
  * Writes append an immutable payload and a replacement directory, flush both, then append a
