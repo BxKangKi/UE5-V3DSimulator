@@ -5,6 +5,7 @@
 #include "Misc/Guid.h"
 #include "System/JsonMetadata.h"
 #include "System/ProjectWorkspace.h"
+#include "System/ProjectScripts.h"
 #include "System/SafeFileIO.h"
 
 namespace
@@ -123,10 +124,10 @@ bool V3DSimulatorProjectRepository::CreateProject(
 
     const FSafeFileWriteResult Save = FSafeFileIO::SaveJsonBlocking(
         Json, V3DSimulatorProjectWorkspace::ConfigPath(SafeName));
-    if (!Save.IsSuccess())
+    if (!Save.IsSuccess() || !FV3DProjectScripts::CreateDefaults(Root, OutError))
     {
         Files.DeleteDirectory(*Root, false, true);
-        OutError = Save.Error.IsEmpty() ? TEXT("Project config creation failed.") : Save.Error;
+        if (OutError.IsEmpty()) OutError = Save.Error.IsEmpty() ? TEXT("Project config creation failed.") : Save.Error;
         return false;
     }
     return true;

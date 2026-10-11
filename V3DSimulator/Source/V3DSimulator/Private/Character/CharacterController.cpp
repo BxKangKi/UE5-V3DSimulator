@@ -9,6 +9,7 @@
  */
 
 #include "Character/CharacterController.h"
+#include "System/WorldSurfaceSubsystem.h"
 #include "Character/CharacterControllerMovementComponent.h"
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterFunctionLibrary.h"
@@ -1788,6 +1789,7 @@ void ACharacterController::TriggerFootstepTrace(EControllerHand FootSide)
     // Use complex tracing so the hit result can return the physical material.
     Params.bTraceComplex = true;
     Params.bReturnPhysicalMaterial = true; // Required: ask the trace to return the physical material.
+    Params.bReturnFaceIndex = true;
     Params.AddIgnoredActor(this);
 
     FTraceDelegate TraceDelegate;
@@ -1811,6 +1813,9 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
     if (TraceDatum.OutHits.Num() == 0) return;
 
     const FHitResult& HitResult = TraceDatum.OutHits[0];
+    if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
+        if (Surfaces->PlayFootstep(HitResult)) return;
+
 
     // 2. Resolve the physical material weak pointer from the hit result.
     if (HitResult.PhysMaterial.IsValid())

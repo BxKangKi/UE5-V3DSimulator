@@ -10,6 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "System/ProjectScripts.h"
 #include "Model/ModelData.h"
 #include "Simulator/ModelDefinitionJson.h"
 #include "Simulator/SoundDefinitionJson.h"
@@ -153,6 +154,8 @@ public:
 
     /** Reads the project config.json embedded in the immutable world archive. */
     bool ReadWorldConfig(FString& OutConfigJson, FString& OutError) const;
+    bool HasProjectScripts() const { return ScriptRanges.Num() == 3; }
+    bool ReadProjectScripts(FV3DProjectScripts& OutScripts, FString& OutError) const;
 
     /** Reads a Sound definition JSON and the exact WAV bytes stored beside it. */
     bool ReadSoundDefinition(const FGuid& UUID, FString& OutDefinitionJson, FString& OutError) const;
@@ -202,6 +205,7 @@ private:
     int64 FileSize = 0;
     uint64 DataEndOffset = 0;
     FGWorldArchiveRange WorldConfigRange;
+    TArray<FGWorldArchiveRange> ScriptRanges;
     TMap<FGuid, FGWorldModelRecord> Records;
     TMap<FGuid, FGWorldSoundRecord> SoundRecords;
     /** Sorted root-member intervals used for O(children + roots) manifest overlap checks. */
@@ -244,7 +248,8 @@ public:
         FString& OutArchivePath,
         FString& OutError,
         TFunction<bool()> ShouldCancel = TFunction<bool()>(),
-        const FString& WorldConfigJson = FString());
+        const FString& WorldConfigJson = FString(),
+        const FV3DProjectScripts& Scripts = FV3DProjectScripts());
 
     /** Same immutable archive format, but published to an explicit path such as Resources/Pack.v3d. */
     static bool BuildBlockingToArchivePath(
@@ -254,5 +259,6 @@ public:
         FString& OutArchivePath,
         FString& OutError,
         TFunction<bool()> ShouldCancel = TFunction<bool()>(),
-        const FString& ArchiveConfigJson = FString());
+        const FString& ArchiveConfigJson = FString(),
+        const FV3DProjectScripts& Scripts = FV3DProjectScripts());
 };

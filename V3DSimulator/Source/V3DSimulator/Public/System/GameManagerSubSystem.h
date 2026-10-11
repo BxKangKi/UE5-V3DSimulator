@@ -798,6 +798,8 @@ private:
     struct FProjectBuildState
     {
         FString ConfigJson;
+        FV3DProjectScripts Scripts;
+        FV3DWorldSurfaceConfig SurfaceConfig;
         FString Root;
         FString Name;
         EV3DSimulatorProjectType Type = EV3DSimulatorProjectType::World;
@@ -822,6 +824,8 @@ private:
             PendingSounds.Reset();
             PendingSoundJson.Reset();
             ConfigJson.Reset();
+            Scripts = FV3DProjectScripts();
+            SurfaceConfig = FV3DWorldSurfaceConfig();
         }
 
         void Reset()

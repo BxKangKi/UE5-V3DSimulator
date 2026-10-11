@@ -9,6 +9,7 @@
  */
 
 #include "Model/WorldSceneStreamAction.h"
+#include "System/WorldSurfaceSubsystem.h"
 #include "Model/WorldSceneStreamingSubsystem.h"
 #include "System/V3DStreamingPolicy.h"
 #include "System/V3DStreamingBudget.h"
@@ -1356,6 +1357,9 @@ void UWorldSceneStreamAction::SpawnStreamComponents(const FName &NodeName, const
                 NewShape->AttachToComponent(MeshActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
                 NewShape->SetRelativeTransform(ComponentLocalTransform);
                 NewShape->SetCollisionProfileName(TEXT("BlockAll"));
+                if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(OwnerActor.Get()))
+                    if (UPhysicalMaterial* Physical = Surfaces->GetSimplePhysicalMaterial(MeshActor->GetMeshComponent()))
+                        NewShape->SetPhysMaterialOverride(Physical);
                 NewShape->RegisterComponent();
                 Group.Colliders.Add(NewShape);
             }

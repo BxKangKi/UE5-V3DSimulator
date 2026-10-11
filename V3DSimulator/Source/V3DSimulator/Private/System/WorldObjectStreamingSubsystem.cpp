@@ -141,6 +141,7 @@ void UWorldObjectStreamingSubsystem::Stop()
     check(IsInGameThread());
     ++Generation;
     bRunning = false;
+    CommandEntityIndex.Empty(); NextCommandIndexAt = 0;
     bHasPriorityStreamingFocus = false;
     PriorityStreamingFocus = FVector::ZeroVector;
     PendingLoads.Empty();
@@ -946,6 +947,7 @@ bool UWorldObjectStreamingSubsystem::RegisterPlacedObject(AActor* Actor, const F
 
 void UWorldObjectStreamingSubsystem::UnregisterObject(AActor* Actor, const bool bKeepPersistentRecord)
 {
+    CommandEntityIndex.Empty(); NextCommandIndexAt = 0;
     check(IsInGameThread());
     PendingRegistrations.RemoveAllSwap(
         [Actor](const FPendingRegistration& Pending) { return Pending.Actor.Get() == Actor; },
@@ -987,6 +989,36 @@ void UWorldObjectStreamingSubsystem::MarkObjectChanged(AActor* Actor)
             ++Pair.Value.Revision;
             return;
     }
+}
+
+AActor* UWorldObjectStreamingSubsystem::FindLoadedEntity(const FGuid& EntityUUID)
+{
+    check(IsInGameThread());
+    if (!bRunning || !EntityUUID.IsValid()) return nullptr;
+    const double Now = FPlatformTime::Seconds();
+    // One lazy pass across resident chunks per second, shared by all command target lookups.
+    if (Now >= NextCommandIndexAt)
+    {
+        CommandEntityIndex.Empty(); NextCommandIndexAt = Now + 1.0;
+        for (const auto& Pair : LoadedChunks)
+            for (int32 Index = 0; Index < Pair.Value.Objects.Num(); ++Index)
+                if (Pair.Value.Actors.IsValidIndex(Index) && Pair.Value.Actors[Index].IsValid())
+                    CommandEntityIndex.Add(Pair.Value.Objects[Index].EntityUUID, Pair.Value.Actors[Index]);
+        for (const auto& Pending : PendingRegistrations)
+            if (Pending.Actor.IsValid()) CommandEntityIndex.Add(Pending.EntityUUID, Pending.Actor);
+    }
+    const auto* Actor = CommandEntityIndex.Find(EntityUUID);
+    return Actor ? Actor->Get() : nullptr;
+}
+
+FGuid UWorldObjectStreamingSubsystem::GetEntityUUID(AActor* Actor) const
+{
+    if (!IsValid(Actor)) return FGuid();
+    for (const auto& Pair : LoadedChunks)
+        for (int32 Index = 0; Index < Pair.Value.Actors.Num(); ++Index)
+            if (Pair.Value.Actors[Index].Get() == Actor && Pair.Value.Objects.IsValidIndex(Index)) return Pair.Value.Objects[Index].EntityUUID;
+    for (const auto& Pending : PendingRegistrations) if (Pending.Actor.Get() == Actor) return Pending.EntityUUID;
+    return FGuid();
 }
 
 void UWorldObjectStreamingSubsystem::LoadRuntimeStateAsync(

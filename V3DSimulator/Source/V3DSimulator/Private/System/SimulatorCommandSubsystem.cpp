@@ -18,6 +18,8 @@
 #include "Misc/DefaultValueHelper.h"
 #include "Misc/Parse.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/SimulationScriptSubsystem.h"
+#include "System/SimulationCommandObject.h"
 #include "System/WorldObjectStreamingSubsystem.h"
 #include "Model/WorldSceneStreamingSubsystem.h"
 #include "TimerManager.h"
@@ -56,6 +58,11 @@ bool USimulatorCommandSubsystem::ExecuteCommand(
         return false;
     }
 
+    if (CommandLine.Len() > 1024 || !USimulationScriptSubsystem::CanRequest(RequestingController))
+    {
+        OutMessage = TEXT("Command rejected: line exceeds 1024 characters or authority/cheats permission is missing.");
+        return true;
+    }
     TArray<FString> Tokens;
     Tokenize(CommandLine, Tokens);
     if (Tokens.IsEmpty())
@@ -63,9 +70,25 @@ bool USimulatorCommandSubsystem::ExecuteCommand(
         return false;
     }
 
-    const FString Command = Tokens[0];
+    FString Command = Tokens[0];
+    Command.RemoveFromStart(TEXT("/"));
     Tokens.RemoveAt(0, 1, EAllowShrinking::No);
 
+    if (IsCommandName(Command, TEXT("sim")))
+    {
+        auto* Scripts = RequestingController->GetWorld()->GetSubsystem<USimulationScriptSubsystem>();
+        if (!Scripts) { OutMessage = TEXT("Simulation scripts are unavailable."); return true; }
+        if (Tokens.Num() == 1 && IsCommandName(Tokens[0], TEXT("list")))
+        {
+            TArray<FString> Names;
+            for (FName Name : Scripts->GetCommandNames())
+                if (auto* Object = Scripts->GetCommandObject(Name); Object && Object->GetDefinition().bAllowChat) Names.Add(Name.ToString());
+            OutMessage = Names.IsEmpty() ? TEXT("No chat commands defined in scripts/commands.json.") : FString::Join(Names, TEXT(", "));
+        }
+        else if (Tokens.Num() == 2 && IsCommandName(Tokens[0], TEXT("run"))) Scripts->ExecuteNamed(RequestingController, FName(*Tokens[1]), OutMessage);
+        else OutMessage = TEXT("Usage: /sim list | /sim run <name>");
+        return true;
+    }
     if (IsCommandName(Command, TEXT("weather")))
     {
         ExecuteWeather(RequestingController, Tokens, OutMessage);
@@ -93,10 +116,11 @@ bool USimulatorCommandSubsystem::IsSimulatorCommand(const TCHAR* CommandLine)
     }
 
     const TCHAR* Cursor = CommandLine;
-    const FString Name = FParse::Token(Cursor, false);
+    FString Name = FParse::Token(Cursor, false);
+    Name.RemoveFromStart(TEXT("/"));
     return IsCommandName(Name, TEXT("weather")) ||
         IsCommandName(Name, TEXT("time")) ||
-        IsCommandName(Name, TEXT("tp"));
+        IsCommandName(Name, TEXT("tp")) || IsCommandName(Name, TEXT("sim"));
 }
 
 bool USimulatorCommandSubsystem::ExecuteWeather(

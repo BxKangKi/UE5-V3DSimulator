@@ -44,6 +44,9 @@ public:
     int32 Priority = 50;
 };
 
+class USimulatorChatWidget;
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FSimulatorChatMessage, const FString&, Message);
+
 /**
  * Project-level PlayerController input router.
  *
@@ -60,11 +63,25 @@ class V3DSIMULATOR_API APlayerCharacterController : public APlayerController
 public:
     APlayerCharacterController();
 
-    /** Console frontend for weather/time/tp. Parsing/execution lives in SimulatorCommandSubsystem. */
+    /** Console frontend for weather/time/tp/sim. Parsing/execution lives in SimulatorCommandSubsystem. */
     virtual bool ProcessConsoleExec(const TCHAR* Cmd, FOutputDevice& Ar, UObject* Executor) override;
 
     UFUNCTION(Server, Reliable)
     void ServerExecuteSimulatorCommand(const FString& CommandLine);
+
+    /** Returns false for ordinary chat; recognized simulator commands use the authoritative RPC. */
+    UFUNCTION(BlueprintCallable, Category="Simulation|Chat")
+    bool SubmitChatCommand(const FString& CommandLine);
+    UFUNCTION(BlueprintCallable, Category="Simulation|Chat")
+    void OpenSimulationChat();
+    UFUNCTION(BlueprintCallable, Category="Simulation|Chat")
+    void CloseSimulationChat();
+    UFUNCTION(Client, Reliable)
+    void ClientSimulationCommandResult(const FString& Message);
+    UPROPERTY(BlueprintAssignable, Category="Simulation|Chat")
+    FSimulatorChatMessage OnSimulationCommandMessage;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Simulation|Chat")
+    bool bEnableSimulationChat = true;
 
     /** 2D axis. X = right/left, Y = forward/back. Also drives the vehicle when possessed. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
@@ -353,6 +370,8 @@ public:
     TObjectPtr<UInputAction> DebugAction;
 
 private:
+    UPROPERTY(Transient) TObjectPtr<USimulatorChatWidget> SimulationChat;
+    double NextSimulatorCommandAt = 0;
     /** Registry-created or explicitly overridden top-level widget instances. */
     UPROPERTY(Transient)
     TObjectPtr<UUserWidget> DebugWidget;

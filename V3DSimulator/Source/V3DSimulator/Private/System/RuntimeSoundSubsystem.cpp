@@ -11,20 +11,7 @@
 
 namespace
 {
-    struct FDecodedPcm16
-    {
-        TArray<uint8> Bytes;
-        int32 SampleRate = 0;
-        int32 NumChannels = 0;
-        int32 NumFrames = 0;
-        FString Error;
-
-        bool IsValid() const
-        {
-            return Error.IsEmpty() && !Bytes.IsEmpty() && SampleRate > 0
-                && NumChannels > 0 && NumFrames > 0;
-        }
-    };
+    using FDecodedPcm16 = FV3DDecodedPcm16;
 
     bool ReadU16LE(const TArray<uint8>& Data, const int64 Offset, uint16& Out)
     {
@@ -58,7 +45,7 @@ namespace
         switch (BitsPerSample)
         {
         case 8:
-            return static_cast<int16>((static_cast<int32>(Source[0]) - 128) << 8);
+            return static_cast<int16>((static_cast<int32>(Source[0]) - 128) * 256);
         case 16:
             return static_cast<int16>(static_cast<uint16>(Source[0])
                 | static_cast<uint16>(static_cast<uint16>(Source[1]) << 8));
@@ -246,80 +233,69 @@ URuntimeSoundSubsystem* URuntimeSoundSubsystem::Get(const UObject* WorldContextO
     return IsValid(GameInstance) ? GameInstance->GetSubsystem<URuntimeSoundSubsystem>() : nullptr;
 }
 
-void URuntimeSoundSubsystem::LoadSoundAsync(
-    const FString& SoundReference,
-    FRuntimeSoundLoadCompleted Completion)
+void URuntimeSoundSubsystem::LoadSoundAsync(const FString& SoundReference, FRuntimeSoundLoadCompleted Completion)
+{
+    const TWeakObjectPtr<URuntimeSoundSubsystem> WeakThis(this);
+    LoadPcmAsync(SoundReference, [WeakThis, Completion](FV3DPcmPtr Pcm, const FString& Error)
+    {
+        URuntimeSoundSubsystem* Self = WeakThis.Get();
+        if (!IsValid(Self)) return;
+        if (!Pcm.IsValid()) { Completion.ExecuteIfBound(nullptr, Error); return; }
+        USoundWaveProcedural* Sound = NewObject<USoundWaveProcedural>(Self, NAME_None, RF_Transient);
+        Sound->NumChannels = Pcm->NumChannels;
+        Sound->SetSampleRate(Pcm->SampleRate);
+        Sound->SetNumFrames(Pcm->NumFrames);
+        Sound->SampleByteSize = 2;
+        Sound->Duration = static_cast<float>(Pcm->NumFrames) / Pcm->SampleRate;
+        Sound->QueueAudio(Pcm->Bytes.GetData(), Pcm->Bytes.Num());
+        Completion.ExecuteIfBound(Sound, FString());
+    });
+}
+
+void URuntimeSoundSubsystem::LoadPcmAsync(const FString& SoundReference, FV3DPcmCompletion Completion, int64 MaxBytes)
 {
     check(IsInGameThread());
-
+    if (!Completion) return;
+    const auto Callback = MakeShared<FV3DPcmCompletion, ESPMode::ThreadSafe>(MoveTemp(Completion));
+    MaxBytes = FMath::Clamp<int64>(MaxBytes, 1, FGWorldArchive::MaxSoundBytes);
     FGuid UUID;
     if (!FGWorldArchive::ParseSoundReference(SoundReference.TrimStartAndEnd(), UUID))
     {
-        Completion.ExecuteIfBound(nullptr, TEXT("Sound reference must be gworld://sound/<UUID>."));
+        (*Callback)(nullptr, TEXT("Sound reference must be gworld://sound/<UUID>."));
         return;
     }
-
     UGameInstance* GameInstance = GetGameInstance();
-    UModelDatabaseSubsystem* Database = IsValid(GameInstance)
-        ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    UModelDatabaseSubsystem* Database = IsValid(GameInstance) ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
     const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader = IsValid(Database)
         ? Database->GetArchiveReaderForSound(UUID) : nullptr;
-    if (!Reader.IsValid())
+    FGWorldSoundRecord Record;
+    if (!Reader.IsValid() || !Reader->FindSoundRecord(UUID, Record) || Record.WaveRange.StoredSize > static_cast<uint64>(MaxBytes))
     {
-        Completion.ExecuteIfBound(nullptr, TEXT("The requested Sound asset is not present in the mounted .v3d/.v3d set."));
+        (*Callback)(nullptr, TEXT("Sound is missing or exceeds this request's WAV byte limit."));
         return;
     }
-
     const uint64 Generation = RequestGeneration;
     const TWeakObjectPtr<URuntimeSoundSubsystem> WeakThis(this);
-    const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, Reader, UUID, Generation, Completion]() mutable
-        {
-            TArray<uint8> WaveBytes;
-            FString Error;
-            FDecodedPcm16 Decoded;
-            if (!Reader->ReadSoundWave(UUID, WaveBytes, Error))
-            {
-                Decoded.Error = Error.IsEmpty() ? TEXT("Failed to read the Sound WAV member.") : MoveTemp(Error);
-            }
-            else
-            {
-                Decoded = DecodeWaveToPcm16(MoveTemp(WaveBytes));
-            }
-
-            FSafeFileIO::DispatchTrackedGameThread(
-                [WeakThis, Generation, Completion, Decoded = MoveTemp(Decoded)]() mutable
-                {
-                    URuntimeSoundSubsystem* Self = WeakThis.Get();
-                    if (!IsValid(Self) || Self->RequestGeneration != Generation)
-                    {
-                        return;
-                    }
-                    if (!Decoded.IsValid())
-                    {
-                        Completion.ExecuteIfBound(nullptr, Decoded.Error);
-                        return;
-                    }
-
-                    USoundWaveProcedural* Sound = NewObject<USoundWaveProcedural>(Self, NAME_None, RF_Transient);
-                    if (!IsValid(Sound))
-                    {
-                        Completion.ExecuteIfBound(nullptr, TEXT("Could not allocate USoundWaveProcedural."));
-                        return;
-                    }
-
-                    Sound->NumChannels = Decoded.NumChannels;
-                    Sound->SetSampleRate(Decoded.SampleRate);
-                    Sound->SetNumFrames(Decoded.NumFrames);
-                    Sound->SampleByteSize = 2;
-                    Sound->Duration = static_cast<float>(Decoded.NumFrames) / static_cast<float>(Decoded.SampleRate);
-                    Sound->QueueAudio(Decoded.Bytes.GetData(), Decoded.Bytes.Num());
-                    Completion.ExecuteIfBound(Sound, FString());
-                });
-        });
-
-    if (!bQueued)
+    const bool bQueued = FSafeFileIO::RunTrackedWorker([WeakThis, Reader, UUID, Generation, Callback, MaxBytes]()
     {
-        Completion.ExecuteIfBound(nullptr, TEXT("Sound worker queue is shutting down."));
-    }
+        TArray<uint8> WaveBytes;
+        FString Error;
+        FDecodedPcm16 Decoded;
+        if (!Reader->ReadSoundWave(UUID, WaveBytes, Error)) Decoded.Error = Error;
+        else Decoded = DecodeWaveToPcm16(MoveTemp(WaveBytes));
+        if (Decoded.Bytes.Num() > MaxBytes)
+        {
+            Decoded.Bytes.Empty();
+            Decoded.Error = TEXT("Decoded PCM exceeds this request's byte limit.");
+        }
+        FSafeFileIO::DispatchTrackedGameThread([WeakThis, Generation, Callback, Decoded = MoveTemp(Decoded)]() mutable
+        {
+            URuntimeSoundSubsystem* Self = WeakThis.Get();
+            if (!IsValid(Self) || Self->RequestGeneration != Generation) return;
+            if (!Decoded.IsValid()) { (*Callback)(nullptr, Decoded.Error); return; }
+            FV3DPcmPtr Pcm = MakeShared<FV3DDecodedPcm16, ESPMode::ThreadSafe>(MoveTemp(Decoded));
+            (*Callback)(MoveTemp(Pcm), FString());
+        });
+    });
+    if (!bQueued) (*Callback)(nullptr, TEXT("Sound worker queue is shutting down."));
 }

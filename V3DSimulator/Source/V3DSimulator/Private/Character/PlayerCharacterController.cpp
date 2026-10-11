@@ -29,6 +29,8 @@
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/SimulatorCommandSubsystem.h"
+#include "UI/SimulatorChatWidget.h"
+#include "HAL/PlatformTime.h"
 #include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
@@ -74,6 +76,7 @@ bool APlayerCharacterController::ProcessConsoleExec(const TCHAR* Cmd, FOutputDev
         {
             Ar.Log(*Message);
             ClientMessage(Message);
+            ClientSimulationCommandResult(Message);
         }
         return true;
     }
@@ -83,19 +86,56 @@ bool APlayerCharacterController::ProcessConsoleExec(const TCHAR* Cmd, FOutputDev
 
 void APlayerCharacterController::ServerExecuteSimulatorCommand_Implementation(const FString& CommandLine)
 {
+    const double Now = FPlatformTime::Seconds();
+    if (Now < NextSimulatorCommandAt) return;
+    NextSimulatorCommandAt = Now + 0.1;
+    if (CommandLine.Len() > 1024 || !USimulatorCommandSubsystem::IsSimulatorCommand(*CommandLine))
+    { ClientSimulationCommandResult(TEXT("Invalid simulator command (maximum 1024 characters).")); return; }
     FString Message;
     if (UGameInstance* GameInstance = GetGameInstance())
     {
         if (USimulatorCommandSubsystem* Commands = GameInstance->GetSubsystem<USimulatorCommandSubsystem>())
         {
-            Commands->ExecuteCommand(this, CommandLine.Left(1024), Message);
+            Commands->ExecuteCommand(this, CommandLine, Message);
         }
     }
 
     if (!Message.IsEmpty())
     {
         ClientMessage(Message);
+        ClientSimulationCommandResult(Message);
     }
+}
+
+bool APlayerCharacterController::SubmitChatCommand(const FString& CommandLine)
+{
+    if (!IsLocalController() || !USimulatorCommandSubsystem::IsSimulatorCommand(*CommandLine)) return false;
+    if (CommandLine.Len() > 1024) { ClientSimulationCommandResult(TEXT("Command exceeds 1024 characters.")); return true; }
+    ServerExecuteSimulatorCommand(CommandLine);
+    return true;
+}
+void APlayerCharacterController::ClientSimulationCommandResult_Implementation(const FString& Message)
+{
+    if (IsValid(SimulationChat)) SimulationChat->AppendMessage(Message);
+    OnSimulationCommandMessage.Broadcast(Message);
+}
+void APlayerCharacterController::OpenSimulationChat()
+{
+    auto* Manager = UGameManagerSubSystem::GetSubSystem(this);
+    if (!bEnableSimulationChat || !IsLocalController() || !Manager || Manager->IsWorldLoading()
+        || Manager->GetGamePaused() || !GetPawn() || bMenuWorldTravelPending) return;
+    if (!IsValid(SimulationChat)) SimulationChat = CreateWidget<USimulatorChatWidget>(this, USimulatorChatWidget::StaticClass());
+    if (!SimulationChat) return;
+    if (!SimulationChat->IsInViewport()) SimulationChat->AddToViewport(1000);
+    ClearLatchedMovementInput();
+    UWidgetBlueprintLibrary::SetInputMode_UIOnlyEx(this, SimulationChat, EMouseLockMode::DoNotLock, true);
+    bShowMouseCursor = true;
+    SimulationChat->FocusInput();
+}
+void APlayerCharacterController::CloseSimulationChat()
+{
+    if (IsValid(SimulationChat)) SimulationChat->RemoveFromParent();
+    ApplyGameInputMode();
 }
 
 APlayerCharacterController::APlayerCharacterController() = default;
@@ -381,6 +421,7 @@ void APlayerCharacterController::SetupInputComponent()
     }
     BindConfiguredInputActions();
     BindDirectMouseInputs();
+    if (InputComponent && bEnableSimulationChat) InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &APlayerCharacterController::OpenSimulationChat);
 }
 
 void APlayerCharacterController::BeginPlayingState()
@@ -510,6 +551,8 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
     {
         SettingsMenuWidget->OnCloseRequested.RemoveDynamic(this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
     }
+    if (IsValid(SimulationChat)) SimulationChat->RemoveFromParent();
+    SimulationChat = nullptr;
     if (IsValid(CreatorHUDWidget)) CreatorHUDWidget->RemoveFromParent();
     if (IsValid(DebugWidget)) DebugWidget->RemoveFromParent();
     if (IsValid(PauseMenuWidget)) PauseMenuWidget->RemoveFromParent();
@@ -550,6 +593,7 @@ void APlayerCharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 
 void APlayerCharacterController::ApplyGameInputMode()
 {
+    if (IsValid(SimulationChat) && SimulationChat->IsInViewport()) return;
     // Late UI/Blueprint callbacks must not re-enable gameplay input during level travel.
     if (bMenuWorldTravelPending)
     {

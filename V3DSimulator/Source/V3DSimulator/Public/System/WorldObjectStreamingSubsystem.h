@@ -60,6 +60,10 @@ public:
     bool RegisterPlacedObject(AActor* Actor, const FGuid& ModelUUID);
     void UnregisterObject(AActor* Actor, bool bKeepPersistentRecord);
     void MarkObjectChanged(AActor* Actor);
+    /** Loaded placements only; never reads .dat or loads the world to resolve a command. */
+    AActor* FindLoadedEntity(const FGuid& EntityUUID);
+    UFUNCTION(BlueprintPure, Category="Simulation|Commands")
+    FGuid GetEntityUUID(AActor* Actor) const;
 
     /** Loads the non-spatial dynamic state from the same .dat commit log. */
     void LoadRuntimeStateAsync(
@@ -140,6 +144,8 @@ private:
     TMap<FWorldChunkCoordinate, double> FailedLoadRetryAt;
     /** Objects accepted while their destination chunk is still loading. */
     TArray<FPendingRegistration> PendingRegistrations;
+    TMap<FGuid, TWeakObjectPtr<AActor>> CommandEntityIndex;
+    double NextCommandIndexAt = 0;
 
     void RebuildDesiredChunks();
     void QueueLoad(const FWorldChunkCoordinate& Coordinate, bool bTransientBoundaryLoad);

@@ -9,6 +9,9 @@
  */
 
 #include "System/GameManagerSubSystem.h"
+#include "System/WorldSurfaceSubsystem.h"
+#include "System/ProjectScripts.h"
+#include "System/SimulationScriptSubsystem.h"
 
 #include "GameMode/GameplayGameModeBase.h"
 #include "System/V3DSimulatorGameInstance.h"
@@ -1297,6 +1300,8 @@ void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
 
 void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
 {
+    if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this)) Surfaces->Reset();
+    if (GetWorld()) if (auto* Scripts = GetWorld()->GetSubsystem<USimulationScriptSubsystem>()) Scripts->Reset();
     // GameInstance subsystems survive level travel, so every UPROPERTY reference held here can keep
     // gameplay-world actors, streamed built assets, and async-load state reachable.
     SetWorldLoading(false);
@@ -1851,8 +1856,20 @@ void UGameManagerSubSystem::LoadWorldData()
             Config.Path = ArchiveReader->GetArchivePath() + TEXT("#config.json");
             Config.Error = MoveTemp(ConfigError);
         }
+        FV3DProjectScripts Scripts;
+        FV3DWorldSurfaceConfig SurfaceConfig;
+        FV3DSimulationCommandConfig CommandConfig;
+        FString ScriptError;
+        if (Config.IsSuccess())
+        {
+            if (!ArchiveReader->HasProjectScripts()) FV3DProjectScripts::FromLegacyConfig(Config.JsonObject, Scripts);
+            else if (!ArchiveReader->ReadProjectScripts(Scripts, ScriptError)) Config.Status = ESafeFileIOStatus::ReadFailed;
+            if (ScriptError.IsEmpty() && !Scripts.Parse(SurfaceConfig, CommandConfig, ScriptError)) Config.Status = ESafeFileIOStatus::ValidationFailed;
+            if (!ScriptError.IsEmpty()) Config.Error = TEXT("Project scripts: ") + ScriptError;
+        }
         FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, RequestedRoot, StartupOwner, Config = MoveTemp(Config)]() mutable
+            [WeakThis, RequestedRoot, StartupOwner, Config = MoveTemp(Config),
+                SurfaceConfig = MoveTemp(SurfaceConfig), CommandConfig = MoveTemp(CommandConfig)]() mutable
             {
                 UGameManagerSubSystem* StrongThis = WeakThis.Get();
                 if (!IsValid(StrongThis) || !StrongThis->bManagerStarted
@@ -1862,7 +1879,8 @@ void UGameManagerSubSystem::LoadWorldData()
                 // config.json is immutable author/world configuration. Mutable time/player state is
                 // range-read from the state record in the single .dat commit log.
                 TFunction<void(bool, bool, FWorldRuntimeState, FString)> ApplyLoadedState =
-                    [WeakThis, RequestedRoot, StartupOwner, Config = MoveTemp(Config)](
+                    [WeakThis, RequestedRoot, StartupOwner, Config = MoveTemp(Config),
+                        SurfaceConfig = MoveTemp(SurfaceConfig), CommandConfig = MoveTemp(CommandConfig)](
                         const bool bStateLoaded,
                         const bool bStateMissing,
                         FWorldRuntimeState State,
@@ -1893,6 +1911,14 @@ void UGameManagerSubSystem::LoadWorldData()
                         Manager->FailWorldStartup(FString::Printf(
                             TEXT("World startup failed: archive config.json is not a canonical World project config. Reason=%s"),
                             *ProjectConfigError));
+                        return;
+                    }
+
+                    UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(Manager);
+                    FString SurfaceError;
+                    if (!Surfaces || !Surfaces->Configure(MoveTemp(SurfaceConfig), SurfaceError))
+                    {
+                        Manager->FailWorldStartup(TEXT("World surface configuration failed: ") + SurfaceError);
                         return;
                     }
 
@@ -1932,6 +1958,8 @@ void UGameManagerSubSystem::LoadWorldData()
                     }
 
                     Manager->SetWorldData(Manager->ActiveWorldData);
+                    if (auto* Scripts = Manager->GetWorld()->GetSubsystem<USimulationScriptSubsystem>())
+                        Scripts->Configure(MoveTemp(CommandConfig));
                     Manager->LoadPlayerData();
                     Manager->ApplyLevelSettings();
                     Manager->SpawnWorldEnvManager();
@@ -4577,13 +4605,19 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
         [WeakThis, ProjectRoot, SafeName, ConfigPath]()
     {
         FString ConfigJson;
+        FV3DProjectScripts Scripts;
+        FV3DWorldSurfaceConfig SurfaceConfig;
+        FV3DSimulationCommandConfig CommandConfig;
         FString ValidationError;
         FV3DSimulatorProjectConfig ProjectConfig;
         TSharedPtr<FJsonObject> Canonical;
         if (V3DSimulatorProjectConfig::Load(
                 ConfigPath, SafeName, ProjectConfig, &Canonical, ValidationError)
-            && Canonical.IsValid())
+            && Canonical.IsValid()
+            && FV3DProjectScripts::Load(ProjectRoot, Canonical, Scripts, ValidationError)
+            && Scripts.Parse(SurfaceConfig, CommandConfig, ValidationError))
         {
+            FV3DProjectScripts::RemoveLegacyFields(*Canonical);
             const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
                 TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ConfigJson);
             if (!FJsonSerializer::Serialize(Canonical.ToSharedRef(), Writer) || ConfigJson.IsEmpty())
@@ -4594,7 +4628,8 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
 
         FSafeFileIO::DispatchTrackedGameThread(
             [WeakThis, ProjectRoot, SafeName, ProjectConfig,
-                ConfigJson = MoveTemp(ConfigJson), ValidationError = MoveTemp(ValidationError)]() mutable
+                ConfigJson = MoveTemp(ConfigJson), Scripts = MoveTemp(Scripts), SurfaceConfig = MoveTemp(SurfaceConfig),
+                ValidationError = MoveTemp(ValidationError)]() mutable
         {
             UGameManagerSubSystem* StrongThis = WeakThis.Get();
             if (!IsValid(StrongThis) || StrongThis->ProjectBuild.Root != ProjectRoot
@@ -4624,6 +4659,8 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
 
             StrongThis->ProjectBuild.Type = ProjectConfig.ProjectType;
             StrongThis->ProjectBuild.ConfigJson = MoveTemp(ConfigJson);
+            StrongThis->ProjectBuild.Scripts = MoveTemp(Scripts);
+            StrongThis->ProjectBuild.SurfaceConfig = MoveTemp(SurfaceConfig);
             StrongThis->ProjectBuild.Progress = FMath::Max(StrongThis->ProjectBuild.Progress, 0.03f);
             StrongThis->OnProjectBuildProgress.Broadcast(StrongThis->ProjectBuild.Progress);
             FV3DRuntimeSafety::ResetRecoverableFailures();
@@ -4725,6 +4762,18 @@ void UGameManagerSubSystem::BuildActiveProjectArchive()
     TArray<FModelDefinition> Definitions;
     ModelDatabase->GetDefinitions(Definitions);
     ModelDatabase->GetSoundDefinitions(ProjectBuild.PendingSounds);
+    // Validate references before decoding any large GLB. Runtime does not depend on loose WAVs.
+    if (ProjectBuild.Type == EV3DSimulatorProjectType::World)
+    {
+        FString Error;
+        TSet<FGuid> Available;
+        for (const auto& Sound : ProjectBuild.PendingSounds) Available.Add(Sound.UUID);
+        if (!ProjectBuild.SurfaceConfig.ValidateSounds(Available, Error))
+        {
+            CompleteProjectArchiveBuild(false, FString(), Error);
+            return;
+        }
+    }
     ProjectBuild.PendingSoundJson.Reserve(ProjectBuild.PendingSounds.Num());
     for (const FSoundDefinition& Sound : ProjectBuild.PendingSounds)
     {
@@ -5055,6 +5104,7 @@ void UGameManagerSubSystem::FinishProjectBuild()
     OnProjectBuildProgress.Broadcast(ProjectBuild.Progress);
     NotifyStateChanged();
     const FString ArchiveConfigJson = ProjectBuild.ConfigJson;
+    FV3DProjectScripts ArchiveScripts = MoveTemp(ProjectBuild.Scripts);
     TArray<FGWorldBuildModel> BuildModels = MoveTemp(ProjectBuild.CompletedModelsData);
     TArray<FSoundDefinition> SoundDefinitions = MoveTemp(ProjectBuild.PendingSounds);
     TMap<FGuid, FString> SoundDefinitionJson = MoveTemp(ProjectBuild.PendingSoundJson);
@@ -5062,7 +5112,7 @@ void UGameManagerSubSystem::FinishProjectBuild()
     const uint64 BuildGeneration = ProjectBuild.Generation;
     const TSharedPtr<TAtomic<bool>, ESPMode::ThreadSafe> Cancellation = ProjectBuild.Cancellation;
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, OutputRootOrPath, ArchiveConfigJson, BuildGeneration, Cancellation,
+        [WeakThis, OutputRootOrPath, ArchiveConfigJson, ArchiveScripts = MoveTemp(ArchiveScripts), BuildGeneration, Cancellation,
             bWorldProject, BuildModels = MoveTemp(BuildModels), SoundDefinitions = MoveTemp(SoundDefinitions),
             SoundDefinitionJson = MoveTemp(SoundDefinitionJson)]() mutable
     {
@@ -5094,9 +5144,9 @@ void UGameManagerSubSystem::FinishProjectBuild()
         }
         const bool bSuccess = Error.IsEmpty() && (bWorldProject
             ? FGWorldArchive::BuildBlocking(
-                OutputRootOrPath, BuildModels, BuildSounds, ArchivePath, Error, ShouldCancel, ArchiveConfigJson)
+                OutputRootOrPath, BuildModels, BuildSounds, ArchivePath, Error, ShouldCancel, ArchiveConfigJson, ArchiveScripts)
             : FGWorldArchive::BuildBlockingToArchivePath(
-                OutputRootOrPath, BuildModels, BuildSounds, ArchivePath, Error, ShouldCancel, ArchiveConfigJson));
+                OutputRootOrPath, BuildModels, BuildSounds, ArchivePath, Error, ShouldCancel, ArchiveConfigJson, ArchiveScripts));
         FSafeFileIO::DispatchTrackedGameThread(
             [WeakThis, BuildGeneration, bSuccess,
                 ArchivePath = MoveTemp(ArchivePath), Error = MoveTemp(Error)]()

@@ -8,6 +8,7 @@
  */
 
 #include "Model/InstancedEntityRenderActor.h"
+#include "System/WorldSurfaceSubsystem.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SceneComponent.h"
@@ -70,6 +71,8 @@ UInstancedStaticMeshComponent* AInstancedEntityRenderActor::FindOrCreateMeshComp
     Component->SetCanEverAffectNavigation(false);
     V3DMeshRendering::ConfigureWorldMesh(Component);
     Component->SetStaticMesh(Mesh);
+    if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
+        Surfaces->ApplyToStaticMesh(Component);
     const int32 SafeStartCull = FMath::Max(0, StartCullDistance);
     Component->SetCullDistances(SafeStartCull, FMath::Max(SafeStartCull, EndCullDistance));
     Component->RegisterComponent();
@@ -331,6 +334,8 @@ void AInstancedEntityRenderActor::ReleaseRuntimeResources()
         if (UStaticMesh* Mesh = Component->GetStaticMesh())
         {
             Component->SetStaticMesh(nullptr);
+            Component->EmptyOverrideMaterials();
+            Component->SetPhysMaterialOverride(nullptr);
             if (!Mesh->IsAsset())
             {
                 Mesh->ClearFlags(RF_Public | RF_Standalone);

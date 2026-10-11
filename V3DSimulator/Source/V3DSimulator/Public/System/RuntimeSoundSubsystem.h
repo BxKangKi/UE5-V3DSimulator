@@ -8,6 +8,19 @@
 
 class USoundWaveProcedural;
 
+/** Reusable native PCM. Each playback must create a fresh procedural wave/queue. */
+struct FV3DDecodedPcm16
+{
+    TArray<uint8> Bytes;
+    int32 SampleRate = 0;
+    int32 NumChannels = 0;
+    int32 NumFrames = 0;
+    FString Error;
+    bool IsValid() const { return Error.IsEmpty() && !Bytes.IsEmpty() && SampleRate > 0 && NumChannels > 0 && NumFrames > 0; }
+};
+using FV3DPcmPtr = TSharedPtr<const FV3DDecodedPcm16, ESPMode::ThreadSafe>;
+using FV3DPcmCompletion = TFunction<void(FV3DPcmPtr, const FString&)>;
+
 DECLARE_DYNAMIC_DELEGATE_TwoParams(
     FRuntimeSoundLoadCompleted,
     USoundWaveProcedural*, Sound,
@@ -33,6 +46,10 @@ public:
     /** Loads an exact gworld://sound/<UUID> reference asynchronously. */
     UFUNCTION(BlueprintCallable, Category="Sound")
     void LoadSoundAsync(const FString& SoundReference, FRuntimeSoundLoadCompleted Completion);
+
+    /** Bounded native decode for cached short effects. Completion runs on GameThread. */
+    void LoadPcmAsync(const FString& SoundReference, FV3DPcmCompletion Completion,
+        int64 MaxBytes = 512ll * 1024ll * 1024ll);
 
 private:
     uint64 RequestGeneration = 1;

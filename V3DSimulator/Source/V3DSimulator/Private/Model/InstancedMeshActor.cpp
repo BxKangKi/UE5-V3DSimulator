@@ -8,6 +8,7 @@
  */
 
 #include "Model/InstancedMeshActor.h"
+#include "System/WorldSurfaceSubsystem.h"
 #include "System/V3DStreamingBudget.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
@@ -202,7 +203,11 @@ UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh
     }
     if (ExistingMesh != Mesh)
     {
+        MeshComponent->EmptyOverrideMaterials();
+        MeshComponent->SetPhysMaterialOverride(nullptr);
         MeshComponent->SetStaticMesh(Mesh);
+        if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
+            Surfaces->ApplyToStaticMesh(MeshComponent);
     }
     return MeshComponent;
 }
@@ -285,6 +290,8 @@ bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
     {
         MeshComponent->ClearInstances();
         MeshComponent->SetStaticMesh(nullptr);
+        MeshComponent->EmptyOverrideMaterials();
+        MeshComponent->SetPhysMaterialOverride(nullptr);
         FV3DStreamingBudget::NotifyUnloaded();
         NodeInstanceIndices.Empty();
         FreeInstanceIndices.Empty();
@@ -368,6 +375,8 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
             MeshComponent->SetMaterial(Index, nullptr);
         }
         MeshComponent->SetStaticMesh(nullptr);
+        MeshComponent->EmptyOverrideMaterials();
+        MeshComponent->SetPhysMaterialOverride(nullptr);
         FV3DStreamingBudget::NotifyUnloaded();
     }
     NodeMap.Empty();

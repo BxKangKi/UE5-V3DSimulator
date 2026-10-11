@@ -23,10 +23,11 @@
 
 namespace GWorldArchivePrivate
 {
-    // Current .v3d identity. This format intentionally has no compatibility reader for older layouts.
+    // Revision 5 adds independent script members; revision 4 remains readable.
     constexpr uint64 Magic = 0x0000444C524F5747ull; // ASCII "GWORLD\0\0", little endian.
     constexpr int32 HeaderBytes = 64;
-    constexpr uint64 FormatRevision = 4; // Canonical directory includes per-model gravity; rebuild older archives.
+    constexpr uint64 FormatRevision = 5; // config + three scripts + model/sound directory.
+    constexpr uint64 LegacyFormatRevision = 4;
     constexpr int64 PayloadAlignment = 4096;
     constexpr int32 MaxStringBytes = 64 * 1024 * 1024;
     constexpr int32 MaxNameBytes = 4096;
@@ -972,6 +973,7 @@ namespace GWorldArchivePrivate
 
     bool SerializeDirectory(
         const FGWorldArchiveRange& ConfigRange,
+        const TArray<FGWorldArchiveRange>& ScriptRanges,
         const TArray<FGWorldModelRecord>& Records,
         const TArray<FGWorldSoundRecord>& SoundRecords,
         TArray<uint8>& OutBytes,
@@ -979,6 +981,7 @@ namespace GWorldArchivePrivate
     {
         FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
         WriteRange(Writer, ConfigRange);
+        for (const FGWorldArchiveRange& Range : ScriptRanges) WriteRange(Writer, Range);
         Writer.U32(static_cast<uint32>(Records.Num()));
         for (const FGWorldModelRecord& Record : Records) WriteDirectoryRecord(Writer, Record);
         Writer.U32(static_cast<uint32>(SoundRecords.Num()));
@@ -998,7 +1001,9 @@ namespace GWorldArchivePrivate
         uint64 DirectoryOffset,
         uint32 ExpectedModels,
         uint32 ExpectedSounds,
+        uint64 Revision,
         FGWorldArchiveRange& OutConfigRange,
+        TArray<FGWorldArchiveRange>& OutScriptRanges,
         TMap<FGuid, FGWorldModelRecord>& OutRecords,
         TMap<FGuid, FGWorldSoundRecord>& OutSoundRecords,
         FString& OutError)
@@ -1011,6 +1016,18 @@ namespace GWorldArchivePrivate
             OutError = TEXT("The .v3d config.json directory range is invalid");
             return false;
         }
+        OutScriptRanges.Reset();
+        if (Revision >= FormatRevision)
+        {
+            for (int32 Index = 0; Index < 3; ++Index)
+            {
+                FGWorldArchiveRange Range = ReadRange(Reader);
+                if (!Reader.IsOk() || !IsValidMemberRange(Range, DirectoryOffset, FV3DProjectScripts::MaxScriptBytes + 8)
+                    || Range.Name != FV3DProjectScripts::MemberName(Index))
+                { OutError = TEXT("Invalid .v3d script member range/name"); return false; }
+                OutScriptRanges.Add(MoveTemp(Range));
+            }
+        }
         // Even an empty-string record has a substantial fixed payload. Validate physical space first.
         const uint32 Count = Reader.Count(FGWorldArchive::MaxModels, 196);
         if (!Reader.IsOk() || Count != ExpectedModels)
@@ -1020,8 +1037,9 @@ namespace GWorldArchivePrivate
         }
 
         TArray<TPair<uint64, uint64>> Ranges;
-        Ranges.Reserve(static_cast<int32>(Count) * 3 + static_cast<int32>(ExpectedSounds) * 2 + 1);
+        Ranges.Reserve(static_cast<int32>(Count) * 3 + static_cast<int32>(ExpectedSounds) * 2 + 1 + OutScriptRanges.Num());
         Ranges.Emplace(OutConfigRange.Offset, OutConfigRange.StoredSize);
+        for (const auto& Range : OutScriptRanges) Ranges.Emplace(Range.Offset, Range.StoredSize);
         for (uint32 Index = 0; Index < Count; ++Index)
         {
             FGWorldModelRecord Record;
@@ -1449,7 +1467,8 @@ namespace GWorldArchivePrivate
         FString& OutArchivePath,
         FString& OutError,
         const TFunction<bool()>& ShouldCancel,
-        const FString& WorldConfigJson)
+        const FString& WorldConfigJson,
+        const FV3DProjectScripts& Scripts)
     {
         OutArchivePath.Reset();
         OutError.Reset();
@@ -1567,6 +1586,18 @@ namespace GWorldArchivePrivate
             || !WriteDatMember(*Output, Offset, TEXT("config.json"), ConfigBytes, ConfigRange, OutError))
         {
             return false;
+        }
+
+        TArray<FGWorldArchiveRange> ScriptRanges;
+        for (int32 Index = 0; Index < 3; ++Index)
+        {
+            TArray<uint8> Bytes;
+            FGWorldArchiveRange Range;
+            if (!SerializeWorldConfig(Scripts.Text(Index), Bytes, OutError)
+                || Bytes.Num() > FV3DProjectScripts::MaxScriptBytes + 8)
+            { if (OutError.IsEmpty()) OutError = TEXT("Script member exceeds 2 MiB"); return false; }
+            if (!WriteDatMember(*Output, Offset, FV3DProjectScripts::MemberName(Index), Bytes, Range, OutError)) return false;
+            ScriptRanges.Add(MoveTemp(Range));
         }
 
         TArray<FGWorldModelRecord> Records;
@@ -1711,7 +1742,7 @@ namespace GWorldArchivePrivate
         { OutError = TEXT("Could not align the .v3d directory"); return false; }
         const uint64 DirectoryOffset = static_cast<uint64>(Offset);
         TArray<uint8> Directory;
-        if (!SerializeDirectory(ConfigRange, Records, SoundRecords, Directory, OutError)
+        if (!SerializeDirectory(ConfigRange, ScriptRanges, Records, SoundRecords, Directory, OutError)
             || Offset > MaxArchiveBytes - Directory.Num()
             || !WriteExact(*Output, Directory.GetData(), Directory.Num()))
         { if (OutError.IsEmpty()) OutError = TEXT("Could not write the .v3d directory"); return false; }
@@ -1737,6 +1768,12 @@ namespace GWorldArchivePrivate
             return false;
         }
         {
+            FV3DProjectScripts VerifiedScripts;
+            if (!Verification->ReadProjectScripts(VerifiedScripts, VerifyError))
+            { OutError = TEXT("Temporary archive scripts failed verification: ") + VerifyError; return false; }
+            for (int32 Index = 0; Index < 3; ++Index)
+                if (VerifiedScripts.Text(Index) != Scripts.Text(Index))
+                { OutError = TEXT("Temporary archive script content mismatch"); return false; }
             FString VerifiedConfig;
             if (!Verification->ReadWorldConfig(VerifiedConfig, VerifyError) || VerifiedConfig != ConfigJson)
             {
@@ -2236,11 +2273,12 @@ bool FGWorldArchive::BuildBlocking(
     FString& OutArchivePath,
     FString& OutError,
     TFunction<bool()> ShouldCancel,
-    const FString& WorldConfigJson)
+    const FString& WorldConfigJson,
+    const FV3DProjectScripts& Scripts)
 {
     using namespace GWorldArchivePrivate;
     return GWorldArchivePrivate::BuildBlocking(
-        MakeArchivePath(WorldRoot), Models, Sounds, OutArchivePath, OutError, ShouldCancel, WorldConfigJson);
+        MakeArchivePath(WorldRoot), Models, Sounds, OutArchivePath, OutError, ShouldCancel, WorldConfigJson, Scripts);
 }
 
 bool FGWorldArchive::BuildBlockingToArchivePath(
@@ -2250,11 +2288,12 @@ bool FGWorldArchive::BuildBlockingToArchivePath(
     FString& OutArchivePath,
     FString& OutError,
     TFunction<bool()> ShouldCancel,
-    const FString& ArchiveConfigJson)
+    const FString& ArchiveConfigJson,
+    const FV3DProjectScripts& Scripts)
 {
     using namespace GWorldArchivePrivate;
     return GWorldArchivePrivate::BuildBlocking(
-        ArchivePath, Models, Sounds, OutArchivePath, OutError, ShouldCancel, ArchiveConfigJson);
+        ArchivePath, Models, Sounds, OutArchivePath, OutError, ShouldCancel, ArchiveConfigJson, Scripts);
 }
 
 TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open(
@@ -2297,7 +2336,7 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
     const uint64 ReadFormatRevision = Header.U64();
 
     if (!Header.IsAtEnd() || ReadMagic != Magic || ReadHeaderBytes != HeaderBytes
-        || ReadFormatRevision != FormatRevision || !BuildId.IsValid()
+        || (ReadFormatRevision != FormatRevision && ReadFormatRevision != LegacyFormatRevision) || !BuildId.IsValid()
         || ModelCount > FGWorldArchive::MaxModels || SoundCount > FGWorldArchive::MaxSounds
         || (ModelCount == 0 && SoundCount == 0)
         || DirectorySize == 0 || DirectorySize > static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes)
@@ -2327,8 +2366,8 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
 
     TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Result =
         MakeShared<FGWorldArchiveReader, ESPMode::ThreadSafe>();
-    if (!DeserializeDirectory(Directory, TotalSize, DirectoryOffset, ModelCount, SoundCount,
-            Result->WorldConfigRange, Result->Records, Result->SoundRecords, OutError))
+    if (!DeserializeDirectory(Directory, TotalSize, DirectoryOffset, ModelCount, SoundCount, ReadFormatRevision,
+            Result->WorldConfigRange, Result->ScriptRanges, Result->Records, Result->SoundRecords, OutError))
     {
         return nullptr;
     }
@@ -2336,8 +2375,9 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
     Result->BuildId = BuildId;
     Result->FileSize = TotalSize;
     Result->DataEndOffset = DirectoryOffset;
-    Result->RootMemberRanges.Reserve(Result->Records.Num() * 3 + Result->SoundRecords.Num() * 2 + 1);
+    Result->RootMemberRanges.Reserve(Result->Records.Num() * 3 + Result->SoundRecords.Num() * 2 + 1 + Result->ScriptRanges.Num());
     Result->RootMemberRanges.Emplace(Result->WorldConfigRange.Offset, Result->WorldConfigRange.StoredSize);
+    for (const auto& Range : Result->ScriptRanges) Result->RootMemberRanges.Emplace(Range.Offset, Range.StoredSize);
     for (const TPair<FGuid, FGWorldModelRecord>& Pair : Result->Records)
     {
         const FGWorldModelRecord& Record = Pair.Value;
@@ -2412,6 +2452,25 @@ bool FGWorldArchiveReader::GetSummary(
     if (!Record) return false;
     OutSummary = Record->Summary;
     return true;
+}
+
+bool FGWorldArchiveReader::ReadProjectScripts(FV3DProjectScripts& OutScripts, FString& OutError) const
+{
+    using namespace GWorldArchivePrivate;
+    OutError.Reset(); OutScripts = FV3DProjectScripts();
+    if (ScriptRanges.IsEmpty()) return true; // Revision 4: caller reads legacy surface fields.
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*Path));
+    if (!Handle.IsValid()) { OutError = TEXT("Could not open .v3d script members"); return false; }
+    FV3DProjectScripts Parsed;
+    for (int32 Index = 0; Index < ScriptRanges.Num(); ++Index)
+    {
+        TArray<uint8> Bytes;
+        if (!ReadChecksummedRange(*Handle, FileSize, DataEndOffset, ScriptRanges[Index],
+                FV3DProjectScripts::MaxScriptBytes + 8, Bytes, OutError)
+            || !DeserializeWorldConfig(Bytes, Parsed.Text(Index), OutError)) return false;
+    }
+    OutScripts = MoveTemp(Parsed); return true;
 }
 
 bool FGWorldArchiveReader::ReadWorldConfig(FString& OutConfigJson, FString& OutError) const
