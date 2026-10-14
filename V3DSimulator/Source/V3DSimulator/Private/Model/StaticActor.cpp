@@ -16,6 +16,7 @@
 #include "Components/SceneComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Model/InstancedMeshActor.h"
+#include "Model/V3DHISMChunkPolicy.h"
 #include "Model/WorldSceneStreamAction.h"
 #include "Model/WorldSceneStreamingSubsystem.h"
 #include "Model/V3DMaterialOverrideUtils.h"
@@ -51,6 +52,8 @@ namespace StaticActorPrivate
     {
         TMap<FName, FModelNodeData> Nodes;
         TMap<FName, FName> MeshToGroup;
+        TMap<FName, FVector> MeshSizes;
+        FTransform OwnerTransform = FTransform::Identity;
         TMap<FName, FInstancedMeshGroupInitData> Groups;
         int32 InvalidNodeCount = 0;
     };
@@ -80,18 +83,15 @@ namespace StaticActorPrivate
             Group.Data.NodeBounds += Node.Transform.GetLocation();
             Group.Data.MaxNodeScale = FMath::Max(Group.Data.MaxNodeScale,
                 static_cast<double>(Node.Transform.GetScale3D().GetAbs().GetMax()));
-            if (Node.bAlwaysLoaded
-                || Node.FineChunk.X < 0 || Node.FineChunk.X >= 16
-                || Node.FineChunk.Y < 0 || Node.FineChunk.Y >= 16
-                || Node.FineChunk.Z < 0 || Node.FineChunk.Z >= 16)
-            {
-                Group.Data.AlwaysLoadedNodeNames.Add(Pair.Key);
-            }
-            else
-            {
-                Group.Data.SpatialChunks.FindOrAdd(Node.CoarseChunk)
-                    .FindOrAdd(Node.FineChunk).Add(Pair.Key);
-            }
+            if (Node.bAlwaysLoaded) Group.Data.AlwaysLoadedNodeNames.Add(Pair.Key);
+            const FIntVector ChunkKey = V3DHISMChunkPolicy::Key(
+                Work.OwnerTransform.TransformPosition(Node.Transform.GetLocation()));
+            FInstancedMeshStreamChunk& Chunk = Group.Data.StreamChunks.FindOrAdd(ChunkKey);
+            Chunk.Nodes.Add(Pair.Key);
+            // Include the full world-space cell, transformed back for the actor's immutable index.
+            Chunk.LocalBounds += V3DHISMChunkPolicy::CellBounds(ChunkKey).TransformBy(Work.OwnerTransform.Inverse());
+            const FVector Half = Work.MeshSizes.FindChecked(Node.MeshName).GetAbs() * 0.5;
+            Chunk.LocalBounds += FBox(-Half, Half).TransformBy(Node.Transform);
             Group.Data.Nodes.Add(Pair.Key, MoveTemp(Pair.Value));
         }
 
@@ -271,9 +271,9 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
     for (const TPair<FName, TObjectPtr<AInstancedMeshActor>>& GroupPair : OwnedInstancedMeshActors)
     {
         const AInstancedMeshActor* Group = GroupPair.Value.Get();
-        if (!IsValid(Group)) return false;
+        if (!IsValid(Group) || !Group->AreChunkTreesReady()) return false;
 
-        float MaxWorldRadius = 0.0f;
+        float MaxWorldRadius = static_cast<float>(FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm));
         for (const FName MeshName : Group->GetReferencedMeshNames())
         {
             const FModelMeshData* MeshData = AllMeshMap.Find(MeshName);
@@ -283,20 +283,33 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
                     * OwnerTransform.GetScale3D().GetAbs().GetMax(), EffectiveStreamDistance, MaxDistanceCm)));
         }
 
-        TMap<FName, FModelNodeData> CandidateNodes;
-        Group->BuildStreamNodeSnapshot(
-            WorldLocation, OwnerTransform, MaxWorldRadius, CandidateNodes);
-        TSet<FName> LoadedNodes;
-        Group->GetLoadedNodeSnapshot(LoadedNodes);
-        for (const TPair<FName, FModelNodeData>& NodePair : CandidateNodes)
+        const auto Definitions = Group->CaptureDefinitions();
+        if (!Definitions.IsValid()) return false;
+        // Read immutable rows in place: destination readiness must not copy dense chunk tables.
+        for (const auto& ChunkPair : Definitions->StreamChunks)
         {
-            const FModelNodeData& Node = NodePair.Value;
-            const FModelMeshData* MeshData = AllMeshMap.Find(Node.MeshName);
-            if (!MeshData) return false;
-            const FTransform NodeWorldTransform = Node.Transform * OwnerTransform;
-            const bool bRequired = V3DStreamingPolicy::MeshInRange(MeshData->Size,
-                NodeWorldTransform, WorldLocation, EffectiveStreamDistance, MaxDistanceCm, Node.bAlwaysLoaded);
-            if (bRequired && !LoadedNodes.Contains(NodePair.Key)) return false;
+            const FBox Bounds = ChunkPair.Value.LocalBounds.TransformBy(OwnerTransform);
+            if (Bounds.ComputeSquaredDistanceToPoint(WorldLocation) > FMath::Square(double(MaxWorldRadius))) continue;
+            double ChunkRadius = FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm);
+            for (const FName NodeName : ChunkPair.Value.Nodes)
+            {
+                const FModelNodeData& Node = Definitions->Nodes.FindChecked(NodeName);
+                const FModelMeshData* Mesh = AllMeshMap.Find(Node.MeshName);
+                if (!Mesh) return false;
+                const FTransform Transform = Node.Transform * OwnerTransform;
+                ChunkRadius = FMath::Max(ChunkRadius, Node.bAlwaysLoaded ? MaxDistanceCm
+                    : V3DStreamingPolicy::LoadRadius(Mesh->Size, Transform.GetScale3D().GetAbs().GetMax(),
+                        EffectiveStreamDistance, MaxDistanceCm));
+            }
+            if (Bounds.ComputeSquaredDistanceToPoint(WorldLocation) > FMath::Square(FMath::Min(MaxDistanceCm, ChunkRadius))) continue;
+            for (const FName NodeName : ChunkPair.Value.Nodes)
+            {
+                if (Group->IsNodeLoaded(NodeName)) continue;
+                const FModelNodeData& Node = Definitions->Nodes.FindChecked(NodeName);
+                const FModelMeshData* Mesh = AllMeshMap.Find(Node.MeshName);
+                if (!Mesh || V3DStreamingPolicy::BoundsInRenderRange(FVector::ZeroVector, Mesh->Size,
+                    Node.Transform * OwnerTransform, WorldLocation, MaxDistanceCm)) return false;
+            }
         }
     }
 
@@ -686,6 +699,7 @@ void AStaticActor::BeginBuildInstancedMeshActors()
     TSharedRef<StaticActorPrivate::FStaticGroupingWork, ESPMode::ThreadSafe> Work =
         MakeShared<StaticActorPrivate::FStaticGroupingWork, ESPMode::ThreadSafe>();
     Work->Nodes = MoveTemp(AllNodeMap);
+    Work->OwnerTransform = GetActorTransform();
     Work->MeshToGroup.Reserve(AllMeshMap.Num());
     for (const TPair<FName, FModelMeshData>& Pair : AllMeshMap)
     {
@@ -697,6 +711,7 @@ void AStaticActor::BeginBuildInstancedMeshActors()
         if (!Pair.Key.IsNone() && bHasRuntimeMesh && !Mesh.Size.ContainsNaN())
         {
             Work->MeshToGroup.Add(Pair.Key, StaticActorPrivate::MakeMeshGroupName(Mesh));
+            Work->MeshSizes.Add(Pair.Key, Mesh.Size);
         }
     }
 
@@ -963,7 +978,7 @@ bool AStaticActor::IsPlayerInsideModelRange() const
     const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
     for (const FVector& Observer : ObserverLocations)
     {
-        if (V3DStreamingPolicy::SceneInRange(ModelMetadata.Center, ModelMetadata.Size,
+        if (V3DHISMChunkPolicy::SceneInRange(ModelMetadata.Center, ModelMetadata.Size,
             GetActorTransform(), Observer, ScreenDistance, 1.0, MaxDistanceCm)) return true;
     }
     return false;
@@ -1249,10 +1264,10 @@ void AStaticActor::LaunchNextStreamingBatch()
                 {
                     if (const FModelMeshData* Mesh = AllMeshMap.Find(MeshName))
                     {
-                        const double MeshRadius = InstancedActor->HasAlwaysLoadedNodes()
-                            ? MaxDistanceCm + 0.5 * Mesh->Size.GetAbs().Size() * MaxScale
-                            : V3DStreamingPolicy::LoadRadius(Mesh->Size, MaxScale,
-                                EffectiveStreamDistance, MaxDistanceCm);
+                        const double MeshRadius = FMath::Max(
+                            FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm),
+                            V3DStreamingPolicy::LoadRadius(Mesh->Size, MaxScale, EffectiveStreamDistance, MaxDistanceCm))
+                            + FMath::Sqrt(3.0) * V3DHISMChunkPolicy::ChunkSizeCm;
                         Radius = FMath::Max(Radius, MeshRadius);
                     }
                 }

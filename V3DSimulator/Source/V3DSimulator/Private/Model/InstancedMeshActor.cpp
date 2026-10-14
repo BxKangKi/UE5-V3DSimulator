@@ -12,6 +12,8 @@
 #include "System/V3DStreamingBudget.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Model/V3DHISMChunkPolicy.h"
 #include "Components/LightComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/ShapeComponent.h"
@@ -27,7 +29,7 @@ AInstancedMeshActor::AInstancedMeshActor()
     Root->SetMobility(EComponentMobility::Movable);
     SetRootComponent(Root);
 
-    MeshComponent = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("InstancedMesh"));
+    MeshComponent = CreateDefaultSubobject<UHierarchicalInstancedStaticMeshComponent>(TEXT("InstancedMesh"));
     MeshComponent->SetupAttachment(Root);
     MeshComponent->SetMobility(EComponentMobility::Movable);
     V3DMeshRendering::ConfigureWorldMesh(MeshComponent);
@@ -48,143 +50,68 @@ bool AInstancedMeshActor::InitializeGroup(
     }
 
     GroupName = InGroupName;
-    NodeMap = MoveTemp(InData.Nodes);
     NodeBounds = InData.NodeBounds;
     MaxNodeScale = InData.MaxNodeScale;
     if (!NodeBounds.IsValid)
     {
         // Compatibility for callers that supply nodes without precomputed worker bounds.
         MaxNodeScale = 0.0;
-        for (const auto& Pair : NodeMap)
+        for (const auto& Pair : InData.Nodes)
         {
             MaxNodeScale = FMath::Max(MaxNodeScale,
                 static_cast<double>(Pair.Value.Transform.GetScale3D().GetAbs().GetMax()));
             NodeBounds += Pair.Value.Transform.GetLocation();
         }
     }
-    SpatialChunks = MoveTemp(InData.SpatialChunks);
     AlwaysLoadedNodeNames = MoveTemp(InData.AlwaysLoadedNodeNames);
     ReferencedMeshNames = MoveTemp(InData.ReferencedMeshNames);
-    LoadedNodes.Empty();
-    NodeInstanceIndices.Empty();
-    FreeInstanceIndices.Empty();
+    GroupDefinitions = MakeShared<FInstancedMeshGroupInitData, ESPMode::ThreadSafe>(MoveTemp(InData));
+    LoadedNodes = MakeShared<TSet<FName>, ESPMode::ThreadSafe>();
+    InstanceSlots.Empty();
     DynamicComponentMap.Empty();
     bRuntimeResourcesReleased = false;
-    bInstanceRenderStateDirty = false;
     return true;
 }
 
-void AInstancedMeshActor::BuildStreamNodeSnapshot(
-    const FVector& PlayerWorldLocation,
-    const FTransform& OwnerWorldTransform,
-    const float WorldRadius,
-    TMap<FName, FModelNodeData>& OutNodes) const
+const TMap<FName, FModelNodeData>& AInstancedMeshActor::GetNodeMapRef() const
+{
+    static const TMap<FName, FModelNodeData> Empty;
+    return GroupDefinitions.IsValid() ? GroupDefinitions->Nodes : Empty;
+}
+
+void AInstancedMeshActor::BuildStreamNodeSnapshot(const FVector& Observer, const FTransform& OwnerTransform,
+    const float Radius, TMap<FName, FModelNodeData>& OutNodes) const
 {
     check(IsInGameThread());
+    if (GroupDefinitions.IsValid()) BuildNativeNodeSnapshot(*GroupDefinitions, *LoadedNodes, Observer, OwnerTransform, Radius, OutNodes);
+    else OutNodes.Reset();
+}
+
+void AInstancedMeshActor::BuildNativeNodeSnapshot(const FInstancedMeshGroupInitData& Definitions,
+    const TSet<FName>& Loaded, const FVector& Observer, const FTransform& OwnerTransform,
+    const float Radius, TMap<FName, FModelNodeData>& OutNodes)
+{
+    // Detached native tables only; no UObject, world, or component access on this worker path.
     OutNodes.Reset();
-    if (!FMath::IsFinite(WorldRadius) || WorldRadius < 0.0f) return;
-
-    // Loaded nodes must remain candidates even after leaving a bucket so they can be unloaded.
-    OutNodes.Reserve(LoadedNodes.Num() + AlwaysLoadedNodeNames.Num() + 256);
-    for (const FName Name : LoadedNodes)
-        if (const FModelNodeData* Node = NodeMap.Find(Name)) OutNodes.Add(Name, *Node);
-    for (const FName Name : AlwaysLoadedNodeNames)
-        if (const FModelNodeData* Node = NodeMap.Find(Name)) OutNodes.Add(Name, *Node);
-
-    constexpr double CoarseCm = 8192.0 * 100.0;
-    constexpr double FineCm = 512.0 * 100.0;
-    if (OwnerWorldTransform.ContainsNaN() || PlayerWorldLocation.ContainsNaN())
+    if (!FMath::IsFinite(Radius) || Radius < 0.0f) return;
+    OutNodes.Reserve(Loaded.Num() + 256);
+    for (const FName Name : Loaded)
+        if (const FModelNodeData* Node = Definitions.Nodes.Find(Name)) OutNodes.Add(Name, *Node);
+    if (OwnerTransform.ContainsNaN() || Observer.ContainsNaN()) return;
+    if (Definitions.StreamChunks.IsEmpty()) { OutNodes = Definitions.Nodes; return; }
+    for (const auto& Pair : Definitions.StreamChunks)
     {
-        // Corrupt transforms must not silently disappear from the scene. Falling back to the full
-        // node set costs one pass but keeps geometry recoverable and avoids undefined chunk math.
-        OutNodes = NodeMap;
-        return;
-    }
-    const FVector AbsScale = OwnerWorldTransform.GetScale3D().GetAbs();
-    const double RawMinScale = FMath::Min3(AbsScale.X, AbsScale.Y, AbsScale.Z);
-    if (!FMath::IsFinite(RawMinScale) || RawMinScale <= UE_SMALL_NUMBER)
-    {
-        OutNodes = NodeMap;
-        return;
-    }
-    const double LocalRadius = static_cast<double>(WorldRadius) / RawMinScale;
-    const FVector LocalPlayer = OwnerWorldTransform.InverseTransformPosition(PlayerWorldLocation);
-    if (LocalPlayer.ContainsNaN() || !FMath::IsFinite(LocalRadius))
-    {
-        OutNodes = NodeMap;
-        return;
-    }
-
-    auto FloorCell = [](const double Value, const double Cell)
-    {
-        return static_cast<int32>(FMath::Clamp<double>(FMath::FloorToDouble(Value / Cell), MIN_int32, MAX_int32));
-    };
-    const FIntVector MinCoarse(FloorCell(LocalPlayer.X - LocalRadius, CoarseCm),
-        FloorCell(LocalPlayer.Y - LocalRadius, CoarseCm), FloorCell(LocalPlayer.Z - LocalRadius, CoarseCm));
-    const FIntVector MaxCoarse(FloorCell(LocalPlayer.X + LocalRadius, CoarseCm),
-        FloorCell(LocalPlayer.Y + LocalRadius, CoarseCm), FloorCell(LocalPlayer.Z + LocalRadius, CoarseCm));
-    const FIntVector MinFine(FloorCell(LocalPlayer.X - LocalRadius, FineCm),
-        FloorCell(LocalPlayer.Y - LocalRadius, FineCm), FloorCell(LocalPlayer.Z - LocalRadius, FineCm));
-    const FIntVector MaxFine(FloorCell(LocalPlayer.X + LocalRadius, FineCm),
-        FloorCell(LocalPlayer.Y + LocalRadius, FineCm), FloorCell(LocalPlayer.Z + LocalRadius, FineCm));
-
-    const auto AddCoarseBucket = [this, &OutNodes, &MinFine, &MaxFine](
-        const FIntVector& Coarse,
-        const TMap<FIntVector, TArray<FName>>& FineBuckets)
-    {
-        constexpr int64 LocalFinePerCoarse = 16;
-        for (const TPair<FIntVector, TArray<FName>>& FinePair : FineBuckets)
-        {
-            const int64 GlobalFineX = static_cast<int64>(Coarse.X) * LocalFinePerCoarse + FinePair.Key.X;
-            const int64 GlobalFineY = static_cast<int64>(Coarse.Y) * LocalFinePerCoarse + FinePair.Key.Y;
-            const int64 GlobalFineZ = static_cast<int64>(Coarse.Z) * LocalFinePerCoarse + FinePair.Key.Z;
-            if (GlobalFineX < static_cast<int64>(MinFine.X) || GlobalFineX > static_cast<int64>(MaxFine.X)
-                || GlobalFineY < static_cast<int64>(MinFine.Y) || GlobalFineY > static_cast<int64>(MaxFine.Y)
-                || GlobalFineZ < static_cast<int64>(MinFine.Z) || GlobalFineZ > static_cast<int64>(MaxFine.Z)) continue;
-            for (const FName Name : FinePair.Value)
-                if (const FModelNodeData* Node = NodeMap.Find(Name)) OutNodes.Add(Name, *Node);
-        }
-    };
-
-    const int64 SpanX = static_cast<int64>(MaxCoarse.X) - MinCoarse.X + 1;
-    const int64 SpanY = static_cast<int64>(MaxCoarse.Y) - MinCoarse.Y + 1;
-    const int64 SpanZ = static_cast<int64>(MaxCoarse.Z) - MinCoarse.Z + 1;
-    const bool bCoordinateSpanIsSafe = SpanX > 0 && SpanY > 0 && SpanZ > 0
-        && SpanX <= 64 && SpanY <= 64 && SpanZ <= 64
-        && SpanX * SpanY * SpanZ <= 4096;
-
-    if (bCoordinateSpanIsSafe)
-    {
-        // The normal streaming radius touches only a handful of 8192 m buckets. Direct hash
-        // lookups make the query cost proportional to the requested area instead of world size.
-        for (int64 X = MinCoarse.X; X <= static_cast<int64>(MaxCoarse.X); ++X)
-        for (int64 Y = MinCoarse.Y; Y <= static_cast<int64>(MaxCoarse.Y); ++Y)
-        for (int64 Z = MinCoarse.Z; Z <= static_cast<int64>(MaxCoarse.Z); ++Z)
-        {
-            const FIntVector Coarse(static_cast<int32>(X), static_cast<int32>(Y), static_cast<int32>(Z));
-            if (const TMap<FIntVector, TArray<FName>>* FineBuckets = SpatialChunks.Find(Coarse))
-                AddCoarseBucket(Coarse, *FineBuckets);
-        }
-    }
-    else
-    {
-        // Extremely large radii can make coordinate enumeration expensive. In that unusual case,
-        // inspect only occupied buckets and retain the same fine-cell filter.
-        for (const TPair<FIntVector, TMap<FIntVector, TArray<FName>>>& CoarsePair : SpatialChunks)
-        {
-            const FIntVector& Coarse = CoarsePair.Key;
-            if (Coarse.X < MinCoarse.X || Coarse.X > MaxCoarse.X
-                || Coarse.Y < MinCoarse.Y || Coarse.Y > MaxCoarse.Y
-                || Coarse.Z < MinCoarse.Z || Coarse.Z > MaxCoarse.Z) continue;
-            AddCoarseBucket(Coarse, CoarsePair.Value);
-        }
+        const FBox Bounds = Pair.Value.LocalBounds.TransformBy(OwnerTransform);
+        if (!Bounds.IsValid || Bounds.ComputeSquaredDistanceToPoint(Observer) > FMath::Square(double(Radius))) continue;
+        for (const FName Name : Pair.Value.Nodes)
+            if (const FModelNodeData* Node = Definitions.Nodes.Find(Name)) OutNodes.Add(Name, *Node);
     }
 }
 
 void AInstancedMeshActor::GetLoadedNodeSnapshot(TSet<FName>& OutLoadedNodes) const
 {
     check(IsInGameThread());
-    OutLoadedNodes = LoadedNodes;
+    OutLoadedNodes = *LoadedNodes;
 }
 
 UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh* Mesh)
@@ -197,7 +124,7 @@ UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh
 
     V3DMeshRendering::ConfigureWorldMesh(MeshComponent);
     UStaticMesh* ExistingMesh = MeshComponent->GetStaticMesh();
-    if (IsValid(ExistingMesh) && ExistingMesh != Mesh && !LoadedNodes.IsEmpty())
+    if (IsValid(ExistingMesh) && ExistingMesh != Mesh && !LoadedNodes->IsEmpty())
     {
         return nullptr;
     }
@@ -212,100 +139,154 @@ UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh
     return MeshComponent;
 }
 
+UHierarchicalInstancedStaticMeshComponent* AInstancedMeshActor::CreateChunkComponent(
+    const FIntVector& Chunk, FName& OutPage)
+{
+    check(IsInGameThread());
+    OutPage = FName(*FString::Printf(TEXT("HISM_%d_%d_%d_%d"), Chunk.X, Chunk.Y, Chunk.Z, NextPageId++));
+    auto* Component = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, OutPage, RF_Transient);
+    Component->bAutoRebuildTreeOnInstanceChanges = false;
+    Component->bEnableDensityScaling = false;
+    Component->SetForcedLodModel(0);
+    Component->SetMobility(EComponentMobility::Movable);
+    Component->SetupAttachment(Root);
+    Component->SetGenerateOverlapEvents(false);
+    Component->SetCanEverAffectNavigation(MeshComponent->CanEverAffectNavigation());
+    Component->SetStaticMesh(MeshComponent->GetStaticMesh());
+    Component->SetCollisionProfileName(MeshComponent->GetCollisionProfileName());
+    Component->SetCollisionEnabled(MeshComponent->GetCollisionEnabled());
+    Component->SetCollisionObjectType(MeshComponent->GetCollisionObjectType());
+    Component->SetCollisionResponseToChannels(MeshComponent->GetCollisionResponseToChannels());
+    Component->SetRenderCustomDepth(MeshComponent->bRenderCustomDepth);
+    Component->SetCustomDepthStencilValue(MeshComponent->CustomDepthStencilValue);
+    V3DMeshRendering::ConfigureWorldMesh(Component);
+    if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
+        Surfaces->ApplyToStaticMesh(Component);
+    Component->PreAllocateInstancesMemory(V3DHISMChunkPolicy::MaxInstancesPerComponent);
+    AddInstanceComponent(Component);
+    Component->RegisterComponent(); // Registered empty: no bulk Chaos insertion during registration.
+    ChunkComponents.Add(OutPage, Component);
+    FChunkPage& Page = ChunkPages.Add(OutPage);
+    Page.Chunk = Chunk;
+    Page.Nodes.Reserve(V3DHISMChunkPolicy::MaxInstancesPerComponent);
+    OpenChunkPages.Add(Chunk, OutPage);
+    return Component;
+}
+
+bool AInstancedMeshActor::CanMutateNode(const FName NodeName) const
+{
+    if (const FInstanceSlot* Slot = InstanceSlots.Find(NodeName))
+        if (const auto* Component = ChunkComponents.Find(Slot->Page))
+            return IsValid(Component->Get()) && !Component->Get()->IsAsyncBuilding();
+    return true;
+}
+
 bool AInstancedMeshActor::AddNodeInstance(const FName NodeName, const FTransform& LocalTransform)
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("AddNodeInstance must run on the game thread"))
-        || !IsValid(MeshComponent) || !IsValid(MeshComponent->GetStaticMesh())
-        || NodeName.IsNone() || LocalTransform.ContainsNaN() || !NodeMap.Contains(NodeName))
-    {
-        return false;
-    }
-    if (LoadedNodes.Contains(NodeName))
-    {
-        return true;
-    }
-
-    int32 InstanceIndex = INDEX_NONE;
-    while (!FreeInstanceIndices.IsEmpty() && InstanceIndex == INDEX_NONE)
-    {
-        const int32 Candidate = FreeInstanceIndices.Pop(EAllowShrinking::No);
-        if (Candidate >= 0 && Candidate < MeshComponent->GetNumInstances())
-        {
-            InstanceIndex = Candidate;
-        }
-    }
-
-    if (InstanceIndex == INDEX_NONE)
-    {
-        InstanceIndex = MeshComponent->AddInstance(LocalTransform);
-    }
-    else if (!MeshComponent->UpdateInstanceTransform(
-        InstanceIndex, LocalTransform, false, false, true))
-    {
-        FreeInstanceIndices.Add(InstanceIndex);
-        return false;
-    }
-
-    if (InstanceIndex == INDEX_NONE)
-    {
-        return false;
-    }
-    NodeInstanceIndices.Add(NodeName, InstanceIndex);
-    LoadedNodes.Add(NodeName);
-    bInstanceRenderStateDirty = true;
+    check(IsInGameThread());
+    if (!IsValid(MeshComponent) || !IsValid(MeshComponent->GetStaticMesh())
+        || NodeName.IsNone() || LocalTransform.ContainsNaN() || !GetNodeMapRef().Contains(NodeName)) return false;
+    if (LoadedNodes->Contains(NodeName)) return true;
+    const FIntVector Chunk = V3DHISMChunkPolicy::Key(GetActorTransform().TransformPosition(LocalTransform.GetLocation()));
+    FName PageName = OpenChunkPages.FindRef(Chunk);
+    auto* Component = ChunkComponents.FindRef(PageName).Get();
+    if (!IsValid(Component) || Component->IsAsyncBuilding()
+        || Component->GetNumInstances() >= V3DHISMChunkPolicy::MaxInstancesPerComponent)
+        Component = CreateChunkComponent(Chunk, PageName);
+    const int32 Index = Component->AddInstance(LocalTransform);
+    if (Index == INDEX_NONE) return false;
+    ChunkPages.FindChecked(PageName).Nodes.Add(NodeName);
+    InstanceSlots.Add(NodeName, FInstanceSlot{PageName, Index});
+    LoadedNodes->Add(NodeName);
+    DirtyPages.Add(PageName);
     return true;
+}
+
+void AInstancedMeshActor::DestroyChunkComponent(const FName PageName)
+{
+    if (auto* Component = ChunkComponents.FindRef(PageName).Get())
+    {
+        // A page never exceeds 256 instances; release cost is bounded even for huge chunks.
+        // Teardown may race a tree task. Destroy/unregister without mutating that task's input.
+        // Normal streaming only enters here after CanMutateNode permits the removal.
+        if (!Component->IsAsyncBuilding())
+        {
+            Component->ClearInstances();
+            Component->EmptyOverrideMaterials();
+            Component->SetPhysMaterialOverride(nullptr);
+            Component->SetStaticMesh(nullptr);
+        }
+        RemoveInstanceComponent(Component);
+        Component->DestroyComponent();
+    }
+    if (const FChunkPage* Page = ChunkPages.Find(PageName))
+        if (OpenChunkPages.FindRef(Page->Chunk) == PageName) OpenChunkPages.Remove(Page->Chunk);
+    ChunkComponents.Remove(PageName);
+    ChunkPages.Remove(PageName);
+    DirtyPages.Remove(PageName);
 }
 
 bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("RemoveNodeInstance must run on the game thread"))
-        || !IsValid(MeshComponent))
+    check(IsInGameThread());
+    const FInstanceSlot* SlotPtr = InstanceSlots.Find(NodeName);
+    if (!SlotPtr) { LoadedNodes->Remove(NodeName); return false; }
+    const FInstanceSlot Slot = *SlotPtr;
+    auto* Component = ChunkComponents.FindRef(Slot.Page).Get();
+    FChunkPage* Page = ChunkPages.Find(Slot.Page);
+    if (!IsValid(Component) || !Page || Component->IsAsyncBuilding()) return false;
+    const bool bSwap = Component->SupportsRemoveSwap();
+    if (!Component->RemoveInstance(Slot.Index)) return false;
+    if (bSwap)
     {
-        return false;
+        Page->Nodes.RemoveAtSwap(Slot.Index, 1, EAllowShrinking::No);
+        if (Page->Nodes.IsValidIndex(Slot.Index))
+            InstanceSlots.FindChecked(Page->Nodes[Slot.Index]).Index = Slot.Index;
     }
-
-    const int32* ExistingIndex = NodeInstanceIndices.Find(NodeName);
-    if (!ExistingIndex)
+    else
     {
-        LoadedNodes.Remove(NodeName);
-        return false;
+        Page->Nodes.RemoveAt(Slot.Index, 1, EAllowShrinking::No);
+        for (int32 Index = Slot.Index; Index < Page->Nodes.Num(); ++Index)
+            InstanceSlots.FindChecked(Page->Nodes[Index]).Index = Index;
     }
-
-    const int32 InstanceIndex = *ExistingIndex;
-    FTransform HiddenTransform = FTransform::Identity;
-    HiddenTransform.SetScale3D(FVector::ZeroVector);
-    const bool bInstanceHidden = InstanceIndex >= 0 && InstanceIndex < MeshComponent->GetNumInstances()
-        && MeshComponent->UpdateInstanceTransform(InstanceIndex, HiddenTransform, false, false, true);
-    if (!bInstanceHidden)
+    InstanceSlots.Remove(NodeName);
+    LoadedNodes->Remove(NodeName);
+    if (Page->Nodes.IsEmpty()) DestroyChunkComponent(Slot.Page);
+    else DirtyPages.Add(Slot.Page);
+    if (LoadedNodes->IsEmpty())
     {
-        return false;
-    }
-
-    NodeInstanceIndices.Remove(NodeName);
-    LoadedNodes.Remove(NodeName);
-    FreeInstanceIndices.Add(InstanceIndex);
-    bInstanceRenderStateDirty = true;
-
-    if (LoadedNodes.IsEmpty())
-    {
-        MeshComponent->ClearInstances();
         MeshComponent->SetStaticMesh(nullptr);
         MeshComponent->EmptyOverrideMaterials();
         MeshComponent->SetPhysMaterialOverride(nullptr);
         FV3DStreamingBudget::NotifyUnloaded();
-        NodeInstanceIndices.Empty();
-        FreeInstanceIndices.Empty();
-        bInstanceRenderStateDirty = false;
     }
     return true;
 }
 
-void AInstancedMeshActor::FlushInstanceRenderUpdates()
+bool AInstancedMeshActor::FlushInstanceRenderUpdates(const bool bFinalize)
 {
     check(IsInGameThread());
-    if (!bInstanceRenderStateDirty || !IsValid(MeshComponent)) return;
-    MeshComponent->MarkRenderStateDirty();
-    bInstanceRenderStateDirty = false;
+    int32 BuildsStarted = 0;
+    for (auto It = DirtyPages.CreateIterator(); It; ++It)
+    {
+        auto* Component = ChunkComponents.FindRef(*It).Get();
+        if (!IsValid(Component)) { It.RemoveCurrent(); continue; }
+        if (Component->IsAsyncBuilding()) continue;
+        if (!bFinalize && Component->GetNumInstances() < V3DHISMChunkPolicy::MaxInstancesPerComponent) continue;
+        // No synchronous BuildTree, task waits, or per-instance automatic rebuilds.
+        Component->BuildTreeIfOutdated(true, false);
+        It.RemoveCurrent();
+        if (++BuildsStarted >= 2) break;
+    }
+    return DirtyPages.IsEmpty();
+}
+
+bool AInstancedMeshActor::AreChunkTreesReady() const
+{
+    if (!DirtyPages.IsEmpty()) return false;
+    for (const auto& Pair : ChunkComponents)
+        if (IsValid(Pair.Value.Get()) && !Pair.Value->IsTreeFullyBuilt()) return false;
+    return true;
 }
 
 bool AInstancedMeshActor::HasDynamicComponents(const FName NodeName) const
@@ -367,6 +348,12 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
     {
         DestroyDynamicComponents(NodeName);
     }
+    TArray<FName> Pages;
+    ChunkComponents.GetKeys(Pages);
+    for (const FName Page : Pages) DestroyChunkComponent(Page);
+    OpenChunkPages.Empty();
+    InstanceSlots.Empty();
+    DirtyPages.Empty();
     if (IsValid(MeshComponent))
     {
         MeshComponent->ClearInstances();
@@ -379,13 +366,11 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
         MeshComponent->SetPhysMaterialOverride(nullptr);
         FV3DStreamingBudget::NotifyUnloaded();
     }
-    NodeMap.Empty();
-    SpatialChunks.Empty();
+    GroupDefinitions.Reset();
     AlwaysLoadedNodeNames.Empty();
     ReferencedMeshNames.Empty();
-    LoadedNodes.Empty();
-    NodeInstanceIndices.Empty();
-    FreeInstanceIndices.Empty();
+    LoadedNodes = MakeShared<TSet<FName>, ESPMode::ThreadSafe>();
+    InstanceSlots.Empty();
     GroupName = NAME_None;
 }
 

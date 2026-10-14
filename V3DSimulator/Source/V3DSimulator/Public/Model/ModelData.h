@@ -167,15 +167,22 @@ struct FModelNodeData
     bool bAlwaysLoaded = false;
 };
 
+/** Native 1024 m residency chunk. Bounds include mesh extents, in the scene's local space. */
+struct FInstancedMeshStreamChunk
+{
+    FBox LocalBounds = FBox(ForceInit);
+    TArray<FName> Nodes;
+};
+
 /** Pure native instanced-group payload prepared on a worker before UObject publication. */
 struct V3DSIMULATOR_API FInstancedMeshGroupInitData
 {
     FBox NodeBounds = FBox(ForceInit);
     double MaxNodeScale = 0.0;
     TMap<FName, FModelNodeData> Nodes;
-    TMap<FIntVector, TMap<FIntVector, TArray<FName>>> SpatialChunks;
     TArray<FName> AlwaysLoadedNodeNames;
     TArray<FName> ReferencedMeshNames;
+    TMap<FIntVector, FInstancedMeshStreamChunk> StreamChunks;
 
     bool IsValid() const { return !Nodes.IsEmpty(); }
 };

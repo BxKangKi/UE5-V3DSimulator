@@ -29,6 +29,12 @@ class UWorld;
 class UWorldBakedModelAsset;
 struct FWorldSceneStreamPlan;
 
+struct FWorldSceneUnavailableRegion
+{
+    FName NodeName = NAME_None;
+    FBox WorldBounds = FBox(ForceInit);
+};
+
 /**
  * Stable async-build outer for runtime static meshes.
  *
@@ -163,6 +169,9 @@ private:
     FName CurrentLoadingNode;
     FName CurrentLoadingMesh;
 
+    TArray<FWorldSceneUnavailableRegion> PendingUnavailableRegions;
+    int32 CurrentUnavailableRegionIndex = 0;
+
     int32 CurrentLoadIndex;
     int32 CurrentUnloadIndex;
     int32 CurrentLoadWaterIndex = 0;
@@ -184,6 +193,7 @@ private:
     FTransform CurrentRenderOwnerTransform = FTransform::Identity;
     double CurrentMaxRenderDistanceCm = 819200.0;
     float Distance;
+    float PlanningWorldRadius = 102400.0f;
     double MaxRenderDistanceCm = 819200.0;
     float UnloadDistanceMultiplier = 1.0f;
 

@@ -15,6 +15,7 @@
 #include "InstancedMeshActor.generated.h"
 
 class UInstancedStaticMeshComponent;
+class UHierarchicalInstancedStaticMeshComponent;
 class USceneComponent;
 class UStaticMesh;
 
@@ -40,16 +41,22 @@ public:
     double GetMaxNodeScale() const { return MaxNodeScale; }
     const FBox& GetNodeBounds() const { return NodeBounds; }
     bool HasAlwaysLoadedNodes() const { return !AlwaysLoadedNodeNames.IsEmpty(); }
-    const TMap<FName, FModelNodeData>& GetNodeMapRef() const { return NodeMap; }
+    const TMap<FName, FModelNodeData>& GetNodeMapRef() const;
     const TArray<FName>& GetReferencedMeshNames() const { return ReferencedMeshNames; }
-    /** Copies only nearby 8192m/512m buckets plus loaded/always-loaded rows for one stream pass. */
+    /** Copies complete nearby 1024 m chunks and resident nodes for one stream pass. */
     void BuildStreamNodeSnapshot(
         const FVector& PlayerWorldLocation,
         const FTransform& OwnerWorldTransform,
         float WorldRadius,
         TMap<FName, FModelNodeData>& OutNodes) const;
-    bool HasLoadedNodes() const { return !LoadedNodes.IsEmpty(); }
-    bool IsNodeLoaded(FName NodeName) const { return LoadedNodes.Contains(NodeName); }
+    TSharedPtr<const FInstancedMeshGroupInitData, ESPMode::ThreadSafe> CaptureDefinitions() const { return GroupDefinitions; }
+    /** One planner per group; the set is never mutated until that worker publishes its plan. */
+    TSharedPtr<const TSet<FName>, ESPMode::ThreadSafe> CaptureLoadedNodes() const { return LoadedNodes; }
+    static void BuildNativeNodeSnapshot(const FInstancedMeshGroupInitData& Definitions,
+        const TSet<FName>& Loaded, const FVector& Observer, const FTransform& OwnerTransform,
+        float Radius, TMap<FName, FModelNodeData>& OutNodes);
+    bool HasLoadedNodes() const { return !LoadedNodes->IsEmpty(); }
+    bool IsNodeLoaded(FName NodeName) const { return LoadedNodes->Contains(NodeName); }
     /** Game-thread snapshot used by pure worker-side stream planning. */
     void GetLoadedNodeSnapshot(TSet<FName>& OutLoadedNodes) const;
     UInstancedStaticMeshComponent* GetMeshComponent() const { return MeshComponent.Get(); }
@@ -57,7 +64,10 @@ public:
     UInstancedStaticMeshComponent* AssignStaticMesh(UStaticMesh* Mesh);
     bool AddNodeInstance(FName NodeName, const FTransform& LocalTransform);
     bool RemoveNodeInstance(FName NodeName);
-    void FlushInstanceRenderUpdates();
+    /** Starts at most two bounded async tree builds per slice; never waits on the game thread. */
+    bool FlushInstanceRenderUpdates(bool bFinalize = false);
+    bool CanMutateNode(FName NodeName) const;
+    bool AreChunkTreesReady() const;
 
     bool HasDynamicComponents(FName NodeName) const;
     void StoreDynamicComponents(FName NodeName, FComponentGroup&& Group);
@@ -75,26 +85,30 @@ private:
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USceneComponent> Root;
 
-    /** Allocated in the constructor, before any UWorldSceneStreamAction is created. */
+    /** Empty template holding the one shared mesh/material/collision configuration for all chunks. */
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<UInstancedStaticMeshComponent> MeshComponent;
 
-    UPROPERTY(Transient)
-    TMap<FName, FModelNodeData> NodeMap;
-
-    UPROPERTY(Transient)
-    TSet<FName> LoadedNodes;
+    // Native node tables contain no UObject references and remain alive through worker teardown.
+    TSharedPtr<const FInstancedMeshGroupInitData, ESPMode::ThreadSafe> GroupDefinitions;
+    TSharedPtr<TSet<FName>, ESPMode::ThreadSafe> LoadedNodes = MakeShared<TSet<FName>, ESPMode::ThreadSafe>();
 
     UPROPERTY(Transient)
     TMap<FName, FComponentGroup> DynamicComponentMap;
 
     FName GroupName = NAME_None;
-    TMap<FName, int32> NodeInstanceIndices;
-    TArray<int32> FreeInstanceIndices;
-    /** Native-only two-level spatial index: 8192 m coarse cell -> 512 m child cell -> node keys. */
-    TMap<FIntVector, TMap<FIntVector, TArray<FName>>> SpatialChunks;
+    struct FInstanceSlot { FName Page; int32 Index = INDEX_NONE; };
+    struct FChunkPage { FIntVector Chunk; TArray<FName> Nodes; };
+    UPROPERTY(Transient)
+    TMap<FName, TObjectPtr<UHierarchicalInstancedStaticMeshComponent>> ChunkComponents;
+    TMap<FName, FChunkPage> ChunkPages;
+    TMap<FIntVector, FName> OpenChunkPages;
+    TMap<FName, FInstanceSlot> InstanceSlots;
+    TSet<FName> DirtyPages;
+    int32 NextPageId = 0;
+    UHierarchicalInstancedStaticMeshComponent* CreateChunkComponent(const FIntVector& Chunk, FName& OutPage);
+    void DestroyChunkComponent(FName Page);
     TArray<FName> AlwaysLoadedNodeNames;
     TArray<FName> ReferencedMeshNames;
     bool bRuntimeResourcesReleased = false;
-    bool bInstanceRenderStateDirty = false;
 };

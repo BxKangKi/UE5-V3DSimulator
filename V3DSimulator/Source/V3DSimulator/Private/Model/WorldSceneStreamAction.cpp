@@ -27,6 +27,7 @@
 #include "Setting/GameSettings.h"
 #include "Model/StaticActor.h"
 #include "Model/InstancedMeshActor.h"
+#include "Model/V3DHISMChunkPolicy.h"
 #include "System/StreamingMovementGateSubsystem.h"
 #include "System/SafeFileIO.h"
 #include "System/WorldBakedModelAsset.h"
@@ -35,12 +36,6 @@
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
 #include "World/WaterActor.h"
-
-struct FWorldSceneUnavailableRegion
-{
-    FName NodeName = NAME_None;
-    FBox WorldBounds = FBox(ForceInit);
-};
 
 struct FWorldSceneStreamPlan
 {
@@ -59,9 +54,9 @@ struct FWorldSceneStreamPlan
 
 namespace
 {
-    // glTFRuntime has an unresolved startup crash path in LoadStaticMeshLODs. Runtime streaming
-    // therefore uses the stable single-mesh API unless a project explicitly opts back in.
-    constexpr int32 DefaultRuntimeMultiLOD = 0;
+    // The baked facade builds detached runtime LODs on a worker and uses the guarded finalizer.
+    // HISMC cannot select authored LODs if the shared UStaticMesh contains only LOD0.
+    constexpr int32 DefaultRuntimeMultiLOD = 1;
 
     TAutoConsoleVariable<int32> CVarEnableRuntimeMultiLOD(
         TEXT("gworld.Streaming.EnableRuntimeMultiLOD"),
@@ -186,6 +181,39 @@ namespace
             return BestDistanceSq == TNumericLimits<double>::Max()
                 ? TNumericLimits<double>::Max() : BestDistanceSq;
         };
+        struct FChunkSelection
+        {
+            FBox Bounds = FBox(ForceInit);
+            double Radius = 0.0;
+            bool bResident = false;
+            bool bSelected = false;
+            double DistanceSq = 0.0;
+        };
+        TMap<FIntVector, FChunkSelection> Chunks;
+        for (const auto& Pair : Plan.NodeMap)
+        {
+            const FModelNodeData& Node = Pair.Value;
+            const FModelMeshData* Mesh = Plan.MeshMap.Find(Node.MeshName);
+            if (!Mesh) continue;
+            const FTransform Transform = Node.Transform * OwnerWorldTransform;
+            const FIntVector Key = V3DHISMChunkPolicy::Key(Transform.GetLocation());
+            FChunkSelection& Chunk = Chunks.FindOrAdd(Key);
+            Chunk.Bounds += V3DHISMChunkPolicy::CellBounds(Key);
+            const FVector Half = Mesh->Size.GetAbs() * 0.5;
+            Chunk.Bounds += FBox(-Half, Half).TransformBy(Transform);
+            Chunk.Radius = FMath::Max(Chunk.Radius, FMath::Max(
+                FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm),
+                V3DStreamingPolicy::LoadRadius(Mesh->Size, Transform.GetScale3D().GetAbs().GetMax(), Distance, MaxDistanceCm)));
+            if (Node.bAlwaysLoaded) Chunk.Radius = FMath::Max(Chunk.Radius, MaxDistanceCm);
+            Chunk.bResident |= LoadedMeshNodes.Contains(Pair.Key);
+        }
+        for (auto& Pair : Chunks)
+        {
+            FChunkSelection& Chunk = Pair.Value;
+            Chunk.bSelected = V3DHISMChunkPolicy::InRange(Chunk.Bounds, ObserverLocations,
+                FMath::Min(MaxDistanceCm, Chunk.Radius * (Chunk.bResident ? SafeUnloadMultiplier : 1.0f)));
+            Chunk.DistanceSq = NearestObserverDistanceSq(Chunk.Bounds.GetCenter());
+        }
         for (const TPair<FName, FModelNodeData>& NodePair : Plan.NodeMap)
         {
             const FModelNodeData& Info = NodePair.Value;
@@ -194,17 +222,15 @@ namespace
 
             const FTransform WorldTransform = Info.Transform * OwnerWorldTransform;
             const bool bIsLoaded = LoadedMeshNodes.Contains(NodePair.Key);
+            const FChunkSelection& Chunk = Chunks.FindChecked(V3DHISMChunkPolicy::Key(WorldTransform.GetLocation()));
+            const bool bChunkInRange = Chunk.bSelected;
+            // Residency is chosen for the whole 1024 m chunk. At the outer boundary keep the
+            // requested hard cap: a mesh whose entire bounds are outside it must never spawn.
             bool bInRange = false;
-            for (const FVector& Observer : ObserverLocations)
-            {
-                if (V3DStreamingPolicy::MeshInRange(MeshPtr->Size, WorldTransform, Observer,
-                    Distance, MaxDistanceCm, Info.bAlwaysLoaded,
-                    bIsLoaded ? SafeUnloadMultiplier : 1.0f))
-                {
-                    bInRange = true;
-                    break;
-                }
-            }
+            if (bChunkInRange)
+                for (const FVector& Observer : ObserverLocations)
+                    if (V3DStreamingPolicy::BoundsInRenderRange(FVector::ZeroVector, MeshPtr->Size,
+                        WorldTransform, Observer, MaxDistanceCm)) { bInRange = true; break; }
             if (bIsLoaded != bInRange)
                 NodeDistanceSqCache.Add(NodePair.Key, NearestObserverDistanceSq(WorldTransform.GetLocation()));
 
@@ -248,8 +274,24 @@ namespace
                 Plan.PendingLoadWaterNodes.Add(WaterPair.Key);
             }
         }
-        Plan.PendingLoadNodes.Sort([&NodeDistanceSqCache](const FName A, const FName B) { return NodeDistanceSqCache.FindChecked(A) < NodeDistanceSqCache.FindChecked(B); });
-        Plan.PendingUnloadNodes.Sort([&NodeDistanceSqCache](const FName A, const FName B) { return NodeDistanceSqCache.FindChecked(A) > NodeDistanceSqCache.FindChecked(B); });
+        const auto ChunkOrder = [&Plan, &Chunks, &OwnerWorldTransform, &NodeDistanceSqCache](FName A, FName B, bool bUnload)
+        {
+            const FIntVector CA = V3DHISMChunkPolicy::Key((Plan.NodeMap.FindChecked(A).Transform * OwnerWorldTransform).GetLocation());
+            const FIntVector CB = V3DHISMChunkPolicy::Key((Plan.NodeMap.FindChecked(B).Transform * OwnerWorldTransform).GetLocation());
+            if (CA != CB)
+            {
+                const double DA = Chunks.FindChecked(CA).DistanceSq;
+                const double DB = Chunks.FindChecked(CB).DistanceSq;
+                if (DA != DB) return bUnload ? DA > DB : DA < DB;
+                if (CA.X != CB.X) return CA.X < CB.X;
+                if (CA.Y != CB.Y) return CA.Y < CB.Y;
+                return CA.Z < CB.Z;
+            }
+            const double DA = NodeDistanceSqCache.FindChecked(A), DB = NodeDistanceSqCache.FindChecked(B);
+            return DA != DB ? (bUnload ? DA > DB : DA < DB) : A.LexicalLess(B);
+        };
+        Plan.PendingLoadNodes.Sort([&ChunkOrder](FName A, FName B) { return ChunkOrder(A, B, false); });
+        Plan.PendingUnloadNodes.Sort([&ChunkOrder](FName A, FName B) { return ChunkOrder(A, B, true); });
         Plan.PendingLoadWaterNodes.Sort([&WaterDistanceSqCache](const FName A, const FName B) { return WaterDistanceSqCache.FindChecked(A) < WaterDistanceSqCache.FindChecked(B); });
         Plan.PendingUnloadWaterNodes.Sort([&WaterDistanceSqCache](const FName A, const FName B) { return WaterDistanceSqCache.FindChecked(A) > WaterDistanceSqCache.FindChecked(B); });
     }
@@ -349,7 +391,7 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
     }
 
     // Legacy distance arguments remain source/Blueprint compatible; the shared camera policy
-    // now controls node selection, bucket discovery and readiness at the same 5% threshold.
+    // now supplies chunk radii. Nodes in a resident chunk are no longer removed by a 5% test.
     InDistance = V3DStreamingPolicy::GetScreenSizeDistance(Actor);
 
     auto* Action = NewObject<UWorldSceneStreamAction>();
@@ -372,7 +414,7 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
     else
     {
         Action->GroupName = InMeshActor->GetGroupName();
-        float MaxWorldRadius = 0.0f;
+        float MaxWorldRadius = static_cast<float>(FMath::Min(Action->MaxRenderDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm));
         for (const FName MeshName : InMeshActor->GetReferencedMeshNames())
         {
             const FModelMeshData* MeshData = Actor->GetAllMeshMapRef().Find(MeshName);
@@ -383,16 +425,8 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
                     * Actor->GetActorScale3D().GetAbs().GetMax(), InDistance, Action->MaxRenderDistanceCm)));
         }
 
-        // Build the union of the hierarchical 8192 m -> 512 m buckets around every observer.
-        // Each call also contributes currently loaded nodes so leaving the live-player bucket can
-        // still schedule unloads only after the extra destination observer has been removed.
-        TMap<FName, FModelNodeData> ObserverNodes;
-        for (const FVector& Observer : ValidObservers)
-        {
-            InMeshActor->BuildStreamNodeSnapshot(
-                Observer, Actor->GetActorTransform(), MaxWorldRadius, ObserverNodes);
-            Action->NodeMap.Append(ObserverNodes);
-        }
+        // Snapshot construction and full-cell node copying happen on the planning worker.
+        Action->PlanningWorldRadius = MaxWorldRadius * FMath::Clamp(InUnloadDistanceMultiplier, 1.0f, 2.0f);
     }
     Action->Distance = InDistance;
     Action->UnloadDistanceMultiplier = FMath::Clamp(InUnloadDistanceMultiplier, 1.0f, 2.0f);
@@ -469,6 +503,8 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     MeshMap.Empty();
     LoadedWaterNodes.Empty();
     WaterActorMap.Empty();
+    PendingUnavailableRegions.Empty();
+    CurrentUnavailableRegionIndex = 0;
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
@@ -537,8 +573,11 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
     Plan.MeshMap = MoveTemp(MeshMap);
     Plan.LoadedWaterNodes = MoveTemp(LoadedWaterNodes);
 
-    TSet<FName> LoadedMeshNodes;
-    if (IsValid(MeshActor)) MeshActor->GetLoadedNodeSnapshot(LoadedMeshNodes);
+    const auto Definitions = IsValid(MeshActor) ? MeshActor->CaptureDefinitions()
+        : TSharedPtr<const FInstancedMeshGroupInitData, ESPMode::ThreadSafe>();
+    const auto LoadedMeshNodes = IsValid(MeshActor) ? MeshActor->CaptureLoadedNodes()
+        : TSharedPtr<const TSet<FName>, ESPMode::ThreadSafe>();
+    const float PlanningRadius = PlanningWorldRadius;
     const FTransform OwnerTransform = OwnerActor->GetActorTransform();
     const TArray<FVector> PlanningObserverLocations = ObserverLocations;
     const float PlanningDistance = Distance;
@@ -547,7 +586,7 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
     const bool bPlanningRenderOnly = bRenderOnly;
     const uint32 Serial = ++PreparationSerial;
     bPreparationInFlight = true;
-    if (Plan.NodeMap.IsEmpty() && Plan.WaterNodeMap.IsEmpty() && LoadedMeshNodes.IsEmpty())
+    if (!Definitions.IsValid() && Plan.NodeMap.IsEmpty() && Plan.WaterNodeMap.IsEmpty())
     {
         // No I/O/UObject work exists for this group. Do not spend a worker dispatch and a
         // whole frame occupying a planning slot just to return an empty plan.
@@ -557,10 +596,23 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
     TWeakObjectPtr<UWorldSceneStreamAction> WeakThis(this);
 
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, Serial, Plan = MoveTemp(Plan), LoadedMeshNodes = MoveTemp(LoadedMeshNodes),
+        [WeakThis, Serial, Plan = MoveTemp(Plan), Definitions, LoadedMeshNodes, PlanningRadius,
             OwnerTransform, PlanningObserverLocations, PlanningDistance, PlanningMaxDistanceCm, PlanningUnloadMultiplier, bPlanningRenderOnly]() mutable
         {
-            BuildNativeStreamPlan(Plan, LoadedMeshNodes, OwnerTransform, PlanningObserverLocations,
+            const TSet<FName> EmptyLoaded;
+            const TSet<FName>& Loaded = LoadedMeshNodes.IsValid() ? *LoadedMeshNodes : EmptyLoaded;
+            if (Definitions.IsValid())
+            {
+                TMap<FName, FModelNodeData> ObserverNodes;
+                for (const FVector& Observer : PlanningObserverLocations)
+                {
+                    AInstancedMeshActor::BuildNativeNodeSnapshot(*Definitions, Loaded, Observer,
+                        OwnerTransform, PlanningRadius, ObserverNodes);
+                    Plan.NodeMap.Append(ObserverNodes);
+                }
+            }
+            Plan.OriginalNodeWorkCount = Plan.NodeMap.Num() + Plan.WaterNodeMap.Num();
+            BuildNativeStreamPlan(Plan, Loaded, OwnerTransform, PlanningObserverLocations,
                 PlanningDistance, PlanningMaxDistanceCm, PlanningUnloadMultiplier, bPlanningRenderOnly);
             FSafeFileIO::DispatchTrackedGameThread(
                 [WeakThis, Serial, Plan = MoveTemp(Plan)]() mutable
@@ -606,16 +658,8 @@ void UWorldSceneStreamAction::ApplyPreparedPlan(FWorldSceneStreamPlan&& Plan, co
         WaterActorMap.Remove(InvalidWaterName);
     }
 
-    if (UWorld* World = OwnerActor->GetWorld())
-    {
-        if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
-        {
-            for (const FWorldSceneUnavailableRegion& Region : Plan.UnavailableRegions)
-            {
-                Gate->SetModelRegionAvailable(OwnerActor.Get(), Region.NodeName, Region.WorldBounds, false);
-            }
-        }
-    }
+    PendingUnavailableRegions = MoveTemp(Plan.UnavailableRegions);
+    CurrentUnavailableRegionIndex = 0;
 
     ChunkSize = FMath::Max(1, FMath::Min(
         FMath::Max(1, NodeMap.Num() + WaterNodeMap.Num()), ChunkSize));
@@ -664,6 +708,8 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
         GeneratedMeshWorldContext->ReleaseWorldPin();
     }
     GeneratedMeshWorldContext = nullptr;
+    PendingUnavailableRegions.Empty();
+    CurrentUnavailableRegionIndex = 0;
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
@@ -713,6 +759,16 @@ void UWorldSceneStreamAction::ProcessChunk()
     {
         return OperationsThisSlice < ChunkSize && (OperationsThisSlice == 0 || (FPlatformTime::Seconds() - SliceStartSeconds) < SliceBudgetSeconds);
     };
+    // Large chunks also have many gate regions. Register these within the same frame budget
+    // instead of an unbounded game-thread loop in ApplyPreparedPlan.
+    while (CurrentUnavailableRegionIndex < PendingUnavailableRegions.Num() && HasSliceBudget())
+    {
+        const auto& Region = PendingUnavailableRegions[CurrentUnavailableRegionIndex++];
+        if (UWorld* World = OwnerActor->GetWorld())
+            if (auto* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+                Gate->SetModelRegionAvailable(OwnerActor.Get(), Region.NodeName, Region.WorldBounds, false);
+        ++OperationsThisSlice;
+    }
     if (CurrentSkippedOperationIndex < TotalSkippedOperationCount)
     {
         CurrentSkippedOperationIndex = FMath::Min(CurrentSkippedOperationIndex + SkippedProgressChunkSize, TotalSkippedOperationCount);
@@ -724,8 +780,12 @@ void UWorldSceneStreamAction::ProcessChunk()
     while (CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
     { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true; }
     while (CurrentUnloadIndex < PendingUnloadNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
-    { ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true; }
-    while (!bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num() && HasSliceBudget())
+    {
+        if (IsValid(MeshActor) && !MeshActor->CanMutateNode(PendingUnloadNodes[CurrentUnloadIndex])) break;
+        ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true;
+    }
+    while (CurrentUnavailableRegionIndex >= PendingUnavailableRegions.Num()
+        && !bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num() && HasSliceBudget())
     {
         const FName TargetNode = PendingLoadNodes[CurrentLoadIndex++]; ++OperationsThisSlice; bProgressChanged = true;
         if (IsValid(MeshActor) && MeshActor->IsNodeLoaded(TargetNode)) continue;
@@ -736,12 +796,19 @@ void UWorldSceneStreamAction::ProcessChunk()
     while (CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && HasSliceBudget())
     { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
     while (CurrentUnloadIndex < PendingUnloadNodes.Num() && HasSliceBudget())
-    { ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; bProgressChanged = true; }
-    if (IsValid(MeshActor)) MeshActor->FlushInstanceRenderUpdates();
+    {
+        if (IsValid(MeshActor) && !MeshActor->CanMutateNode(PendingUnloadNodes[CurrentUnloadIndex])) break;
+        ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; bProgressChanged = true;
+    }
+    const bool bNodeWorkFinished = CurrentLoadIndex >= PendingLoadNodes.Num()
+        && CurrentUnloadIndex >= PendingUnloadNodes.Num() && !bIsLoading;
+    if (IsValid(MeshActor)) MeshActor->FlushInstanceRenderUpdates(bNodeWorkFinished);
     if (bProgressChanged) BroadcastProgress();
-    if (CurrentSkippedOperationIndex >= TotalSkippedOperationCount
+    if (CurrentUnavailableRegionIndex >= PendingUnavailableRegions.Num()
+        && CurrentSkippedOperationIndex >= TotalSkippedOperationCount
         && CurrentLoadIndex >= PendingLoadNodes.Num() && CurrentUnloadIndex >= PendingUnloadNodes.Num()
-        && CurrentLoadWaterIndex >= PendingLoadWaterNodes.Num() && CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num() && !bIsLoading)
+        && CurrentLoadWaterIndex >= PendingLoadWaterNodes.Num() && CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num() && !bIsLoading
+        && (!IsValid(MeshActor) || MeshActor->AreChunkTreesReady()))
     {
         UWorld* World = OwnerActor->GetWorld();
         if (IsValid(World)) World->GetTimerManager().ClearTimer(ProcessTimerHandle);
@@ -912,6 +979,15 @@ bool UWorldSceneStreamAction::IsNodeWithinCurrentRenderRange(const FName& Name) 
     const FModelMeshData* Mesh = Node ? MeshMap.Find(Node->MeshName) : nullptr;
     if (!Mesh || !IsValid(OwnerActor)) return false;
     const FTransform Transform = Node->Transform * CurrentRenderOwnerTransform;
+    FBox ChunkBounds = V3DHISMChunkPolicy::CellBounds(V3DHISMChunkPolicy::Key(Transform.GetLocation()));
+    const FVector Half = Mesh->Size.GetAbs() * 0.5;
+    ChunkBounds += FBox(-Half, Half).TransformBy(Transform);
+    const double Radius = Node->bAlwaysLoaded ? CurrentMaxRenderDistanceCm : FMath::Max(
+        FMath::Min(CurrentMaxRenderDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm),
+        V3DStreamingPolicy::LoadRadius(Mesh->Size, MeshActor->GetMaxNodeScale()
+            * CurrentRenderOwnerTransform.GetScale3D().GetAbs().GetMax(), Distance, CurrentMaxRenderDistanceCm));
+    if (!V3DHISMChunkPolicy::InRange(ChunkBounds, CurrentRenderObservers,
+        FMath::Min(CurrentMaxRenderDistanceCm, Radius * UnloadDistanceMultiplier))) return false;
     for (const FVector& Observer : CurrentRenderObservers)
         if (V3DStreamingPolicy::BoundsInRenderRange(FVector::ZeroVector, Mesh->Size,
             Transform, Observer, CurrentMaxRenderDistanceCm)) return true;
@@ -1057,12 +1133,9 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
 
 FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N)
 {
-    if (N <= 1)
-        return 0.0f;
-    float StartValue = FMath::Min(0.5f + (N * 0.1f), 0.95f);
-    float EndValue = 0.3f;
-    float Alpha = (float)i / (float)(N - 1);
-    return FMath::Lerp(StartValue, EndValue, Alpha);
+    if (N <= 1) return 1.0f;
+    // LOD0 -> 1.0, LOD1 -> 0.35, LOD2 -> 0.1225, LOD3 -> 0.042875.
+    return i <= 0 ? 1.0f : FMath::Pow(0.35f, static_cast<float>(i));
 }
 
 void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)

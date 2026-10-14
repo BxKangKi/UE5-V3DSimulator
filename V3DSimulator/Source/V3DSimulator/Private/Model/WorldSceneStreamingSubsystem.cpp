@@ -10,6 +10,7 @@
 #include "Model/WorldSceneStreamingSubsystem.h"
 #include "System/V3DStreamingBudget.h"
 #include "System/V3DStreamingPolicy.h"
+#include "Model/V3DHISMChunkPolicy.h"
 
 #include "Character/CharacterController.h"
 #include "Camera/CameraComponent.h"
@@ -594,7 +595,7 @@ bool UWorldSceneStreamingSubsystem::IsLocationReady(const FVector& WorldLocation
         if (IsFiniteVector(Record.Bounds.Center)
             && IsFiniteVector(Record.Bounds.Size))
         {
-            bInside = V3DStreamingPolicy::SceneInRange(Record.Bounds.Center, Record.Bounds.Size,
+            bInside = V3DHISMChunkPolicy::SceneInRange(Record.Bounds.Center, Record.Bounds.Size,
                 OwnerTransform, WorldLocation, ScreenDistance, 1.0, MaxDistanceCm);
         }
         if (!bInside) continue;
@@ -660,7 +661,7 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
 
             for (const FVector& Observer : StreamingObservers)
             {
-                if (V3DStreamingPolicy::SceneInRange(Bounds.Center, Bounds.Size, OwnerTransform,
+                if (V3DHISMChunkPolicy::SceneInRange(Bounds.Center, Bounds.Size, OwnerTransform,
                     Observer, ScreenDistance, RadiusMultiplier, MaxDistanceCm)) return true;
             }
             return false;
