@@ -9,6 +9,7 @@
 
 #include "System/WorldBakedModelAsset.h"
 #include "System/WorldBakedTexture.h"
+#include "System/V3DTerrain.h"
 #include "System/V3DStreamingBudget.h"
 #include "Misc/ScopeExit.h"
 
@@ -19,6 +20,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "PixelFormat.h"
@@ -196,8 +198,21 @@ namespace WorldBakedModelAssetPrivate
 
     UMaterialInterface* SelectBaseMaterial(
         const FGWorldBakedMaterial& Baked,
-        const FglTFRuntimeMaterialsConfig& Config)
+        const FglTFRuntimeMaterialsConfig& Config,
+        const UObject* Context)
     {
+        // Terrain uses an array/weight shader contract. Generic glTF material overrides cannot
+        // consume these channels. Resolve from the central AssetRegistry or explicit palette override first.
+        if (V3DTerrain::IsPaletteMaterial(Baked))
+        {
+            if (UMaterialInterface* const* Named = Config.MaterialsOverrideByNameMap.Find(Baked.Name))
+                if (IsValid(*Named)) return *Named;
+            if (UMaterialInterface* const* Palette = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.TerrainPalette")))
+                if (IsValid(*Palette)) return *Palette;
+            if (UMaterialInterface* RegistryMaterial = V3DTerrain::ResolveMaterial(Context))
+                return RegistryMaterial;
+            return LoadObject<UMaterialInterface>(nullptr, *Baked.BaseMaterialPath);
+        }
         if (IsValid(Config.ForceMaterial))
         {
             return Config.ForceMaterial;
@@ -246,6 +261,8 @@ namespace WorldBakedModelAssetPrivate
     bool ValidateTextureLayout(const FGWorldBakedTexture& Baked, FString& OutError)
     {
         if (Baked.SizeX <= 0 || Baked.SizeY <= 0
+            || Baked.NumLayers <= 0 || Baked.NumLayers > 2048
+            || (!Baked.bTextureArray && Baked.NumLayers != 1)
             || Baked.PixelFormat <= PF_Unknown || Baked.PixelFormat >= PF_MAX
             || Baked.AddressX >= static_cast<uint8>(TA_MAX)
             || Baked.AddressY >= static_cast<uint8>(TA_MAX)
@@ -260,7 +277,7 @@ namespace WorldBakedModelAssetPrivate
 
         const FPixelFormatInfo& Format = GPixelFormats[Baked.PixelFormat];
         if (!Format.Supported || Format.BlockSizeX <= 0 || Format.BlockSizeY <= 0
-            || Format.BlockSizeZ <= 0 || Format.BlockBytes <= 0)
+            || Format.BlockSizeZ != 1 || Format.BlockBytes <= 0)
         {
             OutError = FString::Printf(
                 TEXT("Baked texture pixel format is unsupported on this platform: %s"),
@@ -273,7 +290,7 @@ namespace WorldBakedModelAssetPrivate
         for (const FGWorldBakedTextureMip& Mip : Baked.Mips)
         {
             if (Mip.SizeX != ExpectedSizeX || Mip.SizeY != ExpectedSizeY
-                || Mip.SizeZ != 1 || Mip.Bytes.IsEmpty())
+                || Mip.SizeZ != Baked.NumLayers || Mip.Bytes.IsEmpty())
             {
                 OutError = FString::Printf(
                     TEXT("Baked texture has an invalid mip chain: %s"), *Baked.Name);
@@ -447,6 +464,8 @@ namespace WorldBakedModelAssetPrivate
                     }
                 }
 
+                // Colors in the public V3D terrain contract are linear weights, including alpha.
+                Primitive.bVertexColorsSRGB = Baked.MaterialName != TEXT("V3D.TerrainPalette");
                 Primitive.Colors.Reserve(Baked.Colors.Num());
                 for (const FVector4f& Value : Baked.Colors) Primitive.Colors.Add(FVector4(Value));
                 Baked.Colors.Empty();
@@ -860,16 +879,16 @@ UMaterialInterface* UWorldBakedModelAsset::FindCachedMaterial(
     return nullptr;
 }
 
-UTexture2D* UWorldBakedModelAsset::FindCachedTexture(
+UTexture* UWorldBakedModelAsset::FindCachedTexture(
     const int32 TextureId,
     FWorldBakedBuildReferenceGuard& ReferenceGuard, const int32 TextureLimit)
 {
     check(IsInGameThread());
     const uint64 TextureCacheKey =
         (static_cast<uint64>(static_cast<uint32>(TextureId)) << 32) | TextureLimit;
-    if (const TWeakObjectPtr<UTexture2D>* Cached = WeakTextureCache.Find(TextureCacheKey))
+    if (const TWeakObjectPtr<UTexture>* Cached = WeakTextureCache.Find(TextureCacheKey))
     {
-        if (UTexture2D* Existing = Cached->Get())
+        if (UTexture* Existing = Cached->Get())
         {
             ReferenceGuard.Add(Existing);
             return Existing;
@@ -879,7 +898,7 @@ UTexture2D* UWorldBakedModelAsset::FindCachedTexture(
     return nullptr;
 }
 
-UTexture2D* UWorldBakedModelAsset::CreateTexture(
+UTexture* UWorldBakedModelAsset::CreateTexture(
     FGWorldBakedTexture& Baked,
     FWorldBakedBuildReferenceGuard& ReferenceGuard,
     FString& OutError, const int32 TextureLimit)
@@ -892,9 +911,9 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
     const uint64 TextureCacheKey =
         (static_cast<uint64>(static_cast<uint32>(Baked.TextureId)) << 32)
         | static_cast<uint32>(TextureLimit);
-    if (const TWeakObjectPtr<UTexture2D>* Cached = WeakTextureCache.Find(TextureCacheKey))
+    if (const TWeakObjectPtr<UTexture>* Cached = WeakTextureCache.Find(TextureCacheKey))
     {
-        if (UTexture2D* Existing = Cached->Get())
+        if (UTexture* Existing = Cached->Get())
         {
             ReferenceGuard.Add(Existing);
             return Existing;
@@ -906,13 +925,51 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
     // satisfies the current user cap instead of rebuilding/resampling pixels at load time. This
     // makes the setting effective immediately and avoids allocating/uploading discarded top mips.
     int32 FirstRuntimeMip = 0;
-    while (FirstRuntimeMip + 1 < Baked.Mips.Num()
+    while (TextureLimit > 0 && FirstRuntimeMip + 1 < Baked.Mips.Num()
         && (Baked.Mips[FirstRuntimeMip].SizeX > TextureLimit
             || Baked.Mips[FirstRuntimeMip].SizeY > TextureLimit))
     {
         ++FirstRuntimeMip;
     }
     const FGWorldBakedTextureMip& RuntimeTopMip = Baked.Mips[FirstRuntimeMip];
+
+    if (Baked.bTextureArray)
+    {
+        UTexture2DArray* Texture = NewObject<UTexture2DArray>(GetTransientPackage(), NAME_None, RF_Transient);
+        if (!IsValid(Texture))
+        {
+            OutError = TEXT("Could not allocate a runtime texture array");
+            return nullptr;
+        }
+        ReferenceGuard.Add(Texture);
+        FTexturePlatformData* Data = new FTexturePlatformData();
+        Data->SizeX = RuntimeTopMip.SizeX; Data->SizeY = RuntimeTopMip.SizeY;
+        Data->PixelFormat = static_cast<EPixelFormat>(Baked.PixelFormat);
+        Data->SetNumSlices(Baked.NumLayers);
+        for (int32 MipIndex = FirstRuntimeMip; MipIndex < Baked.Mips.Num(); ++MipIndex)
+        {
+            const FGWorldBakedTextureMip& Source = Baked.Mips[MipIndex];
+            FTexture2DMipMap* Mip = new FTexture2DMipMap();
+            Mip->SizeX = Source.SizeX; Mip->SizeY = Source.SizeY; Mip->SizeZ = Baked.NumLayers;
+            Mip->BulkData.Lock(LOCK_READ_WRITE);
+            void* Destination = Mip->BulkData.Realloc(Source.Bytes.Num());
+            FMemory::Memcpy(Destination, Source.Bytes.GetData(), Source.Bytes.Num());
+            Mip->BulkData.Unlock();
+            Data->Mips.Add(Mip);
+        }
+        Texture->SetPlatformData(Data);
+        Texture->SRGB = Baked.bSRGB;
+        Texture->AddressX = static_cast<TextureAddress>(Baked.AddressX);
+        Texture->AddressY = static_cast<TextureAddress>(Baked.AddressY);
+        Texture->Filter = static_cast<TextureFilter>(Baked.Filter);
+        Texture->LODGroup = static_cast<TextureGroup>(Baked.LODGroup);
+        // Arrays are immutable dependency resources. Retain their CPU BulkData for resource
+        // recreation; ordinary 2D textures below retain the existing archive-mip provider.
+        Texture->NeverStream = true;
+        Texture->UpdateResource();
+        WeakTextureCache.Add(TextureCacheKey, Texture);
+        return Texture;
+    }
 
     const FGWorldArchiveRange* TextureRange = Manifest.IsValid()
         ? Manifest->TextureRanges.Find(Baked.TextureId) : nullptr;
@@ -979,7 +1036,7 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
 
 UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     const FGWorldBakedMaterial& Baked,
-    const TMap<int32, UTexture2D*>& Textures,
+    const TMap<int32, UTexture*>& Textures,
     const FglTFRuntimeMaterialsConfig& Config,
     FWorldBakedBuildReferenceGuard& ReferenceGuard,
     FString& OutError)
@@ -992,7 +1049,7 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     }
 
     UMaterialInterface* Base =
-        WorldBakedModelAssetPrivate::SelectBaseMaterial(Baked, Config);
+        WorldBakedModelAssetPrivate::SelectBaseMaterial(Baked, Config, this);
     if (!IsValid(Base))
     {
         OutError = FString::Printf(
@@ -1000,6 +1057,20 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
         return nullptr;
     }
     ReferenceGuard.Add(Base);
+    if (V3DTerrain::IsPaletteMaterial(Baked))
+    {
+        for (const FGWorldBakedTextureParameter& Parameter : Baked.Textures)
+        {
+            UTexture* DefaultTexture = nullptr;
+            if (!Base->GetTextureParameterValue(FMaterialParameterInfo(FName(*Parameter.Name)), DefaultTexture)
+                || !Cast<UTexture2DArray>(DefaultTexture))
+            {
+                OutError = FString::Printf(TEXT("Terrain parent %s needs a Texture2DArray parameter named %s; see Docs/V3D_UNREAL_GUIDE.ko.md"),
+                    *GetPathNameSafe(Base), *Parameter.Name);
+                return nullptr;
+            }
+        }
+    }
 
     UMaterialInstanceDynamic* Material =
         UMaterialInstanceDynamic::Create(Base, this);
@@ -1028,7 +1099,7 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
         UTexture* Texture = nullptr;
         if (Parameter.TextureId != INDEX_NONE)
         {
-            UTexture2D* const* Found = Textures.Find(Parameter.TextureId);
+            UTexture* const* Found = Textures.Find(Parameter.TextureId);
             Texture = Found ? *Found : nullptr;
         }
         else if (!Parameter.AssetPath.IsEmpty())
@@ -1078,7 +1149,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
         return true;
     }
 
-    TMap<int32, UTexture2D*> Textures;
+    TMap<int32, UTexture*> Textures;
     TMap<int32, UMaterialInterface*> Materials;
     ReferenceGuard.Reserve(Bundle.Textures.Num() + Bundle.Materials.Num() * 2 + 16);
 
@@ -1099,7 +1170,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
     Textures.Reserve(Bundle.Textures.Num());
     for (FGWorldBakedTexture& Baked : Bundle.Textures)
     {
-        UTexture2D* Texture = CreateTexture(Baked, ReferenceGuard, OutError, Bundle.MaxTextureResolution);
+        UTexture* Texture = CreateTexture(Baked, ReferenceGuard, OutError, Bundle.MaxTextureResolution);
         Baked.Mips.Empty(); // Also release decoded bytes when another request populated the cache.
         if (!Texture) return false;
         Textures.Add(Baked.TextureId, Texture);
@@ -1110,7 +1181,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
         for (const FGWorldBakedTextureParameter& Parameter : BakedMaterial.Textures)
         {
             if (Parameter.TextureId == INDEX_NONE || Textures.Contains(Parameter.TextureId)) continue;
-            UTexture2D* CachedTexture = FindCachedTexture(Parameter.TextureId, ReferenceGuard, Bundle.MaxTextureResolution);
+            UTexture* CachedTexture = FindCachedTexture(Parameter.TextureId, ReferenceGuard, Bundle.MaxTextureResolution);
             if (!IsValid(CachedTexture))
             {
                 OutError = FString::Printf(

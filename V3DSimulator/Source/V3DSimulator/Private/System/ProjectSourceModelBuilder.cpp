@@ -8,6 +8,7 @@
  */
 
 #include "System/ProjectSourceModelBuilder.h"
+#include "System/V3DTerrain.h"
 
 #include "Containers/Ticker.h"
 #include "Animation/Skeleton.h"
@@ -150,7 +151,7 @@ namespace ProjectSourceModelBuilderPrivate
     }
 
     /** Build-only material policy shared by every mesh decoded from the current source GLB. */
-    FglTFRuntimeMaterialsConfig MakeMaterialsConfig(UProjectSourceModelBuilder* Builder)
+    FglTFRuntimeMaterialsConfig MakeMaterialsConfig(UProjectSourceModelBuilder* Builder, UglTFRuntimeAsset* Source)
     {
         FglTFRuntimeMaterialsConfig Config;
         Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -164,7 +165,8 @@ namespace ProjectSourceModelBuilderPrivate
         Config.bGeneratesMipMaps = true;
         Config.bLoadMipMaps = true;
         Config.SpecularFactor = 0.0f;
-        Config.ImagesConfig.bCompressMips = true;
+        // Terrain array construction needs CPU pixels, before platform compression.
+        Config.ImagesConfig.bCompressMips = !V3DTerrain::SourceHasTerrain(Source);
         // Build-time textures are captured immediately from FTexturePlatformData on the game thread.
         // Keep glTFRuntime texture streaming disabled here. On UE 5.8, bStreaming=true attaches
         // glTFRuntime's custom mip provider before UpdateResource(); the provider can report a
@@ -823,7 +825,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
     }
 
     FglTFRuntimeMaterialsConfig MaterialsConfig =
-        ProjectSourceModelBuilderPrivate::MakeMaterialsConfig(this);
+        ProjectSourceModelBuilderPrivate::MakeMaterialsConfig(this, SourceAsset);
 
     // Character materials must be baked against the same master material used by the runtime
     // character loader. Resolve this once per native batch instead of reconstructing the override
@@ -1044,6 +1046,8 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
 
     FGWorldModelMetadata Metadata;
     if (!BakedData.IsSane(&Error)
+        || !V3DTerrain::Bake(SourceAsset, BakedData, Error, this)
+        || !BakedData.IsSane(&Error)
         || !BuildMetadata(Metadata, Error)
         || !Metadata.IsSane(&Error)
         || Metadata.SourceMeshCount != BakedData.Meshes.Num()

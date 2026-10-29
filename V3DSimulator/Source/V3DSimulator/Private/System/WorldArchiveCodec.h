@@ -12,7 +12,7 @@
 #include "CoreMinimal.h"
 #include "System/WorldArchive.h"
 
-/** Stable little-endian codecs for the independently addressable .dat archive members. */
+/** Unreal adapters for the portable single-header V3D member codecs in Format/v3d.hpp. */
 namespace WorldArchiveCodec
 {
     bool SerializeMesh(const FGWorldBakedMesh& Value, TArray<uint8>& Out, FString& Error);

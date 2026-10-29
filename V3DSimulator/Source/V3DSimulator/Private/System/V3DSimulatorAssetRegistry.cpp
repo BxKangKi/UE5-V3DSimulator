@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "System/V3DSimulatorAssetRegistry.h"
+#include "Materials/MaterialInterface.h"
 
 UV3DSimulatorAssetRegistry::UV3DSimulatorAssetRegistry(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
@@ -55,4 +56,22 @@ void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
         EnumSettingWidgetClass = TSoftClassPtr<UEnumSettingWidget>(FSoftObjectPath(
             TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Dropdown.WBP_Settings_Dropdown_C")));
 
+}
+
+UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveTerrainMaterial() const
+{
+    if (!IsInGameThread() || IsGarbageCollecting() || TerrainMaterial.IsNull())
+    {
+        return nullptr;
+    }
+
+    if (UMaterialInterface* Existing = TerrainMaterial.Get())
+    {
+        if (IsValid(Existing))
+        {
+            return Existing;
+        }
+    }
+
+    return TerrainMaterial.LoadSynchronous();
 }

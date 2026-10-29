@@ -315,6 +315,13 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
     const bool bResolveCallSucceeded = Registry->V3DMaterials.Resolve(
         NewCache->References,
         Failures);
+    NewCache->References.Terrain = Registry->ResolveTerrainMaterial();
+    if (!Registry->TerrainMaterial.IsNull() && !IsValid(NewCache->References.Terrain))
+    {
+        Failures.Add(FString::Printf(
+            TEXT("TerrainMaterial -> %s"),
+            *Registry->TerrainMaterial.ToSoftObjectPath().ToString()));
+    }
     bMaterialDefaultAssetResolved = true;
 
     for (const FString& Failure : Failures)

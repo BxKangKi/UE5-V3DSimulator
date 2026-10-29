@@ -195,7 +195,7 @@ private:
     TArray<FglTFRuntimeNode> Nodes;
 
     // Weak-only reuse: unloading the last mesh/material permits normal GC immediately.
-    TMap<uint64, TWeakObjectPtr<UTexture2D>> WeakTextureCache;
+    TMap<uint64, TWeakObjectPtr<UTexture>> WeakTextureCache;
     TMap<uint64, TWeakObjectPtr<UMaterialInterface>> WeakMaterialCache;
     // Learned from verified archive members. No mesh/pixel arrays or UObject references here.
     TMap<int32, TArray<int32>> MeshMaterialDependencies;
@@ -286,16 +286,16 @@ private:
         int32 MaterialId,
         const FglTFRuntimeMaterialsConfig& MaterialsConfig,
         FWorldBakedBuildReferenceGuard& ReferenceGuard);
-    UTexture2D* FindCachedTexture(
+    UTexture* FindCachedTexture(
         int32 TextureId,
         FWorldBakedBuildReferenceGuard& ReferenceGuard, int32 TextureLimit);
-    UTexture2D* CreateTexture(
+    UTexture* CreateTexture(
         FGWorldBakedTexture& Baked,
         FWorldBakedBuildReferenceGuard& ReferenceGuard,
         FString& OutError, int32 TextureLimit);
     UMaterialInterface* CreateMaterial(
         const FGWorldBakedMaterial& Baked,
-        const TMap<int32, UTexture2D*>& Textures,
+        const TMap<int32, UTexture*>& Textures,
         const FglTFRuntimeMaterialsConfig& Config,
         FWorldBakedBuildReferenceGuard& ReferenceGuard,
         FString& OutError);

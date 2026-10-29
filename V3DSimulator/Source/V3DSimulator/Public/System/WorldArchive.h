@@ -127,6 +127,9 @@ struct V3DSIMULATOR_API FGWorldSoundRecord
 };
 
 /**
+ * Unreal adapter for the portable, single-header format declared in Format/v3d.hpp.
+ * New files use the V3D binary signature (revision 6); legacy GWORLD v4/v5 remains readable.
+ *
  * Thread-safe immutable .v3d reader.
  *
  * Open() reads the fixed header and bounded directory only. Every subsequent call opens a private

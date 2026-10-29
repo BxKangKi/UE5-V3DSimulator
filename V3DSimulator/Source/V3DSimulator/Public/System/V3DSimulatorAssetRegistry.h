@@ -106,6 +106,9 @@ public:
     /** Supplies current built-in menu classes when a class reference is empty. */
     void EnsureMenuDefaults();
 
+    /** Synchronously resolves TerrainMaterial on the game thread. */
+    UMaterialInterface* ResolveTerrainMaterial() const;
+
     // Native actor classes can be replaced by Blueprint subclasses without forcing them to load at startup.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Actors")
     TSoftClassPtr<AStaticActor> StaticActorClass;
@@ -210,6 +213,10 @@ public:
     /** Default glTF material soft references live directly in this one central data object. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     FV3DMaterialSoftAssetReferences V3DMaterials;
+
+    /** Base material used by baked V3D terrain palettes (Texture2DArray + vertex-color layer weights). */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UMaterialInterface> TerrainMaterial;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> StaticDecalLightMaterial;

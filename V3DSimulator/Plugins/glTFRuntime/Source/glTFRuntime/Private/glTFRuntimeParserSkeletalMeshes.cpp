@@ -396,7 +396,7 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 				FColor Color = FColor::White;
 				if (VertexIndex < Primitive.Colors.Num())
 				{
-					Color = FLinearColor(Primitive.Colors[VertexIndex]).ToFColor(true);
+					Color = FLinearColor(Primitive.Colors[VertexIndex]).ToFColor(Primitive.bVertexColorsSRGB);
 				}
 
 				LodRenderData->StaticVertexBuffers.PositionVertexBuffer.VertexPosition(BaseVertexIndex) = ModelVertex.Position;

@@ -18,7 +18,7 @@ class UMaterialInterface;
  * Runtime strong-reference set resolved from the central soft-reference registry for glTFRuntime imports.
  *
  * This structure is not editor-authored. Material-name keys are glTF document data and are intentionally
- * preserved so imported materials such as glass or terrain can select the resolved Unreal base material.
+ * preserved so imported materials such as glass can select the resolved Unreal base material.
  */
 USTRUCT(BlueprintType)
 struct V3DSIMULATOR_API FV3DMaterialAssetReferences
@@ -43,6 +43,10 @@ struct V3DSIMULATOR_API FV3DMaterialAssetReferences
     UPROPERTY(Transient, BlueprintReadOnly, Category="glTF Material Assets|Runtime")
     TObjectPtr<UMaterialInterface> TwoSidedTranslucent = nullptr;
 
+    /** Base material resolved from AssetRegistry.TerrainMaterial for baked V3D.TerrainPalette materials. */
+    UPROPERTY(Transient, BlueprintReadOnly, Category="glTF Material Assets|Runtime")
+    TObjectPtr<UMaterialInterface> Terrain = nullptr;
+
     /**
      * Optional glTF material-name overrides. Keys are names stored inside the imported glTF file;
      * values are Unreal material assets selected directly in the editor.
@@ -58,6 +62,7 @@ struct V3DSIMULATOR_API FV3DMaterialAssetReferences
             && !IsValid(TwoSidedMasked.Get())
             && !IsValid(Translucent.Get())
             && !IsValid(TwoSidedTranslucent.Get())
+            && !IsValid(Terrain.Get())
             && ByMaterialName.Num() == 0;
     }
 
@@ -69,6 +74,7 @@ struct V3DSIMULATOR_API FV3DMaterialAssetReferences
         TwoSidedMasked = nullptr;
         Translucent = nullptr;
         TwoSidedTranslucent = nullptr;
+        Terrain = nullptr;
         ByMaterialName.Empty();
     }
 };

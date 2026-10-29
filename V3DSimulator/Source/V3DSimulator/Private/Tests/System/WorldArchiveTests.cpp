@@ -8,6 +8,7 @@
 #include "System/EntityArchive.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/WorldArchive.h"
+#include "Format/v3d.hpp"
 #include "System/WorldBakedModelAsset.h"
 #include "System/WorldBakedTexture.h"
 #include "System/WorldObjectStreamingSubsystem.h"
@@ -22,6 +23,7 @@
 #include "HAL/FileManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Compression.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "PixelFormat.h"
@@ -364,6 +366,43 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
         FGWorldArchive::BuildBlocking(
             Root, Models, Sounds, ArchivePath, Error, TFunction<bool()>(), WorldConfigJson));
     TestTrue(TEXT("Archive was published"), IFileManager::Get().FileExists(*ArchivePath));
+
+    // This independent reader uses only the public header and proves that an external program
+    // can consume bytes written by the Unreal adapter, including compressed scene metadata.
+    TArray<uint8> PortableFixture;
+    if (!TestTrue(TEXT("Read portable fixture"), FFileHelper::LoadFileToArray(PortableFixture, *ArchivePath))) return false;
+    const uint8 ExpectedMagic[] = {0x56, 0x33, 0x44, 0x1a, 0x0d, 0x0a, 0x00, 0x00};
+    TestTrue(TEXT("Archive begins with the public V3D signature"), PortableFixture.Num() >= 8
+        && FMemory::Memcmp(PortableFixture.GetData(), ExpectedMagic, 8) == 0);
+    v3d::archive_reader PortableReader;
+    std::string PortableError;
+    const auto PortableRead = [&PortableFixture](uint64 Offset, uint8* Destination, size_t Count)
+    {
+        if (Offset > static_cast<uint64>(PortableFixture.Num())
+            || Count > static_cast<uint64>(PortableFixture.Num()) - Offset) return false;
+        if (Count) FMemory::Memcpy(Destination, PortableFixture.GetData() + Offset, Count);
+        return true;
+    };
+    const auto Inflate = [](const uint8* Source, size_t SourceSize, uint8* Destination,
+        size_t DestinationSize, std::string& Failure)
+    {
+        const bool Ok = FCompression::UncompressMemory(NAME_Zlib, Destination,
+            static_cast<int64>(DestinationSize), Source, static_cast<int64>(SourceSize), COMPRESS_NoFlags, 0);
+        if (!Ok) Failure = "zlib decode failed";
+        return Ok;
+    };
+    if (!TestTrue(TEXT("Standalone V3D API opens Unreal output"),
+        PortableReader.open(PortableRead, PortableFixture.Num(), PortableError, Inflate))) return false;
+    TestEqual(TEXT("Public format revision is 6"), static_cast<uint64>(PortableReader.header().revision), uint64(6));
+    if (!TestEqual(TEXT("Portable directory contains model"), static_cast<int32>(PortableReader.directory().models.size()), 1)) return false;
+    v3d::model_metadata PortableMetadata;
+    TestTrue(TEXT("Standalone API reads compressed metadata"), PortableReader.read_metadata(
+        PortableReader.directory().models[0], PortableMetadata, PortableError));
+    TestEqual(TEXT("Portable node transform count"), static_cast<int32>(PortableMetadata.nodes.size()), 1);
+    TestEqual(TEXT("Portable instance count"), static_cast<int32>(PortableMetadata.instances.size()), 1);
+    const auto PortableMesh = PortableMetadata.meshes.find("Triangle");
+    TestTrue(TEXT("Portable mesh dimensions are exposed"), PortableMesh != PortableMetadata.meshes.end()
+        && PortableMesh->second.size.x == 100.0 && PortableMesh->second.size.y == 100.0);
 
     TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader =
         FGWorldArchiveReader::Open(ArchivePath, Error);

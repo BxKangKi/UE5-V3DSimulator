@@ -1654,6 +1654,9 @@ struct FglTFRuntimeUInt16Vector4
 
 struct FglTFRuntimePrimitive
 {
+	// V3D: numeric vertex channels (terrain weights) must bypass the sRGB transfer.
+	// Default preserves glTFRuntime's existing COLOR_0 behavior.
+	bool bVertexColorsSRGB = true;
 	TArray<FVector> Positions;
 	TArray<FVector> Normals;
 	TArray<FVector4> Tangents;

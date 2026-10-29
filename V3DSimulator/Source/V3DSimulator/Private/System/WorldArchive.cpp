@@ -8,6 +8,7 @@
  */
 
 #include "System/WorldArchive.h"
+#include "Format/v3d.hpp"
 
 #include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"
@@ -23,20 +24,15 @@
 
 namespace GWorldArchivePrivate
 {
-    // Revision 5 adds independent script members; revision 4 remains readable.
-    constexpr uint64 Magic = 0x0000444C524F5747ull; // ASCII "GWORLD\0\0", little endian.
-    constexpr int32 HeaderBytes = 64;
-    constexpr uint64 FormatRevision = 5; // config + three scripts + model/sound directory.
-    constexpr uint64 LegacyFormatRevision = 4;
-    constexpr int64 PayloadAlignment = 4096;
-    constexpr int32 MaxStringBytes = 64 * 1024 * 1024;
-    constexpr int32 MaxNameBytes = 4096;
+    // v3d.hpp owns revision 6 and the legacy GWORLD revision 4/5 compatibility reader.
+    constexpr int32 HeaderBytes = v3d::archive_header_bytes;
+    constexpr int64 PayloadAlignment = v3d::archive_alignment;
     constexpr int32 MaxNodesPerModel = 2000000;
     constexpr int32 MaxMeshesPerModel = 1000000;
     constexpr int32 MaxBonesPerModel = 65536;
     constexpr int32 MaxCollidersPerMesh = 65536;
     constexpr int32 MaxLightsPerMesh = 65536;
-    constexpr int64 MaxArchiveBytes = 16ll * 1024ll * 1024ll * 1024ll * 1024ll;
+    constexpr int64 MaxArchiveBytes = static_cast<int64>(v3d::archive_max_bytes);
     constexpr double FineChunkCm = 512.0 * 100.0;
     constexpr double CoarseChunkCm = 8192.0 * 100.0;
     constexpr int64 FinePerCoarse = 16;
@@ -136,964 +132,391 @@ namespace GWorldArchivePrivate
         return true;
     }
 
-    class FWriter
+    // The byte layout is owned by v3d.hpp. This layer only translates Unreal values.
+    std::string ToPortable(const FString& Value)
     {
-    public:
-        explicit FWriter(TArray<uint8>& InBytes, const int64 InMaxBytes = MAX_int32)
-            : Bytes(InBytes)
-            , MaxBytes(FMath::Clamp<int64>(InMaxBytes, 1, MAX_int32))
-        {
-            Bytes.Reset();
-        }
-        bool IsOk() const { return bOk; }
-
-        void U8(uint8 Value)
-        {
-            if (!CanAppend(1)) return;
-            Bytes.Add(Value);
-        }
-        void U16(uint16 Value) { U8(Value & 0xffu); U8((Value >> 8u) & 0xffu); }
-        void U32(uint32 Value)
-        {
-            U8(Value & 0xffu); U8((Value >> 8u) & 0xffu);
-            U8((Value >> 16u) & 0xffu); U8((Value >> 24u) & 0xffu);
-        }
-        void I32(int32 Value) { U32(static_cast<uint32>(Value)); }
-        void U64(uint64 Value)
-        {
-            for (int32 Shift = 0; Shift < 64; Shift += 8) U8((Value >> Shift) & 0xffull);
-        }
-        void Float(float Value)
-        {
-            uint32 Bits = 0; FMemory::Memcpy(&Bits, &Value, sizeof(Bits)); U32(Bits);
-        }
-        void Double(double Value)
-        {
-            uint64 Bits = 0; FMemory::Memcpy(&Bits, &Value, sizeof(Bits)); U64(Bits);
-        }
-        void Guid(const FGuid& Value)
-        {
-            U32(Value.A); U32(Value.B); U32(Value.C); U32(Value.D);
-        }
-        void String(const FString& Value, int32 Limit = MaxStringBytes)
-        {
-            FTCHARToUTF8 Utf8(*Value);
-            if (Utf8.Length() < 0 || Utf8.Length() > Limit)
-            {
-                bOk = false;
-                return;
-            }
-            U32(static_cast<uint32>(Utf8.Length()));
-            if (bOk && Utf8.Length() > 0)
-            {
-                Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
-            }
-        }
-        void Name(const FName Value) { String(Value.ToString(), MaxNameBytes); }
-        void Vector(const FVector& Value) { Double(Value.X); Double(Value.Y); Double(Value.Z); }
-        void Quat(const FQuat& Value)
-        {
-            Double(Value.X); Double(Value.Y); Double(Value.Z); Double(Value.W);
-        }
-        void Transform(const FTransform& Value)
-        {
-            Quat(Value.GetRotation()); Vector(Value.GetLocation()); Vector(Value.GetScale3D());
-        }
-    private:
-        bool CanAppend(const int64 Count)
-        {
-            if (!bOk || Count < 0 || Count > MaxBytes - static_cast<int64>(Bytes.Num()))
-            {
-                bOk = false;
-                return false;
-            }
-            return true;
-        }
-
-        void Append(const uint8* Data, const int32 Count)
-        {
-            if (!Data || Count <= 0 || !CanAppend(Count))
-            {
-                if (Count != 0) bOk = false;
-                return;
-            }
-            Bytes.Append(Data, Count);
-        }
-
-        TArray<uint8>& Bytes;
-        int64 MaxBytes = MAX_int32;
-        bool bOk = true;
-    };
-
-    class FReader
-    {
-    public:
-        explicit FReader(const TArray<uint8>& InBytes) : Bytes(InBytes) {}
-        bool IsOk() const { return bOk; }
-        bool IsAtEnd() const { return bOk && Offset == Bytes.Num(); }
-        int32 Remaining() const { return bOk ? Bytes.Num() - Offset : 0; }
-
-        uint8 U8()
-        {
-            if (!Require(1)) return 0;
-            return Bytes[Offset++];
-        }
-        uint16 U16()
-        {
-            const uint16 A = U8();
-            const uint16 B = U8();
-            return A | (B << 8u);
-        }
-        uint32 U32()
-        {
-            const uint32 A = U8();
-            const uint32 B = U8();
-            const uint32 C = U8();
-            const uint32 D = U8();
-            return A | (B << 8u) | (C << 16u) | (D << 24u);
-        }
-        int32 I32() { return static_cast<int32>(U32()); }
-        uint64 U64()
-        {
-            uint64 Value = 0;
-            for (int32 Shift = 0; Shift < 64; Shift += 8) Value |= uint64(U8()) << Shift;
-            return Value;
-        }
-        float Float()
-        {
-            const uint32 Bits = U32(); float Value = 0.0f;
-            FMemory::Memcpy(&Value, &Bits, sizeof(Value)); return Value;
-        }
-        double Double()
-        {
-            const uint64 Bits = U64(); double Value = 0.0;
-            FMemory::Memcpy(&Value, &Bits, sizeof(Value)); return Value;
-        }
-        FGuid Guid()
-        {
-            // Function-argument evaluation order is not a serialization contract. Read fields in
-            // their exact on-disk order before constructing the GUID.
-            const uint32 A = U32();
-            const uint32 B = U32();
-            const uint32 C = U32();
-            const uint32 D = U32();
-            return FGuid(A, B, C, D);
-        }
-        FString String(int32 Limit = MaxStringBytes)
-        {
-            const uint32 Count = U32();
-            if (!bOk || Count > static_cast<uint32>(Limit) || Count > static_cast<uint32>(MAX_int32)
-                || !Require(static_cast<int32>(Count)))
-            {
-                bOk = false;
-                return FString();
-            }
-            if (Count == 0) return FString();
-            const ANSICHAR* Source = reinterpret_cast<const ANSICHAR*>(Bytes.GetData() + Offset);
-            FUTF8ToTCHAR Converted(Source, static_cast<int32>(Count));
-            Offset += static_cast<int32>(Count);
-            if (Converted.Length() < 0) { bOk = false; return FString(); }
-            return FString(Converted.Length(), Converted.Get());
-        }
-        FName Name() { return FName(*String(MaxNameBytes)); }
-        FVector Vector()
-        {
-            // Never rely on constructor-argument evaluation order for an on-disk sequence.
-            const double X = Double();
-            const double Y = Double();
-            const double Z = Double();
-            return FVector(X, Y, Z);
-        }
-        FQuat Quat()
-        {
-            const double X = Double();
-            const double Y = Double();
-            const double Z = Double();
-            const double W = Double();
-            return FQuat(X, Y, Z, W);
-        }
-        FTransform Transform()
-        {
-            const FQuat Rotation = Quat();
-            const FVector Location = Vector();
-            const FVector Scale = Vector();
-            return FTransform(Rotation, Location, Scale);
-        }
-        uint32 Count(const uint32 Limit, const int32 MinimumBytes = 0)
-        {
-            const uint32 Value = U32();
-            if (!bOk || Value > Limit || (MinimumBytes > 0
-                && uint64(Value) * uint64(MinimumBytes) > uint64(Remaining())))
-            {
-                bOk = false;
-            }
-            return bOk ? Value : 0;
-        }
-    private:
-        bool Require(int32 Count)
-        {
-            if (!bOk || Count < 0 || Offset < 0 || Count > Bytes.Num() - Offset)
-            {
-                bOk = false;
-                return false;
-            }
-            return true;
-        }
-
-        const TArray<uint8>& Bytes;
-        int32 Offset = 0;
-        bool bOk = true;
-    };
-
-    template <typename ValueType, typename WriteValue>
-    void WriteSortedStringMap(FWriter& Writer, const TMap<FString, ValueType>& Values, WriteValue&& Write)
-    {
-        TArray<FString> Keys;
-        Values.GetKeys(Keys);
-        Keys.Sort();
-        Writer.U32(static_cast<uint32>(Keys.Num()));
-        for (const FString& Key : Keys)
-        {
-            Writer.String(Key, MaxNameBytes);
-            Write(Values.FindChecked(Key));
-        }
+        FTCHARToUTF8 Converted(*Value);
+        return std::string(Converted.Get(), static_cast<size_t>(Converted.Length()));
     }
 
-    void WriteMeshSettings(FWriter& Writer, const FMeshData& Data)
+    FString ToUnreal(const std::string& Value)
     {
-        Writer.U8(Data.bComplexCollision ? 1 : 0);
-        Writer.U8(Data.bSimpleCollision ? 1 : 0);
-        Writer.U8(Data.bIsEntity ? 1 : 0);
-        Writer.U8(0);
-        Writer.U32(static_cast<uint32>(Data.Colliders.Num()));
-        for (const FModelCollider& Collider : Data.Colliders)
-        {
-            Writer.U8(static_cast<uint8>(Collider.Collider));
-            Writer.U8(0); Writer.U16(0);
-            Writer.Vector(Collider.Center);
-            Writer.Vector(Collider.Size);
-        }
-        Writer.U32(static_cast<uint32>(Data.Lights.Num()));
-        for (const FLightData& Light : Data.Lights)
-        {
-            Writer.Vector(Light.Location);
-            Writer.Float(Light.Intensity);
-            Writer.Float(Light.SourceRadius);
-            Writer.Float(Light.SoftSourceRadius);
-            Writer.Float(Light.AttenuationRadius);
-            Writer.Float(Light.Length);
-            Writer.U8(static_cast<uint8>(Light.Unit));
-            Writer.U8(0); Writer.U16(0);
-        }
+        FUTF8ToTCHAR Converted(Value.data(), static_cast<int32>(Value.size()));
+        return FString(Converted.Length(), Converted.Get());
     }
 
-    bool ReadMeshSettings(FReader& Reader, FMeshData& OutData)
+    v3d::guid ToPortable(const FGuid& V) { return {{V.A, V.B, V.C, V.D}}; }
+    FGuid ToUnreal(const v3d::guid& V) { return FGuid(V[0], V[1], V[2], V[3]); }
+    v3d::dvec3 ToPortable(const FVector& V) { return {V.X, V.Y, V.Z}; }
+    FVector ToUnreal(const v3d::dvec3& V) { return FVector(V.x, V.y, V.z); }
+
+    v3d::transform ToPortable(const FTransform& V)
     {
-        OutData = FMeshData();
-        OutData.bComplexCollision = Reader.U8() != 0;
-        OutData.bSimpleCollision = Reader.U8() != 0;
-        OutData.bIsEntity = Reader.U8() != 0;
-        (void)Reader.U8();
-        const uint32 ColliderCount = Reader.Count(MaxCollidersPerMesh, 52);
-        if (!Reader.IsOk()) return false;
-        OutData.Colliders.Reserve(static_cast<int32>(ColliderCount));
-        for (uint32 Index = 0; Index < ColliderCount; ++Index)
-        {
-            FModelCollider& Collider = OutData.Colliders.AddDefaulted_GetRef();
-            const uint8 ColliderType = Reader.U8();
-            (void)Reader.U8(); (void)Reader.U16();
-            Collider.Center = Reader.Vector();
-            Collider.Size = Reader.Vector();
-            if (ColliderType > static_cast<uint8>(EColliderType::Box)
-                || !IsFiniteVector(Collider.Center) || !IsFiniteVector(Collider.Size)) return false;
-            Collider.Collider = static_cast<EColliderType>(ColliderType);
-        }
-        const uint32 LightCount = Reader.Count(MaxLightsPerMesh, 48);
-        if (!Reader.IsOk()) return false;
-        OutData.Lights.Reserve(static_cast<int32>(LightCount));
-        for (uint32 Index = 0; Index < LightCount; ++Index)
-        {
-            FLightData& Light = OutData.Lights.AddDefaulted_GetRef();
-            Light.Location = Reader.Vector();
-            Light.Intensity = Reader.Float();
-            Light.SourceRadius = Reader.Float();
-            Light.SoftSourceRadius = Reader.Float();
-            Light.AttenuationRadius = Reader.Float();
-            Light.Length = Reader.Float();
-            Light.Unit = static_cast<ELightUnits>(Reader.U8());
-            (void)Reader.U8(); (void)Reader.U16();
-            if (!IsFiniteVector(Light.Location) || !FMath::IsFinite(Light.Intensity)
-                || !FMath::IsFinite(Light.SourceRadius) || !FMath::IsFinite(Light.SoftSourceRadius)
-                || !FMath::IsFinite(Light.AttenuationRadius) || !FMath::IsFinite(Light.Length)) return false;
-        }
-        return Reader.IsOk() && IsSaneMeshSettings(OutData);
+        v3d::transform Result;
+        const FQuat Q = V.GetRotation();
+        Result.rotation = {Q.X, Q.Y, Q.Z, Q.W};
+        Result.translation = ToPortable(V.GetLocation());
+        Result.scale = ToPortable(V.GetScale3D());
+        return Result;
     }
 
-    void WriteMetadata(
-        FWriter& Writer,
-        const FGWorldModelMetadata& Metadata,
-        const FGWorldModelSummary& Summary)
+    FTransform ToUnreal(const v3d::transform& V)
     {
-        Writer.I32(Summary.SourceNodeCount);
-        Writer.I32(Summary.SourceMeshCount);
-        Writer.I32(Summary.SourceMaterialCount);
-        Writer.I32(Summary.SourceTextureCount);
-        Writer.Vector(Summary.Center);
-        Writer.Vector(Summary.Size);
-
-        // This complete index-addressed table preserves hierarchy nodes that the render-oriented
-        // NodeMap intentionally omits (for example empty pivots and skeleton helpers).
-        Writer.U32(static_cast<uint32>(Metadata.NodeTransforms.Num()));
-        for (const FGWorldNodeTransform& Node : Metadata.NodeTransforms)
-        {
-            Writer.I32(Node.NodeIndex);
-            Writer.I32(Node.ParentIndex);
-            Writer.I32(Node.MeshIndex);
-            Writer.I32(Node.SkinIndex);
-            Writer.String(Node.Name, MaxNameBytes);
-            Writer.Transform(Node.LocalTransform);
-        }
-
-        TArray<FName> NodeNames;
-        Metadata.SceneData.NodeMap.GetKeys(NodeNames);
-        NodeNames.Sort([](const FName A, const FName B) { return A.LexicalLess(B); });
-        Writer.U32(static_cast<uint32>(NodeNames.Num()));
-        for (const FName NodeName : NodeNames)
-        {
-            const FModelNodeData& Node = Metadata.SceneData.NodeMap.FindChecked(NodeName);
-            Writer.Name(NodeName);
-            Writer.Name(Node.MeshName);
-            Writer.Transform(Node.Transform);
-            Writer.I32(Node.CoarseChunk.X); Writer.I32(Node.CoarseChunk.Y); Writer.I32(Node.CoarseChunk.Z);
-            Writer.I32(Node.FineChunk.X); Writer.I32(Node.FineChunk.Y); Writer.I32(Node.FineChunk.Z);
-            Writer.U8(Node.bAlwaysLoaded ? 1 : 0); Writer.U8(0); Writer.U16(0);
-        }
-
-        TArray<FName> WaterNames;
-        Metadata.SceneData.WaterNodeMap.GetKeys(WaterNames);
-        WaterNames.Sort([](const FName A, const FName B) { return A.LexicalLess(B); });
-        Writer.U32(static_cast<uint32>(WaterNames.Num()));
-        for (const FName NodeName : WaterNames)
-        {
-            const FWaterStreamNodeData& Water = Metadata.SceneData.WaterNodeMap.FindChecked(NodeName);
-            Writer.Name(NodeName);
-            Writer.Transform(Water.Transform);
-            Writer.Float(Water.StreamRadius);
-        }
-
-        TArray<FName> MeshNames;
-        Metadata.SceneData.MeshMap.GetKeys(MeshNames);
-        MeshNames.Sort([](const FName A, const FName B) { return A.LexicalLess(B); });
-        Writer.U32(static_cast<uint32>(MeshNames.Num()));
-        for (const FName MeshName : MeshNames)
-        {
-            const FModelMeshData& Mesh = Metadata.SceneData.MeshMap.FindChecked(MeshName);
-            Writer.Name(MeshName);
-            Writer.I32(Mesh.LOD0); Writer.I32(Mesh.LOD1);
-            Writer.I32(Mesh.LOD2); Writer.I32(Mesh.LOD3);
-            Writer.Vector(Mesh.Extent);
-            Writer.Vector(Mesh.Size);
-            WriteMeshSettings(Writer, Mesh.Data);
-        }
-
-        TArray<FName> SettingNames;
-        Metadata.SceneData.ModelData.MeshData.GetKeys(SettingNames);
-        SettingNames.Sort([](const FName A, const FName B) { return A.LexicalLess(B); });
-        Writer.U32(static_cast<uint32>(SettingNames.Num()));
-        for (const FName Name : SettingNames)
-        {
-            Writer.Name(Name);
-            WriteMeshSettings(Writer, Metadata.SceneData.ModelData.MeshData.FindChecked(Name));
-        }
+        return FTransform(FQuat(V.rotation.x, V.rotation.y, V.rotation.z, V.rotation.w),
+            ToUnreal(V.translation), ToUnreal(V.scale));
     }
 
-    bool ReadMetadata(FReader& Reader, FGWorldModelMetadata& OutMetadata)
+    v3d::range ToPortable(const FGWorldArchiveRange& V)
     {
-        OutMetadata = FGWorldModelMetadata();
-        OutMetadata.SourceNodeCount = Reader.I32();
-        OutMetadata.SourceMeshCount = Reader.I32();
-        OutMetadata.SourceMaterialCount = Reader.I32();
-        OutMetadata.SourceTextureCount = Reader.I32();
-        OutMetadata.SceneData.ModelData.Center = Reader.Vector();
-        OutMetadata.SceneData.ModelData.Size = Reader.Vector();
+        v3d::range R;
+        R.name = ToPortable(V.Name); R.offset = V.Offset; R.stored_size = V.StoredSize;
+        R.uncompressed_size = V.UncompressedSize; R.crc = V.Crc; R.codec = V.Codec;
+        return R;
+    }
 
-        const uint32 TransformCount = Reader.Count(MaxNodesPerModel, 100);
-        if (!Reader.IsOk()) return false;
-        OutMetadata.NodeTransforms.Reserve(static_cast<int32>(TransformCount));
-        for (uint32 Index = 0; Index < TransformCount; ++Index)
-        {
-            FGWorldNodeTransform& Node = OutMetadata.NodeTransforms.AddDefaulted_GetRef();
-            Node.NodeIndex = Reader.I32();
-            Node.ParentIndex = Reader.I32();
-            Node.MeshIndex = Reader.I32();
-            Node.SkinIndex = Reader.I32();
-            Node.Name = Reader.String(MaxNameBytes);
-            Node.LocalTransform = Reader.Transform();
-            if (!Reader.IsOk() || !IsFiniteTransform(Node.LocalTransform)) return false;
-        }
+    FGWorldArchiveRange ToUnreal(const v3d::range& V)
+    {
+        FGWorldArchiveRange R;
+        R.Name = ToUnreal(V.name); R.Offset = V.offset; R.StoredSize = V.stored_size;
+        R.UncompressedSize = V.uncompressed_size; R.Crc = V.crc; R.Codec = V.codec;
+        return R;
+    }
 
-        const uint32 NodeCount = Reader.Count(MaxNodesPerModel, 88);
-        if (!Reader.IsOk()) return false;
-        OutMetadata.SceneData.NodeMap.Reserve(static_cast<int32>(NodeCount));
-        for (uint32 Index = 0; Index < NodeCount; ++Index)
-        {
-            const FName Name = Reader.Name();
-            FModelNodeData Node;
-            Node.MeshName = Reader.Name();
-            Node.Transform = Reader.Transform();
-            Node.CoarseChunk.X = Reader.I32(); Node.CoarseChunk.Y = Reader.I32(); Node.CoarseChunk.Z = Reader.I32();
-            Node.FineChunk.X = Reader.I32(); Node.FineChunk.Y = Reader.I32(); Node.FineChunk.Z = Reader.I32();
-            Node.bAlwaysLoaded = Reader.U8() != 0; (void)Reader.U8(); (void)Reader.U16();
-            if (!Reader.IsOk() || Name.IsNone() || Node.MeshName.IsNone()
-                || !IsFiniteTransform(Node.Transform)
-                || Node.FineChunk.X < 0 || Node.FineChunk.X >= 16
-                || Node.FineChunk.Y < 0 || Node.FineChunk.Y >= 16
-                || Node.FineChunk.Z < 0 || Node.FineChunk.Z >= 16
-                || OutMetadata.SceneData.NodeMap.Contains(Name)) return false;
-            OutMetadata.SceneData.NodeMap.Add(Name, MoveTemp(Node));
-        }
+    v3d::model_summary ToPortable(const FGWorldModelSummary& V)
+    {
+        v3d::model_summary R;
+        R.source_node_count = V.SourceNodeCount; R.source_mesh_count = V.SourceMeshCount;
+        R.source_material_count = V.SourceMaterialCount; R.source_texture_count = V.SourceTextureCount;
+        R.center = ToPortable(V.Center); R.size = ToPortable(V.Size);
+        return R;
+    }
 
-        const uint32 WaterCount = Reader.Count(MaxNodesPerModel, 88);
-        if (!Reader.IsOk()) return false;
-        OutMetadata.SceneData.WaterNodeMap.Reserve(static_cast<int32>(WaterCount));
-        for (uint32 Index = 0; Index < WaterCount; ++Index)
-        {
-            const FName Name = Reader.Name();
-            FWaterStreamNodeData Water;
-            Water.Transform = Reader.Transform();
-            Water.StreamRadius = Reader.Float();
-            if (!Reader.IsOk() || Name.IsNone() || !IsFiniteTransform(Water.Transform)
-                || !FMath::IsFinite(Water.StreamRadius) || Water.StreamRadius <= 0.0f
-                || OutMetadata.SceneData.WaterNodeMap.Contains(Name)) return false;
-            OutMetadata.SceneData.WaterNodeMap.Add(Name, MoveTemp(Water));
-        }
+    FGWorldModelSummary ToUnreal(const v3d::model_summary& V)
+    {
+        FGWorldModelSummary R;
+        R.SourceNodeCount = V.source_node_count; R.SourceMeshCount = V.source_mesh_count;
+        R.SourceMaterialCount = V.source_material_count; R.SourceTextureCount = V.source_texture_count;
+        R.Center = ToUnreal(V.center); R.Size = ToUnreal(V.size);
+        return R;
+    }
 
-        const uint32 MeshCount = Reader.Count(MaxMeshesPerModel, 80);
-        if (!Reader.IsOk()) return false;
-        OutMetadata.SceneData.MeshMap.Reserve(static_cast<int32>(MeshCount));
-        for (uint32 Index = 0; Index < MeshCount; ++Index)
+    v3d::mesh_settings ToPortable(const FMeshData& V)
+    {
+        v3d::mesh_settings R;
+        R.complex_collision = V.bComplexCollision; R.simple_collision = V.bSimpleCollision;
+        R.is_entity = V.bIsEntity;
+        R.colliders.reserve(V.Colliders.Num()); R.lights.reserve(V.Lights.Num());
+        for (const FModelCollider& C : V.Colliders)
         {
-            const FName Name = Reader.Name();
-            FModelMeshData Mesh;
-            Mesh.LOD0 = Reader.I32(); Mesh.LOD1 = Reader.I32();
-            Mesh.LOD2 = Reader.I32(); Mesh.LOD3 = Reader.I32();
-            Mesh.Extent = Reader.Vector();
-            Mesh.Size = Reader.Vector();
-            if (!ReadMeshSettings(Reader, Mesh.Data) || Name.IsNone()
-                || !IsFiniteVector(Mesh.Extent) || !IsFiniteVector(Mesh.Size)
-                || OutMetadata.SceneData.MeshMap.Contains(Name)) return false;
-            OutMetadata.SceneData.MeshMap.Add(Name, MoveTemp(Mesh));
+            v3d::collider P;
+            P.type = static_cast<uint8>(C.Collider); P.center = ToPortable(C.Center); P.size = ToPortable(C.Size);
+            R.colliders.push_back(std::move(P));
         }
+        for (const FLightData& L : V.Lights)
+        {
+            v3d::light P;
+            P.location = ToPortable(L.Location); P.intensity = L.Intensity;
+            P.source_radius = L.SourceRadius; P.soft_source_radius = L.SoftSourceRadius;
+            P.attenuation_radius = L.AttenuationRadius; P.length = L.Length; P.unit = static_cast<uint8>(L.Unit);
+            R.lights.push_back(std::move(P));
+        }
+        return R;
+    }
 
-        const uint32 SettingCount = Reader.Count(MaxMeshesPerModel, 16);
-        if (!Reader.IsOk()) return false;
-        OutMetadata.SceneData.ModelData.MeshData.Reserve(static_cast<int32>(SettingCount));
-        for (uint32 Index = 0; Index < SettingCount; ++Index)
+    FMeshData ToUnreal(const v3d::mesh_settings& V)
+    {
+        FMeshData R;
+        R.bComplexCollision = V.complex_collision; R.bSimpleCollision = V.simple_collision;
+        R.bIsEntity = V.is_entity;
+        R.Colliders.Reserve(static_cast<int32>(V.colliders.size())); R.Lights.Reserve(static_cast<int32>(V.lights.size()));
+        for (const v3d::collider& C : V.colliders)
         {
-            const FName Name = Reader.Name();
-            FMeshData Settings;
-            if (!ReadMeshSettings(Reader, Settings) || Name.IsNone()
-                || OutMetadata.SceneData.ModelData.MeshData.Contains(Name)) return false;
-            OutMetadata.SceneData.ModelData.MeshData.Add(Name, MoveTemp(Settings));
+            FModelCollider& P = R.Colliders.AddDefaulted_GetRef();
+            P.Collider = static_cast<EColliderType>(C.type); P.Center = ToUnreal(C.center); P.Size = ToUnreal(C.size);
         }
-        if (!Reader.IsOk() || !OutMetadata.IsSane())
+        for (const v3d::light& L : V.lights)
         {
+            FLightData& P = R.Lights.AddDefaulted_GetRef();
+            P.Location = ToUnreal(L.location); P.Intensity = L.intensity;
+            P.SourceRadius = L.source_radius; P.SoftSourceRadius = L.soft_source_radius;
+            P.AttenuationRadius = L.attenuation_radius; P.Length = L.length; P.Unit = static_cast<ELightUnits>(L.unit);
+        }
+        return R;
+    }
+
+    v3d::model_metadata ToPortable(const FGWorldModelMetadata& V, const FGWorldModelSummary& Summary)
+    {
+        v3d::model_metadata R;
+        R.summary = ToPortable(Summary);
+        R.nodes.reserve(V.NodeTransforms.Num());
+        for (const FGWorldNodeTransform& N : V.NodeTransforms)
+        {
+            v3d::node_transform P;
+            P.node_index = N.NodeIndex; P.parent_index = N.ParentIndex; P.mesh_index = N.MeshIndex;
+            P.skin_index = N.SkinIndex; P.name = ToPortable(N.Name); P.local_transform = ToPortable(N.LocalTransform);
+            R.nodes.push_back(std::move(P));
+        }
+        for (const auto& Pair : V.SceneData.NodeMap)
+        {
+            v3d::scene_instance P;
+            const auto& N = Pair.Value;
+            P.mesh_name = ToPortable(N.MeshName.ToString()); P.world_transform = ToPortable(N.Transform);
+            P.coarse_chunk = {{N.CoarseChunk.X, N.CoarseChunk.Y, N.CoarseChunk.Z}};
+            P.fine_chunk = {{N.FineChunk.X, N.FineChunk.Y, N.FineChunk.Z}};
+            P.always_loaded = N.bAlwaysLoaded;
+            R.instances.emplace(ToPortable(Pair.Key.ToString()), std::move(P));
+        }
+        for (const auto& Pair : V.SceneData.WaterNodeMap)
+        {
+            v3d::water_instance P;
+            P.world_transform = ToPortable(Pair.Value.Transform); P.stream_radius = Pair.Value.StreamRadius;
+            R.waters.emplace(ToPortable(Pair.Key.ToString()), std::move(P));
+        }
+        for (const auto& Pair : V.SceneData.MeshMap)
+        {
+            v3d::scene_mesh P;
+            const auto& M = Pair.Value;
+            P.lods = {{M.LOD0, M.LOD1, M.LOD2, M.LOD3}}; P.extent = ToPortable(M.Extent);
+            P.size = ToPortable(M.Size); P.settings = ToPortable(M.Data);
+            R.meshes.emplace(ToPortable(Pair.Key.ToString()), std::move(P));
+        }
+        for (const auto& Pair : V.SceneData.ModelData.MeshData)
+            R.settings.emplace(ToPortable(Pair.Key.ToString()), ToPortable(Pair.Value));
+        return R;
+    }
+
+    bool ToUnreal(const v3d::model_metadata& V, FGWorldModelMetadata& Out, FString& Error)
+    {
+        FGWorldModelMetadata R;
+        R.SourceNodeCount = V.summary.source_node_count; R.SourceMeshCount = V.summary.source_mesh_count;
+        R.SourceMaterialCount = V.summary.source_material_count; R.SourceTextureCount = V.summary.source_texture_count;
+        R.SceneData.ModelData.Center = ToUnreal(V.summary.center); R.SceneData.ModelData.Size = ToUnreal(V.summary.size);
+        R.NodeTransforms.Reserve(static_cast<int32>(V.nodes.size()));
+        for (const auto& N : V.nodes)
+        {
+            auto& P = R.NodeTransforms.AddDefaulted_GetRef();
+            P.NodeIndex = N.node_index; P.ParentIndex = N.parent_index; P.MeshIndex = N.mesh_index;
+            P.SkinIndex = N.skin_index; P.Name = ToUnreal(N.name); P.LocalTransform = ToUnreal(N.local_transform);
+        }
+        const auto DuplicateName = [&Error]()
+        {
+            Error = TEXT("V3D metadata has names that collide under Unreal's FName comparison");
             return false;
+        };
+        for (const auto& Pair : V.instances)
+        {
+            const FName Name(*ToUnreal(Pair.first));
+            if (R.SceneData.NodeMap.Contains(Name)) return DuplicateName();
+            const auto& N = Pair.second;
+            FModelNodeData P;
+            P.MeshName = FName(*ToUnreal(N.mesh_name)); P.Transform = ToUnreal(N.world_transform);
+            P.CoarseChunk = FIntVector(N.coarse_chunk[0], N.coarse_chunk[1], N.coarse_chunk[2]);
+            P.FineChunk = FIntVector(N.fine_chunk[0], N.fine_chunk[1], N.fine_chunk[2]);
+            P.bAlwaysLoaded = N.always_loaded; R.SceneData.NodeMap.Add(Name, MoveTemp(P));
         }
-        // bSuccess is transport state, not serialized authoring data. Set it only after the full
-        // bounded member has passed structural validation so downstream wrapper users see the same
-        // contract as the original build-time scan callback.
-        OutMetadata.SceneData.bSuccess = true;
+        for (const auto& Pair : V.waters)
+        {
+            const FName Name(*ToUnreal(Pair.first));
+            if (R.SceneData.WaterNodeMap.Contains(Name)) return DuplicateName();
+            FWaterStreamNodeData P;
+            P.Transform = ToUnreal(Pair.second.world_transform); P.StreamRadius = Pair.second.stream_radius;
+            R.SceneData.WaterNodeMap.Add(Name, MoveTemp(P));
+        }
+        for (const auto& Pair : V.meshes)
+        {
+            const FName Name(*ToUnreal(Pair.first));
+            if (R.SceneData.MeshMap.Contains(Name)) return DuplicateName();
+            const auto& M = Pair.second;
+            FModelMeshData P;
+            P.LOD0 = M.lods[0]; P.LOD1 = M.lods[1]; P.LOD2 = M.lods[2]; P.LOD3 = M.lods[3];
+            P.Extent = ToUnreal(M.extent); P.Size = ToUnreal(M.size); P.Data = ToUnreal(M.settings);
+            R.SceneData.MeshMap.Add(Name, MoveTemp(P));
+        }
+        for (const auto& Pair : V.settings)
+        {
+            const FName Name(*ToUnreal(Pair.first));
+            if (R.SceneData.ModelData.MeshData.Contains(Name)) return DuplicateName();
+            R.SceneData.ModelData.MeshData.Add(Name, ToUnreal(Pair.second));
+        }
+        if (!R.IsSane(&Error)) return false;
+        R.SceneData.bSuccess = true;
+        Out = MoveTemp(R);
         return true;
     }
 
-    constexpr uint32 DefinitionMagic = 0x31464447u; // "GDF1"
-    constexpr uint32 MetadataMagic = 0x31444D47u; // "GMD1"
-    constexpr uint32 ConfigMagic = 0x31434647u; // "GFC1"
-
-    void WriteRange(FWriter& Writer, const FGWorldArchiveRange& Range)
+    bool CopyPortableBytes(const v3d::bytes& Bytes, TArray<uint8>& Out, FString& Error)
     {
-        Writer.String(Range.Name, MaxNameBytes);
-        Writer.U64(Range.Offset);
-        Writer.U64(Range.StoredSize);
-        Writer.U64(Range.UncompressedSize);
-        Writer.U32(Range.Crc);
-        Writer.U8(Range.Codec);
-        Writer.U8(0);
-        Writer.U16(0);
-    }
-
-    FGWorldArchiveRange ReadRange(FReader& Reader)
-    {
-        FGWorldArchiveRange Range;
-        Range.Name = Reader.String(MaxNameBytes);
-        Range.Offset = Reader.U64();
-        Range.StoredSize = Reader.U64();
-        Range.UncompressedSize = Reader.U64();
-        Range.Crc = Reader.U32();
-        Range.Codec = Reader.U8();
-        (void)Reader.U8();
-        (void)Reader.U16();
-        return Range;
-    }
-
-    void WriteSummary(FWriter& Writer, const FGWorldModelSummary& Summary)
-    {
-        Writer.I32(Summary.SourceNodeCount);
-        Writer.I32(Summary.SourceMeshCount);
-        Writer.I32(Summary.SourceMaterialCount);
-        Writer.I32(Summary.SourceTextureCount);
-        Writer.Vector(Summary.Center);
-        Writer.Vector(Summary.Size);
-    }
-
-    FGWorldModelSummary ReadSummary(FReader& Reader)
-    {
-        FGWorldModelSummary Summary;
-        Summary.SourceNodeCount = Reader.I32();
-        Summary.SourceMeshCount = Reader.I32();
-        Summary.SourceMaterialCount = Reader.I32();
-        Summary.SourceTextureCount = Reader.I32();
-        Summary.Center = Reader.Vector();
-        Summary.Size = Reader.Vector();
-        return Summary;
-    }
-
-    bool SerializeDefinitionData(
-        const FModelDefinition& Definition,
-        const FString& DefinitionJson,
-        TArray<uint8>& OutBytes,
-        FString& OutError)
-    {
-        FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
-        Writer.U32(DefinitionMagic);
-        TArray<FString> BoneNames;
-        Definition.Bones.GetKeys(BoneNames);
-        BoneNames.Sort();
-        Writer.U32(static_cast<uint32>(BoneNames.Num()));
-        for (const FString& BoneName : BoneNames)
+        if (Bytes.empty() || Bytes.size() > static_cast<size_t>(FGWorldArchive::MaxDirectoryBytes))
         {
-            Writer.String(BoneName, MaxNameBytes);
-            Writer.String(Definition.Bones.FindChecked(BoneName), MaxNameBytes);
-        }
-        Writer.String(DefinitionJson);
-        if (!Writer.IsOk() || OutBytes.IsEmpty()
-            || static_cast<int64>(OutBytes.Num()) > FGWorldArchive::MaxDirectoryBytes)
-        {
-            OutError = TEXT("A model definition member exceeded a bounded field or size limit");
+            Error = TEXT("V3D directory member exceeds the simulator allocation limit");
             return false;
         }
+        Out.Reset(static_cast<int32>(Bytes.size()));
+        Out.Append(Bytes.data(), static_cast<int32>(Bytes.size()));
+        Error.Reset();
         return true;
     }
 
-    bool DeserializeDefinitionData(
-        const TArray<uint8>& Bytes,
-        TMap<FString, FString>& OutBones,
-        FString& OutDefinitionJson,
-        FString& OutError)
+    template <typename T>
+    bool EncodePortable(const T& Value, TArray<uint8>& Out, FString& Error)
     {
-        FReader Reader(Bytes);
-        if (Reader.U32() != DefinitionMagic)
-        {
-            OutError = TEXT("The .v3d model definition member has an invalid header");
-            return false;
-        }
-        const uint32 BoneCount = Reader.Count(MaxBonesPerModel, 8);
-        if (!Reader.IsOk())
-        {
-            OutError = TEXT("The .v3d model definition bone count is invalid");
-            return false;
-        }
+        v3d::bytes Bytes; std::string Failure;
+        if (!v3d::encode(Value, Bytes, Failure)) { Error = ToUnreal(Failure); return false; }
+        return CopyPortableBytes(Bytes, Out, Error);
+    }
+
+    bool SerializeDefinitionData(const FModelDefinition& Definition, const FString& DefinitionJson,
+        TArray<uint8>& OutBytes, FString& OutError)
+    {
+        v3d::model_definition Value;
+        Value.json = ToPortable(DefinitionJson);
+        for (const auto& Pair : Definition.Bones)
+            Value.bones.emplace(ToPortable(Pair.Key), ToPortable(Pair.Value));
+        return EncodePortable(Value, OutBytes, OutError);
+    }
+
+    bool DeserializeDefinitionData(const TArray<uint8>& Bytes, TMap<FString, FString>& OutBones,
+        FString& OutDefinitionJson, FString& OutError)
+    {
+        v3d::model_definition Value; std::string Error;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Error)) { OutError = ToUnreal(Error); return false; }
         TMap<FString, FString> Bones;
-        for (uint32 Index = 0; Index < BoneCount; ++Index)
-        {
-            FString BoneName = Reader.String(MaxNameBytes);
-            FString BoneTarget = Reader.String(MaxNameBytes);
-            if (!Reader.IsOk() || BoneName.IsEmpty() || BoneTarget.IsEmpty()
-                || Bones.Contains(BoneName))
-            {
-                OutError = FString::Printf(
-                    TEXT("Invalid or duplicate bone alias at .v3d definition row %u"), Index);
-                return false;
-            }
-            Bones.Add(MoveTemp(BoneName), MoveTemp(BoneTarget));
-        }
-        FString Json = Reader.String();
-        if (!Reader.IsAtEnd() || Json.IsEmpty())
-        {
-            OutError = TEXT("The .v3d model definition is truncated, empty, or has trailing bytes");
-            return false;
-        }
-        OutBones = MoveTemp(Bones);
-        OutDefinitionJson = MoveTemp(Json);
+        for (const auto& Pair : Value.bones) Bones.Add(ToUnreal(Pair.first), ToUnreal(Pair.second));
+        OutBones = MoveTemp(Bones); OutDefinitionJson = ToUnreal(Value.json); OutError.Reset();
         return true;
     }
 
-    bool SerializeMetadataData(
-        const FGWorldModelMetadata& Metadata,
-        const FGWorldModelSummary& Summary,
-        TArray<uint8>& OutBytes,
-        FString& OutError)
+    bool SerializeMetadataData(const FGWorldModelMetadata& Metadata, const FGWorldModelSummary& Summary,
+        TArray<uint8>& OutBytes, FString& OutError)
     {
-        FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
-        Writer.U32(MetadataMagic);
-        WriteMetadata(Writer, Metadata, Summary);
-        if (!Writer.IsOk() || OutBytes.IsEmpty()
-            || static_cast<int64>(OutBytes.Num()) > FGWorldArchive::MaxDirectoryBytes)
-        {
-            OutError = TEXT("A model metadata member exceeded a bounded field or size limit");
-            return false;
-        }
-        return true;
+        return EncodePortable(ToPortable(Metadata, Summary), OutBytes, OutError);
     }
 
-    bool DeserializeMetadataData(
-        const TArray<uint8>& Bytes,
-        FGWorldModelMetadata& OutMetadata,
-        FString& OutError)
+    bool DeserializeMetadataData(const TArray<uint8>& Bytes, FGWorldModelMetadata& OutMetadata, FString& OutError)
     {
-        FReader Reader(Bytes);
-        if (Reader.U32() != MetadataMagic
-            || !ReadMetadata(Reader, OutMetadata) || !Reader.IsAtEnd())
-        {
-            OutError = TEXT("The .v3d model metadata member is invalid or truncated");
-            return false;
-        }
-        return true;
+        v3d::model_metadata Value; std::string Error;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Error)) { OutError = ToUnreal(Error); return false; }
+        return ToUnreal(Value, OutMetadata, OutError);
     }
 
     bool SerializeWorldConfig(const FString& Json, TArray<uint8>& OutBytes, FString& OutError)
     {
-        if (Json.TrimStartAndEnd().IsEmpty())
-        {
-            OutError = TEXT("config.json is empty");
-            return false;
-        }
-        FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
-        Writer.U32(ConfigMagic);
-        Writer.String(Json);
-        if (!Writer.IsOk() || OutBytes.IsEmpty())
-        {
-            OutError = TEXT("config.json exceeded its bounded archive member limit");
-            return false;
-        }
-        return true;
+        if (Json.TrimStartAndEnd().IsEmpty()) { OutError = TEXT("config.json is empty"); return false; }
+        v3d::bytes Bytes; std::string Error;
+        if (!v3d::encode_json(ToPortable(Json), Bytes, Error)) { OutError = ToUnreal(Error); return false; }
+        return CopyPortableBytes(Bytes, OutBytes, OutError);
     }
 
     bool DeserializeWorldConfig(const TArray<uint8>& Bytes, FString& OutJson, FString& OutError)
     {
-        FReader Reader(Bytes);
-        if (Reader.U32() != ConfigMagic)
-        {
-            OutError = TEXT("The .v3d config.json member has an invalid header");
-            return false;
-        }
-        OutJson = Reader.String();
-        if (!Reader.IsAtEnd() || OutJson.TrimStartAndEnd().IsEmpty())
-        {
-            OutJson.Reset();
-            OutError = TEXT("The .v3d config.json member is invalid or truncated");
-            return false;
-        }
-        return true;
+        std::string Json, Error;
+        if (!v3d::decode_json(Bytes.GetData(), Bytes.Num(), Json, Error)) { OutError = ToUnreal(Error); return false; }
+        OutJson = ToUnreal(Json);
+        if (OutJson.TrimStartAndEnd().IsEmpty()) { OutError = TEXT("V3D JSON member is empty"); return false; }
+        OutError.Reset(); return true;
     }
 
-    void WriteDirectoryRecord(FWriter& Writer, const FGWorldModelRecord& Record)
+    v3d::model_record ToPortable(const FGWorldModelRecord& V)
     {
-        const FModelDefinition& Definition = Record.Definition;
-        Writer.Guid(Definition.UUID);
-        Writer.U8(static_cast<uint8>(Definition.AssetType));
-        Writer.U8(static_cast<uint8>(Definition.ModelType));
-        Writer.U8(static_cast<uint8>(Definition.EntityType));
-        Writer.U8(static_cast<uint8>(Definition.ItemType));
-        Writer.String(Definition.Name, MaxNameBytes);
-        Writer.String(Definition.DisplayName, MaxNameBytes);
-        const FGravityFieldSettings& G = Definition.GravityField;
-        Writer.U8(G.bEnabled ? 1 : 0);
-        Writer.U8(static_cast<uint8>(G.Falloff));
-        Writer.I32(G.Priority);
-        Writer.Double(G.RadiusCm);
-        Writer.Double(G.StrengthCmPerSecondSquared);
-        Writer.Vector(G.LocalCenter);
-        WriteSummary(Writer, Record.Summary);
-        WriteRange(Writer, Record.DefinitionRange);
-        WriteRange(Writer, Record.MetadataRange);
-        WriteRange(Writer, Record.ManifestRange);
+        v3d::model_record R;
+        const auto& D = V.Definition;
+        R.uuid = ToPortable(D.UUID); R.asset_type = static_cast<uint8>(D.AssetType);
+        R.model_type = static_cast<uint8>(D.ModelType); R.entity_type = static_cast<uint8>(D.EntityType);
+        R.item_type = static_cast<uint8>(D.ItemType); R.name = ToPortable(D.Name); R.display_name = ToPortable(D.DisplayName);
+        R.gravity.enabled = D.GravityField.bEnabled; R.gravity.falloff = static_cast<uint8>(D.GravityField.Falloff);
+        R.gravity.priority = D.GravityField.Priority; R.gravity.radius_cm = D.GravityField.RadiusCm;
+        R.gravity.strength_cm_per_second_squared = D.GravityField.StrengthCmPerSecondSquared;
+        R.gravity.local_center = ToPortable(D.GravityField.LocalCenter);
+        R.summary = ToPortable(V.Summary); R.definition_range = ToPortable(V.DefinitionRange);
+        R.metadata_range = ToPortable(V.MetadataRange); R.manifest_range = ToPortable(V.ManifestRange);
+        return R;
     }
 
-    bool IsValidMemberRange(
-        const FGWorldArchiveRange& Range,
-        uint64 DirectoryOffset,
-        uint64 MaximumSize)
+    bool ToUnreal(const v3d::model_record& V, FGWorldModelRecord& R)
     {
-        const bool bValidName = Range.Name.EndsWith(TEXT(".dat"), ESearchCase::CaseSensitive)
-            || Range.Name.EndsWith(TEXT(".wav"), ESearchCase::CaseSensitive)
-            || Range.Name.EndsWith(TEXT(".json"), ESearchCase::CaseSensitive);
-        return !Range.Name.IsEmpty()
-            && bValidName
-            && Range.Offset >= static_cast<uint64>(HeaderBytes)
-            && Range.Offset % static_cast<uint64>(PayloadAlignment) == 0
-            && Range.StoredSize > 0 && Range.StoredSize <= MaximumSize
-            && Range.UncompressedSize > 0 && Range.UncompressedSize <= MaximumSize
-            && Range.Codec <= 1
-            && ((Range.Codec == 0 && Range.StoredSize == Range.UncompressedSize)
-                || (Range.Codec == 1 && Range.StoredSize < Range.UncompressedSize))
-            && Range.Offset <= DirectoryOffset
-            && Range.StoredSize <= DirectoryOffset - Range.Offset;
+        auto& D = R.Definition;
+        D.UUID = ToUnreal(V.uuid); D.AssetType = static_cast<EAssetDefinitionType>(V.asset_type);
+        D.ModelType = static_cast<EModelDefinitionType>(V.model_type);
+        D.EntityType = static_cast<EModelEntityType>(V.entity_type); D.ItemType = static_cast<EModelItemType>(V.item_type);
+        D.Name = ToUnreal(V.name); D.DisplayName = ToUnreal(V.display_name);
+        D.GravityField.bEnabled = V.gravity.enabled; D.GravityField.Falloff = static_cast<EGravityFieldFalloff>(V.gravity.falloff);
+        D.GravityField.Priority = V.gravity.priority; D.GravityField.RadiusCm = V.gravity.radius_cm;
+        D.GravityField.StrengthCmPerSecondSquared = V.gravity.strength_cm_per_second_squared;
+        D.GravityField.LocalCenter = ToUnreal(V.gravity.local_center);
+        R.Summary = ToUnreal(V.summary); R.DefinitionRange = ToUnreal(V.definition_range);
+        R.MetadataRange = ToUnreal(V.metadata_range); R.ManifestRange = ToUnreal(V.manifest_range);
+        D.GlbPath = FGWorldArchive::MakeModelReference(D.UUID); D.JsonPath = D.GlbPath + TEXT("#definition");
+        return D.UUID.IsValid() && D.GravityField.IsValid() && R.Summary.IsSane();
     }
 
-    bool ReadDirectoryRecord(
-        FReader& Reader,
-        int64 FileSize,
-        uint64 DirectoryOffset,
-        FGWorldModelRecord& OutRecord)
+    v3d::sound_record ToPortable(const FGWorldSoundRecord& V)
     {
-        OutRecord = FGWorldModelRecord();
-        FModelDefinition& Definition = OutRecord.Definition;
-        Definition.UUID = Reader.Guid();
-        const uint8 AssetType = Reader.U8();
-        const uint8 ModelType = Reader.U8();
-        const uint8 EntityType = Reader.U8();
-        const uint8 ItemType = Reader.U8();
-        Definition.Name = Reader.String(MaxNameBytes);
-        Definition.DisplayName = Reader.String(MaxNameBytes);
-        const uint8 GravityEnabled = Reader.U8();
-        Definition.GravityField.bEnabled = GravityEnabled != 0;
-        Definition.GravityField.Falloff = static_cast<EGravityFieldFalloff>(Reader.U8());
-        Definition.GravityField.Priority = Reader.I32();
-        Definition.GravityField.RadiusCm = Reader.Double();
-        Definition.GravityField.StrengthCmPerSecondSquared = Reader.Double();
-        Definition.GravityField.LocalCenter = Reader.Vector();
-        if (GravityEnabled > 1 || !Definition.GravityField.IsValid()) return false;
-        OutRecord.Summary = ReadSummary(Reader);
-        OutRecord.DefinitionRange = ReadRange(Reader);
-        OutRecord.MetadataRange = ReadRange(Reader);
-        OutRecord.ManifestRange = ReadRange(Reader);
-
-        // Do not trust a directory merely because each enum byte is individually in range. The
-        // subtype relationship is part of the model identity: accepting (for example) an Item
-        // with a Vehicle subtype would make different runtime call sites interpret the same row
-        // differently. Keep this check in the root-directory reader so corrupt rows are rejected
-        // before any definition, metadata, or decoded .dat member is allocated.
-        const bool bHasEntitySubtype = EntityType != static_cast<uint8>(EModelEntityType::None);
-        const bool bHasItemSubtype = ItemType != static_cast<uint8>(EModelItemType::None);
-        const bool bSubtypeCombinationIsValid =
-            (ModelType == static_cast<uint8>(EModelDefinitionType::Dynamic)
-                && !(bHasEntitySubtype && bHasItemSubtype))
-            || ((ModelType == static_cast<uint8>(EModelDefinitionType::Static)
-                    || ModelType == static_cast<uint8>(EModelDefinitionType::Character))
-                && !bHasEntitySubtype && !bHasItemSubtype);
-
-        const FString ExpectedPrefix = FString::Printf(TEXT("models/%s/"),
-            *Definition.UUID.ToString(EGuidFormats::Digits));
-        const bool bRootNamesAreValid =
-            OutRecord.DefinitionRange.Name.Equals(
-                ExpectedPrefix + TEXT("definition.dat"), ESearchCase::CaseSensitive)
-            && OutRecord.MetadataRange.Name.Equals(
-                ExpectedPrefix + TEXT("metadata.dat"), ESearchCase::CaseSensitive)
-            && OutRecord.ManifestRange.Name.Equals(
-                ExpectedPrefix + TEXT("manifest.dat"), ESearchCase::CaseSensitive);
-
-        if (!Definition.UUID.IsValid() || Definition.Name.IsEmpty() || Definition.DisplayName.IsEmpty()
-            || AssetType != static_cast<uint8>(EAssetDefinitionType::Model)
-            || ModelType > static_cast<uint8>(EModelDefinitionType::Character)
-            || EntityType > static_cast<uint8>(EModelEntityType::Animal)
-            || ItemType > static_cast<uint8>(EModelItemType::Misc)
-            || !bSubtypeCombinationIsValid
-            || !bRootNamesAreValid
-            || !OutRecord.Summary.IsSane()
-            || !IsValidMemberRange(OutRecord.DefinitionRange, DirectoryOffset,
-                static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes))
-            || !IsValidMemberRange(OutRecord.MetadataRange, DirectoryOffset,
-                static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes))
-            || !IsValidMemberRange(OutRecord.ManifestRange, DirectoryOffset,
-                static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes)))
-        {
-            return false;
-        }
-
-        Definition.AssetType = EAssetDefinitionType::Model;
-        Definition.ModelType = static_cast<EModelDefinitionType>(ModelType);
-        Definition.EntityType = static_cast<EModelEntityType>(EntityType);
-        Definition.ItemType = static_cast<EModelItemType>(ItemType);
-        Definition.GlbPath = FGWorldArchive::MakeModelReference(Definition.UUID);
-        Definition.JsonPath = Definition.GlbPath + TEXT("#definition");
-        return Reader.IsOk();
+        v3d::sound_record R;
+        R.uuid = ToPortable(V.Definition.UUID); R.name = ToPortable(V.Definition.Name);
+        R.display_name = ToPortable(V.Definition.DisplayName); R.definition_range = ToPortable(V.DefinitionRange);
+        R.wave_range = ToPortable(V.WaveRange);
+        return R;
     }
 
-    void WriteSoundDirectoryRecord(FWriter& Writer, const FGWorldSoundRecord& Record)
+    FGWorldSoundRecord ToUnreal(const v3d::sound_record& V)
     {
-        Writer.Guid(Record.Definition.UUID);
-        Writer.U8(static_cast<uint8>(EAssetDefinitionType::Sound));
-        Writer.U8(0);
-        Writer.U8(0);
-        Writer.U8(0);
-        Writer.String(Record.Definition.Name, MaxNameBytes);
-        Writer.String(Record.Definition.DisplayName, MaxNameBytes);
-        WriteRange(Writer, Record.DefinitionRange);
-        WriteRange(Writer, Record.WaveRange);
+        FGWorldSoundRecord R;
+        R.Definition.AssetType = EAssetDefinitionType::Sound; R.Definition.UUID = ToUnreal(V.uuid);
+        R.Definition.Name = ToUnreal(V.name); R.Definition.DisplayName = ToUnreal(V.display_name);
+        R.Definition.WavPath = FGWorldArchive::MakeSoundReference(R.Definition.UUID);
+        R.Definition.JsonPath = R.Definition.WavPath + TEXT("#definition");
+        R.DefinitionRange = ToUnreal(V.definition_range); R.WaveRange = ToUnreal(V.wave_range);
+        return R;
     }
 
-    bool ReadSoundDirectoryRecord(
-        FReader& Reader,
-        uint64 DirectoryOffset,
-        FGWorldSoundRecord& OutRecord)
+    bool IsValidMemberRange(const FGWorldArchiveRange& Range, uint64 DirectoryOffset, uint64 MaximumSize)
     {
-        OutRecord = FGWorldSoundRecord();
-        const FGuid UUID = Reader.Guid();
-        const uint8 AssetType = Reader.U8();
-        (void)Reader.U8();
-        (void)Reader.U8();
-        (void)Reader.U8();
-        FString Name = Reader.String(MaxNameBytes);
-        FString DisplayName = Reader.String(MaxNameBytes);
-        FGWorldArchiveRange DefinitionRange = ReadRange(Reader);
-        FGWorldArchiveRange WaveRange = ReadRange(Reader);
-        const FString Prefix = FString::Printf(TEXT("sounds/%s/"), *UUID.ToString(EGuidFormats::Digits));
-        if (!Reader.IsOk() || !UUID.IsValid()
-            || AssetType != static_cast<uint8>(EAssetDefinitionType::Sound)
-            || Name.IsEmpty() || DisplayName.IsEmpty()
-            || !DefinitionRange.Name.Equals(Prefix + TEXT("definition.json"), ESearchCase::CaseSensitive)
-            || !WaveRange.Name.Equals(Prefix + TEXT("audio.wav"), ESearchCase::CaseSensitive)
-            || !IsValidMemberRange(DefinitionRange, DirectoryOffset, static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes))
-            || !IsValidMemberRange(WaveRange, DirectoryOffset, static_cast<uint64>(FGWorldArchive::MaxSoundBytes)))
-        {
-            return false;
-        }
-        OutRecord.Definition.AssetType = EAssetDefinitionType::Sound;
-        OutRecord.Definition.UUID = UUID;
-        OutRecord.Definition.Name = MoveTemp(Name);
-        OutRecord.Definition.DisplayName = MoveTemp(DisplayName);
-        OutRecord.Definition.WavPath = FGWorldArchive::MakeSoundReference(UUID);
-        OutRecord.Definition.JsonPath = OutRecord.Definition.WavPath + TEXT("#definition");
-        OutRecord.DefinitionRange = MoveTemp(DefinitionRange);
-        OutRecord.WaveRange = MoveTemp(WaveRange);
-        return true;
+        return v3d::archive_detail::valid_range(ToPortable(Range), DirectoryOffset, MaximumSize);
     }
 
-    bool SerializeDirectory(
-        const FGWorldArchiveRange& ConfigRange,
-        const TArray<FGWorldArchiveRange>& ScriptRanges,
-        const TArray<FGWorldModelRecord>& Records,
-        const TArray<FGWorldSoundRecord>& SoundRecords,
-        TArray<uint8>& OutBytes,
-        FString& OutError)
+    bool SerializeDirectory(const FGWorldArchiveRange& ConfigRange, const TArray<FGWorldArchiveRange>& ScriptRanges,
+        const TArray<FGWorldModelRecord>& Records, const TArray<FGWorldSoundRecord>& SoundRecords,
+        TArray<uint8>& OutBytes, FString& OutError)
     {
-        FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
-        WriteRange(Writer, ConfigRange);
-        for (const FGWorldArchiveRange& Range : ScriptRanges) WriteRange(Writer, Range);
-        Writer.U32(static_cast<uint32>(Records.Num()));
-        for (const FGWorldModelRecord& Record : Records) WriteDirectoryRecord(Writer, Record);
-        Writer.U32(static_cast<uint32>(SoundRecords.Num()));
-        for (const FGWorldSoundRecord& Record : SoundRecords) WriteSoundDirectoryRecord(Writer, Record);
-        if (!Writer.IsOk() || OutBytes.Num() < 4
-            || static_cast<int64>(OutBytes.Num()) > FGWorldArchive::MaxDirectoryBytes)
-        {
-            OutError = TEXT("The .v3d directory exceeded a bounded field or size limit");
-            return false;
-        }
-        return true;
+        v3d::archive_directory D;
+        D.config_range = ToPortable(ConfigRange);
+        for (const auto& Range : ScriptRanges) D.script_ranges.push_back(ToPortable(Range));
+        for (const auto& Record : Records) D.models.push_back(ToPortable(Record));
+        for (const auto& Record : SoundRecords) D.sounds.push_back(ToPortable(Record));
+        v3d::bytes Bytes; std::string Error;
+        if (!v3d::encode_directory(D, v3d::archive_revision, Bytes, Error)) { OutError = ToUnreal(Error); return false; }
+        return CopyPortableBytes(Bytes, OutBytes, OutError);
     }
 
-    bool DeserializeDirectory(
-        const TArray<uint8>& Bytes,
-        int64 FileSize,
-        uint64 DirectoryOffset,
-        uint32 ExpectedModels,
-        uint32 ExpectedSounds,
-        uint64 Revision,
-        FGWorldArchiveRange& OutConfigRange,
-        TArray<FGWorldArchiveRange>& OutScriptRanges,
-        TMap<FGuid, FGWorldModelRecord>& OutRecords,
-        TMap<FGuid, FGWorldSoundRecord>& OutSoundRecords,
-        FString& OutError)
+    bool DeserializeDirectory(const TArray<uint8>& Bytes, uint64 DirectoryOffset,
+        uint32 ExpectedModels, uint32 ExpectedSounds, uint64 Revision, uint32 DirectoryCrc, FGWorldArchiveRange& OutConfigRange,
+        TArray<FGWorldArchiveRange>& OutScriptRanges, TMap<FGuid, FGWorldModelRecord>& OutRecords,
+        TMap<FGuid, FGWorldSoundRecord>& OutSoundRecords, FString& OutError)
     {
-        FReader Reader(Bytes);
-        OutConfigRange = ReadRange(Reader);
-        if (!IsValidMemberRange(OutConfigRange, DirectoryOffset, static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes))
-            || !OutConfigRange.Name.Equals(TEXT("config.json"), ESearchCase::CaseSensitive))
+        v3d::archive_header H;
+        H.directory_offset = DirectoryOffset; H.directory_size = Bytes.Num(); H.revision = Revision;
+        H.model_count = ExpectedModels; H.sound_count = ExpectedSounds; H.directory_crc = DirectoryCrc;
+        v3d::archive_directory D; std::string Error;
+        if (!v3d::decode_directory(Bytes.GetData(), Bytes.Num(), H, D, Error)) { OutError = ToUnreal(Error); return false; }
+        OutConfigRange = ToUnreal(D.config_range); OutScriptRanges.Reset(); OutRecords.Reset(); OutSoundRecords.Reset();
+        for (const auto& Range : D.script_ranges) OutScriptRanges.Add(ToUnreal(Range));
+        for (const auto& Record : D.models)
         {
-            OutError = TEXT("The .v3d config.json directory range is invalid");
-            return false;
+            FGWorldModelRecord R;
+            if (!ToUnreal(Record, R) || OutRecords.Contains(R.Definition.UUID))
+            { OutError = TEXT("V3D directory model cannot be represented by the Unreal adapter"); return false; }
+            const FGuid Id = R.Definition.UUID;
+            OutRecords.Add(Id, MoveTemp(R));
         }
-        OutScriptRanges.Reset();
-        if (Revision >= FormatRevision)
+        for (const auto& Record : D.sounds)
         {
-            for (int32 Index = 0; Index < 3; ++Index)
-            {
-                FGWorldArchiveRange Range = ReadRange(Reader);
-                if (!Reader.IsOk() || !IsValidMemberRange(Range, DirectoryOffset, FV3DProjectScripts::MaxScriptBytes + 8)
-                    || Range.Name != FV3DProjectScripts::MemberName(Index))
-                { OutError = TEXT("Invalid .v3d script member range/name"); return false; }
-                OutScriptRanges.Add(MoveTemp(Range));
-            }
+            FGWorldSoundRecord R = ToUnreal(Record);
+            if (OutRecords.Contains(R.Definition.UUID) || OutSoundRecords.Contains(R.Definition.UUID))
+            { OutError = TEXT("V3D directory contains a duplicate asset UUID"); return false; }
+            const FGuid Id = R.Definition.UUID;
+            OutSoundRecords.Add(Id, MoveTemp(R));
         }
-        // Even an empty-string record has a substantial fixed payload. Validate physical space first.
-        const uint32 Count = Reader.Count(FGWorldArchive::MaxModels, 196);
-        if (!Reader.IsOk() || Count != ExpectedModels)
-        {
-            OutError = TEXT("The .v3d model count is invalid or disagrees with its header");
-            return false;
-        }
-
-        TArray<TPair<uint64, uint64>> Ranges;
-        Ranges.Reserve(static_cast<int32>(Count) * 3 + static_cast<int32>(ExpectedSounds) * 2 + 1 + OutScriptRanges.Num());
-        Ranges.Emplace(OutConfigRange.Offset, OutConfigRange.StoredSize);
-        for (const auto& Range : OutScriptRanges) Ranges.Emplace(Range.Offset, Range.StoredSize);
-        for (uint32 Index = 0; Index < Count; ++Index)
-        {
-            FGWorldModelRecord Record;
-            if (!ReadDirectoryRecord(Reader, FileSize, DirectoryOffset, Record)
-                || OutRecords.Contains(Record.Definition.UUID))
-            {
-                OutError = FString::Printf(TEXT("Invalid or duplicate .v3d model row at index %u"), Index);
-                return false;
-            }
-            Ranges.Emplace(Record.DefinitionRange.Offset, Record.DefinitionRange.StoredSize);
-            Ranges.Emplace(Record.MetadataRange.Offset, Record.MetadataRange.StoredSize);
-            Ranges.Emplace(Record.ManifestRange.Offset, Record.ManifestRange.StoredSize);
-            OutRecords.Add(Record.Definition.UUID, MoveTemp(Record));
-        }
-
-        const uint32 SoundCount = Reader.Count(FGWorldArchive::MaxSounds, 96);
-        if (!Reader.IsOk() || SoundCount != ExpectedSounds)
-        {
-            OutError = TEXT("The .v3d sound count is invalid or disagrees with its header");
-            return false;
-        }
-        for (uint32 Index = 0; Index < SoundCount; ++Index)
-        {
-            FGWorldSoundRecord Record;
-            if (!ReadSoundDirectoryRecord(Reader, DirectoryOffset, Record)
-                || OutSoundRecords.Contains(Record.Definition.UUID)
-                || OutRecords.Contains(Record.Definition.UUID))
-            {
-                OutError = FString::Printf(TEXT("Invalid or duplicate .v3d sound row at index %u"), Index);
-                return false;
-            }
-            Ranges.Emplace(Record.DefinitionRange.Offset, Record.DefinitionRange.StoredSize);
-            Ranges.Emplace(Record.WaveRange.Offset, Record.WaveRange.StoredSize);
-            OutSoundRecords.Add(Record.Definition.UUID, MoveTemp(Record));
-        }
-        if (!Reader.IsAtEnd())
-        {
-            OutError = TEXT("The .v3d directory is truncated or contains trailing bytes");
-            return false;
-        }
-
-        Ranges.Sort([](const TPair<uint64, uint64>& A, const TPair<uint64, uint64>& B)
-        {
-            return A.Key < B.Key;
-        });
-        for (int32 Index = 1; Index < Ranges.Num(); ++Index)
-        {
-            if (Ranges[Index - 1].Key + Ranges[Index - 1].Value > Ranges[Index].Key)
-            {
-                OutError = TEXT("The .v3d definition, metadata, or manifest ranges overlap");
-                return false;
-            }
-        }
-        return true;
+        OutError.Reset(); return true;
     }
 
     bool ReadExact(IFileHandle& Handle, uint8* Destination, int64 Count)
@@ -1446,17 +869,14 @@ namespace GWorldArchivePrivate
         uint32 SoundCount,
         const FGuid& BuildId)
     {
+        v3d::archive_header H;
+        H.directory_offset = DirectoryOffset; H.directory_size = DirectorySize;
+        H.directory_crc = DirectoryCrc; H.model_count = ModelCount; H.sound_count = SoundCount;
+        H.build_id = ToPortable(BuildId);
+        v3d::bytes Encoded; std::string Error;
         TArray<uint8> Bytes;
-        FWriter Writer(Bytes, HeaderBytes);
-        Writer.U64(Magic);
-        Writer.U32(HeaderBytes);
-        Writer.U32(SoundCount);
-        Writer.U64(DirectoryOffset);
-        Writer.U64(DirectorySize);
-        Writer.U32(DirectoryCrc);
-        Writer.U32(ModelCount);
-        Writer.Guid(BuildId);
-        Writer.U64(FormatRevision);
+        if (v3d::encode_header(H, Encoded, Error))
+            Bytes.Append(Encoded.data(), static_cast<int32>(Encoded.size()));
         return Bytes;
     }
 
@@ -2324,29 +1744,27 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
         OutError = TEXT("The .v3d header could not be read");
         return nullptr;
     }
-    FReader Header(HeaderBytesArray);
-    const uint64 ReadMagic = Header.U64();
-    const uint32 ReadHeaderBytes = Header.U32();
-    const uint32 SoundCount = Header.U32();
-    const uint64 DirectoryOffset = Header.U64();
-    const uint64 DirectorySize = Header.U64();
-    const uint32 DirectoryCrc = Header.U32();
-    const uint32 ModelCount = Header.U32();
-    const FGuid BuildId = Header.Guid();
-    const uint64 ReadFormatRevision = Header.U64();
-
-    if (!Header.IsAtEnd() || ReadMagic != Magic || ReadHeaderBytes != HeaderBytes
-        || (ReadFormatRevision != FormatRevision && ReadFormatRevision != LegacyFormatRevision) || !BuildId.IsValid()
-        || ModelCount > FGWorldArchive::MaxModels || SoundCount > FGWorldArchive::MaxSounds
+    v3d::archive_header Header;
+    std::string HeaderError;
+    if (!v3d::decode_header(HeaderBytesArray.GetData(), HeaderBytesArray.Num(),
+            static_cast<uint64>(TotalSize), Header, HeaderError))
+    {
+        OutError = ToUnreal(HeaderError);
+        return nullptr;
+    }
+    const uint32 SoundCount = Header.sound_count;
+    const uint64 DirectoryOffset = Header.directory_offset;
+    const uint64 DirectorySize = Header.directory_size;
+    const uint32 DirectoryCrc = Header.directory_crc;
+    const uint32 ModelCount = Header.model_count;
+    const FGuid BuildId = ToUnreal(Header.build_id);
+    const uint64 ReadFormatRevision = Header.revision;
+    if (ModelCount > FGWorldArchive::MaxModels || SoundCount > FGWorldArchive::MaxSounds
         || (ModelCount == 0 && SoundCount == 0)
-        || DirectorySize == 0 || DirectorySize > static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes)
-        || DirectoryOffset < static_cast<uint64>(HeaderBytes)
-        || DirectoryOffset > static_cast<uint64>(TotalSize)
-        || DirectorySize > static_cast<uint64>(TotalSize) - DirectoryOffset
-        || DirectoryOffset + DirectorySize != static_cast<uint64>(TotalSize)
+        || DirectorySize > static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes)
         || DirectorySize > static_cast<uint64>(MAX_int32))
     {
-        OutError = TEXT("The .v3d header or bounded offsets are invalid");
+        OutError = TEXT("The V3D archive exceeds the simulator's model/sound/directory limits");
         return nullptr;
     }
 
@@ -2358,15 +1776,9 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
         OutError = TEXT("The .v3d directory range could not be read");
         return nullptr;
     }
-    if (FCrc::MemCrc32(Directory.GetData(), Directory.Num()) != DirectoryCrc)
-    {
-        OutError = TEXT("The .v3d directory CRC check failed");
-        return nullptr;
-    }
-
     TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Result =
         MakeShared<FGWorldArchiveReader, ESPMode::ThreadSafe>();
-    if (!DeserializeDirectory(Directory, TotalSize, DirectoryOffset, ModelCount, SoundCount, ReadFormatRevision,
+    if (!DeserializeDirectory(Directory, DirectoryOffset, ModelCount, SoundCount, ReadFormatRevision, DirectoryCrc,
             Result->WorldConfigRange, Result->ScriptRanges, Result->Records, Result->SoundRecords, OutError))
     {
         return nullptr;

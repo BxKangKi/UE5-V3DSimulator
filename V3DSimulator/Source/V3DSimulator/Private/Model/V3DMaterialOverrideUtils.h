@@ -85,6 +85,14 @@ namespace V3DMaterialOverrideUtils
             MaterialsConfig.UnlitOverrideMap = MoveTemp(TypeOverrides);
         }
 
+        if (IsValid(References.Terrain.Get()))
+        {
+            MaterialsConfig.MaterialsOverrideByNameMap.Add(
+                TEXT("V3D.TerrainPalette"),
+                References.Terrain.Get());
+            MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
+        }
+
         ApplyNamedOverrides(References, MaterialsConfig);
     }
 
