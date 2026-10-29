@@ -10,7 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/ResponsiveHUDWidget.h"
 #include "System/GameManagerSubSystem.h"
 #include "CreatorHUDWidget.generated.h"
 
@@ -19,19 +19,58 @@ class UScrollBox;
 class UTextBlock;
 class UUniformGridPanel;
 class UGameUpdateSubSystem;
+class UButton;
+class UMenuButtonWidget;
+class USizeBox;
 
 /**
- * Creator HUD bridge class.
- *
- * Create the visual tree in a WBP child and pass widget references explicitly from the
- * WBP Construct event. This class does not use automatic widget-name binding or widget-tree lookup.
+ * Complete native creator HUD, with a scaled reference canvas and a bounded item browser.
+ * Blueprint children immediately preview the native layout; explicit setters remain available.
  */
 UCLASS(Blueprintable, BlueprintType)
-class V3DSIMULATOR_API UCreatorHUDWidget : public UUserWidget
+class V3DSIMULATOR_API UCreatorHUDWidget : public UResponsiveHUDWidget
 {
     GENERATED_BODY()
 
 public:
+    UCreatorHUDWidget();
+
+    /** Optional diagnostics; the gameplay view shows only the compact toolbar by default. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    bool bShowStatusDetails = false;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    FVector2D StatusPanelSize = FVector2D(460, 320);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    FVector2D ActionsPanelSize = FVector2D(264, 280);
+
+    /** Legacy serialized size. The native toolbar now sizes itself to its seven square slots. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    FVector2D ToolbarSize = FVector2D(432, 72);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    FVector2D StatusPanelOffset = FVector2D(24, 24);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    FVector2D ActionsPanelOffset = FVector2D(-24, 24);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
+    FVector2D ToolbarOffset = FVector2D(0, -16);
+
+    /** Width and height of each square slot in reference-canvas pixels. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout", meta=(ClampMin="32", ClampMax="96"))
+    float ToolbarSlotHeight = 54.f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout", meta=(ClampMin="1", ClampMax="8"))
+    int32 ItemColumns = 4;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout", meta=(ClampMin="8", ClampMax="128"))
+    int32 ItemsPerPage = 32;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Performance", meta=(ClampMin="0.05", ClampMax="1.0"))
+    float PlacementTextRefreshInterval = 0.1f;
+
     /** Explicitly assigns the toolbar grid owned by the WBP. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
     void SetToolbarGrid(UUniformGridPanel* InToolbarGrid);
@@ -60,11 +99,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Creator HUD")
     void RefreshManagerReference();
 
-    /** Refresh entry point for custom WBP toolbar widgets. No fallback buttons are generated here. */
+    /** Updates the native toolbar while preserving custom setter-based layouts. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD")
     void RefreshToolbar();
 
-    /** Refresh entry point for custom WBP item-list widgets. No fallback buttons are generated here. */
+    /** Updates the current browser page; hidden pages do not create widgets. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD")
     void RefreshItemList();
 
@@ -97,6 +136,10 @@ public:
     void ToggleSnapFromUI();
 
 protected:
+    virtual void BuildNativeLayout() override;
+    virtual void BindNativeWidgets() override;
+    virtual void ApplyNativeStyle() override;
+
     /** Binds manager events after the widget is constructed. */
     virtual void NativeConstruct() override;
 
@@ -104,6 +147,35 @@ protected:
     virtual void NativeDestruct() override;
 
 private:
+    UFUNCTION() void HandleNativeAction(const FString& Key);
+    UFUNCTION() void PreviousItemPage();
+    UFUNCTION() void NextItemPage();
+    void BuildToolbarButtons();
+    void ClearNativeInventory();
+    float GetToolbarSlotExtent() const;
+    void ApplyStatusVisibility();
+    void UpdatePlacementRegistration();
+
+    UPROPERTY(Transient) TObjectPtr<UUniformGridPanel> NativeToolbar;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeStatusPanel;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeToolbarPanel;
+    UPROPERTY(Transient) TObjectPtr<UUniformGridPanel> NativeItemGrid;
+    UPROPERTY(Transient) TObjectPtr<UScrollBox> NativeItemsScroll;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeItemsPanel;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeStatus;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativePlacement;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeMessage;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativePageText;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativePreviousPage;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeNextPage;
+    UPROPERTY(Transient) TArray<TObjectPtr<UMenuButtonWidget>> NativeToolbarButtons;
+    UPROPERTY(Transient) TArray<TObjectPtr<UMenuButtonWidget>> NativeInventoryButtons;
+    UPROPERTY(Transient) TArray<TObjectPtr<USizeBox>> NativeToolbarSizes;
+    TArray<FString> VisibleInventorySignature;
+    int32 CurrentItemPage = 0;
+    float PlacementRefreshElapsed = 0.f;
+    bool bHUDConstructed = false;
+
     int32 GameUpdateTickHandle = INDEX_NONE;
     void UpdateFromGameUpdate(float DeltaSeconds);
 

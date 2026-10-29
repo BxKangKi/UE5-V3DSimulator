@@ -37,7 +37,7 @@ void FShaderLibraryModule::StartupModule()
     // Content packages cannot be loaded during PostConfigInit. Upgrade the existing asset only
     // after the engine is initialized; packaged games use the resulting cooked collection.
     if (GEngine) EnsureShaderLibraryParameters();
-    else PostEngineInitHandle = FCoreDelegates::OnPostEngineInit.AddRaw(
+    else PostEngineInitHandle = FCoreDelegates::GetOnPostEngineInit().AddRaw(
         this, &FShaderLibraryModule::EnsureShaderLibraryParameters);
 #endif
     UE_LOG(LogShaderLibraryModule, Log, TEXT("Registered shader source mapping /Plugin/ShaderLibrary -> %s"), *ShaderDirectory);
@@ -46,7 +46,7 @@ void FShaderLibraryModule::StartupModule()
 void FShaderLibraryModule::ShutdownModule()
 {
 #if WITH_EDITOR
-    FCoreDelegates::OnPostEngineInit.Remove(PostEngineInitHandle);
+    FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitHandle);
 #endif
 }
 

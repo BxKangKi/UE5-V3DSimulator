@@ -1,849 +1,566 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-
-/**
- * @file WorldArchiveCodec.cpp
- * Role: Defines this source unit's responsibility within V3DSimulator.
- * Key responsibilities: Implements the behavior exposed by this source unit's public API.
- * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
- */
-
+// The wire format belongs to Format/v3d.hpp. This file only translates Unreal values.
 #include "System/WorldArchiveCodec.h"
+#include "System/V3DTerrain.h"
+#include "Format/v3d.hpp"
+#include "Async/ParallelFor.h"
+#include "HAL/PlatformMisc.h"
+#include "PixelFormat.h"
+#include "Engine/Texture.h"
+#include <type_traits>
 
 namespace WorldArchiveCodecPrivate
 {
-    constexpr uint32 Version = 1;
-    constexpr int32 MaxNameBytes = 4096;
-    constexpr int32 MaxStringBytes = 64 * 1024 * 1024;
-    constexpr uint32 MaxMeshes = 1000000;
-    constexpr uint32 MaxPrimitives = 65536;
-    constexpr uint32 MaxVertices = 100000000;
-    constexpr uint32 MaxIndices = 300000000;
-    constexpr uint32 MaxChannels = 16;
-    constexpr uint32 MaxJointSets = 8;
-    constexpr uint32 MaxMorphTargets = 4096;
-    constexpr uint32 MaxBones = 65536;
-    constexpr uint32 MaxParameters = 65536;
-    constexpr uint32 MaxMips = 32;
-    constexpr uint32 MaxAdditionalTransforms = 65536;
-    constexpr uint32 MaxMipBytes = 1024u * 1024u * 1024u;
-
-    class FWriter
+    std::string ToPortable(const FString& Value)
     {
-    public:
-        explicit FWriter(TArray<uint8>& InBytes) : Bytes(InBytes) { Bytes.Reset(); }
-        bool Ok() const { return bOk; }
-        void U8(const uint8 V)
+        FTCHARToUTF8 Utf8(*Value);
+        return std::string(Utf8.Get(), static_cast<size_t>(Utf8.Length()));
+    }
+    FString ToUnreal(const std::string& Value)
+    {
+        if (Value.empty()) return FString();
+        const FUTF8ToTCHAR Text(Value.data(), static_cast<int32>(Value.size()));
+        return FString(Text.Length(), Text.Get());
+    }
+    v3d::vec2 ToPortable(const FVector2f& V) { return {V.X, V.Y}; }
+    v3d::vec3 ToPortable(const FVector3f& V) { return {V.X, V.Y, V.Z}; }
+    v3d::vec4 ToPortable(const FVector4f& V) { return {V.X, V.Y, V.Z, V.W}; }
+    v3d::vec4 ToPortable(const FLinearColor& V) { return {V.R, V.G, V.B, V.A}; }
+    v3d::dvec3 ToPortable(const FVector& V) { return {V.X, V.Y, V.Z}; }
+    v3d::transform ToPortable(const FTransform& V)
+    {
+        const FQuat Q = V.GetRotation();
+        return {{Q.X, Q.Y, Q.Z, Q.W}, ToPortable(V.GetLocation()), ToPortable(V.GetScale3D())};
+    }
+    FVector2f ToUnreal(const v3d::vec2& V) { return FVector2f(V.x, V.y); }
+    FVector3f ToUnreal(const v3d::vec3& V) { return FVector3f(V.x, V.y, V.z); }
+    FVector4f ToUnreal(const v3d::vec4& V) { return FVector4f(V.x, V.y, V.z, V.w); }
+    FVector ToUnreal(const v3d::dvec3& V) { return FVector(V.x, V.y, V.z); }
+    FTransform ToUnreal(const v3d::transform& V)
+    {
+        return FTransform(FQuat(V.rotation.x, V.rotation.y, V.rotation.z, V.rotation.w),
+            ToUnreal(V.translation), ToUnreal(V.scale));
+    }
+    v3d::joint4 ToPortable(const FGWorldBakedJoint4& V) { return {V.X, V.Y, V.Z, V.W}; }
+    FGWorldBakedJoint4 ToUnreal(const v3d::joint4& V)
+    {
+        FGWorldBakedJoint4 Out; Out.X = V.x; Out.Y = V.y; Out.Z = V.z; Out.W = V.w; return Out;
+    }
+
+    // Declare non-vector conversions before the generic array adapters (two-phase lookup).
+    v3d::primitive ToPortable(const FGWorldBakedPrimitive& V);
+    FGWorldBakedPrimitive ToUnreal(v3d::primitive& V);
+
+    // Only detached vertex streams are eligible. In particular, neither FString/FName/map
+    // conversion nor the recursive primitive adapter runs inside this ParallelFor. Exclude bool:
+    // std::vector<bool> packs different elements into the same word and cannot use disjoint writes.
+    template<typename T>
+    constexpr bool IsPlainVertexStreamElement =
+        (std::is_arithmetic_v<T> && !std::is_same_v<T, bool>)
+        || std::is_same_v<T, FVector2f> || std::is_same_v<T, FVector3f>
+        || std::is_same_v<T, FVector4f> || std::is_same_v<T, FLinearColor>
+        || std::is_same_v<T, FGWorldBakedJoint4>
+        || std::is_same_v<T, v3d::vec2> || std::is_same_v<T, v3d::vec3>
+        || std::is_same_v<T, v3d::vec4> || std::is_same_v<T, v3d::joint4>;
+
+    template<typename ConvertIndex>
+    void ConvertLargeVertexStream(const int32 Count, ConvertIndex&& ConvertOne)
+    {
+        // Bundle reads already shard across a few archive members; keep nested conversion fan-out
+        // bounded as well. Lanes write contiguous ranges for locality and never resize a container.
+        const int32 Lanes = FMath::Clamp(FPlatformMisc::NumberOfCores() - 1, 1, 4);
+        ParallelFor(Lanes, [Count, Lanes, &ConvertOne](const int32 Lane)
         {
-            if (!CanAppend(1)) return;
-            Bytes.Add(V);
-        }
-        void U16(const uint16 V) { U8(V & 0xff); U8((V >> 8) & 0xff); }
-        void U32(const uint32 V)
+            const int32 Begin = static_cast<int32>(static_cast<int64>(Count) * Lane / Lanes);
+            const int32 End = static_cast<int32>(static_cast<int64>(Count) * (Lane + 1) / Lanes);
+            for (int32 Index = Begin; Index < End; ++Index) ConvertOne(Index);
+        });
+    }
+
+    template<typename Src, typename Dst, typename Convert>
+    void CopyToPortable(const TArray<Src>& In, std::vector<Dst>& Out, Convert&& ConvertOne)
+    {
+        if constexpr (IsPlainVertexStreamElement<Src> && IsPlainVertexStreamElement<Dst>)
         {
-            U8(V & 0xff); U8((V >> 8) & 0xff); U8((V >> 16) & 0xff); U8((V >> 24) & 0xff);
-        }
-        void I32(const int32 V) { U32(static_cast<uint32>(V)); }
-        void U64(const uint64 V)
-        {
-            for (int32 Shift = 0; Shift < 64; Shift += 8) U8((V >> Shift) & 0xff);
-        }
-        void Float(const float V)
-        {
-            uint32 Bits = 0; FMemory::Memcpy(&Bits, &V, sizeof(Bits)); U32(Bits);
-        }
-        void Double(const double V)
-        {
-            uint64 Bits = 0; FMemory::Memcpy(&Bits, &V, sizeof(Bits)); U64(Bits);
-        }
-        void String(const FString& V, const int32 Limit = MaxStringBytes)
-        {
-            FTCHARToUTF8 Utf8(*V);
-            if (Utf8.Length() < 0 || Utf8.Length() > Limit) { bOk = false; return; }
-            U32(static_cast<uint32>(Utf8.Length()));
-            if (bOk && Utf8.Length() > 0)
-                Raw(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
-        }
-        void V2(const FVector2f& V) { Float(V.X); Float(V.Y); }
-        void V3(const FVector3f& V) { Float(V.X); Float(V.Y); Float(V.Z); }
-        void V4(const FVector4f& V) { Float(V.X); Float(V.Y); Float(V.Z); Float(V.W); }
-        void Color(const FLinearColor& V) { Float(V.R); Float(V.G); Float(V.B); Float(V.A); }
-        void Vector(const FVector& V) { Double(V.X); Double(V.Y); Double(V.Z); }
-        void Transform(const FTransform& V)
-        {
-            const FQuat Q = V.GetRotation();
-            Double(Q.X); Double(Q.Y); Double(Q.Z); Double(Q.W);
-            Vector(V.GetLocation()); Vector(V.GetScale3D());
-        }
-        void Raw(const uint8* Data, const int32 Count)
-        {
-            if (!CanAppend(Count) || (!Data && Count > 0)) { bOk = false; return; }
-            if (Count > 0) Bytes.Append(Data, Count);
-        }
-    private:
-        bool CanAppend(const int64 Count)
-        {
-            if (!bOk || Count < 0
-                || Count > FGWorldArchive::MaxDatMemberBytes
-                    - static_cast<int64>(Bytes.Num()))
+            if (In.Num() >= 65536 && Out.empty())
             {
-                bOk = false;
-                return false;
+                Out.resize(static_cast<size_t>(In.Num()));
+                ConvertLargeVertexStream(In.Num(), [&In, &Out, &ConvertOne](const int32 Index)
+                {
+                    Out[static_cast<size_t>(Index)] = ConvertOne(In[Index]);
+                });
+                return;
             }
-            return true;
         }
-
-        TArray<uint8>& Bytes;
-        bool bOk = true;
-    };
-
-    class FReader
-    {
-    public:
-        explicit FReader(const TArray<uint8>& InBytes) : Bytes(InBytes) {}
-        bool Ok() const { return bOk; }
-        bool End() const { return bOk && Offset == Bytes.Num(); }
-        int32 Remaining() const { return bOk ? Bytes.Num() - Offset : 0; }
-        uint8 U8() { if (!Need(1)) return 0; return Bytes[Offset++]; }
-        uint16 U16()
-        {
-            const uint16 A = U8();
-            const uint16 B = U8();
-            return A | (B << 8);
-        }
-        uint32 U32()
-        {
-            // A function-argument/declarator evaluation order must never become part of the disk
-            // format. Read each byte in an explicit statement on every supported compiler.
-            const uint32 A = U8();
-            const uint32 B = U8();
-            const uint32 C = U8();
-            const uint32 D = U8();
-            return A | (B << 8) | (C << 16) | (D << 24);
-        }
-        int32 I32() { return static_cast<int32>(U32()); }
-        uint64 U64()
-        {
-            uint64 V = 0; for (int32 Shift = 0; Shift < 64; Shift += 8) V |= uint64(U8()) << Shift;
-            return V;
-        }
-        float Float()
-        {
-            const uint32 Bits = U32(); float V = 0; FMemory::Memcpy(&V, &Bits, sizeof(V)); return V;
-        }
-        double Double()
-        {
-            const uint64 Bits = U64(); double V = 0; FMemory::Memcpy(&V, &Bits, sizeof(V)); return V;
-        }
-        FString String(const int32 Limit = MaxStringBytes)
-        {
-            const uint32 Count = U32();
-            if (!bOk || Count > static_cast<uint32>(Limit) || Count > static_cast<uint32>(MAX_int32)
-                || !Need(static_cast<int32>(Count))) { bOk = false; return FString(); }
-            if (Count == 0) return FString();
-            const ANSICHAR* Source = reinterpret_cast<const ANSICHAR*>(Bytes.GetData() + Offset);
-            FUTF8ToTCHAR Converted(Source, static_cast<int32>(Count));
-            Offset += static_cast<int32>(Count);
-            if (Converted.Length() < 0) { bOk = false; return FString(); }
-            return FString(Converted.Length(), Converted.Get());
-        }
-        FVector2f V2()
-        {
-            const float X = Float();
-            const float Y = Float();
-            return FVector2f(X, Y);
-        }
-        FVector3f V3()
-        {
-            const float X = Float();
-            const float Y = Float();
-            const float Z = Float();
-            return FVector3f(X, Y, Z);
-        }
-        FVector4f V4()
-        {
-            const float X = Float();
-            const float Y = Float();
-            const float Z = Float();
-            const float W = Float();
-            return FVector4f(X, Y, Z, W);
-        }
-        FLinearColor Color()
-        {
-            const float R = Float();
-            const float G = Float();
-            const float B = Float();
-            const float A = Float();
-            return FLinearColor(R, G, B, A);
-        }
-        FVector Vector()
-        {
-            const double X = Double();
-            const double Y = Double();
-            const double Z = Double();
-            return FVector(X, Y, Z);
-        }
-        FTransform Transform()
-        {
-            const double X = Double();
-            const double Y = Double();
-            const double Z = Double();
-            const double W = Double();
-            const FVector Location = Vector();
-            const FVector Scale = Vector();
-            return FTransform(FQuat(X, Y, Z, W), Location, Scale);
-        }
-        uint32 Count(const uint32 Limit, const int32 MinimumBytes = 0)
-        {
-            const uint32 Value = U32();
-            if (!bOk || Value > Limit || (MinimumBytes > 0
-                && uint64(Value) * uint64(MinimumBytes) > uint64(Remaining()))) bOk = false;
-            return bOk ? Value : 0;
-        }
-        bool Raw(uint8* Destination, const int32 Count)
-        {
-            if (Count < 0 || (Count > 0 && !Destination) || !Need(Count)) return false;
-            if (Count > 0) FMemory::Memcpy(Destination, Bytes.GetData() + Offset, Count);
-            Offset += Count; return true;
-        }
-        bool Skip(const int32 Count)
-        {
-            if (!Need(Count)) return false;
-            Offset += Count;
-            return true;
-        }
-    private:
-        bool Need(const int32 Count)
-        {
-            if (!bOk || Count < 0 || Count > Bytes.Num() - Offset) { bOk = false; return false; }
-            return true;
-        }
-        const TArray<uint8>& Bytes;
-        int32 Offset = 0;
-        bool bOk = true;
-    };
-
-    bool Finite(const FVector2f& V) { return FMath::IsFinite(V.X) && FMath::IsFinite(V.Y); }
-    bool Finite(const FVector3f& V) { return FMath::IsFinite(V.X) && FMath::IsFinite(V.Y) && FMath::IsFinite(V.Z); }
-    bool Finite(const FVector4f& V)
-    {
-        return FMath::IsFinite(V.X) && FMath::IsFinite(V.Y) && FMath::IsFinite(V.Z) && FMath::IsFinite(V.W);
+        Out.reserve(static_cast<size_t>(In.Num()));
+        for (const Src& V : In) Out.push_back(ConvertOne(V));
     }
-    bool Finite(const FTransform& V) { return !V.ContainsNaN() && V.GetRotation().IsNormalized(); }
-
-    template<typename T, typename WriteOne>
-    void WriteArray(FWriter& W, const TArray<T>& Values, WriteOne&& Fn)
+    template<typename Src, typename Dst, typename Convert>
+    void CopyToUnreal(std::vector<Src>& In, TArray<Dst>& Out, Convert&& ConvertOne)
     {
-        W.U32(static_cast<uint32>(Values.Num()));
-        for (const T& Value : Values)
+        if constexpr (IsPlainVertexStreamElement<Src> && IsPlainVertexStreamElement<Dst>)
         {
-            Fn(Value);
+            if (In.size() >= 65536 && Out.IsEmpty())
+            {
+                const int32 Count = static_cast<int32>(In.size());
+                Out.SetNumUninitialized(Count);
+                ConvertLargeVertexStream(Count, [&In, &Out, &ConvertOne](const int32 Index)
+                {
+                    Out[Index] = ConvertOne(In[static_cast<size_t>(Index)]);
+                });
+                std::vector<Src>().swap(In);
+                return;
+            }
         }
+        Out.Reserve(static_cast<int32>(In.size()));
+        for (Src& V : In) Out.Add(ConvertOne(V));
+        // Release each portable stream as its Unreal counterpart is filled. Do not retain
+        // a second complete mesh/pixel payload through resource finalization.
+        std::vector<Src>().swap(In);
+    }
+    template<typename Src, typename Dst>
+    void CopyToPortable(const TArray<Src>& In, std::vector<Dst>& Out)
+    {
+        CopyToPortable(In, Out, [](const Src& V) { return ToPortable(V); });
+    }
+    template<typename Src, typename Dst>
+    void CopyToUnreal(std::vector<Src>& In, TArray<Dst>& Out)
+    {
+        CopyToUnreal(In, Out, [](Src& V) { return ToUnreal(V); });
     }
 
-    template<typename T, typename ReadOne>
-    bool ReadArray(FReader& R, TArray<T>& Values, const uint32 Limit, const int32 MinBytes, ReadOne&& Fn)
+    v3d::primitive ToPortable(const FGWorldBakedPrimitive& V)
     {
-        Values.Reset();
-        const uint32 Count = R.Count(Limit, MinBytes);
-        if (!R.Ok())
+        v3d::primitive Out;
+        CopyToPortable(V.Positions, Out.positions);
+        CopyToPortable(V.Normals, Out.normals);
+        CopyToPortable(V.Tangents, Out.tangents);
+        Out.uvs.resize(V.UVs.Num());
+        for (int32 I = 0; I < V.UVs.Num(); ++I) CopyToPortable(V.UVs[I], Out.uvs[I]);
+        CopyToPortable(V.Indices, Out.indices, [](uint32 I) { return I; });
+        Out.joints.resize(V.Joints.Num());
+        for (int32 I = 0; I < V.Joints.Num(); ++I) CopyToPortable(V.Joints[I], Out.joints[I]);
+        Out.weights.resize(V.Weights.Num());
+        for (int32 I = 0; I < V.Weights.Num(); ++I) CopyToPortable(V.Weights[I], Out.weights[I]);
+        CopyToPortable(V.Colors, Out.colors);
+        for (const FGWorldBakedMorphTarget& M : V.MorphTargets)
         {
-            return false;
+            v3d::morph_target Target;
+            Target.name = ToPortable(M.Name);
+            CopyToPortable(M.Positions, Target.positions);
+            CopyToPortable(M.Normals, Target.normals);
+            Out.morph_targets.push_back(std::move(Target));
         }
-        Values.Reserve(static_cast<int32>(Count));
-        for (uint32 Index = 0; Index < Count; ++Index)
+        for (const auto& Pair : V.BoneMap) Out.bone_map.emplace(Pair.Key, ToPortable(Pair.Value.ToString()));
+        for (const auto& Pair : V.WeightMaps)
+            CopyToPortable(Pair.Value, Out.weight_maps[ToPortable(Pair.Key)], [](float F) { return F; });
+        Out.material_name = ToPortable(V.MaterialName);
+        Out.material_id = V.MaterialId; Out.mode = V.Mode;
+        Out.has_material = V.bHasMaterial; Out.high_precision_uvs = V.bHighPrecisionUVs;
+        Out.high_precision_weights = V.bHighPrecisionWeights; Out.disable_shadows = V.bDisableShadows;
+        Out.has_indices = V.bHasIndices;
+        return Out;
+    }
+    FGWorldBakedPrimitive ToUnreal(v3d::primitive& V)
+    {
+        FGWorldBakedPrimitive Out;
+        CopyToUnreal(V.positions, Out.Positions);
+        CopyToUnreal(V.normals, Out.Normals);
+        CopyToUnreal(V.tangents, Out.Tangents);
+        Out.UVs.SetNum(static_cast<int32>(V.uvs.size()));
+        for (int32 I = 0; I < Out.UVs.Num(); ++I) CopyToUnreal(V.uvs[I], Out.UVs[I]);
+        CopyToUnreal(V.indices, Out.Indices, [](uint32 I) { return I; });
+        Out.Joints.SetNum(static_cast<int32>(V.joints.size()));
+        for (int32 I = 0; I < Out.Joints.Num(); ++I) CopyToUnreal(V.joints[I], Out.Joints[I]);
+        Out.Weights.SetNum(static_cast<int32>(V.weights.size()));
+        for (int32 I = 0; I < Out.Weights.Num(); ++I) CopyToUnreal(V.weights[I], Out.Weights[I]);
+        CopyToUnreal(V.colors, Out.Colors);
+        for (v3d::morph_target& M : V.morph_targets)
         {
-            Values.Add(Fn());
+            FGWorldBakedMorphTarget& Target = Out.MorphTargets.AddDefaulted_GetRef();
+            Target.Name = ToUnreal(M.name);
+            CopyToUnreal(M.positions, Target.Positions);
+            CopyToUnreal(M.normals, Target.Normals);
         }
-        return R.Ok();
+        for (const auto& Pair : V.bone_map) Out.BoneMap.Add(Pair.first, FName(*ToUnreal(Pair.second)));
+        for (auto& Pair : V.weight_maps)
+            CopyToUnreal(Pair.second, Out.WeightMaps.Add(ToUnreal(Pair.first)), [](float F) { return F; });
+        Out.MaterialName = ToUnreal(V.material_name);
+        Out.MaterialId = V.material_id; Out.Mode = V.mode;
+        Out.bHasMaterial = V.has_material; Out.bHighPrecisionUVs = V.high_precision_uvs;
+        Out.bHighPrecisionWeights = V.high_precision_weights; Out.bDisableShadows = V.disable_shadows;
+        Out.bHasIndices = V.has_indices;
+        return Out;
+    }
+    v3d::mesh ToPortable(const FGWorldBakedMesh& V)
+    {
+        v3d::mesh Out;
+        Out.mesh_index = V.MeshIndex; Out.name = ToPortable(V.Name);
+        CopyToPortable(V.Primitives, Out.primitives);
+        CopyToPortable(V.AdditionalTransforms, Out.additional_transforms);
+        Out.has_normals = V.bHasNormals; Out.has_tangents = V.bHasTangents;
+        Out.has_uv = V.bHasUV; Out.has_vertex_colors = V.bHasVertexColors;
+        return Out;
+    }
+    FGWorldBakedMesh ToUnreal(v3d::mesh& V)
+    {
+        FGWorldBakedMesh Out;
+        Out.MeshIndex = V.mesh_index; Out.Name = ToUnreal(V.name);
+        CopyToUnreal(V.primitives, Out.Primitives);
+        CopyToUnreal(V.additional_transforms, Out.AdditionalTransforms);
+        Out.bHasNormals = V.has_normals; Out.bHasTangents = V.has_tangents;
+        Out.bHasUV = V.has_uv; Out.bHasVertexColors = V.has_vertex_colors;
+        return Out;
+    }
+    v3d::skin ToPortable(const FGWorldBakedSkin& V)
+    {
+        v3d::skin Out; Out.skin_index = V.SkinIndex;
+        for (const FGWorldBakedBone& B : V.Bones)
+            Out.bones.push_back({ToPortable(B.Name), B.ParentIndex, ToPortable(B.Transform)});
+        for (const auto& Pair : V.JointBoneMap)
+            Out.joint_bone_map.emplace(Pair.Key, ToPortable(Pair.Value.ToString()));
+        return Out;
+    }
+    FGWorldBakedSkin ToUnreal(const v3d::skin& V)
+    {
+        FGWorldBakedSkin Out; Out.SkinIndex = V.skin_index;
+        for (const v3d::bone& B : V.bones)
+        {
+            FGWorldBakedBone& Bone = Out.Bones.AddDefaulted_GetRef();
+            Bone.Name = ToUnreal(B.name); Bone.ParentIndex = B.parent_index;
+            Bone.Transform = ToUnreal(B.local_transform);
+        }
+        for (const auto& Pair : V.joint_bone_map)
+            Out.JointBoneMap.Add(Pair.first, FName(*ToUnreal(Pair.second)));
+        return Out;
+    }
+    v3d::material ToPortable(const FGWorldBakedMaterial& V)
+    {
+        v3d::material Out; Out.material_id = V.MaterialId; Out.name = ToPortable(V.Name);
+        Out.base_material_path = ToPortable(V.BaseMaterialPath); Out.material_type = V.MaterialType;
+        Out.unlit = V.bUnlit;
+        for (const auto& P : V.Scalars) Out.scalars.push_back({ToPortable(P.Name), P.Value});
+        for (const auto& P : V.Vectors) Out.vectors.push_back({ToPortable(P.Name), ToPortable(P.Value)});
+        for (const auto& P : V.Textures)
+            Out.textures.push_back({ToPortable(P.Name), P.TextureId, ToPortable(P.AssetPath)});
+        return Out;
+    }
+    FString DefaultUnrealMaterialPath(const v3d::material& V)
+    {
+        // Portable producers describe material behavior and need not know Unreal asset paths.
+        for (const auto& P : V.scalars)
+            if (P.name == "V3D_Terrain" && P.value == 1.0f)
+                return V3DTerrain::DefaultMaterialPath;
+
+        // Keep the same family order and assets used by FglTFRuntimeParser's constructor.
+        static const TCHAR* const LitParents[] = {
+            TEXT("/glTFRuntime/M_glTFRuntimeBase.M_glTFRuntimeBase"),
+            TEXT("/glTFRuntime/M_glTFRuntimeTranslucent_Inst.M_glTFRuntimeTranslucent_Inst"),
+            TEXT("/glTFRuntime/M_glTFRuntimeTwoSided_Inst.M_glTFRuntimeTwoSided_Inst"),
+            TEXT("/glTFRuntime/M_glTFRuntimeTwoSidedTranslucent_Inst.M_glTFRuntimeTwoSidedTranslucent_Inst"),
+            TEXT("/glTFRuntime/M_glTFRuntimeMasked_Inst.M_glTFRuntimeMasked_Inst"),
+            TEXT("/glTFRuntime/M_glTFRuntimeTwoSidedMasked_Inst.M_glTFRuntimeTwoSidedMasked_Inst")
+        };
+        static const TCHAR* const UnlitParents[] = {
+            TEXT("/glTFRuntime/M_Unlit_glTFRuntimeBase.M_Unlit_glTFRuntimeBase"),
+            TEXT("/glTFRuntime/M_Unlit_glTFRuntimeTranslucent_Inst.M_Unlit_glTFRuntimeTranslucent_Inst"),
+            TEXT("/glTFRuntime/M_Unlit_glTFRuntimeTwoSided_Inst.M_Unlit_glTFRuntimeTwoSided_Inst"),
+            TEXT("/glTFRuntime/M_Unlit_glTFRuntimeTwoSidedTranslucent_Inst.M_Unlit_glTFRuntimeTwoSidedTranslucent_Inst"),
+            TEXT("/glTFRuntime/M_Unlit_glTFRuntimeMasked_Inst.M_Unlit_glTFRuntimeMasked_Inst"),
+            TEXT("/glTFRuntime/M_Unlit_glTFRuntimeTwoSidedMasked_Inst.M_Unlit_glTFRuntimeTwoSidedMasked_Inst")
+        };
+        // decode() validates the family; keep this helper bounded when called directly as well.
+        const uint8 Family = V.material_type <= 5 ? V.material_type : 0;
+        return V.unlit ? UnlitParents[Family] : LitParents[Family];
+    }
+    FGWorldBakedMaterial ToUnreal(const v3d::material& V)
+    {
+        FGWorldBakedMaterial Out; Out.MaterialId = V.material_id; Out.Name = ToUnreal(V.name);
+        Out.BaseMaterialPath = V.base_material_path.empty()
+            ? DefaultUnrealMaterialPath(V) : ToUnreal(V.base_material_path);
+        Out.MaterialType = V.material_type;
+        Out.bUnlit = V.unlit;
+        for (const auto& P : V.scalars)
+        {
+            auto& Parameter = Out.Scalars.AddDefaulted_GetRef();
+            Parameter.Name = ToUnreal(P.name); Parameter.Value = P.value;
+        }
+        for (const auto& P : V.vectors)
+        {
+            auto& Parameter = Out.Vectors.AddDefaulted_GetRef();
+            Parameter.Name = ToUnreal(P.name);
+            Parameter.Value = FLinearColor(P.value.x, P.value.y, P.value.z, P.value.w);
+        }
+        for (const auto& P : V.textures)
+        {
+            auto& Parameter = Out.Textures.AddDefaulted_GetRef();
+            Parameter.Name = ToUnreal(P.name); Parameter.TextureId = P.texture_id;
+            Parameter.AssetPath = ToUnreal(P.asset_path);
+        }
+        return Out;
     }
 
-    void WriteRange(FWriter& W, const FGWorldArchiveRange& R)
+    // Values on disk are v3d::texture_format, never a cast of Unreal's EPixelFormat.
+    bool ToPortablePixelFormat(const int32 In, v3d::texture_format& Out)
     {
-        W.String(R.Name, MaxNameBytes); W.U64(R.Offset); W.U64(R.StoredSize);
-        W.U64(R.UncompressedSize); W.U32(R.Crc); W.U8(R.Codec); W.U8(0); W.U16(0);
-    }
-
-    FGWorldArchiveRange ReadRange(FReader& R)
-    {
-        FGWorldArchiveRange V; V.Name = R.String(MaxNameBytes); V.Offset = R.U64();
-        V.StoredSize = R.U64(); V.UncompressedSize = R.U64(); V.Crc = R.U32();
-        V.Codec = R.U8(); (void)R.U8(); (void)R.U16(); return V;
-    }
-
-    bool Finish(FWriter& W, TArray<uint8>& Bytes, FString& Error)
-    {
-        if (!W.Ok() || Bytes.IsEmpty() || Bytes.Num() > FGWorldArchive::MaxDatMemberBytes)
+        switch (In)
         {
-            Error = TEXT(".dat serialization exceeded a field or member-size limit");
-            Bytes.Reset();
-            return false;
+#define V3D_PIXEL_TO_PORTABLE(UE, Portable) case UE: Out = v3d::texture_format::Portable; return true
+            V3D_PIXEL_TO_PORTABLE(PF_R8G8B8A8, rgba8_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_B8G8R8A8, bgra8_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_G8, r8_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_R8G8, rg8_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_G16, r16_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_FloatRGBA, rgba16_float);
+            V3D_PIXEL_TO_PORTABLE(PF_R16F, r16_float);
+            V3D_PIXEL_TO_PORTABLE(PF_R32_FLOAT, r32_float);
+            V3D_PIXEL_TO_PORTABLE(PF_A32B32G32R32F, rgba32_float);
+            V3D_PIXEL_TO_PORTABLE(PF_DXT1, bc1_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_DXT3, bc2_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_DXT5, bc3_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_BC4, bc4_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_BC5, bc5_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_BC6H, bc6h_ufloat);
+            V3D_PIXEL_TO_PORTABLE(PF_BC7, bc7_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ASTC_4x4, astc_4x4_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ASTC_6x6, astc_6x6_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ASTC_8x8, astc_8x8_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ASTC_10x10, astc_10x10_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ASTC_12x12, astc_12x12_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ETC2_RGB, etc2_rgb8_unorm);
+            V3D_PIXEL_TO_PORTABLE(PF_ETC2_RGBA, etc2_rgba8_unorm);
+#undef V3D_PIXEL_TO_PORTABLE
+            default: return false;
         }
-        Error.Reset();
+    }
+    bool ToUnrealPixelFormat(const v3d::texture_format In, int32& Out)
+    {
+        switch (In)
+        {
+#define V3D_PIXEL_TO_UNREAL(Portable, UE) case v3d::texture_format::Portable: Out = UE; return true
+            V3D_PIXEL_TO_UNREAL(rgba8_unorm, PF_R8G8B8A8);
+            V3D_PIXEL_TO_UNREAL(bgra8_unorm, PF_B8G8R8A8);
+            V3D_PIXEL_TO_UNREAL(r8_unorm, PF_G8);
+            V3D_PIXEL_TO_UNREAL(rg8_unorm, PF_R8G8);
+            V3D_PIXEL_TO_UNREAL(r16_unorm, PF_G16);
+            V3D_PIXEL_TO_UNREAL(rgba16_float, PF_FloatRGBA);
+            V3D_PIXEL_TO_UNREAL(r16_float, PF_R16F);
+            V3D_PIXEL_TO_UNREAL(r32_float, PF_R32_FLOAT);
+            V3D_PIXEL_TO_UNREAL(rgba32_float, PF_A32B32G32R32F);
+            V3D_PIXEL_TO_UNREAL(bc1_unorm, PF_DXT1);
+            V3D_PIXEL_TO_UNREAL(bc2_unorm, PF_DXT3);
+            V3D_PIXEL_TO_UNREAL(bc3_unorm, PF_DXT5);
+            V3D_PIXEL_TO_UNREAL(bc4_unorm, PF_BC4);
+            V3D_PIXEL_TO_UNREAL(bc5_unorm, PF_BC5);
+            V3D_PIXEL_TO_UNREAL(bc6h_ufloat, PF_BC6H);
+            V3D_PIXEL_TO_UNREAL(bc7_unorm, PF_BC7);
+            V3D_PIXEL_TO_UNREAL(astc_4x4_unorm, PF_ASTC_4x4);
+            V3D_PIXEL_TO_UNREAL(astc_6x6_unorm, PF_ASTC_6x6);
+            V3D_PIXEL_TO_UNREAL(astc_8x8_unorm, PF_ASTC_8x8);
+            V3D_PIXEL_TO_UNREAL(astc_10x10_unorm, PF_ASTC_10x10);
+            V3D_PIXEL_TO_UNREAL(astc_12x12_unorm, PF_ASTC_12x12);
+            V3D_PIXEL_TO_UNREAL(etc2_rgb8_unorm, PF_ETC2_RGB);
+            V3D_PIXEL_TO_UNREAL(etc2_rgba8_unorm, PF_ETC2_RGBA);
+#undef V3D_PIXEL_TO_UNREAL
+            default: return false;
+        }
+    }
+    bool ToPortable(const FGWorldBakedTexture& V, v3d::texture& Out, FString& Error)
+    {
+        if (!ToPortablePixelFormat(V.PixelFormat, Out.pixel_format))
+        {
+            Error = FString::Printf(TEXT("Texture '%s' uses unsupported EPixelFormat %d; no portable V3D mapping exists"),
+                *V.Name, V.PixelFormat); return false;
+        }
+        Out.texture_id = V.TextureId; Out.name = ToPortable(V.Name);
+        Out.width = V.SizeX; Out.height = V.SizeY; Out.layers = V.NumLayers;
+        Out.is_array = V.bTextureArray;
+        // The public enum values have explicit mappings even when today's UE values coincide.
+        switch (V.AddressX)
+        {
+            case TA_Wrap: Out.address_x = uint8(v3d::address_mode::wrap); break;
+            case TA_Clamp: Out.address_x = uint8(v3d::address_mode::clamp); break;
+            case TA_Mirror: Out.address_x = uint8(v3d::address_mode::mirror); break;
+            default: Error = TEXT("Unsupported texture AddressX"); return false;
+        }
+        switch (V.AddressY)
+        {
+            case TA_Wrap: Out.address_y = uint8(v3d::address_mode::wrap); break;
+            case TA_Clamp: Out.address_y = uint8(v3d::address_mode::clamp); break;
+            case TA_Mirror: Out.address_y = uint8(v3d::address_mode::mirror); break;
+            default: Error = TEXT("Unsupported texture AddressY"); return false;
+        }
+        switch (V.Filter)
+        {
+            case TF_Nearest: Out.filter = uint8(v3d::filter_mode::nearest); break;
+            case TF_Bilinear: Out.filter = uint8(v3d::filter_mode::bilinear); break;
+            case TF_Trilinear: Out.filter = uint8(v3d::filter_mode::trilinear); break;
+            case TF_Default: Out.filter = uint8(v3d::filter_mode::default_filter); break;
+            default: Error = TEXT("Unsupported texture filter"); return false;
+        }
+        Out.lod_group = V.LODGroup; Out.srgb = V.bSRGB;
+        for (const auto& M : V.Mips)
+        {
+            v3d::mip Mip; Mip.width = M.SizeX; Mip.height = M.SizeY; Mip.layers = M.SizeZ;
+            // Pixel blocks require no value conversion. A bulk copy avoids per-byte adapter work
+            // and additional task fan-out while independent archive members already run in parallel.
+            if (!M.Bytes.IsEmpty()) Mip.bytes.assign(M.Bytes.GetData(), M.Bytes.GetData() + M.Bytes.Num());
+            Out.mips.push_back(std::move(Mip));
+        }
         return true;
     }
-
-    bool Header(FReader& R, const uint32 Magic, FString& Error)
+    bool ToUnreal(v3d::texture& V, FGWorldBakedTexture& Out, FString& Error)
     {
-        if (R.U32() != Magic || R.U32() != Version)
+        if (V.legacy_unreal_pixel_format >= 0)
         {
-            Error = TEXT(".dat member magic/version mismatch");
-            return false;
+            // Only the legacy TEXR/v1 reader can set this field. It is never written by v6.
+            if (V.legacy_unreal_pixel_format <= PF_Unknown || V.legacy_unreal_pixel_format >= PF_MAX)
+            { Error = TEXT("Legacy texture has an invalid Unreal pixel format"); return false; }
+            Out.PixelFormat = V.legacy_unreal_pixel_format;
+        }
+        else if (!ToUnrealPixelFormat(V.pixel_format, Out.PixelFormat))
+        { Error = TEXT("V3D texture format has no Unreal mapping"); return false; }
+        Out.TextureId = V.texture_id; Out.Name = ToUnreal(V.name);
+        Out.SizeX = V.width; Out.SizeY = V.height; Out.NumLayers = V.layers;
+        Out.bTextureArray = V.is_array;
+        switch (v3d::address_mode(V.address_x))
+        {
+            case v3d::address_mode::wrap: Out.AddressX = TA_Wrap; break;
+            case v3d::address_mode::clamp: Out.AddressX = TA_Clamp; break;
+            case v3d::address_mode::mirror: Out.AddressX = TA_Mirror; break;
+            default: Error = TEXT("V3D texture has an invalid AddressX"); return false;
+        }
+        switch (v3d::address_mode(V.address_y))
+        {
+            case v3d::address_mode::wrap: Out.AddressY = TA_Wrap; break;
+            case v3d::address_mode::clamp: Out.AddressY = TA_Clamp; break;
+            case v3d::address_mode::mirror: Out.AddressY = TA_Mirror; break;
+            default: Error = TEXT("V3D texture has an invalid AddressY"); return false;
+        }
+        switch (v3d::filter_mode(V.filter))
+        {
+            case v3d::filter_mode::nearest: Out.Filter = TF_Nearest; break;
+            case v3d::filter_mode::bilinear: Out.Filter = TF_Bilinear; break;
+            case v3d::filter_mode::trilinear: Out.Filter = TF_Trilinear; break;
+            case v3d::filter_mode::default_filter: Out.Filter = TF_Default; break;
+            default: Error = TEXT("V3D texture has an invalid filter"); return false;
+        }
+        Out.LODGroup = V.lod_group; Out.bSRGB = V.srgb;
+        // lod_group is an optional engine hint, not part of the texture interpretation.
+        if (Out.LODGroup >= TEXTUREGROUP_MAX) Out.LODGroup = TEXTUREGROUP_World;
+        for (auto& M : V.mips)
+        {
+            auto& Mip = Out.Mips.AddDefaulted_GetRef();
+            Mip.SizeX = M.width; Mip.SizeY = M.height; Mip.SizeZ = M.layers;
+            if (!M.bytes.empty()) Mip.Bytes.Append(M.bytes.data(), static_cast<int32>(M.bytes.size()));
+            std::vector<uint8_t>().swap(M.bytes);
         }
         return true;
+    }
+    v3d::range ToPortable(const FGWorldArchiveRange& V)
+    {
+        return {ToPortable(V.Name), V.Offset, V.StoredSize, V.UncompressedSize, V.Crc, V.Codec};
+    }
+    FGWorldArchiveRange ToUnreal(const v3d::range& V)
+    {
+        FGWorldArchiveRange Out; Out.Name = ToUnreal(V.name); Out.Offset = V.offset;
+        Out.StoredSize = V.stored_size; Out.UncompressedSize = V.uncompressed_size;
+        Out.Crc = V.crc; Out.Codec = V.codec; return Out;
+    }
+    v3d::manifest ToPortable(const FGWorldModelManifest& V)
+    {
+        v3d::manifest Out;
+        for (const auto& P : V.MeshRanges) Out.mesh_ranges.emplace(P.Key, ToPortable(P.Value));
+        for (const auto& P : V.SkinRanges) Out.skin_ranges.emplace(P.Key, ToPortable(P.Value));
+        for (const auto& P : V.MaterialRanges) Out.material_ranges.emplace(P.Key, ToPortable(P.Value));
+        for (const auto& P : V.TextureRanges) Out.texture_ranges.emplace(P.Key, ToPortable(P.Value));
+        for (const auto& P : V.MeshNames) Out.mesh_names.emplace(P.Key, ToPortable(P.Value));
+        return Out;
+    }
+    FGWorldModelManifest ToUnreal(const v3d::manifest& V)
+    {
+        FGWorldModelManifest Out;
+        for (const auto& P : V.mesh_ranges) Out.MeshRanges.Add(P.first, ToUnreal(P.second));
+        for (const auto& P : V.skin_ranges) Out.SkinRanges.Add(P.first, ToUnreal(P.second));
+        for (const auto& P : V.material_ranges) Out.MaterialRanges.Add(P.first, ToUnreal(P.second));
+        for (const auto& P : V.texture_ranges) Out.TextureRanges.Add(P.first, ToUnreal(P.second));
+        for (const auto& P : V.mesh_names) Out.MeshNames.Add(P.first, ToUnreal(P.second));
+        return Out;
+    }
+    template<typename T>
+    bool Encode(const T& Value, TArray<uint8>& Out, FString& Error)
+    {
+        Out.Reset(); std::vector<uint8_t> Bytes; std::string Detail;
+        if (!v3d::encode(Value, Bytes, Detail)) { Error = ToUnreal(Detail); return false; }
+        if (Bytes.size() > size_t(FGWorldArchive::MaxDatMemberBytes))
+        { Error = TEXT("Portable V3D member exceeds Unreal's TArray limit"); return false; }
+        if (!Bytes.empty()) Out.Append(Bytes.data(), static_cast<int32>(Bytes.size()));
+        Error.Reset(); return true;
     }
 }
 
 namespace WorldArchiveCodec
 {
     using namespace WorldArchiveCodecPrivate;
-
     bool SerializeMesh(const FGWorldBakedMesh& V, TArray<uint8>& Out, FString& Error)
-    {
-        FWriter W(Out); W.U32(0x4853454d); W.U32(Version); W.I32(V.MeshIndex); W.String(V.Name, MaxNameBytes);
-        W.U8(V.bHasNormals); W.U8(V.bHasTangents); W.U8(V.bHasUV); W.U8(V.bHasVertexColors);
-        WriteArray(W, V.AdditionalTransforms, [&W](const FTransform& T) { W.Transform(T); });
-        W.U32(static_cast<uint32>(V.Primitives.Num()));
-        for (const FGWorldBakedPrimitive& P : V.Primitives)
-        {
-            WriteArray(W, P.Positions, [&W](const FVector3f& X) { W.V3(X); });
-            WriteArray(W, P.Normals, [&W](const FVector3f& X) { W.V3(X); });
-            WriteArray(W, P.Tangents, [&W](const FVector4f& X) { W.V4(X); });
-            W.U32(static_cast<uint32>(P.UVs.Num()));
-            for (const TArray<FVector2f>& Channel : P.UVs)
-                WriteArray(W, Channel, [&W](const FVector2f& X) { W.V2(X); });
-            W.U32(static_cast<uint32>(P.Indices.Num()));
-            for (const uint32 X : P.Indices) W.U32(X);
-            W.U32(static_cast<uint32>(P.Joints.Num()));
-            for (const TArray<FGWorldBakedJoint4>& Set : P.Joints)
-                WriteArray(W, Set, [&W](const FGWorldBakedJoint4& X)
-                { W.U16(X.X); W.U16(X.Y); W.U16(X.Z); W.U16(X.W); });
-            W.U32(static_cast<uint32>(P.Weights.Num()));
-            for (const TArray<FVector4f>& Set : P.Weights)
-                WriteArray(W, Set, [&W](const FVector4f& X) { W.V4(X); });
-            WriteArray(W, P.Colors, [&W](const FVector4f& X) { W.V4(X); });
-            W.U32(static_cast<uint32>(P.MorphTargets.Num()));
-            for (const FGWorldBakedMorphTarget& M : P.MorphTargets)
-            {
-                W.String(M.Name, MaxNameBytes);
-                WriteArray(W, M.Positions, [&W](const FVector3f& X) { W.V3(X); });
-                WriteArray(W, M.Normals, [&W](const FVector3f& X) { W.V3(X); });
-            }
-            TArray<int32> BoneKeys; P.BoneMap.GetKeys(BoneKeys); BoneKeys.Sort(); W.U32(BoneKeys.Num());
-            for (const int32 Key : BoneKeys) { W.I32(Key); W.String(P.BoneMap.FindChecked(Key).ToString(), MaxNameBytes); }
-            TArray<FString> WeightKeys; P.WeightMaps.GetKeys(WeightKeys); WeightKeys.Sort(); W.U32(WeightKeys.Num());
-            for (const FString& Key : WeightKeys)
-            {
-                W.String(Key, MaxNameBytes); const TArray<float>& Values = P.WeightMaps.FindChecked(Key);
-                W.U32(Values.Num()); for (const float X : Values) W.Float(X);
-            }
-            W.String(P.MaterialName, MaxNameBytes); W.I32(P.MaterialId); W.I32(P.Mode);
-            W.U8(P.bHasMaterial); W.U8(P.bHighPrecisionUVs); W.U8(P.bHighPrecisionWeights);
-            W.U8(P.bDisableShadows); W.U8(P.bHasIndices); W.U8(0); W.U16(0);
-        }
-        return Finish(W, Out, Error);
-    }
-
+    { return Encode(ToPortable(V), Out, Error); }
     bool DeserializeMesh(const TArray<uint8>& Bytes, FGWorldBakedMesh& Out, FString& Error, const bool bDependenciesOnly)
     {
-        Out = FGWorldBakedMesh(); FReader R(Bytes); if (!Header(R, 0x4853454d, Error)) return false;
-        Out.MeshIndex = R.I32(); Out.Name = R.String(MaxNameBytes);
-        const auto ReadMeshArray = [&R, bDependenciesOnly](auto& Values,
-            const uint32 Limit, const int32 MinBytes, auto&& ReadOne)
+        Out = {}; v3d::mesh Value; std::string Detail;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Detail, bDependenciesOnly))
+        { Error = ToUnreal(Detail); return false; }
+        Out = ToUnreal(Value);
+        if (!bDependenciesOnly)
         {
-            if (!bDependenciesOnly) return ReadArray(R, Values, Limit, MinBytes, ReadOne);
-            const uint32 Count = R.Count(Limit, MinBytes);
-            const uint64 ByteCount = uint64(Count) * uint64(MinBytes);
-            return R.Ok() && ByteCount <= uint64(MAX_int32) && R.Skip(int32(ByteCount));
-        };
-        const uint8 HasNormals = R.U8(); const uint8 HasTangents = R.U8();
-        const uint8 HasUv = R.U8(); const uint8 HasVertexColors = R.U8();
-        if (HasNormals > 1 || HasTangents > 1 || HasUv > 1 || HasVertexColors > 1)
-        { Error = TEXT("mesh.dat contains an invalid boolean flag"); return false; }
-        Out.bHasNormals = HasNormals != 0; Out.bHasTangents = HasTangents != 0;
-        Out.bHasUV = HasUv != 0; Out.bHasVertexColors = HasVertexColors != 0;
-        if (!ReadMeshArray(Out.AdditionalTransforms, MaxAdditionalTransforms, 80,
-                [&R]() { return R.Transform(); })) return false;
-        const uint32 PrimitiveCount = R.Count(MaxPrimitives, 4); if (!R.Ok()) return false;
-        Out.Primitives.Reserve(PrimitiveCount);
-        for (uint32 PrimitiveIndex = 0; PrimitiveIndex < PrimitiveCount; ++PrimitiveIndex)
-        {
-            FGWorldBakedPrimitive& P = Out.Primitives.AddDefaulted_GetRef();
-            if (!ReadMeshArray(P.Positions, MaxVertices, 12, [&R]() { return R.V3(); })
-                || !ReadMeshArray(P.Normals, MaxVertices, 12, [&R]() { return R.V3(); })
-                || !ReadMeshArray(P.Tangents, MaxVertices, 16, [&R]() { return R.V4(); })) return false;
-            const uint32 UvCount = R.Count(MaxChannels, 4); if (!R.Ok()) return false; P.UVs.SetNum(UvCount);
-            for (uint32 I = 0; I < UvCount; ++I)
-                if (!ReadMeshArray(P.UVs[I], MaxVertices, 8, [&R]() { return R.V2(); })) return false;
-            if (!ReadMeshArray(P.Indices, MaxIndices, 4, [&R]() { return R.U32(); })) return false;
-            const uint32 JointSetCount = R.Count(MaxJointSets, 4); if (!R.Ok()) return false; P.Joints.SetNum(JointSetCount);
-            for (uint32 I = 0; I < JointSetCount; ++I)
-                if (!ReadMeshArray(P.Joints[I], MaxVertices, 8, [&R]()
-                    { FGWorldBakedJoint4 X; X.X=R.U16(); X.Y=R.U16(); X.Z=R.U16(); X.W=R.U16(); return X; })) return false;
-            const uint32 WeightSetCount = R.Count(MaxJointSets, 4); if (!R.Ok()) return false; P.Weights.SetNum(WeightSetCount);
-            for (uint32 I = 0; I < WeightSetCount; ++I)
-                if (!ReadMeshArray(P.Weights[I], MaxVertices, 16, [&R]() { return R.V4(); })) return false;
-            if (!ReadMeshArray(P.Colors, MaxVertices, 16, [&R]() { return R.V4(); })) return false;
-            const uint32 MorphCount = R.Count(MaxMorphTargets, 12); if (!R.Ok()) return false; P.MorphTargets.Reserve(MorphCount);
-            for (uint32 I = 0; I < MorphCount; ++I)
-            {
-                FGWorldBakedMorphTarget& M = P.MorphTargets.AddDefaulted_GetRef(); M.Name = R.String(MaxNameBytes);
-                if (!ReadMeshArray(M.Positions, MaxVertices, 12, [&R]() { return R.V3(); })
-                    || !ReadMeshArray(M.Normals, MaxVertices, 12, [&R]() { return R.V3(); })) return false;
-            }
-            const uint32 BoneCount = R.Count(MaxBones, 8); if (!R.Ok()) return false;
-            for (uint32 I = 0; I < BoneCount; ++I)
-            { const int32 Key = R.I32(); const FName Name(*R.String(MaxNameBytes)); if (Key < 0 || Name.IsNone() || P.BoneMap.Contains(Key)) return false; P.BoneMap.Add(Key, Name); }
-            const uint32 WeightMapCount = R.Count(MaxMorphTargets, 8); if (!R.Ok()) return false;
-            for (uint32 I = 0; I < WeightMapCount; ++I)
-            {
-                const FString Key = R.String(MaxNameBytes); TArray<float> Values;
-                if (Key.IsEmpty() || P.WeightMaps.Contains(Key)
-                    || !ReadMeshArray(Values, MaxVertices, 4, [&R]() { return R.Float(); })) return false;
-                P.WeightMaps.Add(Key, MoveTemp(Values));
-            }
-            P.MaterialName = R.String(MaxNameBytes); P.MaterialId = R.I32(); P.Mode = R.I32();
-            const uint8 HasMaterial=R.U8(); const uint8 HighPrecisionUvs=R.U8();
-            const uint8 HighPrecisionWeights=R.U8(); const uint8 DisableShadows=R.U8();
-            const uint8 HasIndices=R.U8(); (void)R.U8(); (void)R.U16();
-            if(HasMaterial>1||HighPrecisionUvs>1||HighPrecisionWeights>1||DisableShadows>1||HasIndices>1)
-            {Error=TEXT("mesh.dat contains an invalid primitive boolean flag");Out={};return false;}
-            P.bHasMaterial=HasMaterial!=0;P.bHighPrecisionUVs=HighPrecisionUvs!=0;
-            P.bHighPrecisionWeights=HighPrecisionWeights!=0;P.bDisableShadows=DisableShadows!=0;
-            P.bHasIndices=HasIndices!=0;
+            // Keep engine-specific checks (e.g. FName semantics) after portable validation.
+            const int32 MeshIndex = Out.MeshIndex; Out.MeshIndex = 0;
+            FGWorldBakedModel Check; Check.Meshes.Add(MoveTemp(Out));
+            if (!Check.IsSane(&Error)) { Out = {}; return false; }
+            Out = MoveTemp(Check.Meshes[0]); Out.MeshIndex = MeshIndex;
         }
-        if (bDependenciesOnly)
-        {
-            if (!R.End() || Out.MeshIndex < 0)
-            { Error = TEXT("mesh.dat dependency layout is malformed"); Out = {}; return false; }
-            Error.Reset();
-            return true;
-        }
-        // IsSane also checks full-model contiguous IDs. Temporarily normalize this member's ID and
-        // move (never copy) its potentially large arrays into the validation model.
-        const int32 SerializedMeshIndex = Out.MeshIndex;
-        Out.MeshIndex = 0;
-        FGWorldBakedModel Check;
-        Check.Meshes.Add(MoveTemp(Out));
-        FString SaneError;
-        if (!R.End() || !Check.IsSane(&SaneError))
-        {
-            Error = SaneError.IsEmpty() ? TEXT("mesh.dat is malformed") : SaneError;
-            Out = FGWorldBakedMesh();
-            return false;
-        }
-        Out = MoveTemp(Check.Meshes[0]);
-        Out.MeshIndex = SerializedMeshIndex;
-        Error.Reset();
-        return true;
+        Error.Reset(); return true;
     }
-
     bool SerializeSkin(const FGWorldBakedSkin& V, TArray<uint8>& Out, FString& Error)
-    {
-        FWriter W(Out);
-        W.U32(0x4e494b53); // "SKIN"
-        W.U32(Version);
-        W.I32(V.SkinIndex);
-        W.U32(V.Bones.Num());
-        for (const FGWorldBakedBone& Bone : V.Bones)
-        {
-            W.String(Bone.Name, MaxNameBytes);
-            W.I32(Bone.ParentIndex);
-            W.Transform(Bone.Transform);
-        }
-
-        // Map iteration order is not deterministic, so every map is serialized by sorted key.
-        TArray<int32> Keys;
-        V.JointBoneMap.GetKeys(Keys);
-        Keys.Sort();
-        W.U32(Keys.Num());
-        for (const int32 Key : Keys)
-        {
-            W.I32(Key);
-            W.String(V.JointBoneMap.FindChecked(Key).ToString(), MaxNameBytes);
-        }
-        return Finish(W, Out, Error);
-    }
-
+    { return Encode(ToPortable(V), Out, Error); }
     bool DeserializeSkin(const TArray<uint8>& Bytes, FGWorldBakedSkin& Out, FString& Error)
     {
-        Out = FGWorldBakedSkin();
-        FReader R(Bytes);
-        if (!Header(R, 0x4e494b53, Error))
-        {
-            return false;
-        }
-        Out.SkinIndex = R.I32();
-
-        const uint32 BoneCount = R.Count(MaxBones, 88);
-        if (!R.Ok())
-        {
-            Error = TEXT("skin.dat bone count is invalid or truncated");
-            return false;
-        }
-        Out.Bones.Reserve(BoneCount);
-        for (uint32 Index = 0; Index < BoneCount; ++Index)
-        {
-            FGWorldBakedBone& Bone = Out.Bones.AddDefaulted_GetRef();
-            Bone.Name = R.String(MaxNameBytes);
-            Bone.ParentIndex = R.I32();
-            Bone.Transform = R.Transform();
-        }
-
-        const uint32 JointCount = R.Count(MaxBones, 8);
-        if (!R.Ok())
-        {
-            Error = TEXT("skin.dat joint map is invalid or truncated");
-            return false;
-        }
-        for (uint32 Index = 0; Index < JointCount; ++Index)
-        {
-            const int32 Key = R.I32();
-            const FName Name(*R.String(MaxNameBytes));
-            if (Key < 0 || Name.IsNone() || Out.JointBoneMap.Contains(Key))
-            {
-                Error = TEXT("skin.dat contains an invalid or duplicate joint mapping");
-                Out = FGWorldBakedSkin();
-                return false;
-            }
-            Out.JointBoneMap.Add(Key, Name);
-        }
-
-        FGWorldBakedModel Check;
-        Check.Skins.Add(MoveTemp(Out));
-        FString SaneError;
-        if (!R.End() || !Check.IsSane(&SaneError))
-        {
-            Error = SaneError.IsEmpty() ? TEXT("skin.dat is malformed") : SaneError;
-            Out = FGWorldBakedSkin();
-            return false;
-        }
-        Out = MoveTemp(Check.Skins[0]);
-        Error.Reset();
-        return true;
+        Out = {}; v3d::skin Value; std::string Detail;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Detail))
+        { Error = ToUnreal(Detail); return false; }
+        FGWorldBakedModel Check; Check.Skins.Add(ToUnreal(Value));
+        if (!Check.IsSane(&Error)) return false;
+        Out = MoveTemp(Check.Skins[0]); Error.Reset(); return true;
     }
-
     bool SerializeMaterial(const FGWorldBakedMaterial& V, TArray<uint8>& Out, FString& Error)
-    {
-        FWriter W(Out);
-        W.U32(0x4c54414d); // "MATL"
-        W.U32(Version);
-        W.I32(V.MaterialId);
-        W.String(V.Name, MaxNameBytes);
-        W.String(V.BaseMaterialPath);
-        W.U8(V.MaterialType);
-        W.U8(V.bUnlit);
-        W.U16(0); // Reserved for a future format revision.
-
-        W.U32(V.Scalars.Num());
-        for (const FGWorldBakedScalarParameter& Parameter : V.Scalars)
-        {
-            W.String(Parameter.Name, MaxNameBytes);
-            W.Float(Parameter.Value);
-        }
-        W.U32(V.Vectors.Num());
-        for (const FGWorldBakedVectorParameter& Parameter : V.Vectors)
-        {
-            W.String(Parameter.Name, MaxNameBytes);
-            W.Color(Parameter.Value);
-        }
-        W.U32(V.Textures.Num());
-        for (const FGWorldBakedTextureParameter& Parameter : V.Textures)
-        {
-            W.String(Parameter.Name, MaxNameBytes);
-            W.I32(Parameter.TextureId);
-            W.String(Parameter.AssetPath);
-        }
-        return Finish(W, Out, Error);
-    }
-
+    { return Encode(ToPortable(V), Out, Error); }
     bool DeserializeMaterial(const TArray<uint8>& Bytes, FGWorldBakedMaterial& Out, FString& Error)
     {
-        Out = FGWorldBakedMaterial();
-        FReader R(Bytes);
-        if (!Header(R, 0x4c54414d, Error))
-        {
-            return false;
-        }
-        Out.MaterialId = R.I32();
-        Out.Name = R.String(MaxNameBytes);
-        Out.BaseMaterialPath = R.String();
-        Out.MaterialType = R.U8();
-        const uint8 Unlit = R.U8();
-        Out.bUnlit = Unlit != 0;
-        (void)R.U16();
-
-        const uint32 ScalarCount = R.Count(MaxParameters, 8);
-        if (!R.Ok())
-        {
-            Error = TEXT("material.dat scalar table is invalid or truncated");
-            return false;
-        }
-        Out.Scalars.Reserve(ScalarCount);
-        for (uint32 Index = 0; Index < ScalarCount; ++Index)
-        {
-            FGWorldBakedScalarParameter& Parameter = Out.Scalars.AddDefaulted_GetRef();
-            Parameter.Name = R.String(MaxNameBytes);
-            Parameter.Value = R.Float();
-        }
-
-        const uint32 VectorCount = R.Count(MaxParameters, 20);
-        if (!R.Ok())
-        {
-            Error = TEXT("material.dat vector table is invalid or truncated");
-            return false;
-        }
-        Out.Vectors.Reserve(VectorCount);
-        for (uint32 Index = 0; Index < VectorCount; ++Index)
-        {
-            FGWorldBakedVectorParameter& Parameter = Out.Vectors.AddDefaulted_GetRef();
-            Parameter.Name = R.String(MaxNameBytes);
-            Parameter.Value = R.Color();
-        }
-
-        const uint32 TextureCount = R.Count(MaxParameters, 12);
-        if (!R.Ok())
-        {
-            Error = TEXT("material.dat texture table is invalid or truncated");
-            return false;
-        }
-        Out.Textures.Reserve(TextureCount);
-        for (uint32 Index = 0; Index < TextureCount; ++Index)
-        {
-            FGWorldBakedTextureParameter& Parameter = Out.Textures.AddDefaulted_GetRef();
-            Parameter.Name = R.String(MaxNameBytes);
-            Parameter.TextureId = R.I32();
-            Parameter.AssetPath = R.String();
-        }
-
-        bool bParametersValid = Unlit <= 1;
-        for (const FGWorldBakedScalarParameter& Parameter : Out.Scalars)
-        {
-            bParametersValid = bParametersValid && !Parameter.Name.IsEmpty()
-                && FMath::IsFinite(Parameter.Value);
-        }
-        for (const FGWorldBakedVectorParameter& Parameter : Out.Vectors)
-        {
-            bParametersValid = bParametersValid && !Parameter.Name.IsEmpty()
-                && FMath::IsFinite(Parameter.Value.R) && FMath::IsFinite(Parameter.Value.G)
-                && FMath::IsFinite(Parameter.Value.B) && FMath::IsFinite(Parameter.Value.A);
-        }
-        for (const FGWorldBakedTextureParameter& Parameter : Out.Textures)
-        {
-            const bool bBaked = Parameter.TextureId != INDEX_NONE;
-            const bool bAsset = !Parameter.AssetPath.IsEmpty();
-            bParametersValid = bParametersValid && !Parameter.Name.IsEmpty()
-                && Parameter.TextureId >= INDEX_NONE && bBaked != bAsset;
-        }
-
-        if (!R.End() || Out.MaterialId < 0 || Out.Name.IsEmpty()
-            || Out.BaseMaterialPath.IsEmpty() || Out.MaterialType > 5 || !bParametersValid)
-        {
-            Error = TEXT("material.dat is malformed");
-            Out = FGWorldBakedMaterial();
-            return false;
-        }
-        Error.Reset();
-        return true;
+        Out = {}; v3d::material Value; std::string Detail;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Detail))
+        { Error = ToUnreal(Detail); return false; }
+        Out = ToUnreal(Value); Error.Reset(); return true;
     }
-
-    bool SerializeTexture(
-        const FGWorldBakedTexture& V,
-        TArray<uint8>& Out,
-        FString& Error)
+    bool SerializeTexture(const FGWorldBakedTexture& V, TArray<uint8>& Out, FString& Error)
     {
-        FWriter W(Out);
-        W.U32(0x52584554); // "TEXR"
-        W.U32(Version);
-        W.I32(V.TextureId);
-        W.String(V.Name, MaxNameBytes);
-        W.I32(V.SizeX);
-        W.I32(V.SizeY);
-        W.I32(V.PixelFormat);
-        W.U8(V.AddressX);
-        W.U8(V.AddressY);
-        W.U8(V.Filter);
-        W.U8(V.LODGroup);
-        W.U8(V.bSRGB);
-        W.U8(0);
-        W.U16(0);
-        W.U32(V.Mips.Num());
-        for (const FGWorldBakedTextureMip& Mip : V.Mips)
-        {
-            W.I32(Mip.SizeX);
-            W.I32(Mip.SizeY);
-            W.I32(Mip.SizeZ);
-            W.U32(Mip.Bytes.Num());
-            W.Raw(Mip.Bytes.GetData(), Mip.Bytes.Num());
-        }
-        return Finish(W, Out, Error);
+        Out.Reset(); v3d::texture Value;
+        if (!ToPortable(V, Value, Error)) return false;
+        return Encode(Value, Out, Error);
     }
-
-    bool DeserializeTexture(
-        const TArray<uint8>& Bytes,
-        FGWorldBakedTexture& Out,
-        FString& Error,
-        const int32 MaxResolution)
+    bool DeserializeTexture(const TArray<uint8>& Bytes, FGWorldBakedTexture& Out, FString& Error, const int32 MaxResolution)
     {
-        Out = FGWorldBakedTexture();
-        FReader R(Bytes);
-        if (!Header(R, 0x52584554, Error)) return false;
-        Out.TextureId = R.I32();
-        Out.Name = R.String(MaxNameBytes);
-        Out.SizeX = R.I32();
-        Out.SizeY = R.I32();
-        Out.PixelFormat = R.I32();
-        Out.AddressX = R.U8();
-        Out.AddressY = R.U8();
-        Out.Filter = R.U8();
-        Out.LODGroup = R.U8();
-        const uint8 Srgb = R.U8();
-        Out.bSRGB = Srgb != 0;
-        (void)R.U8();
-        (void)R.U16();
-        const uint32 MipCount = R.Count(MaxMips, 16);
-        bool bValid = R.Ok() && MipCount > 0 && Out.SizeX > 0 && Out.SizeY > 0;
-        int32 ExpectedX = Out.SizeX;
-        int32 ExpectedY = Out.SizeY;
-        Out.Mips.Reserve(MipCount);
-        for (uint32 Index = 0; bValid && Index < MipCount; ++Index)
-        {
-            const int32 X = R.I32();
-            const int32 Y = R.I32();
-            const int32 Z = R.I32();
-            const uint32 ByteCount = R.Count(MaxMipBytes, 1);
-            bValid = R.Ok() && X == ExpectedX && Y == ExpectedY && Z == 1 && ByteCount > 0;
-            if (!bValid) break;
-            ExpectedX = FMath::Max(1, ExpectedX >> 1);
-            ExpectedY = FMath::Max(1, ExpectedY >> 1);
-            // Validate skipped mip metadata and bounds too. CRC still covers the whole member.
-            // Retain the final mip even for legacy archives with an incomplete mip chain.
-            if (MaxResolution > 0 && (X > MaxResolution || Y > MaxResolution) && Index + 1 < MipCount)
-            {
-                bValid = R.Skip(static_cast<int32>(ByteCount));
-                continue;
-            }
-            FGWorldBakedTextureMip& Mip = Out.Mips.AddDefaulted_GetRef();
-            Mip.SizeX = X; Mip.SizeY = Y; Mip.SizeZ = Z;
-            Mip.Bytes.SetNumUninitialized(static_cast<int32>(ByteCount));
-            bValid = R.Raw(Mip.Bytes.GetData(), Mip.Bytes.Num());
-        }
-        if (!bValid || !R.End() || Out.TextureId < 0 || Out.Name.IsEmpty()
-            || Srgb > 1 || Out.Mips.IsEmpty())
-        {
-            Error = TEXT("texture.dat is malformed or truncated");
-            Out = FGWorldBakedTexture();
-            return false;
-        }
-        Out.SizeX = Out.Mips[0].SizeX;
-        Out.SizeY = Out.Mips[0].SizeY;
-        Error.Reset();
-        return true;
+        Out = {}; v3d::texture Value; std::string Detail;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Detail, static_cast<uint32>(FMath::Max(0, MaxResolution))))
+        { Error = ToUnreal(Detail); return false; }
+        if (!ToUnreal(Value, Out, Error)) { Out = {}; return false; }
+        Error.Reset(); return true;
     }
-
-    bool SerializeManifest(
-        const FGWorldModelManifest& V,
-        TArray<uint8>& Out,
-        FString& Error)
+    bool SerializeManifest(const FGWorldModelManifest& V, TArray<uint8>& Out, FString& Error)
+    { return Encode(ToPortable(V), Out, Error); }
+    bool DeserializeManifest(const TArray<uint8>& Bytes, FGWorldModelManifest& Out, FString& Error)
     {
-        FWriter W(Out);
-        W.U32(0x464e414d); // "MANF"
-        W.U32(Version);
-        const auto WriteMap = [&W](const TMap<int32, FGWorldArchiveRange>& Map)
-        {
-            TArray<int32> Keys;
-            Map.GetKeys(Keys);
-            Keys.Sort();
-            W.U32(Keys.Num());
-            for (const int32 Key : Keys)
-            {
-                W.I32(Key);
-                WriteRange(W, Map.FindChecked(Key));
-            }
-        };
-        WriteMap(V.MeshRanges);
-        WriteMap(V.SkinRanges);
-        WriteMap(V.MaterialRanges);
-        WriteMap(V.TextureRanges);
-
-        TArray<int32> MeshKeys;
-        V.MeshNames.GetKeys(MeshKeys);
-        MeshKeys.Sort();
-        W.U32(MeshKeys.Num());
-        for (const int32 Key : MeshKeys)
-        {
-            W.I32(Key);
-            W.String(V.MeshNames.FindChecked(Key), MaxNameBytes);
-        }
-        return Finish(W, Out, Error);
-    }
-
-    bool DeserializeManifest(
-        const TArray<uint8>& Bytes,
-        FGWorldModelManifest& Out,
-        FString& Error)
-    {
-        Out = FGWorldModelManifest();
-        FReader R(Bytes);
-        if (!Header(R, 0x464e414d, Error))
-        {
-            return false;
-        }
-
-        const auto ReadMap = [&R](TMap<int32, FGWorldArchiveRange>& Map)
-        {
-            // key(4) + the smallest range row(36)
-            const uint32 Count = R.Count(MaxMeshes, 40);
-            if (!R.Ok())
-            {
-                return false;
-            }
-            for (uint32 Index = 0; Index < Count; ++Index)
-            {
-                const int32 Key = R.I32();
-                FGWorldArchiveRange Range = ReadRange(R);
-                if (Key < 0 || Map.Contains(Key))
-                {
-                    return false;
-                }
-                Map.Add(Key, MoveTemp(Range));
-            }
-            return R.Ok();
-        };
-
-        if (!ReadMap(Out.MeshRanges) || !ReadMap(Out.SkinRanges)
-            || !ReadMap(Out.MaterialRanges) || !ReadMap(Out.TextureRanges))
-        {
-            Error = TEXT("manifest.dat contains an invalid or duplicate range table");
-            Out = FGWorldModelManifest();
-            return false;
-        }
-
-        const uint32 MeshNameCount = R.Count(MaxMeshes, 8);
-        if (!R.Ok())
-        {
-            Error = TEXT("manifest.dat mesh-name table is invalid or truncated");
-            Out = FGWorldModelManifest();
-            return false;
-        }
-        for (uint32 Index = 0; Index < MeshNameCount; ++Index)
-        {
-            const int32 Key = R.I32();
-            FString Name = R.String(MaxNameBytes);
-            if (Key < 0 || Name.IsEmpty() || Out.MeshNames.Contains(Key))
-            {
-                Error = TEXT("manifest.dat contains an invalid or duplicate mesh name");
-                Out = FGWorldModelManifest();
-                return false;
-            }
-            Out.MeshNames.Add(Key, MoveTemp(Name));
-        }
-        if (!R.End())
-        {
-            Error = TEXT("manifest.dat is malformed");
-            Out = FGWorldModelManifest();
-            return false;
-        }
-        Error.Reset();
-        return true;
+        Out = {}; v3d::manifest Value; std::string Detail;
+        if (!v3d::decode(Bytes.GetData(), Bytes.Num(), Value, Detail))
+        { Error = ToUnreal(Detail); return false; }
+        Out = ToUnreal(Value); Error.Reset(); return true;
     }
 }

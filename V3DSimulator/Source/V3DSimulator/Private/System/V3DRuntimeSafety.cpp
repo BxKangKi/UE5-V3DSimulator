@@ -1092,6 +1092,15 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
     while (State.ActiveOperations.Num() < MaximumConcurrentNativeOperations &&
         V3DRuntimeSafetyPrivate::IsNativeGateIdle())
     {
+        // ClearCache is exclusive against all finalizers. Continuously refilling free slots can
+        // otherwise retain completed builders and their parser/mesh caches for an entire long
+        // streaming session, after their memory permits have already been released. Periodically
+        // drain the bounded active wave so teardown gets a gate before admitting another wave.
+        if (State.PendingAssetReleases.Num() >= MaximumConcurrentNativeOperations)
+        {
+            ProcessPendingAssetReleases_GameThread();
+            if (!State.PendingAssetReleases.IsEmpty()) return;
+        }
         int32 SelectedIndex = INDEX_NONE;
         TArray<V3DRuntimeSafetyPrivate::FQueuedOperation> RejectedBeforeStart;
         V3DRuntimeSafetyPrivate::FQueuedOperation Operation;
@@ -1242,4 +1251,48 @@ bool FV3DDeferredCompletionDrainTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("No completion delegate remains after the drain"), V3DRuntimeSafetyPrivate::GetState().DeferredCompletions.IsEmpty());
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DNativeReleaseFairnessTest,
+    "V3DSimulator.Streaming.Memory.NativeReleaseFairness",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DNativeReleaseFairnessTest::RunTest(const FString&)
+{
+    if (FV3DRuntimeSafety::GetPendingOperationCount() != 0 || FV3DRuntimeSafety::IsCircuitOpen()
+        || V3DRuntimeSafetyPrivate::IsShuttingDown())
+    {
+        AddError(TEXT("Run this test in an idle editor before shutdown."));
+        return false;
+    }
+    auto& Concurrency = V3DRuntimeSafetyPrivate::CVarMaximumConcurrentNativeOperations;
+    const int32 PreviousLimit = Concurrency.GetValueOnGameThread();
+    Concurrency.AsVariable()->Set(2, ECVF_SetByCode);
+    ON_SCOPE_EXIT { Concurrency.AsVariable()->Set(PreviousLimit, ECVF_SetByCode); };
+    TStrongObjectPtr<UObject> Owner(NewObject<UObject>());
+    TStrongObjectPtr<UglTFRuntimeAsset> First(NewObject<UglTFRuntimeAsset>());
+    TStrongObjectPtr<UglTFRuntimeAsset> Second(NewObject<UglTFRuntimeAsset>());
+    TStrongObjectPtr<UglTFRuntimeAsset> Third(NewObject<UglTFRuntimeAsset>());
+    TStrongObjectPtr<UglTFRuntimeAsset> Fourth(NewObject<UglTFRuntimeAsset>());
+    int32 Started = 0;
+    const auto Start = [&Started](uint64) { ++Started; };
+    const uint64 A = FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), First.Get(), TEXT("release A"), Start);
+    const uint64 B = FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Second.Get(), TEXT("release B"), Start);
+    const uint64 C = FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Third.Get(), TEXT("release C"), Start);
+    const uint64 D = FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Fourth.Get(), TEXT("release D"), Start);
+    TestEqual(TEXT("Native work begins at bounded concurrency"), Started, 2);
+    FV3DRuntimeSafety::RequestAssetRelease(First.Get());
+    FV3DRuntimeSafety::CompleteOperation(A);
+    TestEqual(TEXT("A small teardown backlog preserves parallel throughput"), Started, 3);
+    FV3DRuntimeSafety::RequestAssetRelease(Second.Get());
+    FV3DRuntimeSafety::CompleteOperation(B);
+    TestEqual(TEXT("A full teardown wave drains before refilling the native gate"), Started, 3);
+    TestEqual(TEXT("Deferred parser ownership stays bounded"),
+        V3DRuntimeSafetyPrivate::GetState().PendingAssetReleases.Num(), 2);
+    FV3DRuntimeSafety::CompleteOperation(C);
+    TestEqual(TEXT("Clearing deferred caches resumes queued work"), Started, 4);
+    TestEqual(TEXT("The cache-release barrier clears every completed builder"),
+        V3DRuntimeSafetyPrivate::GetState().PendingAssetReleases.Num(), 0);
+    FV3DRuntimeSafety::CompleteOperation(D);
+    TestEqual(TEXT("The native coordinator finishes empty"), FV3DRuntimeSafety::GetPendingOperationCount(), 0);
+    return true;
+}
+
 #endif

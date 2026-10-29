@@ -8,17 +8,52 @@
  */
 
 #include "UI/SettingsMenuWidget.h"
+#include "UI/WidgetStyleSafety.h"
+#include "UI/HUDLegacyStyle.h"
+#include "Components/Overlay.h"
+#include "Components/OverlaySlot.h"
 #include "UI/SettingControlWidget.h"
 #include "System/SimulatorFileServices.h"
 #include "Blueprint/WidgetTree.h"
 
 #include "Components/ContentWidget.h"
+#include "Components/ButtonSlot.h"
+#include "Components/Border.h"
+#include "Components/CanvasPanel.h"
+#include "Components/ScrollBox.h"
+#include "Components/SizeBox.h"
+#include "Components/VerticalBoxSlot.h"
+#include "Components/HorizontalBox.h"
+#include "Components/HorizontalBoxSlot.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
-#include "System/V3DSimulatorAssetRegistry.h"
-#include "System/V3DSimulatorGameInstance.h"
+
+namespace
+{
+    void ApplySettingsMenuComboTheme(UComboBoxString* Dropdown, FLinearColor Panel, FLinearColor Accent, FLinearColor Text)
+    {
+        FComboBoxStyle Style = Dropdown->GetWidgetStyle();
+        Style.ComboButtonStyle.ButtonStyle.Normal.TintColor = FSlateColor(Panel);
+        Style.ComboButtonStyle.ButtonStyle.Hovered.TintColor = FSlateColor(Accent);
+        Style.ComboButtonStyle.ButtonStyle.Pressed.TintColor = FSlateColor(Accent);
+        Style.ComboButtonStyle.MenuBorderBrush.TintColor = FSlateColor(Panel);
+        V3DWidgetStyle::SetOwnedStyle(*Dropdown, Style);
+        FTableRowStyle Item = Dropdown->GetItemStyle();
+        Item.EvenRowBackgroundBrush.TintColor = FSlateColor(Panel);
+        Item.OddRowBackgroundBrush.TintColor = FSlateColor(Panel);
+        Item.EvenRowBackgroundHoveredBrush.TintColor = FSlateColor(Accent);
+        Item.OddRowBackgroundHoveredBrush.TintColor = FSlateColor(Accent);
+        Item.ActiveBrush.TintColor = FSlateColor(Accent);
+        Item.ActiveHoveredBrush.TintColor = FSlateColor(Accent);
+        Item.InactiveBrush.TintColor = FSlateColor(Panel);
+        Item.InactiveHoveredBrush.TintColor = FSlateColor(Accent);
+        Item.TextColor = FSlateColor(Text);
+        Item.SelectedTextColor = FSlateColor(Text);
+        V3DWidgetStyle::SetOwnedItemStyle(*Dropdown, Item);
+    }
+}
 
 namespace
 {
@@ -58,6 +93,7 @@ namespace
     const TArray<ESettingsField>& GetDefaultSettingsFields()
     {
         static const TArray<ESettingsField> Fields = {
+            ESettingsField::MouseSensitivity,
             ESettingsField::QualityProfile,
             ESettingsField::BloomIntensity,
             ESettingsField::BloomThreshold,
@@ -187,6 +223,7 @@ namespace
     {
         switch (Field)
         {
+        case ESettingsField::MouseSensitivity: return TEXT("MouseSensitivity");
         case ESettingsField::QualityProfile: return TEXT("QualityProfile");
         case ESettingsField::BloomIntensity: return TEXT("BloomIntensity");
         case ESettingsField::BloomThreshold: return TEXT("BloomThreshold");
@@ -347,15 +384,28 @@ void USettingsCycleButton::HandleClicked()
     }
 }
 
+USettingsMenuWidget::USettingsMenuWidget(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    BodyFontSize = 24;
+    TitleFontSize = 100;
+    ButtonHeight = 64.f;
+    FontOutlineSize = 2;
+}
+
 void USettingsMenuWidget::NativeConstruct()
 {
     Super::NativeConstruct();
 
-    // Keep explicit Blueprint controls; repair missing bindings using the shipped layout names.
-    if (!AssignedSettingsListBox.IsValid())
-        AssignedSettingsListBox = Cast<UVerticalBox>(GetWidgetFromName(TEXT("SettingsList")));
-    if (!AssignedBackButton.IsValid())
-        SetBackButton(Cast<UButton>(GetWidgetFromName(TEXT("Back"))));
+    if (IsDesignTime()) return;
+    // Explicit custom layouts may opt into the same native rows through a named or assigned host.
+    if (!IsUsingNativeLayout())
+    {
+        if (!AssignedSettingsListBox.IsValid())
+            AssignedSettingsListBox = Cast<UVerticalBox>(GetWidgetFromName(TEXT("SettingsList")));
+        if (!AssignedBackButton.IsValid())
+            SetBackButton(Cast<UButton>(GetWidgetFromName(TEXT("Back"))));
+    }
     CollectAssignedWidgetReferences();
     BindButtonEvents();
     InitializeSettingsFromSavedData();
@@ -381,20 +431,18 @@ void USettingsMenuWidget::NativeDestruct()
         if (IsValid(Binding)) Binding->Unbind();
     }
     ControlBindings.Empty();
-    ResolvedBooleanSettingWidgetClass = nullptr;
-    ResolvedFloatSettingWidgetClass = nullptr;
-    ResolvedEnumSettingWidgetClass = nullptr;
-
     Super::NativeDestruct();
 }
 
 void USettingsMenuWidget::SetTitleText(UTextBlock* InTitleText)
 {
+    if (!AcceptWidgetAssignment(InTitleText)) return;
     AssignedTitleText = InTitleText;
 }
 
 void USettingsMenuWidget::SetApplyButton(UButton* InButton)
 {
+    if (!AcceptWidgetAssignment(InButton)) return;
     if (UButton* Button = AssignedApplyButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
@@ -410,6 +458,7 @@ void USettingsMenuWidget::SetApplyButton(UButton* InButton)
 
 void USettingsMenuWidget::SetConfirmButton(UButton* InButton)
 {
+    if (!AcceptWidgetAssignment(InButton)) return;
     if (UButton* Button = AssignedConfirmButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
@@ -425,6 +474,7 @@ void USettingsMenuWidget::SetConfirmButton(UButton* InButton)
 
 void USettingsMenuWidget::SetBackButton(UButton* InButton)
 {
+    if (!AcceptWidgetAssignment(InButton)) return;
     if (UButton* Button = AssignedBackButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
@@ -440,6 +490,7 @@ void USettingsMenuWidget::SetBackButton(UButton* InButton)
 
 void USettingsMenuWidget::SetCancelButton(UButton* InButton)
 {
+    if (!AcceptWidgetAssignment(InButton)) return;
     if (UButton* Button = AssignedCancelButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
@@ -456,6 +507,7 @@ void USettingsMenuWidget::SetCancelButton(UButton* InButton)
 
 void USettingsMenuWidget::SetSettingsListBox(UVerticalBox* InVerticalBox)
 {
+    if (IsUsingNativeLayout()) return;
     if (AssignedSettingsListBox.Get() == InVerticalBox)
     {
         RebuildGeneratedSettingWidgets();
@@ -469,66 +521,29 @@ void USettingsMenuWidget::SetSettingsListBox(UVerticalBox* InVerticalBox)
 
 void USettingsMenuWidget::ClearGeneratedSettingWidgets()
 {
-    if (UVerticalBox* Host = AssignedSettingsListBox.Get())
+    // Remove only rows we created. A custom Blueprint may also place headings/spacers in the host.
+    for (USettingControlWidget* Row : GeneratedSettingWidgets)
     {
-        // This host is intentionally dedicated to generated setting rows.
-        Host->ClearChildren();
+        if (IsValid(Row))
+        {
+            // Detached rows retained by an external graph must not keep editing this menu.
+            Row->ConfigureSetting(nullptr, Row->GetSettingField());
+            Row->RemoveFromParent();
+        }
     }
     GeneratedSettingWidgets.Empty();
 }
 
-UClass* USettingsMenuWidget::ResolveGeneratedSettingWidgetClass(const ESettingsControlType ControlType)
-{
-    UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
-    if (IsValid(Registry)) Registry->EnsureMenuDefaults();
-
-    TObjectPtr<UClass>* Cache = nullptr;
-    UClass* LoadedClass = nullptr;
-    switch (ControlType)
-    {
-    case ESettingsControlType::Toggle:
-        Cache = &ResolvedBooleanSettingWidgetClass;
-        if (IsValid(Cache->Get())) return Cache->Get();
-        if (IsValid(Registry) && !Registry->BooleanSettingWidgetClass.IsNull())
-            LoadedClass = Registry->BooleanSettingWidgetClass.LoadSynchronous();
-        break;
-    case ESettingsControlType::Slider:
-        Cache = &ResolvedFloatSettingWidgetClass;
-        if (IsValid(Cache->Get())) return Cache->Get();
-        if (IsValid(Registry) && !Registry->FloatSettingWidgetClass.IsNull())
-            LoadedClass = Registry->FloatSettingWidgetClass.LoadSynchronous();
-        break;
-    case ESettingsControlType::Dropdown:
-        Cache = &ResolvedEnumSettingWidgetClass;
-        if (IsValid(Cache->Get())) return Cache->Get();
-        if (IsValid(Registry) && !Registry->EnumSettingWidgetClass.IsNull())
-            LoadedClass = Registry->EnumSettingWidgetClass.LoadSynchronous();
-        break;
-    default:
-        return nullptr;
-    }
-
-    if (!Cache) return nullptr;
-    UClass* ExpectedClass = ControlType == ESettingsControlType::Toggle ? UBooleanSettingWidget::StaticClass()
-        : ControlType == ESettingsControlType::Slider ? UFloatSettingWidget::StaticClass()
-        : UEnumSettingWidget::StaticClass();
-    if (!IsValid(LoadedClass) || !LoadedClass->IsChildOf(ExpectedClass)
-        || LoadedClass->HasAnyClassFlags(CLASS_Abstract))
-    {
-        FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
-            TEXT("Settings row class unavailable for control %d; using native row."), static_cast<int32>(ControlType)));
-        LoadedClass = ExpectedClass;
-    }
-    *Cache = LoadedClass;
-    return LoadedClass;
-}
-
 USettingControlWidget* USettingsMenuWidget::CreateGeneratedSettingWidget(ESettingsField Field)
 {
-    UClass* const WidgetClass = ResolveGeneratedSettingWidgetClass(GetSettingControlType(Field));
-    if (!IsValid(WidgetClass))
+    UClass* WidgetClass = nullptr;
+    // Selecting a native class cannot trigger package IO or run a component Blueprint graph.
+    switch (GetSettingControlType(Field))
     {
-        return nullptr;
+    case ESettingsControlType::Toggle: WidgetClass = UBooleanSettingWidget::StaticClass(); break;
+    case ESettingsControlType::Slider: WidgetClass = UFloatSettingWidget::StaticClass(); break;
+    case ESettingsControlType::Dropdown: WidgetClass = UEnumSettingWidget::StaticClass(); break;
+    default: return nullptr;
     }
 
     return Cast<USettingControlWidget>(
@@ -537,19 +552,9 @@ USettingControlWidget* USettingsMenuWidget::CreateGeneratedSettingWidget(ESettin
 
 void USettingsMenuWidget::RebuildGeneratedSettingWidgets()
 {
+    if (IsUsingNativeLayout() || IsDesignTime()) return;
     if (!AssignedSettingsListBox.IsValid())
         AssignedSettingsListBox = Cast<UVerticalBox>(GetWidgetFromName(TEXT("SettingsList")));
-    if (!AssignedSettingsListBox.IsValid() && IsValid(WidgetTree))
-    {
-        TArray<UWidget*> Widgets;
-        WidgetTree->GetAllWidgets(Widgets);
-        UVerticalBox* Candidate = nullptr;
-        int32 Count = 0;
-        for (UWidget* Widget : Widgets)
-            if (UVerticalBox* Box = Cast<UVerticalBox>(Widget); Box && Box != WidgetTree->RootWidget && Box->GetChildrenCount() == 0)
-            { Candidate = Box; ++Count; }
-        if (Count == 1) AssignedSettingsListBox = Candidate;
-    }
     UVerticalBox* Host = AssignedSettingsListBox.Get();
     if (!IsValid(Host))
     {
@@ -567,12 +572,13 @@ void USettingsMenuWidget::RebuildGeneratedSettingWidgets()
         {
             const ESettingsControlType ControlType = GetSettingControlType(Field);
             UE_LOG(LogTemp, Verbose,
-                TEXT("AssetRegistry settings row WBP class is not assigned for field %s (control type %d)."),
+                TEXT("Cannot create native settings row for field %s (control type %d)."),
                 *FieldName(Field).ToString(), static_cast<int32>(ControlType));
             continue;
         }
 
         // Supply metadata before the row's Slate tree and Construct events can run.
+        Row->ApplyControlTheme(FontObject, FontOutlineSize, TextColor, ButtonColor, HoveredButtonTint, ButtonHeight);
         Row->ConfigureSetting(this, Field);
         Host->AddChildToVerticalBox(Row);
         GeneratedSettingWidgets.Add(Row);
@@ -594,6 +600,7 @@ void USettingsMenuWidget::RefreshGeneratedSettingWidgets()
 
 void USettingsMenuWidget::RegisterSettingValueText(ESettingsField Field, UTextBlock* InTextBlock)
 {
+    if (!AcceptWidgetAssignment(InTextBlock)) return;
     if (IsAutomaticStreamingField(Field))
     {
         if (IsValid(InTextBlock)) InTextBlock->SetVisibility(ESlateVisibility::Collapsed);
@@ -615,6 +622,7 @@ void USettingsMenuWidget::RegisterSettingValueText(ESettingsField Field, UTextBl
 
 void USettingsMenuWidget::RegisterSettingButton(ESettingsField Field, UButton* InButton)
 {
+    if (!AcceptWidgetAssignment(InButton)) return;
     if (IsAutomaticStreamingField(Field))
     {
         if (IsValid(InButton)) InButton->SetVisibility(ESlateVisibility::Collapsed);
@@ -645,6 +653,7 @@ void USettingsMenuWidget::RegisterSettingButton(ESettingsField Field, UButton* I
 
 void USettingsMenuWidget::RegisterSettingSlider(ESettingsField Field, USlider* InSlider)
 {
+    if (!AcceptWidgetAssignment(InSlider)) return;
     if (IsAutomaticStreamingField(Field))
     {
         if (IsValid(InSlider)) InSlider->SetVisibility(ESlateVisibility::Collapsed);
@@ -684,6 +693,7 @@ void USettingsMenuWidget::RegisterSettingSlider(ESettingsField Field, USlider* I
 
 void USettingsMenuWidget::RegisterSettingDropdown(ESettingsField Field, UComboBoxString* InDropdown)
 {
+    if (!AcceptWidgetAssignment(InDropdown)) return;
     if (IsAutomaticStreamingField(Field))
     {
         if (IsValid(InDropdown)) InDropdown->SetVisibility(ESlateVisibility::Collapsed);
@@ -718,6 +728,7 @@ void USettingsMenuWidget::RegisterSettingDropdown(ESettingsField Field, UComboBo
 
 void USettingsMenuWidget::RegisterSettingToggleButton(ESettingsField Field, UButton* InButton)
 {
+    if (!AcceptWidgetAssignment(InButton)) return;
     if (IsAutomaticStreamingField(Field))
     {
         if (IsValid(InButton)) InButton->SetVisibility(ESlateVisibility::Collapsed);
@@ -759,6 +770,7 @@ ESettingsControlType USettingsMenuWidget::GetSettingControlType(ESettingsField F
     case ESettingsField::CelShadingMode:
         return ESettingsControlType::Toggle;
 
+    case ESettingsField::MouseSensitivity:
     case ESettingsField::BloomIntensity:
     case ESettingsField::BloomThreshold:
     case ESettingsField::AmbientOcclusionIntensity:
@@ -779,6 +791,8 @@ bool USettingsMenuWidget::GetSettingSliderRange(
 {
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity:
+        OutMin = 0.05f; OutMax = 5.0f; OutStep = 0.05f; return true;
     case ESettingsField::BloomIntensity:
         OutMin = BloomIntensityMin; OutMax = BloomIntensityMax; OutStep = 0.01f; return true;
     case ESettingsField::BloomThreshold:
@@ -820,9 +834,11 @@ float USettingsMenuWidget::GetPendingNumericSettingValue(ESettingsField Field) c
 
 void USettingsMenuWidget::SetSettingFromSliderValue(ESettingsField Field, const float Value)
 {
-    if (bRefreshingControls) return;
+    if (bRefreshingControls || !FMath::IsFinite(Value)) return;
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity:
+        PendingMouseSensitivity = FMath::Clamp(Value, 0.05f, 5.0f); break;
     case ESettingsField::BloomIntensity:
         PendingBloomIntensity = FMath::Clamp(Value, BloomIntensityMin, BloomIntensityMax); break;
     case ESettingsField::BloomThreshold:
@@ -842,7 +858,21 @@ void USettingsMenuWidget::SetSettingFromSliderValue(ESettingsField Field, const 
     default:
         return;
     }
-    ApplyAndSaveSettingsFromUI();
+    if (Field == ESettingsField::MouseSensitivity)
+    {
+        // Reading the multiplier during Input_Look makes a drag immediately visible without
+        // reapplying all render settings and rebuilding streaming budgets for each mouse event.
+        if (!IsDesignTime())
+        {
+            if (UGameSettings* Settings = GetEditableSettings())
+            {
+                Settings->MouseSensitivity = PendingMouseSensitivity;
+                Settings->SaveSettingsData();
+            }
+        }
+        RefreshSettingsValues();
+    }
+    else ApplyAndSaveSettingsFromUI();
 }
 
 void USettingsMenuWidget::SetSettingFromDropdownSelection(
@@ -914,6 +944,7 @@ void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
 
 UGameSettings* USettingsMenuWidget::GetEditableSettings() const
 {
+    if (IsDesignTime()) return nullptr;
     if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
     {
         return SubSystem->GetGameSettings();
@@ -1234,6 +1265,7 @@ float USettingsMenuWidget::GetPendingNumericValue(ESettingsField Field) const
 {
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity: return PendingMouseSensitivity;
     case ESettingsField::BloomIntensity: return PendingBloomIntensity;
     case ESettingsField::BloomThreshold: return PendingBloomThreshold;
     case ESettingsField::AmbientOcclusionIntensity: return PendingAmbientOcclusionIntensity;
@@ -1273,7 +1305,7 @@ void USettingsMenuWidget::RefreshRegisteredControls()
         }
         else if (UButton* Button = Cast<UButton>(Control))
         {
-            SetButtonTextFromUI(Button, GetSettingButtonText(Field));
+            SetButtonTextFromUI(Button, IsUsingNativeLayout() ? GetPendingSettingValueText(Field) : GetSettingButtonText(Field));
         }
     }
 }
@@ -1285,6 +1317,7 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
         return;
     }
 
+    PendingMouseSensitivity = Settings->GetClampedMouseSensitivity();
     PendingBloomIntensity = FMath::Clamp(Settings->BloomIntensity, BloomIntensityMin, BloomIntensityMax);
     PendingBloomThreshold = FMath::Clamp(Settings->BloomThreshold, BloomThresholdMin, BloomThresholdMax);
     PendingAmbientOcclusionIntensity = FMath::Clamp(Settings->AmbientOcclusionIntensity, AmbientOcclusionMin, AmbientOcclusionMax);
@@ -1318,6 +1351,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
         return;
     }
 
+    Settings->MouseSensitivity = PendingMouseSensitivity;
     Settings->BloomIntensity = PendingBloomIntensity;
     Settings->BloomThreshold = PendingBloomThreshold;
     Settings->AmbientOcclusionIntensity = PendingAmbientOcclusionIntensity;
@@ -1397,7 +1431,7 @@ void USettingsMenuWidget::CycleSettingByButtonTextFromUI(UButton* SourceButton, 
 
 void USettingsMenuWidget::ApplyAndSaveSettingsFromUI()
 {
-    if (bRefreshingControls) return;
+    if (bRefreshingControls || IsDesignTime()) return;
     if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
     {
         ApplyPendingToSettings(SubSystem->GetGameSettings());
@@ -1434,6 +1468,7 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
 {
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity: return FText::FromString(TEXT("Mouse Sensitivity"));
     case ESettingsField::BloomIntensity: return FText::FromString(TEXT("Bloom Intensity"));
     case ESettingsField::BloomThreshold: return FText::FromString(TEXT("Bloom Threshold"));
     case ESettingsField::AmbientOcclusionIntensity: return FText::FromString(TEXT("Ambient Occlusion"));
@@ -1483,6 +1518,10 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
 
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity:
+        for (int32 Index = 1; Index <= 100; ++Index)
+            Options.Add(FText::FromString(FString::Printf(TEXT("%.2fx"), Index * 0.05f)));
+        break;
     case ESettingsField::BloomIntensity:
         for (float Value = BloomIntensityMin; Value <= BloomIntensityMax + KINDA_SMALL_NUMBER; Value += BloomStep)
         {
@@ -1595,6 +1634,7 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
 {
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity: CycleFloat(PendingMouseSensitivity, 0.05f, 5.0f, 0.05f, Direction); break;
     case ESettingsField::BloomIntensity: CycleFloat(PendingBloomIntensity, BloomIntensityMin, BloomIntensityMax, BloomStep, Direction); break;
     case ESettingsField::BloomThreshold: CycleFloat(PendingBloomThreshold, BloomThresholdMin, BloomThresholdMax, BloomStep, Direction); break;
     case ESettingsField::AmbientOcclusionIntensity: CycleFloat(PendingAmbientOcclusionIntensity, AmbientOcclusionMin, AmbientOcclusionMax, AmbientOcclusionStep, Direction); break;
@@ -1660,6 +1700,7 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
 {
     switch (Field)
     {
+    case ESettingsField::MouseSensitivity: return FText::FromString(FString::Printf(TEXT("%.2fx"), PendingMouseSensitivity));
     case ESettingsField::BloomIntensity: return FText::FromString(FString::Printf(TEXT("%.2f"), PendingBloomIntensity));
     case ESettingsField::BloomThreshold: return FText::FromString(FString::Printf(TEXT("%.2f"), PendingBloomThreshold));
     case ESettingsField::AmbientOcclusionIntensity: return FText::FromString(FString::Printf(TEXT("%.2f"), PendingAmbientOcclusionIntensity));
@@ -1795,3 +1836,233 @@ void USettingsMenuWidget::CycleGlobalIlluminationQualityFromUI() { CycleSettingV
 void USettingsMenuWidget::CycleReflectionQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ReflectionQuality); }
 void USettingsMenuWidget::CycleDynamicGlobalIlluminationMethodFromUI() { CycleSettingValueFromUI(ESettingsField::DynamicGlobalIlluminationMethod); }
 void USettingsMenuWidget::CycleReflectionMethodFromUI() { CycleSettingValueFromUI(ESettingsField::ReflectionMethod); }
+
+void USettingsMenuWidget::BuildNativeLayout()
+{
+    NativeControls.Reset();
+    NativeValueLabels.Reset();
+    NativeFieldLabels.Reset();
+    NativeControlFields.Reset();
+    NativeApply = nullptr;
+
+    UBorder* Panel = AddPanel(PanelSize, FVector2D::ZeroVector);
+    UVerticalBox* Content = WidgetTree->ConstructWidget<UVerticalBox>();
+    Panel->SetContent(Content);
+    UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
+    Content->AddChildToVerticalBox(Header);
+    NativeTitle = AddText(Header, NSLOCTEXT("V3DUI", "Settings", "Settings"), true);
+    if (UOverlaySlot* Slot = Cast<UOverlaySlot>(NativeTitle->Slot))
+    {
+        Slot->SetHorizontalAlignment(HAlign_Center);
+        Slot->SetVerticalAlignment(VAlign_Center);
+        Slot->SetPadding(FMargin(0.f, 8.f));
+    }
+    NativeBack = AddButton(Header, NSLOCTEXT("V3DUI", "Back", "Back"));
+    if (UButtonSlot* Slot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) Slot->SetPadding(FMargin(12.f));
+    if (USizeBox* Size = Cast<USizeBox>(NativeBack->GetParent())) Size->SetMinDesiredWidth(128.f);
+    if (UOverlaySlot* Slot = Cast<UOverlaySlot>(NativeBack->GetParent()->Slot))
+    {
+        Slot->SetHorizontalAlignment(HAlign_Left);
+        Slot->SetVerticalAlignment(VAlign_Center);
+        Slot->SetPadding(FMargin(32.f, 0.f));
+    }
+
+    UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>();
+    Scroll->SetAnimateWheelScrolling(true);
+    Content->AddChildToVerticalBox(Scroll)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+    UVerticalBox* List = WidgetTree->ConstructWidget<UVerticalBox>();
+    Scroll->AddChild(List);
+
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        const ESettingsControlType Type = GetSettingControlType(Field);
+        UVerticalBox* Row = WidgetTree->ConstructWidget<UVerticalBox>();
+        List->AddChildToVerticalBox(Row)->SetPadding(FMargin(8.f));
+        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>();
+        Label->SetText(GetSettingLabelText(Field));
+        Label->SetAutoWrapText(true);
+        UVerticalBox* Controls = WidgetTree->ConstructWidget<UVerticalBox>();
+        if (Type == ESettingsControlType::Dropdown)
+        {
+            Row->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
+            Row->AddChildToVerticalBox(Controls)->SetPadding(FMargin(8.f));
+        }
+        else
+        {
+            UHorizontalBox* Line = WidgetTree->ConstructWidget<UHorizontalBox>();
+            Row->AddChildToVerticalBox(Line);
+            UHorizontalBoxSlot* LabelSlot = Line->AddChildToHorizontalBox(Label);
+            LabelSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            LabelSlot->SetVerticalAlignment(VAlign_Center);
+            LabelSlot->SetPadding(FMargin(8.f));
+            UHorizontalBoxSlot* ControlSlot = Line->AddChildToHorizontalBox(Controls);
+            ControlSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            ControlSlot->SetVerticalAlignment(VAlign_Center);
+            ControlSlot->SetPadding(FMargin(8.f));
+        }
+        UTextBlock* Value = WidgetTree->ConstructWidget<UTextBlock>();
+        Value->SetText(GetPendingSettingValueText(Field));
+        Value->SetJustification(ETextJustify::Center);
+        UWidget* Control = nullptr;
+        switch (Type)
+        {
+        case ESettingsControlType::Slider:
+            {
+                USlider* Slider = WidgetTree->ConstructWidget<USlider>();
+                float Min = 0.f, Max = 1.f, Step = .01f;
+                GetSettingSliderRange(Field, Min, Max, Step);
+                Slider->SetMinValue(Min);
+                Slider->SetMaxValue(Max);
+                Slider->SetStepSize(Step);
+                Slider->SetValue(GetPendingNumericSettingValue(Field));
+                Controls->AddChildToVerticalBox(Slider);
+                Control = Slider;
+            }
+            break;
+        case ESettingsControlType::Dropdown:
+            {
+                UComboBoxString* Dropdown = WidgetTree->ConstructWidget<UComboBoxString>();
+                Dropdown->OnGenerateWidgetEvent.BindDynamic(this, &USettingsMenuWidget::GenerateNativeOption);
+                for (const FText& Option : GetSettingOptionTexts(Field)) Dropdown->AddOption(Option.ToString());
+                Dropdown->SetSelectedOption(GetPendingSettingValueText(Field).ToString());
+                Controls->AddChildToVerticalBox(Dropdown);
+                Control = Dropdown;
+            }
+            break;
+        case ESettingsControlType::Toggle:
+            Control = AddButton(Controls, GetPendingSettingValueText(Field));
+            break;
+        }
+        Controls->AddChildToVerticalBox(Value);
+        if (Type != ESettingsControlType::Slider) Value->SetVisibility(ESlateVisibility::Collapsed);
+        NativeControlFields.Add(Field);
+        NativeControls.Add(Control);
+        NativeValueLabels.Add(Value);
+        NativeFieldLabels.Add(Label);
+    }
+}
+
+void USettingsMenuWidget::BindNativeWidgets()
+{
+    if (!IsUsingNativeLayout()) return;
+    AssignedSettingsListBox.Reset();
+    SetTitleText(NativeTitle);
+    SetApplyButton(NativeApply);
+    SetBackButton(NativeBack);
+    SetConfirmButton(nullptr);
+    SetCancelButton(nullptr);
+
+    // Native controls are restored after a legacy WBP Construct/PreConstruct graph.
+    // Replace only adapters that were replaced by that graph; retain live adapters on refresh.
+    for (int32 Index = 0; Index < NativeControls.Num(); ++Index)
+    {
+        const ESettingsField Field = NativeControlFields[Index];
+        RegisteredValueTextWidgets.FindOrAdd(Field) = NativeValueLabels[Index].Get();
+        UWidget* Control = NativeControls[Index];
+        bool bAlreadyBound = false;
+        for (USettingsControlBinding* Binding : ControlBindings)
+            if (IsValid(Binding) && Binding->GetField() == Field && Binding->GetControlObject() == Control)
+                bAlreadyBound = true;
+        if (bAlreadyBound) continue;
+        if (USlider* Slider = Cast<USlider>(Control)) RegisterSettingSlider(Field, Slider);
+        else if (UComboBoxString* Dropdown = Cast<UComboBoxString>(Control)) RegisterSettingDropdown(Field, Dropdown);
+        else if (UButton* Button = Cast<UButton>(Control)) RegisterSettingToggleButton(Field, Button);
+    }
+    CollectAssignedWidgetReferences();
+    RefreshSettingsValues();
+}
+
+void USettingsMenuWidget::ApplyNativeStyle()
+{
+    Super::ApplyNativeStyle();
+    // The original Settings header uses the engine's default font; generated rows use Pretendard.
+    if (NativeTitle)
+    {
+        FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();
+        V3DHUDLegacyStyle::ApplyFont(Font, nullptr, TitleFontSize, FontOutlineSize);
+        NativeTitle->SetFont(Font);
+    }
+    if (NativeBack)
+    {
+        if (UButtonSlot* Slot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) Slot->SetPadding(FMargin(12.f));
+        if (UTextBlock* Label = Cast<UTextBlock>(NativeBack->GetContent()))
+        {
+            FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();
+            V3DHUDLegacyStyle::ApplyFont(Font, nullptr, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), FontOutlineSize);
+            Label->SetFont(Font);
+        }
+    }
+    for (int32 Index = 0; Index < NativeFieldLabels.Num(); ++Index)
+    {
+        UTextBlock* Label = NativeFieldLabels[Index];
+        if (!IsValid(Label)) continue;
+        const bool bToggle = GetSettingControlType(NativeControlFields[Index]) == ESettingsControlType::Toggle;
+        FSlateFontInfo Font = Label->GetFont();
+        V3DHUDLegacyStyle::ApplyFont(Font, FontObject,
+            bToggle ? FMath::RoundToInt(BodyFontSize * 4.f / 3.f) : BodyFontSize, 1);
+        Label->SetFont(Font);
+        Label->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });
+    for (const TWeakObjectPtr<UTextBlock>& WeakLabel : NativeOptionLabels)
+    {
+        UTextBlock* Label = WeakLabel.Get();
+        if (!IsValid(Label)) continue;
+        FSlateFontInfo Font = Label->GetFont();
+        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+        Label->SetFont(Font);
+        Label->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    for (UTextBlock* Value : NativeValueLabels)
+    {
+        if (!IsValid(Value)) continue;
+        FSlateFontInfo Font = Value->GetFont();
+        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Max(8, BodyFontSize / 2), 1);
+        Value->SetFont(Font);
+        Value->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    for (UWidget* Control : NativeControls)
+    {
+        if (USlider* Slider = Cast<USlider>(Control))
+        {
+            FSliderStyle Style = Slider->GetWidgetStyle();
+            Style.BarThickness = 24.f;
+            Style.NormalThumbImage.ImageSize = FVector2D(16.f, 32.f);
+            Style.HoveredThumbImage.ImageSize = FVector2D(16.f, 32.f);
+            V3DWidgetStyle::SetOwnedStyle(*Slider, Style);
+            Slider->SetSliderHandleColor(FLinearColor::White);
+            Slider->SetSliderBarColor(FLinearColor(.33f, .33f, .33f, 1.f));
+        }
+        else if (UComboBoxString* Dropdown = Cast<UComboBoxString>(Control))
+            ApplySettingsMenuComboTheme(Dropdown, ButtonColor, HoveredButtonTint, TextColor);
+        else if (UButton* Button = Cast<UButton>(Control))
+        {
+            if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
+            {
+                FSlateFontInfo Font = Label->GetFont();
+                V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 2.f / 3.f), 1);
+                Label->SetFont(Font);
+            }
+        }
+    }
+}
+
+
+UWidget* USettingsMenuWidget::GenerateNativeOption(FString Option)
+{
+    UTextBlock* Text = NewObject<UTextBlock>(this);
+    Text->SetText(FText::FromString(Option));
+    FSlateFontInfo Font = Text->GetFont();
+    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+    Text->SetFont(Font);
+    Text->SetColorAndOpacity(FSlateColor(TextColor));
+    NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });
+    NativeOptionLabels.Add(Text);
+    return Text;
+}
+
+void USettingsMenuWidget::ReleaseSlateResources(bool bReleaseChildren)
+{
+    Super::ReleaseSlateResources(bReleaseChildren);
+    NativeOptionLabels.Reset();
+}

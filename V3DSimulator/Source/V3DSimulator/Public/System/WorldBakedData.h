@@ -141,6 +141,10 @@ struct V3DSIMULATOR_API FGWorldBakedTexture
     FString Name;
     int32 SizeX = 0;
     int32 SizeY = 0;
+    /** Number of 2D array slices. Mip SizeZ equals this value and never shrinks. */
+    int32 NumLayers = 1;
+    /** Distinguishes a one-slice Texture2DArray from an ordinary Texture2D. */
+    bool bTextureArray = false;
     int32 PixelFormat = 0;
     uint8 AddressX = 0;
     uint8 AddressY = 0;

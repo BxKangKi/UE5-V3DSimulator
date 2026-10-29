@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Types/SlateEnums.h"
 #include "System/ProjectConfig.h"
 #include "UI/SelectionWidgetBase.h"
 #include "ProjectSelectionWidget.generated.h"
@@ -11,14 +12,15 @@ class UButton;
 class UEditableTextBox;
 class UPanelWidget;
 class UMenuButtonWidget;
-class UStartWorldWidget;
+class UMainWorldWidget;
 class UBuildStatusWidget;
+class UComboBoxString;
 
 /**
  * Project browser shown directly over the current start menu.
  *
- * Generated-entry creation and lifecycle are provided by USelectionWidgetBase. Each entry is a
- * Blueprint-authored UMenuButtonWidget class; native code discovers valid Projects/<Project> folders,
+ * The complete layout and entry lifecycle are implemented in C++ and previewed in Blueprint children.
+ * Native code discovers valid Projects/<Project> folders,
  * populates the assigned panel, and starts the project-specific resources/ -> .v3d/.v3d build pipeline.
  */
 UCLASS(Blueprintable, BlueprintType)
@@ -27,11 +29,13 @@ class V3DSIMULATOR_API UProjectSelectionWidget : public USelectionWidgetBase
     GENERATED_BODY()
 
 public:
+    UProjectSelectionWidget(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
 
-    /** Internal owner assigned when this widget is registered with UStartWorldWidget. */
-    void SetOwnerStartWidget(UStartWorldWidget* InOwnerWidget);
+    /** Internal owner assigned when this widget is registered with UMainWorldWidget. */
+    void SetOwnerMainWidget(UMainWorldWidget* InOwnerWidget);
 
     /** Assign the panel that receives generated project buttons. */
     UFUNCTION(BlueprintCallable, Category="Projects|Widgets")
@@ -79,7 +83,7 @@ public:
     bool SetProjectType(const FString& ProjectName, EV3DSimulatorProjectType ProjectType);
 
     UFUNCTION(BlueprintCallable, Category="Projects|Configuration")
-    void SetNewProjectType(EV3DSimulatorProjectType ProjectType) { NewProjectType = ProjectType; }
+    void SetNewProjectType(EV3DSimulatorProjectType ProjectType);
 
     UFUNCTION(BlueprintPure, Category="Projects|Configuration")
     EV3DSimulatorProjectType GetNewProjectType() const { return NewProjectType; }
@@ -92,9 +96,17 @@ public:
     void CloseProjectSelection();
 
 protected:
+    virtual void BuildNativeLayout() override;
+    virtual void ApplyNativeStyle() override;
+    virtual void BindNativeWidgets() override;
     virtual void OnSelectionEntryActivated(const FString& SelectionKey) override;
 
 private:
+    UFUNCTION()
+    void HandleNativeProjectTypeChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+    UFUNCTION()
+    UWidget* GenerateNativeProjectType(FString Item);
+
     void BindNavigationButtons();
     void UnbindNavigationButtons();
     UEditableTextBox* EnsureNewProjectNameTextBox();
@@ -106,7 +118,7 @@ private:
     UFUNCTION()
     void HandleBuildStatusConfirmed();
 
-    TWeakObjectPtr<UStartWorldWidget> OwnerStartWidget;
+    TWeakObjectPtr<UMainWorldWidget> OwnerMainWidget;
     TWeakObjectPtr<UButton> BackButton;
     TWeakObjectPtr<UButton> RefreshButton;
     TWeakObjectPtr<UEditableTextBox> NewProjectNameTextBox;
@@ -119,4 +131,11 @@ private:
     TObjectPtr<UBuildStatusWidget> BuildStatusWidget;
 
     bool bGeneratedBuildStatusWidget = false;
+
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeProjectPanel;
+    UPROPERTY(Transient) TObjectPtr<UPanelWidget> NativeProjectList;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeProjectBack;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeProjectRefresh;
+    UPROPERTY(Transient) TObjectPtr<UEditableTextBox> NativeProjectName;
+    UPROPERTY(Transient) TObjectPtr<UComboBoxString> NativeProjectType;
 };

@@ -18,21 +18,22 @@
 #include "System/JsonMetadata.h"
 #include "System/JsonMetadataNormalizer.h"
 #include "System/ProjectBuildPolicy.h"
+#include "System/SourceModelImport.h"
 
 
 bool ModelDefinitionJson::EnsureDefinitions(
     const FString& ModelRootDirectory,
     const EV3DSimulatorProjectType ProjectType,
     TArray<FString>* OutUpdatedJsonFiles,
-    TArray<FString>* OutDiscoveredGlbFiles)
+    TArray<FString>* OutDiscoveredModelFiles)
 {
     if (OutUpdatedJsonFiles != nullptr)
     {
         OutUpdatedJsonFiles->Reset();
     }
-    if (OutDiscoveredGlbFiles != nullptr)
+    if (OutDiscoveredModelFiles != nullptr)
     {
-        OutDiscoveredGlbFiles->Reset();
+        OutDiscoveredModelFiles->Reset();
     }
 
     if (ModelRootDirectory.IsEmpty()
@@ -41,11 +42,11 @@ bool ModelDefinitionJson::EnsureDefinitions(
         return false;
     }
 
-    TArray<FString> GlbFiles;
+    TArray<FString> SourceFiles;
     IFileManager::Get().FindFilesRecursive(
-        GlbFiles,
+        SourceFiles,
         *ModelRootDirectory,
-        // *.* is used instead of an extension wildcard so .glb, .GLB and mixed-case variants are
+        // *.* is used instead of an extension wildcard so mixed-case format extensions are
         // returned consistently by platform file implementations. The extension is filtered below.
         TEXT("*.*"),
         true,
@@ -54,10 +55,10 @@ bool ModelDefinitionJson::EnsureDefinitions(
 
     // Wildcard extension matching is case-sensitive on some packaged platforms. Enumerate the
     // authoring root once, then apply the extension contract explicitly and consistently.
-    GlbFiles.RemoveAllSwap(
+    SourceFiles.RemoveAllSwap(
         [](const FString& Path)
         {
-            return !FPaths::GetExtension(Path).Equals(TEXT("glb"), ESearchCase::IgnoreCase);
+            return !V3DSourceModelImport::IsModelSource(Path);
         },
         EAllowShrinking::No);
 
@@ -65,42 +66,56 @@ bool ModelDefinitionJson::EnsureDefinitions(
     // ModelDatabaseSubsystem, so discovery and build cannot accidentally operate on different
     // recursive scans while an authoring tool is saving the project authoring tree.
     TSet<FString> SeenPaths;
-    TArray<FString> NormalizedGlbFiles;
-    NormalizedGlbFiles.Reserve(GlbFiles.Num());
-    for (const FString& CandidatePath : GlbFiles)
+    TArray<FString> NormalizedModelFiles;
+    NormalizedModelFiles.Reserve(SourceFiles.Num());
+    for (const FString& CandidatePath : SourceFiles)
     {
         FString Path = FSafeFileIO::NormalizeFilePath(CandidatePath);
         if (!Path.IsEmpty() && IFileManager::Get().FileExists(*Path)
             && !SeenPaths.Contains(Path))
         {
             SeenPaths.Add(Path);
-            NormalizedGlbFiles.Add(MoveTemp(Path));
+            NormalizedModelFiles.Add(MoveTemp(Path));
         }
     }
-    GlbFiles = MoveTemp(NormalizedGlbFiles);
+    SourceFiles = MoveTemp(NormalizedModelFiles);
+    // A sidecar has one source owner. Exporting Chair.glb and Chair.fbx together must not
+    // silently assign one UUID/definition to two different source models.
+    TMap<FString, FString> JsonOwners;
+    for (const FString& SourcePath : SourceFiles)
+    {
+        const FString JsonKey = FPaths::ChangeExtension(SourcePath, TEXT("json")).ToLower();
+        if (const FString* Previous = JsonOwners.Find(JsonKey))
+        {
+            UE_LOG(LogTemp, Error, TEXT("Model sidecar collision: %s and %s share %s"),
+                **Previous, *SourcePath, *JsonKey);
+            return false;
+        }
+        JsonOwners.Add(JsonKey, SourcePath);
+    }
     constexpr int32 MaxGeneratedDefinitions = 100000; // Must not exceed the .v3d model cap.
-    if (GlbFiles.Num() > MaxGeneratedDefinitions)
+    if (SourceFiles.Num() > MaxGeneratedDefinitions)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("Model definition generation rejected more than %d GLB files under %s"),
+            TEXT("Model definition generation rejected more than %d source model files under %s"),
             MaxGeneratedDefinitions, *ModelRootDirectory);
         return false;
     }
 
-    GlbFiles.Sort();
-    if (OutDiscoveredGlbFiles != nullptr)
+    SourceFiles.Sort();
+    if (OutDiscoveredModelFiles != nullptr)
     {
-        *OutDiscoveredGlbFiles = GlbFiles;
+        *OutDiscoveredModelFiles = SourceFiles;
     }
     bool bAllWritesSucceeded = true;
     const EModelDefinitionType DefaultType = V3DSimulatorProjectBuildPolicy::DefaultModelType(ProjectType);
-    for (const FString& GlbPath : GlbFiles)
+    for (const FString& SourcePath : SourceFiles)
     {
-        const FString JsonPath = FPaths::ChangeExtension(GlbPath, TEXT("json"));
+        const FString JsonPath = FPaths::ChangeExtension(SourcePath, TEXT("json"));
         bool bChanged = false;
         FString Error;
         if (!V3DSimulatorJsonMetadataNormalizer::EnsureAssetJson(
-                JsonPath, FPaths::GetBaseFilename(GlbPath), EAssetDefinitionType::Model,
+                JsonPath, FPaths::GetBaseFilename(SourcePath), EAssetDefinitionType::Model,
                 DefaultType, bChanged, Error))
         {
             UE_LOG(LogTemp, Error, TEXT("Model JSON normalization failed: %s (%s)"), *JsonPath, *Error);
@@ -115,7 +130,7 @@ bool ModelDefinitionJson::EnsureDefinitions(
 
 bool ModelDefinitionJson::LoadDefinition(
     const FString& JsonPath,
-    const FString& ExpectedGlbPath,
+    const FString& ExpectedSourcePath,
     FModelDefinition& OutDefinition,
     FString& OutError,
     FString* OutCanonicalJson)
@@ -152,7 +167,7 @@ bool ModelDefinitionJson::LoadDefinition(
     if (!V3DSimulatorAssetTypes::TryParse(AssetTypeText, ParsedAssetType)
         || ParsedAssetType != EAssetDefinitionType::Model)
     {
-        OutError = FString::Printf(TEXT("AssetType '%s' cannot be paired with a GLB; expected Model"), *AssetTypeText);
+        OutError = FString::Printf(TEXT("AssetType '%s' cannot be paired with a source model; expected Model"), *AssetTypeText);
         return false;
     }
     OutDefinition.AssetType = EAssetDefinitionType::Model;
@@ -265,7 +280,7 @@ bool ModelDefinitionJson::LoadDefinition(
     if (OutDefinition.ModelType == EModelDefinitionType::Character && Root->HasField(TEXT("GravityField")))
     { OutError = TEXT("GravityField is authored on Static or Dynamic models"); return false; }
 
-    OutDefinition.GlbPath = FSafeFileIO::NormalizeFilePath(ExpectedGlbPath);
+    OutDefinition.GlbPath = FSafeFileIO::NormalizeFilePath(ExpectedSourcePath);
     OutDefinition.JsonPath = FSafeFileIO::NormalizeFilePath(JsonPath);
 
     if (OutCanonicalJson)

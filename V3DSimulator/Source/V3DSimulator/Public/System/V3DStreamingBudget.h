@@ -17,9 +17,12 @@ public:
     };
     using FPermit = TSharedPtr<FLease, ESPMode::ThreadSafe>;
 
-    /** GT only. Queued entries contain metadata/callbacks only; no decoded assets or strong owner. */
+    /** GT only. Queued entries contain metadata/callbacks only; no decoded assets or strong owner.
+     * IsStillNeeded is an optional side-effect-free GT predicate for per-request cancellation.
+     * Rejected requests are removed before callbacks run, including when every worker is busy. */
     static void Enqueue(UObject* Owner, TFunction<int64()> EstimateBytes,
-        TFunction<void(FPermit)> Start, TFunction<void()> Reject);
+        TFunction<void(FPermit)> Start, TFunction<void()> Reject,
+        TFunction<bool()> IsStillNeeded = TFunction<bool()>());
     static void Shutdown();
     /** Ask the engine for a throttled, deferred GC after streaming releases strong references. */
     static void NotifyUnloaded();

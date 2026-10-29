@@ -1,37 +1,48 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "System/V3DSimulatorAssetRegistry.h"
+#include "System/V3DTerrain.h"
+#include "Materials/MaterialInterface.h"
+#include "UI/BuildStatusWidget.h"
+#include "UI/CreatorHUDWidget.h"
+#include "UI/DebugHUDWidget.h"
+#include "UI/LoadingHUDWidget.h"
+#include "UI/PauseMenuWidget.h"
+#include "UI/MainWorldWidget.h"
 
 UV3DSimulatorAssetRegistry::UV3DSimulatorAssetRegistry(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
-    // Shared UI component classes are centralized here. These native defaults keep existing
-    // projects working after the per-widget class overrides were removed; a Blueprint registry
-    // subclass can still override any path in one place. No widget instance is loaded by this CDO.
+    // Preserve top-level screen Blueprint overrides without registering code-only components.
+    // These soft paths do not load widget instances while constructing the registry CDO.
     ProjectSelectionWidgetClass = TSoftClassPtr<UProjectSelectionWidget>(
         FSoftObjectPath(TEXT("/Game/Blueprints/UI/WBP_ProjectSelection.WBP_ProjectSelection_C")));
     BuildStatusWidgetClass = TSoftClassPtr<UBuildStatusWidget>(
         FSoftObjectPath(TEXT("/Game/Blueprints/UI/WBP_BuildStatus.WBP_BuildStatus_C")));
-    SelectionEntryWidgetClass = TSoftClassPtr<UMenuButtonWidget>(
-        FSoftObjectPath(TEXT("/Game/Blueprints/UI/Components/WBP_Button.WBP_Button_C")));
-    BuildStatusConfirmWidgetClass = TSoftClassPtr<UMenuButtonWidget>(
-        FSoftObjectPath(TEXT("/Game/Blueprints/UI/Components/WBP_Button.WBP_Button_C")));
-    BooleanSettingWidgetClass = TSoftClassPtr<UBooleanSettingWidget>(
-        FSoftObjectPath(TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Toggle.WBP_Settings_Toggle_C")));
-    FloatSettingWidgetClass = TSoftClassPtr<UFloatSettingWidget>(
-        FSoftObjectPath(TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Slider.WBP_Settings_Slider_C")));
-    EnumSettingWidgetClass = TSoftClassPtr<UEnumSettingWidget>(
-        FSoftObjectPath(TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Dropdown.WBP_Settings_Dropdown_C")));
     EnsureMenuDefaults();
 }
 
 void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
 {
+    if (TerrainMaterial.IsNull())
+        TerrainMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(V3DTerrain::DefaultMaterialPath));
     if (ShaderLibraryMPC.IsNull())
         ShaderLibraryMPC = TSoftObjectPtr<UMaterialParameterCollection>(FSoftObjectPath(
             TEXT("/ShaderLibrary/MPC_ShaderLibrary.MPC_ShaderLibrary")));
+    if (CreatorHUDWidgetClass.IsNull())
+        CreatorHUDWidgetClass = TSoftClassPtr<UCreatorHUDWidget>(UCreatorHUDWidget::StaticClass());
+    if (PauseMenuWidgetClass.IsNull())
+        PauseMenuWidgetClass = TSoftClassPtr<UPauseMenuWidget>(UPauseMenuWidget::StaticClass());
+    if (DebugWidgetClass.IsNull())
+        DebugWidgetClass = TSoftClassPtr<UUserWidget>(UDebugHUDWidget::StaticClass());
+    if (LoadingWidgetClass.IsNull())
+        LoadingWidgetClass = TSoftClassPtr<UUserWidget>(ULoadingHUDWidget::StaticClass());
+    if (BuildStatusWidgetClass.IsNull())
+        BuildStatusWidgetClass = TSoftClassPtr<UBuildStatusWidget>(UBuildStatusWidget::StaticClass());
+    if (MultiplayerMenuWidgetClass.IsNull())
+        MultiplayerMenuWidgetClass = TSoftClassPtr<UMainWorldWidget>(UMultiplayerMenuWidget::StaticClass());
     if (StartMenuWidgetClass.IsNull())
-        StartMenuWidgetClass = TSoftClassPtr<UStartWorldWidget>(FSoftObjectPath(
+        StartMenuWidgetClass = TSoftClassPtr<UMainWorldWidget>(FSoftObjectPath(
             TEXT("/Game/Blueprints/UI/WBP_StartMenu.WBP_StartMenu_C")));
     if (WorldSelectionWidgetClass.IsNull())
         WorldSelectionWidgetClass = TSoftClassPtr<UWorldSelectionWidget>(FSoftObjectPath(
@@ -42,17 +53,22 @@ void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
     if (ProjectSelectionWidgetClass.IsNull())
         ProjectSelectionWidgetClass = TSoftClassPtr<UProjectSelectionWidget>(FSoftObjectPath(
             TEXT("/Game/Blueprints/UI/WBP_ProjectSelection.WBP_ProjectSelection_C")));
-    if (SelectionEntryWidgetClass.IsNull())
-        SelectionEntryWidgetClass = TSoftClassPtr<UMenuButtonWidget>(FSoftObjectPath(
-            TEXT("/Game/Blueprints/UI/Components/WBP_Button.WBP_Button_C")));
-    if (BooleanSettingWidgetClass.IsNull())
-        BooleanSettingWidgetClass = TSoftClassPtr<UBooleanSettingWidget>(FSoftObjectPath(
-            TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Toggle.WBP_Settings_Toggle_C")));
-    if (FloatSettingWidgetClass.IsNull())
-        FloatSettingWidgetClass = TSoftClassPtr<UFloatSettingWidget>(FSoftObjectPath(
-            TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Slider.WBP_Settings_Slider_C")));
-    if (EnumSettingWidgetClass.IsNull())
-        EnumSettingWidgetClass = TSoftClassPtr<UEnumSettingWidget>(FSoftObjectPath(
-            TEXT("/Game/Blueprints/UI/Components/WBP_Settings_Dropdown.WBP_Settings_Dropdown_C")));
+}
 
+UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveTerrainMaterial() const
+{
+    if (!IsInGameThread() || IsGarbageCollecting() || TerrainMaterial.IsNull())
+    {
+        return nullptr;
+    }
+
+    if (UMaterialInterface* Existing = TerrainMaterial.Get())
+    {
+        if (IsValid(Existing))
+        {
+            return Existing;
+        }
+    }
+
+    return TerrainMaterial.LoadSynchronous();
 }

@@ -88,12 +88,15 @@ public:
      * This is a metadata-only query and never opens or reads the archive file.
      */
     bool ContainsChunk(const FWorldChunkCoordinate& Coordinate) const;
+    /** Metadata-only peak reservation for encoded bytes and decoded entity rows. */
+    int64 EstimateChunkLoadBytes(const FWorldChunkCoordinate& Coordinate) const;
     void GetGravitySourceChunks(TArray<FWorldChunkCoordinate>& OutCoordinates) const;
 
     bool LoadChunk(
         const FWorldChunkCoordinate& Coordinate,
         TArray<FWorldChunkObject>& OutObjects,
-        FString& OutError) const;
+        FString& OutError,
+        int64 MaxTransientBytes = MAX_int64) const;
     /** Reserves request order before worker dispatch so late workers cannot overwrite newer state. */
     uint64 ReserveChunkWrite(const FWorldChunkCoordinate& Coordinate);
     FSafeFileWriteResult SaveChunk(

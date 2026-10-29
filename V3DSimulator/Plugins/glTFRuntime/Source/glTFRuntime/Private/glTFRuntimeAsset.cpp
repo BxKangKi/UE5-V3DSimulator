@@ -1713,6 +1713,28 @@ void UglTFRuntimeAsset::LoadSkeletalMeshFromRuntimeLODsAsync(const TArray<FglTFR
 	Parser->LoadSkeletalMeshFromRuntimeLODsAsync(RuntimeLODs, SkinIndex, AsyncCallback, SkeletalMeshConfig);
 }
 
+void UglTFRuntimeAsset::LoadStaticMeshFromRuntimeLODsAsyncMove(TArray<FglTFRuntimeMeshLOD>&& RuntimeLODs, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
+{
+	if (!Parser)
+	{
+		RuntimeLODs.Empty();
+		AsyncCallback.ExecuteIfBound(nullptr);
+		return;
+	}
+	Parser->LoadStaticMeshFromRuntimeLODsAsyncMove(MoveTemp(RuntimeLODs), AsyncCallback, StaticMeshConfig);
+}
+
+void UglTFRuntimeAsset::LoadSkeletalMeshFromRuntimeLODsAsyncMove(TArray<FglTFRuntimeMeshLOD>&& RuntimeLODs, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig)
+{
+	if (!Parser)
+	{
+		RuntimeLODs.Empty();
+		AsyncCallback.ExecuteIfBound(nullptr);
+		return;
+	}
+	Parser->LoadSkeletalMeshFromRuntimeLODsAsyncMove(MoveTemp(RuntimeLODs), SkinIndex, AsyncCallback, SkeletalMeshConfig);
+}
+
 float UglTFRuntimeAsset::GetDownloadTime() const
 {
 	GLTF_CHECK_PARSER(0);

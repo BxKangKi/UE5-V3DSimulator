@@ -34,7 +34,7 @@ class V3DSIMULATOR_API UModelDatabaseSubsystem final : public UGameInstanceSubsy
 public:
     virtual void Deinitialize() override;
 
-    /** Opens only the immutable built archive. Runtime never falls back to source GLBs. */
+    /** Opens only the immutable built archive. Runtime never falls back to source model files. */
     void InitializeForWorld(
         const FString& InWorldRoot,
         FModelDatabaseReady Completion = FModelDatabaseReady());

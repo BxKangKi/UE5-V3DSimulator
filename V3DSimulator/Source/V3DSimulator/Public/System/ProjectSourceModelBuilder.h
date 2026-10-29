@@ -23,17 +23,18 @@ class UTexture2D;
 class FglTFRuntimeParser;
 struct FglTFRuntimeConfig;
 struct FglTFRuntimeMeshLOD;
+namespace V3DSourceModelImport { class FSession; }
 
-/** Native completion signal for one source GLB build. Always emitted on the game thread. */
+/** Native completion signal for one source model build. Always emitted on the game thread. */
 DECLARE_MULTICAST_DELEGATE_TwoParams(
     FProjectSourceModelBuildFinished,
     UProjectSourceModelBuilder*,
     bool);
 
 /**
- * One-shot build worker for a single authoring GLB.
+ * One-shot build worker for a single authoring model.
  *
- * This object is the only gameplay-module type allowed to open a source GLB. It asks
+ * This object is the gameplay owner of the authoring model decoder. It asks
  * glTFRuntime to decode the document once, copies the resulting render data into the stable
  * FGWorldBaked* structures, and releases the parser before publishing its result. It never
  * spawns an actor and it cannot be used by the runtime gworld:// resolver.
@@ -92,6 +93,8 @@ private:
     FString DefinitionJson;
     FGWorldBuildModel CompletedModel;
     FGWorldBakedModel BakedData;
+    /** Optional blob import metadata lives only until the stable baked payload is complete. */
+    TSharedPtr<V3DSourceModelImport::FSession> ImportSession;
     TMap<TWeakObjectPtr<UMaterialInterface>, int32> MaterialIds;
     TMap<TWeakObjectPtr<UTexture2D>, int32> TextureIds;
     TArray<FString> SourceMeshNames;

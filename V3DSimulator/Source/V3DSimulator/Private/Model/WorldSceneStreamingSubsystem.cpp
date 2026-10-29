@@ -12,6 +12,7 @@
 #include "System/V3DStreamingPolicy.h"
 #include "Model/V3DHISMChunkPolicy.h"
 
+#include "Async/ParallelFor.h"
 #include "Character/CharacterController.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -45,6 +46,54 @@ namespace
     bool IsFiniteVector(const FVector& Value)
     {
         return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
+    }
+
+    // Snapshot arithmetic is native-only. ParallelFor joins before returning, so no worker can
+    // retain scene rows past StopWorldStreaming or a Blueprint callback that starts another world.
+    void BuildSceneSelectionPlan(const TArray<FWorldSceneStreamRecord>& Records,
+        const FV3DStreamingEvaluationInputs& View, TArray<int32>& OutOrder, TArray<uint8>& OutUnloadRange)
+    {
+        struct FRange { double DistanceSq = 0.0; bool bLoad = false; };
+        TArray<FRange> Ranges;
+        Ranges.SetNum(Records.Num());
+        OutUnloadRange.SetNumUninitialized(Records.Num());
+        constexpr int32 BatchSize = 128;
+        const int32 BatchCount = FMath::DivideAndRoundUp(Records.Num(), BatchSize);
+        ParallelFor(BatchCount, [&](const int32 Batch)
+        {
+            const int32 End = FMath::Min(Records.Num(), (Batch + 1) * BatchSize);
+            for (int32 I = Batch * BatchSize; I < End; ++I)
+            {
+                const FWorldSceneStreamRecord& Record = Records[I];
+                const bool bFinite = IsFiniteVector(Record.Bounds.Center) && IsFiniteVector(Record.Bounds.Size);
+                bool bLoad = !bFinite || Record.bHasGravityField;
+                bool bRetain = !bFinite;
+                double DistanceSq = TNumericLimits<double>::Max();
+                const FVector Center = bFinite ? View.OwnerTransform.TransformPosition(Record.Bounds.Center)
+                    : FVector::ZeroVector;
+                for (const FVector& Observer : View.Observers)
+                {
+                    DistanceSq = FMath::Min(DistanceSq,
+                        static_cast<double>(FVector::DistSquared(Observer, Center)));
+                    if (!bFinite) continue;
+                    bLoad |= V3DHISMChunkPolicy::SceneInRange(Record.Bounds.Center, Record.Bounds.Size,
+                        View.OwnerTransform, Observer, View.ScreenDistance, 1.0, View.MaxRenderDistanceCm);
+                    bRetain |= V3DHISMChunkPolicy::SceneInRange(Record.Bounds.Center, Record.Bounds.Size,
+                        View.OwnerTransform, Observer, View.ScreenDistance, View.UnloadMultiplier, View.MaxRenderDistanceCm);
+                }
+                Ranges[I].bLoad = bLoad;
+                Ranges[I].DistanceSq = bFinite ? DistanceSq : 0.0;
+                OutUnloadRange[I] = bRetain ? 1 : 0;
+            }
+        }, Records.Num() < 512 ? EParallelForFlags::ForceSingleThread : EParallelForFlags::None);
+        OutOrder.Reset();
+        OutOrder.Reserve(Records.Num());
+        for (int32 I = 0; I < Records.Num(); ++I) if (Ranges[I].bLoad) OutOrder.Add(I);
+        OutOrder.Sort([&Ranges](const int32 A, const int32 B)
+        {
+            return Ranges[A].DistanceSq == Ranges[B].DistanceSq ? A < B
+                : Ranges[A].DistanceSq < Ranges[B].DistanceSq;
+        });
     }
 
     FString StableCharacterId(const FWorldCharacterStreamRecord& Record)
@@ -148,7 +197,9 @@ void UWorldSceneStreamingSubsystem::StartWorldStreaming(
         return;
     }
 
+    if (bStoppingStreaming) return;
     StopWorldStreaming();
+    const uint64 Session = StreamingGeneration;
     WorldRoot = FSafeFileIO::NormalizeFilePath(InWorldRoot);
     InitialPlayerName = InInitialPlayerName.TrimStartAndEnd();
     bRenderOnlyStreaming = bInRenderOnlyStreaming;
@@ -234,6 +285,7 @@ void UWorldSceneStreamingSubsystem::StartWorldStreaming(
     // The first pass uses only compact directory summaries. EnsureSceneActor causes exact metadata
     // and decoded .dat member reads solely for a scene whose bounds intersects the player's radius.
     UpdateStreaming();
+    if (!bActive || StreamingGeneration != Session) return;
     ScheduleStreamingUpdates();
     BeginInitialPlayerStreamingIfNeeded();
 
@@ -258,10 +310,16 @@ void UWorldSceneStreamingSubsystem::StopWorldStreaming()
         return;
     }
 
+    if (bStoppingStreaming) return;
+    TGuardValue<bool> StopGuard(bStoppingStreaming, true);
+    ++StreamingGeneration;
     ClearTimers();
     bActive = false;
 
-    for (TPair<FString, TObjectPtr<AStaticActor>>& Pair : ActiveSceneActors)
+    // Remove owned entries before Destroy/EndPlay can re-enter this subsystem.
+    auto ScenesToDestroy = MoveTemp(ActiveSceneActors);
+    ActiveSceneActors.Empty();
+    for (TPair<FString, TObjectPtr<AStaticActor>>& Pair : ScenesToDestroy)
     {
         if (IsValid(Pair.Value))
         {
@@ -283,6 +341,9 @@ void UWorldSceneStreamingSubsystem::StopWorldStreaming()
     OwnerActor = nullptr;
     ActivePlayerCharacter.Reset();
     SceneRecords.Empty();
+    SceneEvaluation.Reset();
+    SceneLoadOrder.Empty();
+    SceneUnloadRange.Empty();
     CharacterRecords.Empty();
     FailedCharacterReferences.Empty();
     WorldRoot.Reset();
@@ -613,10 +674,12 @@ bool UWorldSceneStreamingSubsystem::IsLocationReady(const FVector& WorldLocation
 void UWorldSceneStreamingSubsystem::UpdateStreaming()
 {
     if (!EnsureStreamGameThread(TEXT("UWorldSceneStreamingSubsystem::UpdateStreaming"))
-        || !bActive || !IsValid(OwnerActor))
+        || !bActive || !IsValid(OwnerActor) || bUpdatingStreaming)
     {
         return;
     }
+    TGuardValue<bool> UpdateGuard(bUpdatingStreaming, true);
+    const uint64 Session = StreamingGeneration;
 
     int32 SpawnBudget = 2;
     float UnloadMultiplier = 1.10f;
@@ -630,134 +693,67 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     }
     SpawnBudget = FMath::Max(1, SpawnBudget);
 
-    struct FPendingSceneLoad
+    FV3DStreamingEvaluationInputs View;
+    GetStreamingObserverLocations(View.Observers);
+    View.OwnerTransform = OwnerActor->GetActorTransform();
+    View.ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
+    View.MaxRenderDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
+    View.UnloadMultiplier = UnloadMultiplier;
+    View.bRenderOnly = bRenderOnlyStreaming;
+    if (SceneEvaluation.NeedsEvaluation(View))
     {
-        const FWorldSceneStreamRecord* Record = nullptr;
-        double DistanceSq = 0.0;
-    };
-    // Only the nearest SpawnBudget records can be spawned this tick. Keep that bounded top-K set
-    // instead of allocating and sorting every in-range scene (which can be tens of thousands in a
-    // large archive). PendingLoadCount still tracks whether startup needs another burst.
-    TArray<FPendingSceneLoad> PendingLoads;
-    PendingLoads.Reserve(FMath::Min(SceneRecords.Num(), SpawnBudget));
-    int32 PendingLoadCount = 0;
-    TArray<FVector> StreamingObservers;
-    GetStreamingObserverLocations(StreamingObservers);
-    const FTransform OwnerTransform = OwnerActor->GetActorTransform();
-    const double ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
-    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
+        BuildSceneSelectionPlan(SceneRecords, View, SceneLoadOrder, SceneUnloadRange);
+        SceneEvaluation.Capture(MoveTemp(View));
+    }
 
-    // UpdateStreaming can scan thousands of compact directory records. Snapshot both observers
-    // once. A priority destination is additive, so current-area actors stay resident until the
-    // destination has completed and the teleport/spawn transaction clears its extra focus.
-    const auto IsInsideRange =
-        [&OwnerTransform, &StreamingObservers, ScreenDistance, MaxDistanceCm](
-            const FModelData& Bounds, const float RadiusMultiplier)
-        {
-            if (!IsFiniteVector(Bounds.Center) || !IsFiniteVector(Bounds.Size))
-            {
-                return true;
-            }
-
-            for (const FVector& Observer : StreamingObservers)
-            {
-                if (V3DHISMChunkPolicy::SceneInRange(Bounds.Center, Bounds.Size, OwnerTransform,
-                    Observer, ScreenDistance, RadiusMultiplier, MaxDistanceCm)) return true;
-            }
-            return false;
-        };
-
-    const auto GetNearestObserverDistanceSq =
-        [&OwnerTransform, &StreamingObservers](const FModelData& Bounds)
-        {
-            if (!IsFiniteVector(Bounds.Center)) return 0.0;
-            const FVector WorldCenter = OwnerTransform.TransformPosition(Bounds.Center);
-            double BestDistanceSq = TNumericLimits<double>::Max();
-            for (const FVector& Observer : StreamingObservers)
-            {
-                BestDistanceSq = FMath::Min(
-                    BestDistanceSq, static_cast<double>(FVector::DistSquared(Observer, WorldCenter)));
-            }
-            return BestDistanceSq == TNumericLimits<double>::Max() ? 0.0 : BestDistanceSq;
-        };
-
-    for (const FWorldSceneStreamRecord& Record : SceneRecords)
+    TArray<FString> PendingUnloads;
+    for (int32 Index = 0; Index < SceneRecords.Num(); ++Index)
     {
+        const FWorldSceneStreamRecord& Record = SceneRecords[Index];
         const TObjectPtr<AStaticActor>* Existing = ActiveSceneActors.Find(Record.RuntimeReference);
-        const bool bHasActor = Existing && IsValid(Existing->Get());
-
-        if (bHasActor)
+        if (!Existing) continue;
+        if (!IsValid(Existing->Get()))
         {
-            const UGravityFieldComponent* Field = Existing->Get()->GravityField.Get();
-            const bool bActiveField = IsValid(Field) && Field->GetSettingsRef().bEnabled;
-            if (!Record.bHasGravityField && !bActiveField && !IsInsideRange(Record.Bounds, UnloadMultiplier))
-            {
-                DestroySceneActor(Record.RuntimeReference);
-            }
+            ActiveSceneActors.Remove(Record.RuntimeReference);
             continue;
         }
-
-        if (Record.bHasGravityField || IsInsideRange(Record.Bounds, 1.0f))
-        {
-            ++PendingLoadCount;
-            const double CandidateDistanceSq = GetNearestObserverDistanceSq(Record.Bounds);
-
-            if (PendingLoads.Num() < SpawnBudget)
-            {
-                FPendingSceneLoad& Candidate = PendingLoads.AddDefaulted_GetRef();
-                Candidate.Record = &Record;
-                Candidate.DistanceSq = CandidateDistanceSq;
-            }
-            else
-            {
-                // SpawnBudget is intentionally small (normally a few dozen), so a bounded linear
-                // farthest search is faster and simpler than maintaining a large all-record sort.
-                int32 FarthestIndex = 0;
-                double FarthestDistanceSq = PendingLoads[0].DistanceSq;
-                for (int32 PendingIndex = 1; PendingIndex < PendingLoads.Num(); ++PendingIndex)
-                {
-                    if (PendingLoads[PendingIndex].DistanceSq > FarthestDistanceSq)
-                    {
-                        FarthestIndex = PendingIndex;
-                        FarthestDistanceSq = PendingLoads[PendingIndex].DistanceSq;
-                    }
-                }
-                if (CandidateDistanceSq < FarthestDistanceSq)
-                {
-                    PendingLoads[FarthestIndex].Record = &Record;
-                    PendingLoads[FarthestIndex].DistanceSq = CandidateDistanceSq;
-                }
-            }
-        }
-        else if (Existing)
-        {
-            // Remove stale null entries without allocating an actor just to clean the map.
-            ActiveSceneActors.Remove(Record.RuntimeReference);
-        }
+        const UGravityFieldComponent* Field = Existing->Get()->GravityField.Get();
+        const bool bActiveField = IsValid(Field) && Field->GetSettingsRef().bEnabled;
+        if (!Record.bHasGravityField && !bActiveField && !SceneUnloadRange[Index])
+            PendingUnloads.Add(Record.RuntimeReference);
+    }
+    for (const FString& RuntimeReference : PendingUnloads)
+    {
+        DestroySceneActor(RuntimeReference);
+        if (!bActive || StreamingGeneration != Session) return;
     }
 
-    // Spawn the closest coarse scenes first, but cap UObject/actor construction per update. This is
-    // the main protection against the initial built-world load monopolizing one game-thread frame.
-    PendingLoads.Sort([](const FPendingSceneLoad& A, const FPendingSceneLoad& B)
+    // The sorted native view plan is reused until observers/settings change. Startup no longer
+    // scans all bounds and searches a top-K set again for every small scene construction batch.
+    // Only the selected row is copied across Spawn/BeginPlay, which can invalidate the whole plan.
+    bool bAllScenesStarted = true;
+    int32 Spawned = 0;
+    const double SliceStart = FPlatformTime::Seconds();
+    const double SliceBudget = FV3DStreamingBudget::RemainingSceneSeconds();
+    for (int32 PlanIndex = 0; PlanIndex < SceneLoadOrder.Num(); ++PlanIndex)
     {
-        return A.DistanceSq < B.DistanceSq;
-    });
-    const int32 SpawnCount = FMath::Min(SpawnBudget, PendingLoads.Num());
-    for (int32 Index = 0; Index < SpawnCount; ++Index)
-    {
-        if (PendingLoads[Index].Record)
+        const FWorldSceneStreamRecord& Candidate = SceneRecords[SceneLoadOrder[PlanIndex]];
+        const TObjectPtr<AStaticActor>* Existing = ActiveSceneActors.Find(Candidate.RuntimeReference);
+        if (Existing && IsValid(Existing->Get())) continue;
+        // Ensure at least one request progresses even when other scenes used this frame's slice.
+        if (Spawned >= SpawnBudget || (Spawned > 0 && FPlatformTime::Seconds() - SliceStart >= SliceBudget))
         {
-            EnsureSceneActor(*PendingLoads[Index].Record);
+            bAllScenesStarted = false;
+            break;
         }
+        const FWorldSceneStreamRecord Record = Candidate;
+        if (!EnsureSceneActor(Record)) bAllScenesStarted = false;
+        ++Spawned;
+        if (!bActive || StreamingGeneration != Session) return;
     }
-
-    // Initial readiness remains false while an in-range scene is deliberately deferred to a later
-    // update by the spawn budget. Out-of-range archive records never block startup.
-    bInitialScenePassComplete = PendingLoadCount <= SpawnBudget;
-    if (!bInitialScenePassComplete)
-    {
-        QueueInitialStreamingBurst();
-    }
+    FV3DStreamingBudget::ChargeSceneSeconds(FPlatformTime::Seconds() - SliceStart);
+    bInitialScenePassComplete = bAllScenesStarted;
+    if (!bInitialScenePassComplete) QueueInitialStreamingBurst();
     BeginInitialPlayerStreamingIfNeeded();
 }
 
@@ -823,10 +819,13 @@ AStaticActor* UWorldSceneStreamingSubsystem::EnsureSceneActor(
         ActiveSceneActors.Remove(Record.RuntimeReference);
     }
 
-    if (!IsValid(OwnerActor))
+    if (!bActive || !IsValid(OwnerActor))
     {
         return nullptr;
     }
+    const uint64 Session = StreamingGeneration;
+    const FString RuntimeReference = Record.RuntimeReference;
+    const FTransform SceneTransform = OwnerActor->GetActorTransform();
     UWorld* World = OwnerActor->GetWorld();
     if (!World)
     {
@@ -848,41 +847,52 @@ AStaticActor* UWorldSceneStreamingSubsystem::EnsureSceneActor(
     AStaticActor* Actor = FActorHelper::SpawnActorDeferred<AStaticActor>(
         World,
         SceneClass,
-        OwnerActor->GetActorTransform(),
+        SceneTransform,
         Parameters);
+    if (!bActive || StreamingGeneration != Session)
+    {
+        if (IsValid(Actor)) Actor->Destroy();
+        return nullptr;
+    }
     if (!IsValid(Actor) && SceneClass != AStaticActor::StaticClass())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("Configured WorldStream Static class failed deferred spawn; retrying native AStaticActor. Class=%s"),
             *GetNameSafe(SceneClass));
         Actor = FActorHelper::SpawnActorDeferred<AStaticActor>(
-            World, AStaticActor::StaticClass(), OwnerActor->GetActorTransform(), Parameters);
+            World, AStaticActor::StaticClass(), SceneTransform, Parameters);
     }
-    if (!IsValid(Actor))
+    if (!IsValid(Actor) || !bActive || StreamingGeneration != Session)
     {
+        if (IsValid(Actor)) Actor->Destroy();
         return nullptr;
     }
 
     Actor->SetRenderOnlyStreaming(bRenderOnlyStreaming);
-    Actor->Init(Record.RuntimeReference);
-    Actor->FinishSpawning(OwnerActor->GetActorTransform());
-    ActiveSceneActors.Add(Record.RuntimeReference, Actor);
+    Actor->Init(RuntimeReference);
+    Actor->FinishSpawning(SceneTransform);
+    if (!bActive || StreamingGeneration != Session || !IsValid(Actor))
+    {
+        if (IsValid(Actor))
+        {
+            Actor->ReleaseRuntimeResourcesForWorldExit();
+            Actor->Destroy();
+        }
+        return nullptr;
+    }
+    ActiveSceneActors.Add(RuntimeReference, Actor);
     return Actor;
 }
 
 void UWorldSceneStreamingSubsystem::DestroySceneActor(const FString& RuntimeReference)
 {
-    TObjectPtr<AStaticActor>* Existing = ActiveSceneActors.Find(RuntimeReference);
-    if (!Existing)
+    TObjectPtr<AStaticActor> Existing;
+    if (!ActiveSceneActors.RemoveAndCopyValue(RuntimeReference, Existing)) return;
+    if (IsValid(Existing))
     {
-        return;
+        Existing->ReleaseRuntimeResourcesForWorldExit();
+        Existing->Destroy();
     }
-    if (IsValid(Existing->Get()))
-    {
-        Existing->Get()->ReleaseRuntimeResourcesForWorldExit();
-        Existing->Get()->Destroy();
-    }
-    ActiveSceneActors.Remove(RuntimeReference);
     FV3DStreamingBudget::NotifyUnloaded();
 }
 
@@ -1277,3 +1287,46 @@ void UWorldSceneStreamingSubsystem::WriteLogAsync(const FString& Message) const
 {
     FSimulatorFileServices::WriteLogAsync(TEXT("WorldSceneStreamingSubsystem"), Message);
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DParallelScenePlanTest,
+    "V3DSimulator.World.Startup.ParallelScenePlan",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DParallelScenePlanTest::RunTest(const FString&)
+{
+    // More than the production parallel threshold, with destinations in different worker batches.
+    TArray<FWorldSceneStreamRecord> Records;
+    Records.SetNum(768);
+    for (int32 I = 0; I < Records.Num(); ++I)
+    {
+        Records[I].Bounds.Center = FVector(static_cast<double>(I) * 1000000.0, 0, 0);
+        Records[I].Bounds.Size = FVector(200.0);
+    }
+    Records.Last().bHasGravityField = true;
+    FV3DStreamingEvaluationInputs View;
+    View.Observers = {Records[128].Bounds.Center, Records[512].Bounds.Center};
+    View.ScreenDistance = 30.0;
+    View.MaxRenderDistanceCm = 3276800.0;
+    TArray<int32> Order;
+    TArray<uint8> UnloadRange;
+    BuildSceneSelectionPlan(Records, View, Order, UnloadRange);
+    TestEqual(TEXT("Both observers and distant gravity source are selected"), Order.Num(), 3);
+    if (Order.Num() == 3)
+    {
+        TestEqual(TEXT("Equal-distance ties preserve directory order"), Order[0], 128);
+        TestEqual(TEXT("Additive destination gets its own nearby scene"), Order[1], 512);
+        TestEqual(TEXT("Gravity source bypasses visual culling"), Order[2], 767);
+    }
+    TestEqual(TEXT("Parallel output covers every directory row"), UnloadRange.Num(), Records.Num());
+    TestTrue(TEXT("Live scene retained"), UnloadRange[128] != 0);
+    TestFalse(TEXT("Distant visual scene can unload"), UnloadRange[300] != 0);
+    View.Observers.SetNum(1);
+    BuildSceneSelectionPlan(Records, View, Order, UnloadRange);
+    TestFalse(TEXT("Removing a preload focus removes obsolete visual work"), Order.Contains(512));
+    Records.Empty();
+    BuildSceneSelectionPlan(Records, View, Order, UnloadRange);
+    TestTrue(TEXT("World reset releases the previous plan"), Order.IsEmpty() && UnloadRange.IsEmpty());
+    return true;
+}
+#endif

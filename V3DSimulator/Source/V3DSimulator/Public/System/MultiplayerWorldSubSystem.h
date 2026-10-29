@@ -10,10 +10,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
+#include "Engine/Engine.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "MultiplayerWorldSubSystem.generated.h"
 
 class UWorld;
+class UNetDriver;
+class ULoadingHUDWidget;
 
 UENUM(BlueprintType)
 enum class EMultiplayerWorldMode : uint8
@@ -35,6 +39,8 @@ class V3DSIMULATOR_API UMultiplayerWorldSubSystem : public UGameInstanceSubsyste
 
 public:
     static UMultiplayerWorldSubSystem* Get(const UObject* WorldContextObject);
+    virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+    virtual void Deinitialize() override;
 
     UFUNCTION(BlueprintPure, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     static UMultiplayerWorldSubSystem* Find(const UObject* WorldContextObject) { return Get(WorldContextObject); }
@@ -69,6 +75,20 @@ public:
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool JoinMultiplayerWorld(const UObject* WorldContextObject, const FString& InServerAddress, const FString& WorldFolderName);
 
+    /** True while connecting or after a failed attempt; Back remains available in both states. */
+    UFUNCTION(BlueprintPure, Category="Multiplayer")
+    bool CanCancelConnection() const { return bConnectionPending || bConnectionFailed; }
+
+    UFUNCTION(BlueprintPure, Category="Multiplayer")
+    bool IsConnectionPending() const { return bConnectionPending; }
+
+    UFUNCTION(BlueprintPure, Category="Multiplayer")
+    FText GetConnectionStatusText() const;
+
+    /** Cancels queued travel and the pending network handshake before restoring the menu. */
+    UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
+    bool CancelClientConnection(const UObject* WorldContextObject);
+
     UFUNCTION(BlueprintPure, Category="Multiplayer")
     EMultiplayerWorldMode GetWorldMode() const { return WorldMode; }
 
@@ -82,6 +102,31 @@ public:
     static bool ShouldUseClientRenderOnlyStreaming(const UObject* WorldContextObject);
 
 private:
+    void ShowConnectionWidget();
+    void RemoveConnectionWidget();
+    void StopConnectionTicker();
+    void CancelPendingConnectionTravel(UWorld* World);
+    void FailConnection(const FText& Message);
+    bool TickConnection(float DeltaSeconds);
+    void HandlePreLoadMap(const FWorldContext& Context, const FString& MapName);
+    void HandlePostLoadMap(UWorld* LoadedWorld);
+    void HandleNetworkFailure(UWorld* World, UNetDriver* NetDriver, ENetworkFailure::Type FailureType, const FString& Error);
+    void HandleTravelFailure(UWorld* World, ETravelFailure::Type FailureType, const FString& Error);
+
+    UPROPERTY(Transient)
+    TObjectPtr<ULoadingHUDWidget> ConnectionWidget;
+
+    bool bConnectionMapLoading = false;
+    bool bConnectionPending = false;
+    bool bConnectionFailed = false;
+    double ConnectionStartSeconds = 0.0;
+    FText ConnectionFailureText;
+    FDelegateHandle NetworkFailureHandle;
+    FDelegateHandle TravelFailureHandle;
+    FDelegateHandle PreLoadMapHandle;
+    FDelegateHandle PostLoadMapHandle;
+    FTSTicker::FDelegateHandle ConnectionTickerHandle;
+
     EMultiplayerWorldMode WorldMode = EMultiplayerWorldMode::SinglePlayer;
     FString SelectedWorldFolderName;
     FString ServerAddress = TEXT("127.0.0.1:7777");

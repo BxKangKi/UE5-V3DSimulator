@@ -118,21 +118,27 @@ void UWorldSurfaceSubsystem::ApplyToStaticMesh(UStaticMeshComponent* Component)
         UPhysicalMaterial* Physical = PhysicalMaterials.FindRef(Surface);
         if (IsValid(Base) && IsValid(Physical))
         {
-            auto& Cache = MaterialCache.FindOrAdd(TWeakObjectPtr<UMaterialInterface>(Base));
-            UMaterialInstanceDynamic* Material = Cache.FindRef(Surface).Get();
-            if (!IsValid(Material))
+            // Applying a surface again must preserve the existing wrapper. Keying another
+            // wrapper by that MID would create one more material on every refresh, defeat
+            // sharing between components and retain redundant parameter/texture references.
+            if (Base->GetPhysicalMaterial() != Physical)
             {
-                UMaterialInterface* Parent = Base;
-                while (UMaterialInstanceDynamic* Dynamic = Cast<UMaterialInstanceDynamic>(Parent))
-                    Parent = Dynamic->Parent;
-                if (!IsValid(Parent)) continue;
-                Material = UMaterialInstanceDynamic::Create(Parent, this);
-                Material->CopyMaterialUniformParameters(Base);
-                Material->PhysMaterial = Physical;
-                Material->bOverridePhysMaterial = true; // UE 5.8
-                Cache.Add(Surface, Material);
+                auto& Cache = MaterialCache.FindOrAdd(TWeakObjectPtr<UMaterialInterface>(Base));
+                UMaterialInstanceDynamic* Material = Cache.FindRef(Surface).Get();
+                if (!IsValid(Material))
+                {
+                    UMaterialInterface* Parent = Base;
+                    while (UMaterialInstanceDynamic* Dynamic = Cast<UMaterialInstanceDynamic>(Parent))
+                        Parent = Dynamic->Parent;
+                    if (!IsValid(Parent)) continue;
+                    Material = UMaterialInstanceDynamic::Create(Parent, this);
+                    Material->CopyMaterialUniformParameters(Base);
+                    Material->PhysMaterial = Physical;
+                    Material->bOverridePhysMaterial = true; // UE 5.8
+                    Cache.Add(Surface, Material);
+                }
+                Component->SetMaterial(Index, Material);
             }
-            Component->SetMaterial(Index, Material);
         }
         else Physical = Base ? Base->GetPhysicalMaterial() : nullptr;
         if (Index == 0) Uniform = Physical;

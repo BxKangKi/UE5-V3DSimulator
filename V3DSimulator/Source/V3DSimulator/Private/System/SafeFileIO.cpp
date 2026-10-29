@@ -48,7 +48,8 @@ namespace SafeFileIOPrivate
     struct FState
     {
         FCriticalSection StateLock;
-        TMap<FString, TSharedPtr<FCriticalSection, ESPMode::ThreadSafe>> PathLocks;
+        TMap<FString, TWeakPtr<FCriticalSection, ESPMode::ThreadSafe>> PathLocks;
+        uint32 PathLockRequests = 0;
         TMap<FString, TArray<FQueuedAppendRequest>> PendingAppends;
         TSet<FString> ActiveAppendWorkers;
         int64 PendingAppendCharacters = 0;
@@ -102,10 +103,19 @@ namespace SafeFileIOPrivate
         FState& State = GetState();
         FScopeLock StateScope(&State.StateLock);
 
-        TSharedPtr<FCriticalSection, ESPMode::ThreadSafe>& ExistingLock = State.PathLocks.FindOrAdd(NormalizedPath);
+        // Operations own their locks. The registry must not keep a mutex and path alive forever
+        // for each asset opened across projects; retain only weak entries and prune in batches.
+        if ((++State.PathLockRequests % 128u) == 0u)
+        {
+            for (auto It = State.PathLocks.CreateIterator(); It; ++It)
+                if (!It.Value().IsValid()) It.RemoveCurrent();
+        }
+        TSharedPtr<FCriticalSection, ESPMode::ThreadSafe> ExistingLock =
+            State.PathLocks.FindRef(NormalizedPath).Pin();
         if (!ExistingLock.IsValid())
         {
             ExistingLock = MakeShared<FCriticalSection, ESPMode::ThreadSafe>();
+            State.PathLocks.Add(NormalizedPath, ExistingLock);
         }
         return ExistingLock.ToSharedRef();
     }
@@ -132,6 +142,25 @@ namespace SafeFileIOPrivate
         const uint64* Latest = State.LatestWriteSequenceByPath.Find(NormalizedPath);
         return Latest && *Latest == Sequence;
     }
+
+    void ReleaseWriteSequence(const FString& NormalizedPath, const uint64 Sequence)
+    {
+        FState& State = GetState();
+        FScopeLock StateScope(&State.StateLock);
+        const uint64* Latest = State.LatestWriteSequenceByPath.Find(NormalizedPath);
+        if (Latest && *Latest == Sequence) State.LatestWriteSequenceByPath.Remove(NormalizedPath);
+        // Missing means superseded too, so an older queued write stays rejected after the newest
+        // request finishes. A newer reservation must never be erased by an older completion.
+    }
+
+    struct FScopedWriteSequenceRelease
+    {
+        const FString& Path;
+        const uint64 Sequence;
+        FScopedWriteSequenceRelease(const FString& InPath, const uint64 InSequence)
+            : Path(InPath), Sequence(InSequence) {}
+        ~FScopedWriteSequenceRelease() { ReleaseWriteSequence(Path, Sequence); }
+    };
 
     FString GetBackupPath(const FString& Path)
     {
@@ -1314,6 +1343,7 @@ FSafeFileWriteResult FSafeFileIO::SaveJsonBlocking(
     }
 
     const uint64 WriteSequence = SafeFileIOPrivate::ReserveWriteSequence(NormalizedPath);
+    const SafeFileIOPrivate::FScopedWriteSequenceRelease SequenceCleanup(NormalizedPath, WriteSequence);
     const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> PathLock =
         SafeFileIOPrivate::GetPathLock(NormalizedPath);
     FScopeLock ScopeLock(&PathLock.Get());
@@ -1361,6 +1391,7 @@ FSafeFileWriteResult FSafeFileIO::CreateJsonIfMissingBlocking(
     }
 
     const uint64 WriteSequence = SafeFileIOPrivate::ReserveWriteSequence(NormalizedPath);
+    const SafeFileIOPrivate::FScopedWriteSequenceRelease SequenceCleanup(NormalizedPath, WriteSequence);
     const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> PathLock =
         SafeFileIOPrivate::GetPathLock(NormalizedPath);
     FScopeLock ScopeLock(&PathLock.Get());
@@ -1415,7 +1446,7 @@ void FSafeFileIO::SaveJsonAsync(
         [JsonObject, NormalizedPath, MaxOutputBytes, WriteSequence, TrackedOperation,
             Callback = MoveTemp(Callback)]() mutable
         {
-
+            const SafeFileIOPrivate::FScopedWriteSequenceRelease SequenceCleanup(NormalizedPath, WriteSequence);
             FSafeFileWriteResult Result;
             Result.Path = NormalizedPath;
             FString ValidationError;
@@ -1527,6 +1558,7 @@ FSafeFileWriteResult FSafeFileIO::SaveBinaryBlocking(
         return Result;
     }
     const uint64 WriteSequence = SafeFileIOPrivate::ReserveWriteSequence(NormalizedPath);
+    const SafeFileIOPrivate::FScopedWriteSequenceRelease SequenceCleanup(NormalizedPath, WriteSequence);
     const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> PathLock =
         SafeFileIOPrivate::GetPathLock(NormalizedPath);
     FScopeLock ScopeLock(&PathLock.Get());
@@ -1576,6 +1608,7 @@ void FSafeFileIO::SaveBinaryAsync(
         [Data = MoveTemp(Data), NormalizedPath, MaxOutputBytes, WriteSequence, TrackedOperation,
             Callback = MoveTemp(Callback)]() mutable
         {
+            const SafeFileIOPrivate::FScopedWriteSequenceRelease SequenceCleanup(NormalizedPath, WriteSequence);
             const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> PathLock =
                 SafeFileIOPrivate::GetPathLock(NormalizedPath);
             FScopeLock ScopeLock(&PathLock.Get());
@@ -1898,6 +1931,54 @@ void FSafeFileIO::CleanupStaleTemporaryFiles(const FString& RootDirectory, const
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
 #include "Misc/ScopeExit.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFileMetadataLifetimeTest,
+    "V3DSimulator.System.FileIO.MetadataLifetime",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DFileMetadataLifetimeTest::RunTest(const FString&)
+{
+    if (FSafeFileIO::GetPendingOperationCount() != 0)
+    {
+        AddError(TEXT("Run this test with no active file work."));
+        return false;
+    }
+    using namespace SafeFileIOPrivate;
+    const FString Path = TEXT("FileMetadataLifetime/shared-path");
+    {
+        const auto First = GetPathLock(Path);
+        const auto Second = GetPathLock(Path);
+        TestTrue(TEXT("Concurrent operations on one path share a lock"), &First.Get() == &Second.Get());
+        for (int32 Index = 0; Index < 512; ++Index)
+        {
+            const auto Temporary = GetPathLock(FString::Printf(TEXT("FileMetadataLifetime/%d"), Index));
+        }
+        const auto StillActive = GetPathLock(Path);
+        TestTrue(TEXT("Pruning cannot replace an active lock"), &First.Get() == &StillActive.Get());
+    }
+    int32 ExpiredLocks = 0;
+    {
+        FState& State = GetState();
+        FScopeLock Scope(&State.StateLock);
+        for (const auto& Pair : State.PathLocks)
+            if (Pair.Key.StartsWith(TEXT("FileMetadataLifetime/")) && !Pair.Value.IsValid()) ++ExpiredLocks;
+    }
+    TestTrue(TEXT("Expired path entries are bounded by the pruning batch"), ExpiredLocks <= 128);
+
+    const uint64 Older = ReserveWriteSequence(Path);
+    const uint64 Newer = ReserveWriteSequence(Path);
+    ReleaseWriteSequence(Path, Older);
+    TestTrue(TEXT("Old completion preserves the newest reservation"), IsLatestWriteSequence(Path, Newer));
+    ReleaseWriteSequence(Path, Newer);
+    TestFalse(TEXT("Completed newest write no longer retains metadata"), IsLatestWriteSequence(Path, Newer));
+    TestFalse(TEXT("An older queued save stays superseded after newest completes"), IsLatestWriteSequence(Path, Older));
+    const uint64 Final = ReserveWriteSequence(Path);
+    {
+        const FScopedWriteSequenceRelease Release(Path, Final);
+        TestTrue(TEXT("A new save can reserve the path again"), IsLatestWriteSequence(Path, Final));
+    }
+    TestFalse(TEXT("Scope cleanup also releases failed or early-returned saves"), IsLatestWriteSequence(Path, Final));
+    return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFileShutdownCleanupTest,
     "V3DSimulator.System.FileIO.ShutdownCleanup",

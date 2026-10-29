@@ -8,7 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/ResponsiveHUDWidget.h"
 #include "SelectionWidgetBase.generated.h"
 
 class UMenuButtonWidget;
@@ -18,11 +18,11 @@ class UWidget;
 /**
  * Base class for menus that generate selectable entries at runtime.
  *
- * Button appearance is intentionally not defined here. Each entry is created from a Blueprint
- * widget class derived from UMenuButtonWidget, allowing the complete button design to live in WBP.
+ * Entries use the native UMenuButtonWidget class. Screen layout
+ * and shared appearance are supplied by UResponsiveHUDWidget and remain editable in Class Defaults.
  */
 UCLASS(Abstract, Blueprintable, BlueprintType)
-class V3DSIMULATOR_API USelectionWidgetBase : public UUserWidget
+class V3DSIMULATOR_API USelectionWidgetBase : public UResponsiveHUDWidget
 {
     GENERATED_BODY()
 
@@ -34,12 +34,14 @@ public:
     void HandleSelectionButtonClicked(const FString& SelectionKey);
 
 protected:
+    virtual void ApplyNativeStyle() override;
+
     /** Assigns the panel that owns generated entries. Existing generated entries are removed. */
     void SetSelectionListPanel(UPanelWidget* InPanel);
 
     UPanelWidget* GetSelectionListPanel() const { return SelectionListPanel.Get(); }
 
-    /** Creates, configures, binds, and adds one WBP entry to the assigned panel. */
+    /** Creates, configures, binds, and adds one native entry to the assigned panel. */
     UWidget* AddGeneratedSelectionEntry(const FString& SelectionKey, const FString& DisplayName);
 
     /** Removes generated entries without touching Blueprint-authored children. */
@@ -49,13 +51,8 @@ protected:
     virtual void OnSelectionEntryActivated(const FString& SelectionKey);
 
 private:
-    UClass* ResolveSelectionEntryWidgetClass();
-
     TWeakObjectPtr<UPanelWidget> SelectionListPanel;
 
     UPROPERTY(Transient)
     TArray<TObjectPtr<UMenuButtonWidget>> GeneratedSelectionEntries;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UClass> ResolvedSelectionEntryWidgetClass;
 };

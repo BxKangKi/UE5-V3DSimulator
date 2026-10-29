@@ -9,7 +9,10 @@
 
 #include "System/WorldBakedModelAsset.h"
 #include "System/WorldBakedTexture.h"
+#include "Model/WorldSceneStreamAction.h"
+#include "System/V3DTerrain.h"
 #include "System/V3DStreamingBudget.h"
+#include "Misc/App.h"
 #include "Misc/ScopeExit.h"
 
 #include "Async/ParallelFor.h"
@@ -19,6 +22,8 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
+#include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "PixelFormat.h"
@@ -78,10 +83,49 @@ private:
     TArray<TObjectPtr<UObject>> References;
 };
 
+/** Native callback state survives facade collection without retaining a UObject or pixel buffer. */
+struct FWorldBakedDependencyReadState
+{
+    bool bCompleted = false; // Game-thread-only, including rejection/shutdown completion.
+    TArray<TFunction<void(bool)>> Waiters;
+
+    void Complete(const bool bReady)
+    {
+        check(IsInGameThread());
+        if (bCompleted) return;
+        bCompleted = true;
+        TArray<TFunction<void(bool)>> LocalWaiters = MoveTemp(Waiters);
+        for (auto& Waiter : LocalWaiters)
+            if (Waiter) Waiter(bReady);
+    }
+};
+
 namespace WorldBakedModelAssetPrivate
 {
     constexpr int32 MaxTextureMips = 32;
     constexpr int64 MaxTextureMipBytes = 1024ll * 1024ll * 1024ll;
+
+    FString BuildDependencyReadKey(const TArray<int32>& MeshIndices)
+    {
+        TSet<int32> UniqueIndices;
+        for (const int32 Index : MeshIndices) UniqueIndices.Add(Index);
+        TArray<int32> Sorted = UniqueIndices.Array();
+        Sorted.Sort();
+        FString Key;
+        Key.Reserve(Sorted.Num() * 12);
+        for (const int32 Index : Sorted) Key += FString::Printf(TEXT("%d,"), Index);
+        return Key;
+    }
+
+    bool IsRequestOuterUsable(const UObject* Outer)
+    {
+        check(IsInGameThread());
+        if (!Outer) return true;
+        if (!IsValid(Outer)) return false;
+        const auto* GeneratedContext = Cast<UWorldGeneratedStaticMeshContext>(Outer);
+        return !GeneratedContext || !GeneratedContext->IsBuildCancelled();
+    }
+
     int32 ResolveRequestTextureLimit(const FglTFRuntimeMaterialsConfig& Config, const UObject* Context)
     {
         // Gameplay callers already snapshot the user cap. Facades have no world, so repeatedly
@@ -119,6 +163,9 @@ namespace WorldBakedModelAssetPrivate
 
         const auto HashTypedMap = [&Hash](const TMap<EglTFRuntimeMaterialType, UMaterialInterface*>& Map)
         {
+            // Include empty-map boundaries: moving the same override between shader families
+            // changes material selection and must not reuse the previous family's cached MID.
+            Hash = HashCombineFast(Hash, GetTypeHash(Map.Num()));
             TArray<EglTFRuntimeMaterialType> Keys;
             Map.GenerateKeyArray(Keys);
             Keys.Sort([](const EglTFRuntimeMaterialType A, const EglTFRuntimeMaterialType B)
@@ -134,6 +181,11 @@ namespace WorldBakedModelAssetPrivate
         };
         HashTypedMap(Config.UberMaterialsOverrideMap);
         HashTypedMap(Config.UnlitOverrideMap);
+        HashTypedMap(Config.MetallicRoughnessOverrideMap);
+        HashTypedMap(Config.SpecularGlossinessOverrideMap);
+        HashTypedMap(Config.ClearCoatOverrideMap);
+        HashTypedMap(Config.SheenOverrideMap);
+        HashTypedMap(Config.TransmissionOverrideMap);
 
         TArray<FString> ScalarKeys;
         Config.ScalarParamsOverrides.GenerateKeyArray(ScalarKeys);
@@ -194,10 +246,114 @@ namespace WorldBakedModelAssetPrivate
         return Key;
     }
 
+    enum class EBakedMaterialFamily : uint8
+    {
+        Unknown,
+        MetallicRoughness,
+        SpecularGlossiness,
+        Unlit,
+        ClearCoat,
+        Sheen,
+        Transmission
+    };
+
+    EBakedMaterialFamily ResolveMaterialFamily(
+        const FGWorldBakedMaterial& Baked,
+        UMaterialInterface* SourceMaterial)
+    {
+        const auto HasPositiveScalar = [&Baked](const TCHAR* Name)
+        {
+            return Baked.Scalars.ContainsByPredicate([Name](const FGWorldBakedScalarParameter& Parameter)
+            {
+                return Parameter.Name == Name && FMath::IsFinite(Parameter.Value) && Parameter.Value > 0.0f;
+            });
+        };
+        const auto HasPositiveColor = [&Baked](const TCHAR* Name)
+        {
+            return Baked.Vectors.ContainsByPredicate([Name](const FGWorldBakedVectorParameter& Parameter)
+            {
+                const FLinearColor& Value = Parameter.Value;
+                return Parameter.Name == Name
+                    && FMath::IsFinite(Value.R) && FMath::IsFinite(Value.G) && FMath::IsFinite(Value.B)
+                    && (Value.R > 0.0f || Value.G > 0.0f || Value.B > 0.0f);
+            });
+        };
+
+        EBakedMaterialFamily SourceFamily = EBakedMaterialFamily::Unknown;
+        UMaterial* SourceBase = IsValid(SourceMaterial) ? SourceMaterial->GetMaterial() : nullptr;
+        if (IsValid(SourceBase))
+        {
+            const FMaterialShadingModelField ShadingModels = SourceBase->GetShadingModels();
+            if (ShadingModels.HasShadingModel(MSM_ThinTranslucent))
+                SourceFamily = EBakedMaterialFamily::Transmission;
+            else if (ShadingModels.HasShadingModel(MSM_Cloth))
+                SourceFamily = EBakedMaterialFamily::Sheen;
+            else if (ShadingModels.HasShadingModel(MSM_ClearCoat))
+                SourceFamily = EBakedMaterialFamily::ClearCoat;
+            else if (ShadingModels.HasShadingModel(MSM_Unlit))
+                SourceFamily = EBakedMaterialFamily::Unlit;
+        }
+
+        // Capturing stores the actual UMaterial master, including for plugin instances. These
+        // exact identities distinguish DefaultLit metallic/roughness from specular/glossiness;
+        // an arbitrary project DefaultLit shader is not evidence of the glTF parameter contract.
+        const FString& Path = Baked.BaseMaterialPath;
+        if (SourceFamily == EBakedMaterialFamily::Unknown)
+        {
+            if (Path == TEXT("/glTFRuntime/M_glTFRuntimeBase.M_glTFRuntimeBase"))
+                SourceFamily = EBakedMaterialFamily::MetallicRoughness;
+            else if (Path == TEXT("/glTFRuntime/M_glTFRuntime_SG_Base.M_glTFRuntime_SG_Base"))
+                SourceFamily = EBakedMaterialFamily::SpecularGlossiness;
+            else if (Path == TEXT("/glTFRuntime/M_Transmission_glTFRuntimeBase.M_Transmission_glTFRuntimeBase"))
+                SourceFamily = EBakedMaterialFamily::Transmission;
+            else if (Path == TEXT("/glTFRuntime/M_ClearCoat_glTFRuntimeBase.M_ClearCoat_glTFRuntimeBase"))
+                SourceFamily = EBakedMaterialFamily::ClearCoat;
+            else if (Path == TEXT("/glTFRuntime/M_Unlit_glTFRuntimeBase.M_Unlit_glTFRuntimeBase"))
+                SourceFamily = EBakedMaterialFamily::Unlit;
+        }
+
+        // A bake can retain several extension parameters. Match glTFRuntime's final selection
+        // order (transmission wins over sheen and clearcoat), ignoring neutral factor defaults.
+        if (SourceFamily == EBakedMaterialFamily::Transmission || HasPositiveScalar(TEXT("transmissionFactor")))
+            return EBakedMaterialFamily::Transmission;
+        if (SourceFamily == EBakedMaterialFamily::Sheen || HasPositiveColor(TEXT("sheenColorFactor")))
+            return EBakedMaterialFamily::Sheen;
+        if (SourceFamily == EBakedMaterialFamily::ClearCoat || HasPositiveScalar(TEXT("clearcoatFactor")))
+            return EBakedMaterialFamily::ClearCoat;
+        if (SourceFamily == EBakedMaterialFamily::Unlit || Baked.bUnlit)
+            return EBakedMaterialFamily::Unlit;
+
+        // Custom specular/glossiness masters still have an identifiable glTF parameter pair.
+        // A specularFactor alone also occurs in metallic/roughness and cannot select this family.
+        const bool bHasGlossiness = Baked.Scalars.ContainsByPredicate([](const FGWorldBakedScalarParameter& Parameter)
+        {
+            return Parameter.Name == TEXT("glossinessFactor") && FMath::IsFinite(Parameter.Value);
+        });
+        if (bHasGlossiness && (Baked.Vectors.ContainsByPredicate([](const FGWorldBakedVectorParameter& Parameter)
+            { return Parameter.Name == TEXT("specularFactor"); })
+            || Baked.Textures.ContainsByPredicate([](const FGWorldBakedTextureParameter& Parameter)
+            { return Parameter.Name == TEXT("specularGlossinessTexture"); })))
+        {
+            return EBakedMaterialFamily::SpecularGlossiness;
+        }
+        return SourceFamily;
+    }
+
     UMaterialInterface* SelectBaseMaterial(
         const FGWorldBakedMaterial& Baked,
-        const FglTFRuntimeMaterialsConfig& Config)
+        const FglTFRuntimeMaterialsConfig& Config,
+        const UObject* Context)
     {
+        // Terrain uses an array/weight shader contract. Generic glTF material overrides cannot
+        // consume these channels. Resolve from the central AssetRegistry or explicit palette override first.
+        if (V3DTerrain::IsPaletteMaterial(Baked))
+        {
+            if (UMaterialInterface* const* Named = Config.MaterialsOverrideByNameMap.Find(Baked.Name))
+                if (IsValid(*Named)) return *Named;
+            if (UMaterialInterface* const* Palette = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.TerrainPalette")))
+                if (IsValid(*Palette)) return *Palette;
+            return V3DTerrain::ResolveMaterial(Context, Baked.BaseMaterialPath);
+        }
         if (IsValid(Config.ForceMaterial))
         {
             return Config.ForceMaterial;
@@ -211,21 +367,37 @@ namespace WorldBakedModelAssetPrivate
             }
         }
 
-        const EglTFRuntimeMaterialType Type =
-            static_cast<EglTFRuntimeMaterialType>(Baked.MaterialType);
-        const TMap<EglTFRuntimeMaterialType, UMaterialInterface*>& Overrides =
-            Baked.bUnlit ? Config.UnlitOverrideMap : Config.UberMaterialsOverrideMap;
-        if (UMaterialInterface* const* Typed = Overrides.Find(Type))
+        UMaterialInterface* SourceMaterial = LoadObject<UMaterialInterface>(nullptr, *Baked.BaseMaterialPath);
+        const EBakedMaterialFamily Family = ResolveMaterialFamily(Baked, SourceMaterial);
+        const TMap<EglTFRuntimeMaterialType, UMaterialInterface*>* Overrides = nullptr;
+        switch (Family)
         {
-            if (IsValid(*Typed))
+        case EBakedMaterialFamily::MetallicRoughness: Overrides = &Config.MetallicRoughnessOverrideMap; break;
+        case EBakedMaterialFamily::SpecularGlossiness: Overrides = &Config.SpecularGlossinessOverrideMap; break;
+        case EBakedMaterialFamily::Unlit: Overrides = &Config.UnlitOverrideMap; break;
+        case EBakedMaterialFamily::ClearCoat: Overrides = &Config.ClearCoatOverrideMap; break;
+        case EBakedMaterialFamily::Sheen: Overrides = &Config.SheenOverrideMap; break;
+        case EBakedMaterialFamily::Transmission: Overrides = &Config.TransmissionOverrideMap; break;
+        default: break;
+        }
+        const EglTFRuntimeMaterialType Type = static_cast<EglTFRuntimeMaterialType>(Baked.MaterialType);
+        if (Overrides)
+        {
+            if (UMaterialInterface* const* Typed = Overrides->Find(Type))
+                if (IsValid(*Typed)) return *Typed;
+        }
+        if (Family == EBakedMaterialFamily::MetallicRoughness)
+        {
+            if (UMaterialInterface* const* Typed = Config.UberMaterialsOverrideMap.Find(Type))
             {
-                return *Typed;
+                if (IsValid(*Typed)) return *Typed;
             }
         }
 
-        // The archive stores the shader asset identity, not a transient MID pointer. Project and
-        // plugin master materials must consequently remain cooked just as they did for glTFRuntime.
-        return LoadObject<UMaterialInterface>(nullptr, *Baked.BaseMaterialPath);
+        // A generic PBR override cannot reproduce a clearcoat/transmission/cloth shader or an
+        // unrecognized custom contract. Preserve the captured master when no matching family
+        // override was supplied. Its cooked asset identity already exists in the archive format.
+        return SourceMaterial;
     }
 
     bool CheckedMultiply(const int64 A, const int64 B, int64& Out)
@@ -246,6 +418,8 @@ namespace WorldBakedModelAssetPrivate
     bool ValidateTextureLayout(const FGWorldBakedTexture& Baked, FString& OutError)
     {
         if (Baked.SizeX <= 0 || Baked.SizeY <= 0
+            || Baked.NumLayers <= 0 || Baked.NumLayers > 2048
+            || (!Baked.bTextureArray && Baked.NumLayers != 1)
             || Baked.PixelFormat <= PF_Unknown || Baked.PixelFormat >= PF_MAX
             || Baked.AddressX >= static_cast<uint8>(TA_MAX)
             || Baked.AddressY >= static_cast<uint8>(TA_MAX)
@@ -260,7 +434,7 @@ namespace WorldBakedModelAssetPrivate
 
         const FPixelFormatInfo& Format = GPixelFormats[Baked.PixelFormat];
         if (!Format.Supported || Format.BlockSizeX <= 0 || Format.BlockSizeY <= 0
-            || Format.BlockSizeZ <= 0 || Format.BlockBytes <= 0)
+            || Format.BlockSizeZ != 1 || Format.BlockBytes <= 0)
         {
             OutError = FString::Printf(
                 TEXT("Baked texture pixel format is unsupported on this platform: %s"),
@@ -273,7 +447,7 @@ namespace WorldBakedModelAssetPrivate
         for (const FGWorldBakedTextureMip& Mip : Baked.Mips)
         {
             if (Mip.SizeX != ExpectedSizeX || Mip.SizeY != ExpectedSizeY
-                || Mip.SizeZ != 1 || Mip.Bytes.IsEmpty())
+                || Mip.SizeZ != Baked.NumLayers || Mip.Bytes.IsEmpty())
             {
                 OutError = FString::Printf(
                     TEXT("Baked texture has an invalid mip chain: %s"), *Baked.Name);
@@ -419,6 +593,7 @@ namespace WorldBakedModelAssetPrivate
                     {
                         Primitive.UVs[Channel].Add(FVector2D(Value));
                     }
+                    Baked.UVs[Channel].Empty();
                 }
 
                 Primitive.Indices = MoveTemp(Baked.Indices);
@@ -435,6 +610,7 @@ namespace WorldBakedModelAssetPrivate
                         Joint.Z = Value.Z;
                         Joint.W = Value.W;
                     }
+                    Baked.Joints[SetIndex].Empty();
                 }
 
                 Primitive.Weights.SetNum(Baked.Weights.Num());
@@ -445,21 +621,26 @@ namespace WorldBakedModelAssetPrivate
                     {
                         Primitive.Weights[SetIndex].Add(FVector4(Value));
                     }
+                    Baked.Weights[SetIndex].Empty();
                 }
 
+                // Colors in the public V3D terrain contract are linear weights, including alpha.
+                Primitive.bVertexColorsSRGB = Baked.MaterialName != TEXT("V3D.TerrainPalette");
                 Primitive.Colors.Reserve(Baked.Colors.Num());
                 for (const FVector4f& Value : Baked.Colors) Primitive.Colors.Add(FVector4(Value));
                 Baked.Colors.Empty();
 
                 Primitive.MorphTargets.Reserve(Baked.MorphTargets.Num());
-                for (const FGWorldBakedMorphTarget& BakedMorph : Baked.MorphTargets)
+                for (FGWorldBakedMorphTarget& BakedMorph : Baked.MorphTargets)
                 {
                     FglTFRuntimeMorphTarget& Morph = Primitive.MorphTargets.AddDefaulted_GetRef();
                     Morph.Name = BakedMorph.Name;
                     Morph.Positions.Reserve(BakedMorph.Positions.Num());
                     for (const FVector3f& Value : BakedMorph.Positions) Morph.Positions.Add(FVector(Value));
+                    BakedMorph.Positions.Empty();
                     Morph.Normals.Reserve(BakedMorph.Normals.Num());
                     for (const FVector3f& Value : BakedMorph.Normals) Morph.Normals.Add(FVector(Value));
+                    BakedMorph.Normals.Empty();
                 }
 
                 Primitive.OverrideBoneMap = !Baked.BoneMap.IsEmpty()
@@ -539,6 +720,7 @@ bool UWorldBakedModelAsset::InitializePrepared(
     WeakMaterialCache.Reset();
     MeshMaterialDependencies.Reset();
     MaterialTextureDependencies.Reset();
+    PendingDependencyReads.Reset();
     AsyncBuildReferences.Reset();
     ActiveFinalizeRequests.Reset();
     SharedRenderMeshCache.Reset();
@@ -690,7 +872,28 @@ void UWorldBakedModelAsset::PrepareDependenciesAsync(
     }
     if (bKnown) { Completion(true); return; }
 
+    const FString DependencyKey = WorldBakedModelAssetPrivate::BuildDependencyReadKey(MeshIndices);
+    if (auto* Pending = PendingDependencyReads.Find(DependencyKey))
+    {
+        (*Pending)->Waiters.Add(MoveTemp(Completion));
+        return;
+    }
+    const TSharedPtr<FWorldBakedDependencyReadState, ESPMode::ThreadSafe> State =
+        MakeShared<FWorldBakedDependencyReadState, ESPMode::ThreadSafe>();
+    State->Waiters.Add(MoveTemp(Completion));
+    PendingDependencyReads.Add(DependencyKey, State);
     TWeakObjectPtr<UWorldBakedModelAsset> WeakThis(this);
+    const auto Finish = [WeakThis, DependencyKey, State](const bool bReady)
+    {
+        check(IsInGameThread());
+        if (State->bCompleted) return;
+        auto* Owner = WeakThis.Get();
+        const auto* Current = Owner ? Owner->PendingDependencyReads.Find(DependencyKey) : nullptr;
+        const bool bCurrent = Current && *Current == State;
+        if (bCurrent) Owner->PendingDependencyReads.Remove(DependencyKey);
+        // Remove before callbacks: reentrant callers may begin a fresh probe after a failure.
+        State->Complete(bCurrent && bReady && !FSafeFileIO::IsShuttingDown());
+    };
     FV3DStreamingBudget::Enqueue(this,
         [WeakThis, MeshIndices]() -> int64
         {
@@ -706,37 +909,39 @@ void UWorldBakedModelAsset::PrepareDependenciesAsync(
                 Bytes = FMath::Min(Ceiling, Bytes + int64(FMath::Min<uint64>(Pair.Value.UncompressedSize, uint64(Ceiling / 3))) * 3);
             return Bytes;
         },
-        [WeakThis, MeshIndices, Completion](FV3DStreamingBudget::FPermit Permit)
+        [WeakThis, MeshIndices, Finish, DependencyKey, State](FV3DStreamingBudget::FPermit Permit)
         {
             auto* Self = WeakThis.Get();
-            if (!Self || !Self->Reader.IsValid() || !Self->Manifest.IsValid()) { Completion(false); return; }
+            if (!Self || !Self->Reader.IsValid() || !Self->Manifest.IsValid()) { Finish(false); return; }
             const auto LocalReader = Self->Reader;
             const auto LocalManifest = Self->Manifest;
             const FGuid LocalUUID = Self->UUID;
             const bool bQueued = FSafeFileIO::RunTrackedWorker(
-                [WeakThis, MeshIndices, Completion, Permit, LocalReader, LocalManifest, LocalUUID]()
+                [WeakThis, MeshIndices, Finish, Permit, LocalReader, LocalManifest, LocalUUID, DependencyKey, State]()
                 {
                     FGWorldBakedAssetBundle Dependencies;
                     FString Error;
                     const bool bRead = LocalReader->ReadMeshBundle(LocalUUID, *LocalManifest,
-                        MeshIndices, INDEX_NONE, true, Dependencies, Error, nullptr, nullptr, 0, true);
+                        MeshIndices, INDEX_NONE, true, Dependencies, Error, nullptr, nullptr, 0, true,
+                        []() { return FSafeFileIO::IsShuttingDown(); });
                     // No geometry/pixels may wait in the second admission queue. Only IDs and
                     // small material descriptions cross to GT. The lease ends after this callback.
                     Dependencies.Meshes.Empty();
                     Dependencies.Skins.Empty();
                     FSafeFileIO::DispatchTrackedGameThread(
-                        [WeakThis, Completion, Permit, bRead, Dependencies = MoveTemp(Dependencies)]() mutable
+                        [WeakThis, Finish, Permit, bRead, DependencyKey, State, Dependencies = MoveTemp(Dependencies)]() mutable
                         {
                             auto* Owner = WeakThis.Get();
-                            const bool bReady = Owner && bRead && !FSafeFileIO::IsShuttingDown();
+                            const auto* Current = Owner ? Owner->PendingDependencyReads.Find(DependencyKey) : nullptr;
+                            const bool bReady = Current && *Current == State && bRead && !FSafeFileIO::IsShuttingDown();
                             if (bReady) Owner->RememberDependencies(Dependencies);
                             Dependencies.Reset();
-                            Completion(bReady);
+                            Finish(bReady);
                         }, true);
                 }, true);
-            if (!bQueued) Completion(false);
+            if (!bQueued) Finish(false);
         },
-        [Completion]() { Completion(false); });
+        [Finish]() { Finish(false); });
 }
 
 uint64 UWorldBakedModelAsset::RetainReadReferences(const FWorldBakedBuildReferenceGuard& Guard)
@@ -860,16 +1065,16 @@ UMaterialInterface* UWorldBakedModelAsset::FindCachedMaterial(
     return nullptr;
 }
 
-UTexture2D* UWorldBakedModelAsset::FindCachedTexture(
+UTexture* UWorldBakedModelAsset::FindCachedTexture(
     const int32 TextureId,
     FWorldBakedBuildReferenceGuard& ReferenceGuard, const int32 TextureLimit)
 {
     check(IsInGameThread());
     const uint64 TextureCacheKey =
         (static_cast<uint64>(static_cast<uint32>(TextureId)) << 32) | TextureLimit;
-    if (const TWeakObjectPtr<UTexture2D>* Cached = WeakTextureCache.Find(TextureCacheKey))
+    if (const TWeakObjectPtr<UTexture>* Cached = WeakTextureCache.Find(TextureCacheKey))
     {
-        if (UTexture2D* Existing = Cached->Get())
+        if (UTexture* Existing = Cached->Get())
         {
             ReferenceGuard.Add(Existing);
             return Existing;
@@ -879,7 +1084,7 @@ UTexture2D* UWorldBakedModelAsset::FindCachedTexture(
     return nullptr;
 }
 
-UTexture2D* UWorldBakedModelAsset::CreateTexture(
+UTexture* UWorldBakedModelAsset::CreateTexture(
     FGWorldBakedTexture& Baked,
     FWorldBakedBuildReferenceGuard& ReferenceGuard,
     FString& OutError, const int32 TextureLimit)
@@ -892,9 +1097,9 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
     const uint64 TextureCacheKey =
         (static_cast<uint64>(static_cast<uint32>(Baked.TextureId)) << 32)
         | static_cast<uint32>(TextureLimit);
-    if (const TWeakObjectPtr<UTexture2D>* Cached = WeakTextureCache.Find(TextureCacheKey))
+    if (const TWeakObjectPtr<UTexture>* Cached = WeakTextureCache.Find(TextureCacheKey))
     {
-        if (UTexture2D* Existing = Cached->Get())
+        if (UTexture* Existing = Cached->Get())
         {
             ReferenceGuard.Add(Existing);
             return Existing;
@@ -906,13 +1111,63 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
     // satisfies the current user cap instead of rebuilding/resampling pixels at load time. This
     // makes the setting effective immediately and avoids allocating/uploading discarded top mips.
     int32 FirstRuntimeMip = 0;
-    while (FirstRuntimeMip + 1 < Baked.Mips.Num()
+    while (TextureLimit > 0 && FirstRuntimeMip + 1 < Baked.Mips.Num()
         && (Baked.Mips[FirstRuntimeMip].SizeX > TextureLimit
             || Baked.Mips[FirstRuntimeMip].SizeY > TextureLimit))
     {
         ++FirstRuntimeMip;
     }
     const FGWorldBakedTextureMip& RuntimeTopMip = Baked.Mips[FirstRuntimeMip];
+
+    if (Baked.bTextureArray)
+    {
+        UTexture2DArray* Texture = NewObject<UTexture2DArray>(GetTransientPackage(), NAME_None, RF_Transient);
+        if (!IsValid(Texture))
+        {
+            OutError = TEXT("Could not allocate a runtime texture array");
+            return nullptr;
+        }
+        ReferenceGuard.Add(Texture);
+        FTexturePlatformData* Data = new FTexturePlatformData();
+        Data->SizeX = RuntimeTopMip.SizeX; Data->SizeY = RuntimeTopMip.SizeY;
+        Data->PixelFormat = static_cast<EPixelFormat>(Baked.PixelFormat);
+        Data->SetNumSlices(Baked.NumLayers);
+        for (int32 MipIndex = FirstRuntimeMip; MipIndex < Baked.Mips.Num(); ++MipIndex)
+        {
+            FGWorldBakedTextureMip& Source = Baked.Mips[MipIndex];
+            FTexture2DMipMap* Mip = new FTexture2DMipMap();
+            Mip->SizeX = Source.SizeX; Mip->SizeY = Source.SizeY; Mip->SizeZ = Baked.NumLayers;
+            Mip->BulkData.Lock(LOCK_READ_WRITE);
+            void* Destination = Mip->BulkData.Realloc(Source.Bytes.Num());
+            FMemory::Memcpy(Destination, Source.Bytes.GetData(), Source.Bytes.Num());
+            Mip->BulkData.Unlock();
+            Source.Bytes.Empty(); // BulkData now owns the only CPU copy of this palette mip.
+            Data->Mips.Add(Mip);
+        }
+        Texture->SetPlatformData(Data);
+        Texture->SRGB = Baked.bSRGB;
+        Texture->AddressX = static_cast<TextureAddress>(Baked.AddressX);
+        Texture->AddressY = static_cast<TextureAddress>(Baked.AddressY);
+        Texture->AddressZ = TA_Clamp; // Palette layer indices must never interpolate across wrapping layers.
+        Texture->bNotOfflineProcessed = true; // Archive bytes use ordinary row/block layout, never platform tiling.
+        Texture->Filter = static_cast<TextureFilter>(Baked.Filter);
+        Texture->LODGroup = static_cast<TextureGroup>(Baked.LODGroup);
+        // Arrays are immutable dependency resources. Retain their CPU BulkData for resource
+        // recreation; ordinary 2D textures below retain the existing archive-mip provider.
+        Texture->NeverStream = true;
+        Texture->UpdateResource();
+        if (Texture->GetArraySize() != Baked.NumLayers
+            || Texture->GetSizeX() != RuntimeTopMip.SizeX
+            || Texture->GetSizeY() != RuntimeTopMip.SizeY
+            || (FApp::CanEverRender() && !Texture->GetResource()))
+        {
+            OutError = FString::Printf(TEXT("Runtime texture array %d did not create its %dx%dx%d resource"),
+                Baked.TextureId, RuntimeTopMip.SizeX, RuntimeTopMip.SizeY, Baked.NumLayers);
+            return nullptr;
+        }
+        WeakTextureCache.Add(TextureCacheKey, Texture);
+        return Texture;
+    }
 
     const FGWorldArchiveRange* TextureRange = Manifest.IsValid()
         ? Manifest->TextureRanges.Find(Baked.TextureId) : nullptr;
@@ -965,6 +1220,7 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
     Texture->SRGB = Baked.bSRGB;
     Texture->AddressX = static_cast<TextureAddress>(Baked.AddressX);
     Texture->AddressY = static_cast<TextureAddress>(Baked.AddressY);
+    Texture->bNotOfflineProcessed = true;
     Texture->Filter = static_cast<TextureFilter>(Baked.Filter);
     Texture->LODGroup = static_cast<TextureGroup>(Baked.LODGroup);
 
@@ -979,7 +1235,7 @@ UTexture2D* UWorldBakedModelAsset::CreateTexture(
 
 UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     const FGWorldBakedMaterial& Baked,
-    const TMap<int32, UTexture2D*>& Textures,
+    const TMap<int32, UTexture*>& Textures,
     const FglTFRuntimeMaterialsConfig& Config,
     FWorldBakedBuildReferenceGuard& ReferenceGuard,
     FString& OutError)
@@ -992,7 +1248,7 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     }
 
     UMaterialInterface* Base =
-        WorldBakedModelAssetPrivate::SelectBaseMaterial(Baked, Config);
+        WorldBakedModelAssetPrivate::SelectBaseMaterial(Baked, Config, this);
     if (!IsValid(Base))
     {
         OutError = FString::Printf(
@@ -1000,6 +1256,31 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
         return nullptr;
     }
     ReferenceGuard.Add(Base);
+    if (V3DTerrain::IsPaletteMaterial(Baked))
+    {
+        // Every built-world scene is drawn by an ISM/HISM component. A parent can expose all
+        // four array parameters yet still render the engine's fallback material if its instanced
+        // vertex-factory permutation was never compiled. In editor this public check requests it;
+        // cooked builds must carry it from the editor's terrain material preparation pass.
+        if (FApp::CanEverRender() && !Base->CheckMaterialUsage(MATUSAGE_InstancedStaticMeshes))
+        {
+            OutError = FString::Printf(
+                TEXT("Terrain parent %s has no instanced-static-mesh shader. Open/save the terrain material in the updated editor, then cook again."),
+                *GetPathNameSafe(Base));
+            return nullptr;
+        }
+        for (const FGWorldBakedTextureParameter& Parameter : Baked.Textures)
+        {
+            UTexture* DefaultTexture = nullptr;
+            if (!Base->GetTextureParameterValue(FMaterialParameterInfo(FName(*Parameter.Name)), DefaultTexture)
+                || !Cast<UTexture2DArray>(DefaultTexture))
+            {
+                OutError = FString::Printf(TEXT("Terrain parent %s needs a Texture2DArray parameter named %s; see Docs/V3D_UNREAL_GUIDE.ko.md"),
+                    *GetPathNameSafe(Base), *Parameter.Name);
+                return nullptr;
+            }
+        }
+    }
 
     UMaterialInstanceDynamic* Material =
         UMaterialInstanceDynamic::Create(Base, this);
@@ -1011,9 +1292,20 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     }
     ReferenceGuard.Add(Material);
 
+    const FName FadeDistanceName(TEXT("FadeDistance"));
     for (const FGWorldBakedScalarParameter& Parameter : Baked.Scalars)
     {
-        Material->SetScalarParameterValue(FName(*Parameter.Name), Parameter.Value);
+        const FName ParameterName(*Parameter.Name);
+        // Camera fade belongs to the current shader/selected parent, not to imported glTF
+        // surface data. Older archives captured inherited defaults as explicit values, so
+        // replaying them here can re-enable a stale positive fade after the parent returns
+        // to -1. A parent's authored override (e.g. MI_Entity's close-camera fade) survives,
+        // and the explicit runtime config below can still override it. Keep the comparison
+        // case-insensitive, matching Unreal's material parameter lookup.
+        if (ParameterName != FadeDistanceName)
+        {
+            Material->SetScalarParameterValue(ParameterName, Parameter.Value);
+        }
     }
     for (const TPair<FString, float>& Override : Config.ScalarParamsOverrides)
     {
@@ -1028,7 +1320,7 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
         UTexture* Texture = nullptr;
         if (Parameter.TextureId != INDEX_NONE)
         {
-            UTexture2D* const* Found = Textures.Find(Parameter.TextureId);
+            UTexture* const* Found = Textures.Find(Parameter.TextureId);
             Texture = Found ? *Found : nullptr;
         }
         else if (!Parameter.AssetPath.IsEmpty())
@@ -1047,11 +1339,29 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
         // before material mutation can enter engine code and expose a collection point.
         ReferenceGuard.Add(Texture);
         Material->SetTextureParameterValue(FName(*Parameter.Name), Texture);
+        if (V3DTerrain::IsPaletteMaterial(Baked))
+        {
+            UTexture* Bound = nullptr;
+            UTexture2DArray* Array = Cast<UTexture2DArray>(Texture);
+            if (!Array || Array->GetArraySize() != 4
+                || !Material->GetTextureParameterValue(FMaterialParameterInfo(FName(*Parameter.Name)), Bound)
+                || Bound != Texture)
+            {
+                OutError = FString::Printf(TEXT("Terrain array binding failed: Material=%s Parameter=%s Texture=%s Layers=%d"),
+                    *Baked.Name, *Parameter.Name, *GetPathNameSafe(Texture), Array ? Array->GetArraySize() : 0);
+                return nullptr;
+            }
+        }
     }
 
     const uint64 MaterialCacheKey =
         WorldBakedModelAssetPrivate::BuildMaterialCacheKey(Baked.MaterialId, Config);
     WeakMaterialCache.Add(MaterialCacheKey, Material);
+    if (V3DTerrain::IsPaletteMaterial(Baked))
+    {
+        UE_LOG(LogTemp, Display, TEXT("[V3DTerrain] Runtime palette bound. Material=%s Parent=%s Arrays=%d Rendering=%s"),
+            *Baked.Name, *GetPathNameSafe(Base), Baked.Textures.Num(), FApp::CanEverRender() ? TEXT("ready") : TEXT("disabled"));
+    }
     return Material;
 }
 
@@ -1078,7 +1388,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
         return true;
     }
 
-    TMap<int32, UTexture2D*> Textures;
+    TMap<int32, UTexture*> Textures;
     TMap<int32, UMaterialInterface*> Materials;
     ReferenceGuard.Reserve(Bundle.Textures.Num() + Bundle.Materials.Num() * 2 + 16);
 
@@ -1099,7 +1409,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
     Textures.Reserve(Bundle.Textures.Num());
     for (FGWorldBakedTexture& Baked : Bundle.Textures)
     {
-        UTexture2D* Texture = CreateTexture(Baked, ReferenceGuard, OutError, Bundle.MaxTextureResolution);
+        UTexture* Texture = CreateTexture(Baked, ReferenceGuard, OutError, Bundle.MaxTextureResolution);
         Baked.Mips.Empty(); // Also release decoded bytes when another request populated the cache.
         if (!Texture) return false;
         Textures.Add(Baked.TextureId, Texture);
@@ -1110,7 +1420,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
         for (const FGWorldBakedTextureParameter& Parameter : BakedMaterial.Textures)
         {
             if (Parameter.TextureId == INDEX_NONE || Textures.Contains(Parameter.TextureId)) continue;
-            UTexture2D* CachedTexture = FindCachedTexture(Parameter.TextureId, ReferenceGuard, Bundle.MaxTextureResolution);
+            UTexture* CachedTexture = FindCachedTexture(Parameter.TextureId, ReferenceGuard, Bundle.MaxTextureResolution);
             if (!IsValid(CachedTexture))
             {
                 OutError = FString::Printf(
@@ -1302,7 +1612,7 @@ void UWorldBakedMeshFinalizeRequest::BeginStatic(
     // representation before InitResources; changing the flag after completion is too late.
     FglTFRuntimeStaticMeshAsync NativeCallback;
     NativeCallback.BindDynamic(this, &UWorldBakedMeshFinalizeRequest::HandleStaticMeshFinalized);
-    Builder->LoadStaticMeshFromRuntimeLODsAsync(LODs, NativeCallback, Config);
+    Builder->LoadStaticMeshFromRuntimeLODsAsyncMove(MoveTemp(LODs), NativeCallback, Config);
 }
 
 void UWorldBakedMeshFinalizeRequest::BeginSkeletal(
@@ -1324,7 +1634,7 @@ void UWorldBakedMeshFinalizeRequest::BeginSkeletal(
     }
     FglTFRuntimeSkeletalMeshAsync NativeCallback;
     NativeCallback.BindDynamic(this, &UWorldBakedMeshFinalizeRequest::HandleSkeletalMeshFinalized);
-    Builder->LoadSkeletalMeshFromRuntimeLODsAsync(LODs, INDEX_NONE, NativeCallback, Config);
+    Builder->LoadSkeletalMeshFromRuntimeLODsAsyncMove(MoveTemp(LODs), INDEX_NONE, NativeCallback, Config);
 }
 
 void UWorldBakedMeshFinalizeRequest::HandleStaticMeshFinalized(UStaticMesh* StaticMesh)
@@ -1407,9 +1717,9 @@ void UWorldBakedModelAsset::QueueStaticRuntimeLODFinalizer(
         {
             if (UWorldBakedMeshFinalizeRequest* StrongRequest = WeakRequest.Get())
             {
-                if (bHadOuter && !WeakOuter.IsValid())
+                if (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())))
                 {
-                    StrongRequest->RejectBeforeStart(TEXT("Mesh outer was destroyed while queued"));
+                    StrongRequest->RejectBeforeStart(TEXT("Mesh outer was cancelled or expired while queued"));
                     FV3DRuntimeSafety::CompleteOperation(Ticket);
                     return;
                 }
@@ -1467,9 +1777,9 @@ void UWorldBakedModelAsset::QueueSkeletalRuntimeLODFinalizer(
         {
             if (UWorldBakedMeshFinalizeRequest* StrongRequest = WeakRequest.Get())
             {
-                if (bHadOuter && !WeakOuter.IsValid())
+                if (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())))
                 {
-                    StrongRequest->RejectBeforeStart(TEXT("Mesh outer was destroyed while queued"));
+                    StrongRequest->RejectBeforeStart(TEXT("Mesh outer was cancelled or expired while queued"));
                     FV3DRuntimeSafety::CompleteOperation(Ticket);
                     return;
                 }
@@ -1754,15 +2064,16 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAsyncNative(
     const auto SubmitPayload = [WeakOwner, MeshIndices, TextureLimit, MaterialSignature, Config, Callback](const bool bReady)
     {
         UWorldBakedModelAsset* Owner = WeakOwner.Get();
-        if (!bReady || !Owner) { if (Callback) Callback(nullptr); return; }
-        FV3DStreamingBudget::Enqueue(Owner,
+        if (!bReady || !Owner || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(Config.Outer))
+        { if (Callback) Callback(nullptr); return; }
+        FV3DStreamingBudget::Enqueue(Config.Outer ? Config.Outer : Owner,
             [WeakOwner, MeshIndices, TextureLimit, MaterialSignature, bMaterials = !Config.MaterialsConfig.bSkipLoad]()
             { return WeakOwner.IsValid() ? WeakOwner->EstimateLoadBytes(MeshIndices, bMaterials, INDEX_NONE, TextureLimit, MaterialSignature) : int64(0); },
             [WeakOwner, MeshIndices, Config, Callback,
                 WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]
                 (FV3DStreamingBudget::FPermit Permit) mutable
             {
-                if (bHadOuter && !WeakOuter.IsValid())
+                if (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())))
                 {
                     if (Callback) Callback(nullptr);
                     return;
@@ -1772,7 +2083,12 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAsyncNative(
                         [Permit, Callback](UStaticMesh* Mesh) { if (Callback) Callback(Mesh); }, Config);
                 else if (Callback) Callback(nullptr);
             },
-            [Callback]() { if (Callback) Callback(nullptr); });
+            [Callback]() { if (Callback) Callback(nullptr); },
+            [WeakOwner, WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]()
+            {
+                return WeakOwner.IsValid() && (!bHadOuter || (WeakOuter.IsValid()
+                    && WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())));
+            });
     };
     if (Config.MaterialsConfig.bSkipLoad) SubmitPayload(true);
     else PrepareDependenciesAsync(MeshIndices, SubmitPayload);
@@ -1802,10 +2118,13 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAdmitted(
     const uint64 ReadId = RetainReadReferences(CacheGuard);
     const TWeakObjectPtr<UObject> WeakOuter(Config.Outer);
     const bool bHadOuter = Config.Outer != nullptr;
+    const auto* GeneratedContext = Cast<UWorldGeneratedStaticMeshContext>(Config.Outer);
+    const TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation = GeneratedContext
+        ? GeneratedContext->GetBuildCancellationToken() : nullptr;
     const bool bQueued = LocalReader.IsValid() && LocalManifest.IsValid()
         && FSafeFileIO::RunTrackedWorker(
             [WeakThis, LocalReader, LocalManifest, LocalUUID, LocalReference, WeakOuter, bHadOuter,
-                MeshIndices, Callback, Config, CachedTextureIds, CachedMaterialIds, TextureResolution, ReadId]() mutable
+                MeshIndices, Callback, Config, CachedTextureIds, CachedMaterialIds, TextureResolution, ReadId, Cancellation]() mutable
             {
                 FGWorldBakedAssetBundle Bundle;
                 TArray<FglTFRuntimeMeshLOD> LODs;
@@ -1814,7 +2133,9 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAdmitted(
                 const bool bRead = LocalReader->ReadMeshBundle(
                     LocalUUID, *LocalManifest, MeshIndices, INDEX_NONE,
                     !Config.MaterialsConfig.bSkipLoad, Bundle, Error,
-                    &CachedTextureIds, &CachedMaterialIds, TextureResolution);
+                    &CachedTextureIds, &CachedMaterialIds, TextureResolution, false,
+                    [Cancellation]() { return FSafeFileIO::IsShuttingDown()
+                        || (Cancellation.IsValid() && Cancellation->GetValue() != 0); });
                 const bool bPrepared = bRead
                     && WorldBakedModelAssetPrivate::BuildRuntimeLODsDetached(
                         Bundle, INDEX_NONE, !Config.MaterialsConfig.bSkipLoad,
@@ -1835,7 +2156,7 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAdmitted(
                     {
                         UWorldBakedModelAsset* Self = WeakThis.Get();
                         ON_SCOPE_EXIT { if (auto* Owner = WeakThis.Get()) Owner->ReleaseReadReferences(ReadId); };
-                        if (!IsValid(Self) || (bHadOuter && !WeakOuter.IsValid()) || FSafeFileIO::IsShuttingDown())
+                        if (!IsValid(Self) || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))) || FSafeFileIO::IsShuttingDown())
                         {
                             if (Callback) Callback(nullptr);
                             return;
@@ -2013,15 +2334,16 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAsyncNative(
     const auto SubmitPayload = [WeakOwner, MeshIndex, SkinIndex, TextureLimit, MaterialSignature, Config, Callback](const bool bReady)
     {
         UWorldBakedModelAsset* Owner = WeakOwner.Get();
-        if (!bReady || !Owner) { if (Callback) Callback(nullptr); return; }
-        FV3DStreamingBudget::Enqueue(Owner,
+        if (!bReady || !Owner || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(Config.Outer))
+        { if (Callback) Callback(nullptr); return; }
+        FV3DStreamingBudget::Enqueue(Config.Outer ? Config.Outer : Owner,
             [WeakOwner, MeshIndex, SkinIndex, TextureLimit, MaterialSignature, bMaterials = !Config.MaterialsConfig.bSkipLoad]()
             { return WeakOwner.IsValid() ? WeakOwner->EstimateLoadBytes({MeshIndex}, bMaterials, SkinIndex, TextureLimit, MaterialSignature) : int64(0); },
             [WeakOwner, MeshIndex, SkinIndex, Config, Callback,
                 WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]
                 (FV3DStreamingBudget::FPermit Permit) mutable
             {
-                if (bHadOuter && !WeakOuter.IsValid())
+                if (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())))
                 {
                     if (Callback) Callback(nullptr);
                     return;
@@ -2031,7 +2353,12 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAsyncNative(
                         [Permit, Callback](USkeletalMesh* Mesh) { if (Callback) Callback(Mesh); }, Config);
                 else if (Callback) Callback(nullptr);
             },
-            [Callback]() { if (Callback) Callback(nullptr); });
+            [Callback]() { if (Callback) Callback(nullptr); },
+            [WeakOwner, WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]()
+            {
+                return WeakOwner.IsValid() && (!bHadOuter || (WeakOuter.IsValid()
+                    && WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())));
+            });
     };
     if (Config.MaterialsConfig.bSkipLoad) SubmitPayload(true);
     else PrepareDependenciesAsync({MeshIndex}, SubmitPayload);
@@ -2063,10 +2390,13 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
     const uint64 ReadId = RetainReadReferences(CacheGuard);
     const TWeakObjectPtr<UObject> WeakOuter(Config.Outer);
     const bool bHadOuter = Config.Outer != nullptr;
+    const auto* GeneratedContext = Cast<UWorldGeneratedStaticMeshContext>(Config.Outer);
+    const TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation = GeneratedContext
+        ? GeneratedContext->GetBuildCancellationToken() : nullptr;
     const bool bQueued = LocalReader.IsValid() && LocalManifest.IsValid()
         && FSafeFileIO::RunTrackedWorker(
             [WeakThis, LocalReader, LocalManifest, LocalUUID, LocalReference, WeakOuter, bHadOuter,
-                MeshIndices, SkinIndex, Callback, Config, CachedTextureIds, CachedMaterialIds, TextureResolution, ReadId]() mutable
+                MeshIndices, SkinIndex, Callback, Config, CachedTextureIds, CachedMaterialIds, TextureResolution, ReadId, Cancellation]() mutable
             {
                 FGWorldBakedAssetBundle Bundle;
                 TArray<FglTFRuntimeMeshLOD> LODs;
@@ -2075,7 +2405,9 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
                 const bool bRead = LocalReader->ReadMeshBundle(
                     LocalUUID, *LocalManifest, MeshIndices, SkinIndex,
                     !Config.MaterialsConfig.bSkipLoad, Bundle, Error,
-                    &CachedTextureIds, &CachedMaterialIds, TextureResolution);
+                    &CachedTextureIds, &CachedMaterialIds, TextureResolution, false,
+                    [Cancellation]() { return FSafeFileIO::IsShuttingDown()
+                        || (Cancellation.IsValid() && Cancellation->GetValue() != 0); });
                 const bool bPrepared = bRead
                     && WorldBakedModelAssetPrivate::BuildRuntimeLODsDetached(
                         Bundle, SkinIndex, !Config.MaterialsConfig.bSkipLoad,
@@ -2093,7 +2425,7 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
                     {
                         UWorldBakedModelAsset* Self = WeakThis.Get();
                         ON_SCOPE_EXIT { if (auto* Owner = WeakThis.Get()) Owner->ReleaseReadReferences(ReadId); };
-                        if (!IsValid(Self) || (bHadOuter && !WeakOuter.IsValid()) || FSafeFileIO::IsShuttingDown())
+                        if (!IsValid(Self) || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))) || FSafeFileIO::IsShuttingDown())
                         {
                             if (Callback) Callback(nullptr);
                             return;
@@ -2133,6 +2465,224 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedInvalidRuntimeLODsTest,
+    "V3DSimulator.Streaming.Memory.InvalidRuntimeLODsComplete",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedInvalidRuntimeLODsTest::RunTest(const FString&)
+{
+    // Invalid async input must finish once rather than create zero-LOD render resources or leave
+    // the caller's request/config references pinned indefinitely. No render/worker work is needed.
+    TStrongObjectPtr<UWorldBakedModelAsset> Owner(NewObject<UWorldBakedModelAsset>());
+    for (const bool bEmptySet : {true, false})
+    {
+        TStrongObjectPtr<UglTFRuntimeAsset> Builder(NewObject<UglTFRuntimeAsset>());
+        TStrongObjectPtr<UWorldBakedMeshFinalizeRequest> Request(NewObject<UWorldBakedMeshFinalizeRequest>());
+        int32 Completions = 0;
+        UStaticMesh* Result = nullptr;
+        Request->InitializeStatic(Owner.Get(), Builder.Get(), FString(),
+            [&Completions, &Result](UStaticMesh* Mesh) { ++Completions; Result = Mesh; });
+        TArray<FglTFRuntimeMeshLOD> LODs;
+        if (!bEmptySet) LODs.AddDefaulted(); // A LOD without any primitive is also invalid.
+        Request->BeginStatic(0, MoveTemp(LODs), FglTFRuntimeStaticMeshConfig());
+        TestEqual(TEXT("Invalid geometry completes exactly once"), Completions, 1);
+        TestNull(TEXT("Invalid geometry never publishes a mesh"), Result);
+        TestEqual(TEXT("Rejected consuming load releases input storage"), LODs.Num(), 0);
+    }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedFadeDistancePolicyTest,
+    "V3DSimulator.Streaming.Materials.CurrentFadeDistancePolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedFadeDistancePolicyTest::RunTest(const FString&)
+{
+    TStrongObjectPtr<UMaterialInterface> WorldParent(LoadObject<UMaterialInterface>(nullptr,
+        TEXT("/Game/Resources/Materials/V3D/MI_Opaque.MI_Opaque")));
+    TStrongObjectPtr<UMaterialInterface> CharacterParent(LoadObject<UMaterialInterface>(nullptr,
+        TEXT("/Game/Resources/Materials/V3D/MI_Entity.MI_Entity")));
+    if (!TestNotNull(TEXT("World shader parent is available"), WorldParent.Get())
+        || !TestNotNull(TEXT("Character shader parent is available"), CharacterParent.Get())) return false;
+
+    TStrongObjectPtr<UWorldBakedModelAsset> Owner(NewObject<UWorldBakedModelAsset>());
+    FWorldBakedBuildReferenceGuard Guard;
+    Guard.Add(Owner.Get());
+    FGWorldBakedMaterial Baked;
+    Baked.MaterialId = 0;
+    Baked.Name = TEXT("Legacy inherited fade");
+    Baked.BaseMaterialPath = WorldParent->GetMaterial()->GetPathName();
+    // Older archives contain resolved parent scalars without recording their provenance.
+    // Mixed case checks that the filter follows FName's material-parameter lookup semantics.
+    Baked.Scalars.Add({TEXT("fAdEdIsTaNcE"), 10000.0f});
+    Baked.Scalars.Add({TEXT("metallicFactor"), 0.75f});
+    const TMap<int32, UTexture*> Textures;
+    FglTFRuntimeMaterialsConfig Config;
+    FString Error;
+    const FMaterialParameterInfo FadeInfo(FName(TEXT("FadeDistance")));
+    const auto ReadScalar = [this](UMaterialInterface* Material,
+        const FMaterialParameterInfo& Info, const float Expected, const TCHAR* Description)
+    {
+        if (!TestNotNull(TEXT("Runtime material was created"), Material)) return false;
+        float Actual = 0.0f;
+        if (!TestTrue(TEXT("Runtime scalar is available"), Material->GetScalarParameterValue(Info, Actual)))
+            return false;
+        return TestEqual(Description, Actual, Expected);
+    };
+
+    Config.ForceMaterial = WorldParent.Get();
+    UMaterialInterface* WorldMaterial = Owner->CreateMaterial(Baked, Textures, Config, Guard, Error);
+    if (!WorldMaterial) { AddError(Error); return false; }
+    ReadScalar(WorldMaterial, FadeInfo, -1.0f,
+        TEXT("A stale baked positive fade cannot override the current disabled default"));
+    ReadScalar(WorldMaterial, FMaterialParameterInfo(FName(TEXT("metallicFactor"))), 0.75f,
+        TEXT("Imported surface scalar values still replay"));
+
+    Config.ForceMaterial = CharacterParent.Get();
+    UMaterialInterface* CharacterMaterial = Owner->CreateMaterial(Baked, Textures, Config, Guard, Error);
+    if (!CharacterMaterial) { AddError(Error); return false; }
+    ReadScalar(CharacterMaterial, FadeInfo, 50.0f,
+        TEXT("The selected character parent's authored fade remains intact"));
+
+    Config.ForceMaterial = WorldParent.Get();
+    Config.ScalarParamsOverrides.Add(TEXT("FADEDISTANCE"), 250.0f);
+    UMaterialInterface* ExplicitMaterial = Owner->CreateMaterial(Baked, Textures, Config, Guard, Error);
+    if (!ExplicitMaterial) { AddError(Error); return false; }
+    ReadScalar(ExplicitMaterial, FadeInfo, 250.0f,
+        TEXT("An explicit runtime fade override takes precedence"));
+    TestEqual(TEXT("Portable archived fade snapshot remains unchanged"), Baked.Scalars[0].Value, 10000.0f);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedMaterialFamiliesTest,
+    "V3DSimulator.Streaming.Materials.OverrideFamilies",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedMaterialFamiliesTest::RunTest(const FString&)
+{
+    // Transient materials exercise the same LoadObject + shading-model path without modifying
+    // project assets or compiling shader resources. Strong pointers isolate the test from GC.
+    TStrongObjectPtr<UMaterial> Source(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Generic(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> ClearCoat(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Sheen(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Transmission(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> SpecularGlossiness(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Unlit(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Named(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Forced(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Palette(NewObject<UMaterial>());
+
+    FGWorldBakedMaterial Baked;
+    Baked.Name = TEXT("AdvancedSurface");
+    Baked.BaseMaterialPath = Source->GetPathName();
+    Baked.MaterialType = static_cast<uint8>(EglTFRuntimeMaterialType::Opaque);
+    FglTFRuntimeMaterialsConfig Config;
+    Config.UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Generic.Get());
+    const auto Select = [&Baked, &Config]()
+    {
+        return WorldBakedModelAssetPrivate::SelectBaseMaterial(Baked, Config, nullptr);
+    };
+
+    Source->SetShadingModel(MSM_ClearCoat);
+    TestTrue(TEXT("Clearcoat source survives a generic PBR override"), Select() == Source.Get());
+    Config.ClearCoatOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, ClearCoat.Get());
+    TestTrue(TEXT("Real ClearCoat shading model selects its family map"), Select() == ClearCoat.Get());
+    Source->SetShadingModel(MSM_DefaultLit);
+    Baked.Scalars.Add({TEXT("clearcoatFactor"), 0.5f});
+    TestTrue(TEXT("Active captured clearcoat survives a custom DefaultLit parent"), Select() == ClearCoat.Get());
+
+    Config.SheenOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Sheen.Get());
+    Baked.Vectors.Add({TEXT("sheenColorFactor"), FLinearColor(0.2f, 0.0f, 0.0f, 1.0f)});
+    TestTrue(TEXT("Sheen takes precedence over clearcoat as in glTFRuntime"), Select() == Sheen.Get());
+    Config.TransmissionOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Transmission.Get());
+    Baked.Scalars.Add({TEXT("transmissionFactor"), 0.25f});
+    TestTrue(TEXT("Transmission takes precedence over sheen and clearcoat"), Select() == Transmission.Get());
+    Config.TransmissionOverrideMap.Empty();
+    TestTrue(TEXT("Missing transmission override retains the source, without downgrading"), Select() == Source.Get());
+    Config.TransmissionOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Transmission.Get());
+
+    Baked.Scalars.Empty();
+    Baked.Vectors.Empty();
+    Source->SetShadingModel(MSM_Cloth);
+    TestTrue(TEXT("Actual Cloth shading model selects the sheen map"), Select() == Sheen.Get());
+    Source->SetShadingModel(MSM_ThinTranslucent);
+    TestTrue(TEXT("Actual ThinTranslucent shading model selects transmission"), Select() == Transmission.Get());
+
+    Source->SetShadingModel(MSM_DefaultLit);
+    Config.SpecularGlossinessOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, SpecularGlossiness.Get());
+    Baked.Scalars.Add({TEXT("glossinessFactor"), 0.75f});
+    Baked.Vectors.Add({TEXT("specularFactor"), FLinearColor::White});
+    TestTrue(TEXT("Captured glTF specular/glossiness contract selects its own family"), Select() == SpecularGlossiness.Get());
+    Baked.Scalars.Empty();
+    Baked.Vectors.Empty();
+    Baked.Scalars.Add({TEXT("clearcoatFactor"), 0.0f});
+    TestTrue(TEXT("An unknown DefaultLit shader with neutral clearcoat keeps its exact parent"), Select() == Source.Get());
+    Config.UnlitOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Unlit.Get());
+    Baked.bUnlit = true;
+    TestTrue(TEXT("Captured unlit materials keep the unlit override family"), Select() == Unlit.Get());
+    Baked.bUnlit = false;
+
+    Config.MaterialsOverrideByNameMap.Add(Baked.Name, Named.Get());
+    Config.ForceMaterial = Forced.Get();
+    TestTrue(TEXT("Explicit ForceMaterial retains precedence over a named override"), Select() == Forced.Get());
+    Config.ForceMaterial = nullptr;
+    TestTrue(TEXT("Named override retains precedence over automatic family selection"), Select() == Named.Get());
+
+    // Palette shaders consume texture arrays rather than ordinary glTF texture parameters.
+    Baked.Scalars.Add({TEXT("V3D_Terrain"), 1.0f});
+    Config.MaterialsOverrideByNameMap.Add(TEXT("V3D.TerrainPalette"), Palette.Get());
+    Config.ForceMaterial = Forced.Get();
+    TestTrue(TEXT("Authored palette name remains the first terrain override"), Select() == Named.Get());
+    Config.MaterialsOverrideByNameMap.Remove(Baked.Name);
+    TestTrue(TEXT("Palette override is preserved ahead of ForceMaterial and generic PBR"), Select() == Palette.Get());
+
+    Baked.Scalars.Empty();
+    Config.ForceMaterial = nullptr;
+    Baked.BaseMaterialPath = TEXT("/glTFRuntime/M_glTFRuntimeBase.M_glTFRuntimeBase");
+    TestTrue(TEXT("Ordinary glTF metallic/roughness still accepts the generic override"), Select() == Generic.Get());
+    Config.MetallicRoughnessOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Named.Get());
+    TestTrue(TEXT("An explicit metallic/roughness map precedes the generic fallback"), Select() == Named.Get());
+    Baked.MaterialType = static_cast<uint8>(EglTFRuntimeMaterialType::TwoSidedTranslucent);
+    Config.UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Generic.Get());
+    TestTrue(TEXT("Family selection retains the baked blend and two-sided type"), Select() == Generic.Get());
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedMaterialFamilySignatureTest,
+    "V3DSimulator.Streaming.Materials.FamilyCacheSignature",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedMaterialFamilySignatureTest::RunTest(const FString&)
+{
+    TStrongObjectPtr<UMaterial> First(NewObject<UMaterial>());
+    TStrongObjectPtr<UMaterial> Second(NewObject<UMaterial>());
+    const FglTFRuntimeMaterialsConfig Empty;
+    const uint32 EmptySignature = WorldBakedModelAssetPrivate::BuildMaterialConfigSignature(Empty);
+    using FOverrideMap = TMap<EglTFRuntimeMaterialType, UMaterialInterface*>;
+    const auto CheckMap = [this, &First, &Second, EmptySignature](
+        const TCHAR* Name, FOverrideMap FglTFRuntimeMaterialsConfig::* Map)
+    {
+        FglTFRuntimeMaterialsConfig Config;
+        (Config.*Map).Add(EglTFRuntimeMaterialType::Opaque, First.Get());
+        const uint32 FirstSignature = WorldBakedModelAssetPrivate::BuildMaterialConfigSignature(Config);
+        TestTrue(FString::Printf(TEXT("%s participates in the material cache key"), Name), FirstSignature != EmptySignature);
+        (Config.*Map).Add(EglTFRuntimeMaterialType::Opaque, Second.Get());
+        TestTrue(FString::Printf(TEXT("Changing %s invalidates cached materials"), Name),
+            FirstSignature != WorldBakedModelAssetPrivate::BuildMaterialConfigSignature(Config));
+    };
+    CheckMap(TEXT("Uber"), &FglTFRuntimeMaterialsConfig::UberMaterialsOverrideMap);
+    CheckMap(TEXT("Unlit"), &FglTFRuntimeMaterialsConfig::UnlitOverrideMap);
+    CheckMap(TEXT("MetallicRoughness"), &FglTFRuntimeMaterialsConfig::MetallicRoughnessOverrideMap);
+    CheckMap(TEXT("SpecularGlossiness"), &FglTFRuntimeMaterialsConfig::SpecularGlossinessOverrideMap);
+    CheckMap(TEXT("ClearCoat"), &FglTFRuntimeMaterialsConfig::ClearCoatOverrideMap);
+    CheckMap(TEXT("Sheen"), &FglTFRuntimeMaterialsConfig::SheenOverrideMap);
+    CheckMap(TEXT("Transmission"), &FglTFRuntimeMaterialsConfig::TransmissionOverrideMap);
+    FglTFRuntimeMaterialsConfig GenericConfig, ClearCoatConfig;
+    GenericConfig.UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, First.Get());
+    ClearCoatConfig.ClearCoatOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, First.Get());
+    TestTrue(TEXT("Moving an override between families also invalidates cached materials"),
+        WorldBakedModelAssetPrivate::BuildMaterialConfigSignature(GenericConfig)
+            != WorldBakedModelAssetPrivate::BuildMaterialConfigSignature(ClearCoatConfig));
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedRequestReferencesTest,
     "V3DSimulator.Streaming.Memory.RequestReferences",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -2209,4 +2759,116 @@ bool FV3DBakedRequestReferencesTest::RunTest(const FString&)
     TestEqual(TEXT("All temporary request pins released"), Asset->PendingReadReferences.Num(), 0);
     return true;
 }
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedDependencyCompletionTest,
+    "V3DSimulator.Streaming.Memory.DependencyCoalescing",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedDependencyCompletionTest::RunTest(const FString&)
+{
+    TestEqual(TEXT("Equivalent mesh dependency sets share a cold probe"),
+        WorldBakedModelAssetPrivate::BuildDependencyReadKey({7, 2, 7}),
+        WorldBakedModelAssetPrivate::BuildDependencyReadKey({2, 7}));
+    TestTrue(TEXT("Different dependency sets cannot coalesce"),
+        WorldBakedModelAssetPrivate::BuildDependencyReadKey({2, 7})
+            != WorldBakedModelAssetPrivate::BuildDependencyReadKey({2, 8}));
+
+    FWorldBakedDependencyReadState State;
+    int32 Completions = 0;
+    int32 Successes = 0;
+    TSharedPtr<int32> NativePayload = MakeShared<int32>(1);
+    const TWeakPtr<int32> WeakPayload = NativePayload;
+    State.Waiters.Add([&State, &Completions, &Successes, NativePayload](const bool bReady)
+    {
+        ++Completions;
+        if (bReady) ++Successes;
+        State.Complete(false); // Reentrant cancellation cannot complete another waiter twice.
+    });
+    State.Waiters.Add([&Completions, &Successes](const bool bReady)
+    {
+        ++Completions;
+        if (bReady) ++Successes;
+    });
+    NativePayload.Reset();
+    State.Complete(true);
+    State.Complete(false);
+    TestEqual(TEXT("Every joined request receives one terminal result"), Completions, 2);
+    TestEqual(TEXT("All waiters receive the same completed result"), Successes, 2);
+    TestTrue(TEXT("Completion releases native captures immediately"), !WeakPayload.IsValid());
+    TestEqual(TEXT("Completed coalesced state retains no callback storage"), State.Waiters.Num(), 0);
+
+    TStrongObjectPtr<UWorldGeneratedStaticMeshContext> Context(NewObject<UWorldGeneratedStaticMeshContext>());
+    Context->Initialize(nullptr);
+    TestTrue(TEXT("New request context permits admission"),
+        WorldBakedModelAssetPrivate::IsRequestOuterUsable(Context.Get()));
+    const auto Token = Context->GetBuildCancellationToken();
+    Context->CancelBuild();
+    TestFalse(TEXT("Cancelled live context cannot submit late pixel work"),
+        WorldBakedModelAssetPrivate::IsRequestOuterUsable(Context.Get()));
+    TestTrue(TEXT("Detached worker token observes cancellation"), Token.IsValid() && Token->GetValue() != 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DTerrainRuntimeBindingsTest,
+    "V3DSimulator.Streaming.Terrain.RuntimeArrayBindings",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DTerrainRuntimeBindingsTest::RunTest(const FString&)
+{
+    if (!FApp::CanEverRender())
+    {
+        AddInfo(TEXT("Runtime array resource test requires an editor with a renderer."));
+        return true;
+    }
+    TStrongObjectPtr<UWorldBakedModelAsset> Owner(NewObject<UWorldBakedModelAsset>());
+    FWorldBakedBuildReferenceGuard Guard;
+    Guard.Add(Owner.Get());
+    FGWorldBakedMaterial Palette;
+    Palette.MaterialId = 0;
+    Palette.Name = TEXT("V3D.TerrainPalette");
+    Palette.BaseMaterialPath = V3DTerrain::DefaultMaterialPath;
+    Palette.Scalars.Add({TEXT("V3D_Terrain"), 1.0f});
+    const TCHAR* Names[] = {TEXT("V3D_BaseColorArray"), TEXT("V3D_NormalArray"),
+        TEXT("V3D_ORMArray"), TEXT("V3D_EmissiveArray")};
+    TMap<int32, UTexture*> Textures;
+    FString Error;
+    for (int32 Id = 0; Id < 4; ++Id)
+    {
+        FGWorldBakedTexture Baked;
+        Baked.TextureId = Id;
+        Baked.Name = Names[Id];
+        Baked.SizeX = Baked.SizeY = 2;
+        Baked.NumLayers = 4;
+        Baked.bTextureArray = true;
+        Baked.PixelFormat = PF_B8G8R8A8;
+        Baked.bSRGB = Id == 0 || Id == 3;
+        Baked.Filter = TF_Trilinear;
+        for (int32 Size = 2; Size > 0; Size >>= 1)
+        {
+            auto& Mip = Baked.Mips.AddDefaulted_GetRef();
+            Mip.SizeX = Mip.SizeY = Size;
+            Mip.SizeZ = 4;
+            Mip.Bytes.Init(uint8(64 + Id * 32), Size * Size * 4 * 4);
+        }
+        UTexture2DArray* Texture = Cast<UTexture2DArray>(Owner->CreateTexture(Baked, Guard, Error, 2));
+        if (!TestNotNull(TEXT("Raw palette array creates an engine resource"), Texture))
+        { AddError(Error); return false; }
+        TestEqual(TEXT("All palette layers survive resource creation"), Texture->GetArraySize(), 4);
+        TestTrue(TEXT("Palette uses the ordinary raw pixel layout"), Texture->bNotOfflineProcessed != 0);
+        Textures.Add(Id, Texture);
+        Palette.Textures.Add({Names[Id], Id, FString()});
+    }
+    FglTFRuntimeMaterialsConfig Config;
+    UMaterialInterface* Material = Owner->CreateMaterial(Palette, Textures, Config, Guard, Error);
+    if (!TestNotNull(TEXT("Palette material accepts runtime arrays and HISM usage"), Material))
+    { AddError(Error); return false; }
+    TestTrue(TEXT("Palette has the instanced-static-mesh shader permutation"),
+        Material->CheckMaterialUsage(MATUSAGE_InstancedStaticMeshes));
+    for (int32 Id = 0; Id < 4; ++Id)
+    {
+        UTexture* Bound = nullptr;
+        TestTrue(TEXT("MID keeps the decoded array, rather than the template texture"),
+            Material->GetTextureParameterValue(FMaterialParameterInfo(FName(Names[Id])), Bound)
+                && Bound == Textures.FindChecked(Id));
+    }
+    return true;
+}
+
 #endif

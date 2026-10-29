@@ -61,6 +61,7 @@
 #include "Camera/PlayerCameraManager.h"
 #include "Weather/WeatherSubsystem.h"
 #include "Blueprint/UserWidget.h"
+#include "UI/LoadingHUDWidget.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SceneComponent.h"
@@ -315,6 +316,13 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
     const bool bResolveCallSucceeded = Registry->V3DMaterials.Resolve(
         NewCache->References,
         Failures);
+    NewCache->References.Terrain = Registry->ResolveTerrainMaterial();
+    if (!Registry->TerrainMaterial.IsNull() && !IsValid(NewCache->References.Terrain))
+    {
+        Failures.Add(FString::Printf(
+            TEXT("TerrainMaterial -> %s"),
+            *Registry->TerrainMaterial.ToSoftObjectPath().ToString()));
+    }
     bMaterialDefaultAssetResolved = true;
 
     for (const FString& Failure : Failures)
@@ -2729,21 +2737,28 @@ void UGameManagerSubSystem::SetLoadingWidget(UUserWidget* InWidget)
 
 void UGameManagerSubSystem::ShowLoadingWidget()
 {
+    if (IsValid(LoadingWidgetInstance.Get()) && !LoadingWidgetInstance->IsA<ULoadingHUDWidget>())
+    {
+        LoadingWidgetInstance->RemoveFromParent();
+        LoadingWidgetInstance = nullptr;
+    }
     if (!IsValid(LoadingWidgetInstance.Get()))
     {
         UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
         APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
-        if (IsValid(Registry) && IsValid(PlayerController) && PlayerController->IsLocalController()
-            && !Registry->LoadingWidgetClass.IsNull())
+        if (IsValid(PlayerController) && PlayerController->IsLocalController())
         {
-            if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous())
+            UClass* WidgetClass = IsValid(Registry) ? Registry->LoadingWidgetClass.LoadSynchronous() : nullptr;
+            if (!IsValid(WidgetClass) || !WidgetClass->IsChildOf(ULoadingHUDWidget::StaticClass())
+                || WidgetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
             {
-                UUserWidget* Widget = CreateWidget<UUserWidget>(PlayerController, WidgetClass);
-                if (IsValid(Widget))
-                {
-                    Widget->AddToPlayerScreen(100);
-                    SetLoadingWidget(Widget);
-                }
+                WidgetClass = ULoadingHUDWidget::StaticClass();
+            }
+            ULoadingHUDWidget* Widget = CreateWidget<ULoadingHUDWidget>(PlayerController, WidgetClass);
+            if (IsValid(Widget))
+            {
+                Widget->AddToPlayerScreen(100);
+                SetLoadingWidget(Widget);
             }
         }
     }

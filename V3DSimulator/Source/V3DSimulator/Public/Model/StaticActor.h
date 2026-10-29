@@ -10,6 +10,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/ThreadSafeCounter.h"
+#include "TimerManager.h"
 #include "GameFramework/Actor.h"
 #include "Model/ModelData.h"
 #include "System/V3DStreamingEvaluation.h"
@@ -107,6 +109,8 @@ protected:
     virtual void Destroyed() override;
 
 private:
+    friend class FV3DStaticStreamingSchedulingTest;
+
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USceneComponent> Root;
 
@@ -154,6 +158,10 @@ private:
     FString ObjectName;
     FString BaseName;
     uint64 MetadataRequestSerial = 0;
+    /** Detached workers never inspect actor lifetime from their background thread. */
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> WorkCancellation;
+    FTimerHandle StreamingBatchTimerHandle;
+    bool bStreamingBatchQueued = false;
     int32 GameUpdateTickHandle = INDEX_NONE;
     float LoadingStatus = 0.0f;
     bool bIsLoaded = false;
@@ -186,6 +194,7 @@ private:
     void SetStreamGroupProgress(FName GroupName, float Progress);
     void StartStreamingStep();
     void LaunchNextStreamingBatch();
+    void QueueStreamingBatch();
     void FinishStreamingCycle();
     void BeginBuildInstancedMeshActors();
     void OnInstancedMeshGroupsPrepared(

@@ -396,7 +396,7 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 				FColor Color = FColor::White;
 				if (VertexIndex < Primitive.Colors.Num())
 				{
-					Color = FLinearColor(Primitive.Colors[VertexIndex]).ToFColor(true);
+					Color = FLinearColor(Primitive.Colors[VertexIndex]).ToFColor(Primitive.bVertexColorsSRGB);
 				}
 
 				LodRenderData->StaticVertexBuffers.PositionVertexBuffer.VertexPosition(BaseVertexIndex) = ModelVertex.Position;
@@ -4327,10 +4327,18 @@ USkeletalMesh* FglTFRuntimeParser::LoadSkeletalMeshFromRuntimeLODs(const TArray<
 
 void FglTFRuntimeParser::LoadSkeletalMeshFromRuntimeLODsAsync(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig)
 {
+	// Blueprint/legacy callers retain ownership; only this compatibility entry makes a copy.
+	TArray<FglTFRuntimeMeshLOD> OwnedRuntimeLODs(RuntimeLODs);
+	LoadSkeletalMeshFromRuntimeLODsAsyncMove(MoveTemp(OwnedRuntimeLODs), SkinIndex, AsyncCallback, SkeletalMeshConfig);
+}
+
+void FglTFRuntimeParser::LoadSkeletalMeshFromRuntimeLODsAsyncMove(TArray<FglTFRuntimeMeshLOD>&& RuntimeLODs, const int32 SkinIndex, const FglTFRuntimeSkeletalMeshAsync& AsyncCallback, const FglTFRuntimeSkeletalMeshConfig& SkeletalMeshConfig)
+{
 	TSharedRef<FglTFRuntimeSkeletalMeshContext, ESPMode::ThreadSafe> SkeletalMeshContext = MakeShared<FglTFRuntimeSkeletalMeshContext, ESPMode::ThreadSafe>(AsShared(), -1, SkeletalMeshConfig);
 	SkeletalMeshContext->SkinIndex = SkinIndex;
 
-	Async(EAsyncExecution::Thread, [this, SkeletalMeshContext, RuntimeLODs, AsyncCallback]()
+	// The finalizer waits for its GameThread callback, so moved LOD storage outlives every use.
+	Async(EAsyncExecution::Thread, [this, SkeletalMeshContext, RuntimeLODs = MoveTemp(RuntimeLODs), AsyncCallback]() mutable
 		{
 			FglTFRuntimeSkeletalMeshContextFinalizer AsyncFinalizer(SkeletalMeshContext, AsyncCallback);
 

@@ -18,7 +18,7 @@
 
 struct FV3DWorldLaunchProfile;
 class UWorld;
-class UStartWorldWidget;
+class UMainWorldWidget;
 class USettingsMenuWidget;
 class UUserWidget;
 class UGameViewportClient;
@@ -40,78 +40,78 @@ public:
     AMainGameMode();
 
     /** Optional explicit override. Missing widgets are auto-created from the central registry. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
-    void SetStartMenuWidget(UStartWorldWidget* InWidget);
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
+    void SetStartMenuWidget(UMainWorldWidget* InWidget);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void SetWorldSelectionWidget(UWorldSelectionWidget* InWidget);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
-    void SetMultiplayerMenuWidget(UStartWorldWidget* InWidget);
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
+    void SetMultiplayerMenuWidget(UMainWorldWidget* InWidget);
 
     /** Register the same USettingsMenuWidget-derived WBP type used by the pause menu. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void SetSettingsWidget(USettingsMenuWidget* InWidget);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void ShowSettingsMenu();
 
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void ReturnFromSettings();
 
     /** Opens the world-selection widget from the start screen. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void StartGame();
 
-    /** Shows the start screen widget. Bind this through UStartWorldWidget when the world-selection Back button is clicked. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    /** Shows the start screen widget. Bind this through UMainWorldWidget when the world-selection Back button is clicked. */
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void ReturnToMainMenuFromWorldSelection();
 
     /** Shows the already-registered main start-screen widget. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void ShowStartMenu();
 
     /** Shows the already-registered world-selection widget for single-player world travel. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void ShowWorldSelectionMenu();
 
     /** Shows the already-registered multiplayer menu widget. */
-    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    UFUNCTION(BlueprintCallable, Category="Main World|UI")
     void ShowMultiplayerMenu();
 
     /** Re-scans available world folders and refreshes opened world-list widgets. */
-    UFUNCTION(BlueprintCallable, Category="Start World|Data")
+    UFUNCTION(BlueprintCallable, Category="Main World|Data")
     void RefreshWorldFolderNameMap();
 
     /** Returns a map of world-folder names to display names for Blueprint world-list widgets. */
-    UFUNCTION(BlueprintPure, Category="Start World|Data")
+    UFUNCTION(BlueprintPure, Category="Main World|Data")
     TMap<FString, FString> GetFolderNameMap() const { return FolderNameMap; }
 
     /** Validates and resolves an exact world-folder key from the current index of .v3d files under Worlds. */
-    UFUNCTION(BlueprintCallable, Category="Start World|Data")
+    UFUNCTION(BlueprintCallable, Category="Main World|Data")
     bool TryResolveWorldFolderKey(const FString& WorldFolderKey, FString& OutFolderName) const;
 
     /** Opens the directly assigned single-player gameplay world after selecting an external world-data folder. */
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    UFUNCTION(BlueprintCallable, Category="Main World|Navigation")
     void OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    UFUNCTION(BlueprintCallable, Category="Main World|Navigation")
     void HostMultiplayerWorldByFolderName(const FString& WorldFolderName);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    UFUNCTION(BlueprintCallable, Category="Main World|Navigation")
     void OpenClientConnectionWorld(const FString& InServerAddress);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    UFUNCTION(BlueprintCallable, Category="Main World|Navigation")
     void JoinMultiplayerServer(const FString& InServerAddress, const FString& OptionalWorldFolderName);
 
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    UFUNCTION(BlueprintCallable, Category="Main World|Navigation")
     void SetPendingServerAddress(const FString& InServerAddress);
 
-    UFUNCTION(BlueprintPure, Category="Start World|Navigation")
+    UFUNCTION(BlueprintPure, Category="Main World|Navigation")
     FString GetPendingServerAddress() const { return PendingServerAddress; }
 
-    /** Cleans StartWorld UI before any menu-triggered map travel. */
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    /** Cleans MainWorld UI before any menu-triggered map travel. */
+    UFUNCTION(BlueprintCallable, Category="Main World|Navigation")
     void PrepareMenuForWorldTravel();
 
 protected:
@@ -119,22 +119,22 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Main World|Navigation")
     FString DefaultServerAddress = TEXT("127.0.0.1:7777");
 
     /** Applies UI-only input and shows the mouse cursor when menu widgets are opened. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Input")
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Main World|Input")
     bool bApplyMenuInputMode = true;
 
     /** If MainWorld is still alive after this delay, restore the selection UI instead of leaving a blank/start screen. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation", meta=(ClampMin="1.0"))
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Main World|Navigation", meta=(ClampMin="1.0"))
     float GameplayTravelFailureTimeoutSeconds = 5.0f;
 
     /**
      * Minimum delay before accepting a world button after returning from gameplay. The guard also
      * remains active while the mouse/confirm key that initiated Exit is still held.
      */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Input", meta=(ClampMin="0.05", ClampMax="2.0"))
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Main World|Input", meta=(ClampMin="0.05", ClampMax="2.0"))
     float WorldSelectionReturnInputGuardSeconds = 0.20f;
 
 private:
@@ -150,7 +150,7 @@ private:
     void ApplyMenuInputMode(UUserWidget* FocusWidget) const;
     void BuildLevelFolderNameMap();
     void HandleGameplayTravelWatchdogExpired();
-    void StartWorldSelectionReturnInputGuard();
+    void BeginWorldSelectionReturnInputGuard();
     void TryReleaseWorldSelectionReturnInputGuard();
     void CancelWorldSelectionReturnInputGuard();
     bool IsWorldSelectionActivationInputHeld() const;
@@ -164,13 +164,13 @@ private:
 
 private:
     UPROPERTY(Transient)
-    TObjectPtr<UStartWorldWidget> StartMenuWidget;
+    TObjectPtr<UMainWorldWidget> StartMenuWidget;
 
     UPROPERTY(Transient)
     TObjectPtr<UWorldSelectionWidget> WorldSelectionWidget;
 
     UPROPERTY(Transient)
-    TObjectPtr<UStartWorldWidget> MultiplayerMenuWidget;
+    TObjectPtr<UMainWorldWidget> MultiplayerMenuWidget;
 
     UPROPERTY(Transient)
     TObjectPtr<USettingsMenuWidget> SettingsWidget;

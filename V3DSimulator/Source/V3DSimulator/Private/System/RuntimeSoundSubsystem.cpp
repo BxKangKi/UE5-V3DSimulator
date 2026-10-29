@@ -211,6 +211,9 @@ namespace
             DecodeOne(SampleIndex);
         }
         WaveBytes.SetNum(DecodedBytes, EAllowShrinking::No);
+        // PCM can be much smaller than its source WAV (32-bit samples and metadata chunks).
+        // Cache admission counts decoded bytes, so release source-buffer slack before publishing.
+        WaveBytes.Shrink();
         Result.Bytes = MoveTemp(WaveBytes);
         Result.SampleRate = static_cast<int32>(SampleRate);
         Result.NumChannels = Channels;

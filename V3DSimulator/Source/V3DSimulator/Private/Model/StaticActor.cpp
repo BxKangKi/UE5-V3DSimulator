@@ -9,6 +9,8 @@
 
 #include "Model/StaticActor.h"
 #include "System/V3DStreamingPolicy.h"
+#include "System/V3DStreamingBudget.h"
+#include "Misc/ScopeExit.h"
 #include "HAL/PlatformTime.h"
 #include "Gravity/GravityFieldComponent.h"
 
@@ -56,6 +58,7 @@ namespace StaticActorPrivate
         FTransform OwnerTransform = FTransform::Identity;
         TMap<FName, FInstancedMeshGroupInitData> Groups;
         int32 InvalidNodeCount = 0;
+        TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation;
     };
 
     void BuildStaticGroups(FStaticGroupingWork& Work)
@@ -65,8 +68,17 @@ namespace StaticActorPrivate
         Work.Groups.Reset();
         Work.InvalidNodeCount = 0;
 
+        const FTransform InverseOwnerTransform = Work.OwnerTransform.Inverse();
+        uint32 Examined = 0;
         for (TPair<FName, FModelNodeData>& Pair : Work.Nodes)
         {
+            if ((Examined++ & 255) == 0 && Work.Cancellation.IsValid()
+                && Work.Cancellation->GetValue() != 0)
+            {
+                // Partial groups are worker-owned and die here; nothing is published to a new world.
+                Work.Groups.Empty();
+                return;
+            }
             const FModelNodeData& Node = Pair.Value;
             const FName* GroupName = Work.MeshToGroup.Find(Node.MeshName);
             if (Pair.Key.IsNone()
@@ -89,7 +101,7 @@ namespace StaticActorPrivate
             FInstancedMeshStreamChunk& Chunk = Group.Data.StreamChunks.FindOrAdd(ChunkKey);
             Chunk.Nodes.Add(Pair.Key);
             // Include the full world-space cell, transformed back for the actor's immutable index.
-            Chunk.LocalBounds += V3DHISMChunkPolicy::CellBounds(ChunkKey).TransformBy(Work.OwnerTransform.Inverse());
+            Chunk.LocalBounds += V3DHISMChunkPolicy::CellBounds(ChunkKey).TransformBy(InverseOwnerTransform);
             const FVector Half = Work.MeshSizes.FindChecked(Node.MeshName).GetAbs() * 0.5;
             Chunk.LocalBounds += FBox(-Half, Half).TransformBy(Node.Transform);
             Group.Data.Nodes.Add(Pair.Key, MoveTemp(Pair.Value));
@@ -396,6 +408,8 @@ void AStaticActor::StartBuiltLoad()
         return;
     }
 
+    if (WorkCancellation.IsValid()) WorkCancellation->Increment();
+    WorkCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
     StreamingEvaluation.Reset();
     NextStreamingUpdateSeconds = 0.0;
     bIsLoaded = false;
@@ -443,6 +457,9 @@ void AStaticActor::ReleaseRuntimeResourcesForWorldExit()
         return;
     }
     bRuntimeResourcesReleased = true;
+    if (WorkCancellation.IsValid()) WorkCancellation->Increment();
+    WorkCancellation.Reset();
+    bStreamingBatchQueued = false;
 
     if (UWorld* World = GetWorld())
     {
@@ -500,10 +517,12 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
     LoadingStatus = FMath::Max(LoadingStatus, 0.05f);
 
     TWeakObjectPtr<AStaticActor> WeakThis(this);
+    const auto Cancellation = WorkCancellation;
     const bool bQueued = Reader.IsValid()
         && FSafeFileIO::RunTrackedWorker(
-            [WeakThis, Reader, UUID, RequestSerial, ExpectedReference]() mutable
+            [WeakThis, Reader, UUID, RequestSerial, ExpectedReference, Cancellation]() mutable
             {
+                if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
                 FGWorldModelMetadata Metadata;
                 FGWorldModelManifest Manifest;
                 FString Errors[2];
@@ -524,6 +543,7 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
                     }
                 });
 
+                if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
                 const bool bSuccess = Results[0] && Results[1];
                 FString Error;
                 if (!bSuccess)
@@ -699,6 +719,7 @@ void AStaticActor::BeginBuildInstancedMeshActors()
     TSharedRef<StaticActorPrivate::FStaticGroupingWork, ESPMode::ThreadSafe> Work =
         MakeShared<StaticActorPrivate::FStaticGroupingWork, ESPMode::ThreadSafe>();
     Work->Nodes = MoveTemp(AllNodeMap);
+    Work->Cancellation = WorkCancellation;
     Work->OwnerTransform = GetActorTransform();
     Work->MeshToGroup.Reserve(AllMeshMap.Num());
     for (const TPair<FName, FModelMeshData>& Pair : AllMeshMap)
@@ -721,7 +742,9 @@ void AStaticActor::BeginBuildInstancedMeshActors()
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
         [WeakThis, Work, RequestSerial, ExpectedReference]() mutable
         {
+            if (Work->Cancellation.IsValid() && Work->Cancellation->GetValue() != 0) return;
             StaticActorPrivate::BuildStaticGroups(*Work);
+            if (Work->Cancellation.IsValid() && Work->Cancellation->GetValue() != 0) return;
             FSafeFileIO::DispatchTrackedGameThread(
                 [WeakThis, Work, RequestSerial, ExpectedReference]() mutable
                 {
@@ -805,47 +828,65 @@ void AStaticActor::BuildInstancedMeshActorsStep()
 
     // These are lightweight group actors; payload concurrency is governed separately.
     // Fill a time slice instead of delaying every few cheap groups by an entire frame.
-    const double Deadline = FPlatformTime::Seconds() + 0.002;
-    const int32 BeginIndex = PendingInstancedGroupIndex;
-    const int32 EndIndex = FMath::Min(PendingInstancedGroupIndex + 32, PendingInstancedGroupNames.Num());
-    for (; PendingInstancedGroupIndex < EndIndex
-        && (PendingInstancedGroupIndex == BeginIndex || FPlatformTime::Seconds() < Deadline);
-        ++PendingInstancedGroupIndex)
+    const double SliceStart = FPlatformTime::Seconds();
+    const double SliceBudget = FMath::Min(0.002, FV3DStreamingBudget::RemainingSceneSeconds());
+    if (SliceBudget <= 0.0)
     {
-        const FName GroupName = PendingInstancedGroupNames[PendingInstancedGroupIndex];
-        FInstancedMeshGroupInitData* GroupData = PendingInstancedGroups.Find(GroupName);
-        if (!GroupData)
+        World->GetTimerManager().SetTimerForNextTick(
+            this, &AStaticActor::BuildInstancedMeshActorsStep);
+        return;
+    }
+    {
+        ON_SCOPE_EXIT { FV3DStreamingBudget::ChargeSceneSeconds(FPlatformTime::Seconds() - SliceStart); };
+        const uint64 RequestSerial = MetadataRequestSerial;
+        const double Deadline = SliceStart + SliceBudget;
+        const int32 BeginIndex = PendingInstancedGroupIndex;
+        const int32 EndIndex = FMath::Min(PendingInstancedGroupIndex + 32, PendingInstancedGroupNames.Num());
+        for (; PendingInstancedGroupIndex < EndIndex
+            && (PendingInstancedGroupIndex == BeginIndex || FPlatformTime::Seconds() < Deadline);
+            ++PendingInstancedGroupIndex)
         {
-            continue;
-        }
+            const FName GroupName = PendingInstancedGroupNames[PendingInstancedGroupIndex];
+            FInstancedMeshGroupInitData* GroupData = PendingInstancedGroups.Find(GroupName);
+            if (!GroupData)
+            {
+                continue;
+            }
 
-        FInstancedMeshGroupInitData PreparedGroup = MoveTemp(*GroupData);
-        PendingInstancedGroups.Remove(GroupName);
+            FInstancedMeshGroupInitData PreparedGroup = MoveTemp(*GroupData);
+            PendingInstancedGroups.Remove(GroupName);
 
-        FActorSpawnParameters Parameters;
-        Parameters.Owner = this;
-        Parameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        AInstancedMeshActor* InstancedActor =
-            FActorHelper::SpawnActorDeferred<AInstancedMeshActor>(
-                World, AInstancedMeshActor::StaticClass(), GetActorTransform(), Parameters);
-        const bool bInitialized = IsValid(InstancedActor)
-            && InstancedActor->InitializeGroup(GroupName, MoveTemp(PreparedGroup));
-        if (IsValid(InstancedActor))
-        {
-            InstancedActor->FinishSpawning(GetActorTransform());
-        }
-        if (!bInitialized
-            || !IsValid(InstancedActor)
-            || !InstancedActor->AttachToActor(
-                this, FAttachmentTransformRules::KeepWorldTransform))
-        {
+            FActorSpawnParameters Parameters;
+            Parameters.Owner = this;
+            Parameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+            AInstancedMeshActor* InstancedActor =
+                FActorHelper::SpawnActorDeferred<AInstancedMeshActor>(
+                    World, AInstancedMeshActor::StaticClass(), GetActorTransform(), Parameters);
+            const bool bInitialized = IsValid(InstancedActor)
+                && InstancedActor->InitializeGroup(GroupName, MoveTemp(PreparedGroup));
             if (IsValid(InstancedActor))
             {
-                InstancedActor->Destroy();
+                InstancedActor->FinishSpawning(GetActorTransform());
             }
-            continue;
+            // Native construction/BeginPlay may re-enter world teardown or Init().
+            if (bIsDestroyed || MetadataRequestSerial != RequestSerial)
+            {
+                if (IsValid(InstancedActor)) InstancedActor->Destroy();
+                return;
+            }
+            if (!bInitialized
+                || !IsValid(InstancedActor)
+                || !InstancedActor->AttachToActor(
+                    this, FAttachmentTransformRules::KeepWorldTransform))
+            {
+                if (IsValid(InstancedActor))
+                {
+                    InstancedActor->Destroy();
+                }
+                continue;
+            }
+            OwnedInstancedMeshActors.Add(GroupName, InstancedActor);
         }
-        OwnedInstancedMeshActors.Add(GroupName, InstancedActor);
     }
 
     const float GroupFraction = PendingInstancedGroupNames.IsEmpty()
@@ -1188,9 +1229,26 @@ void AStaticActor::StartStreamingStep()
     LaunchNextStreamingBatch();
 }
 
+void AStaticActor::QueueStreamingBatch()
+{
+    check(IsInGameThread());
+    if (bStreamingBatchQueued || bIsDestroyed || !bAsyncLoading) return;
+    if (UWorld* World = GetWorld())
+    {
+        bStreamingBatchQueued = true;
+        StreamingBatchTimerHandle = World->GetTimerManager().SetTimerForNextTick(
+            this, &AStaticActor::LaunchNextStreamingBatch);
+    }
+}
+
 void AStaticActor::LaunchNextStreamingBatch()
 {
     check(IsInGameThread());
+    if (bStreamingBatchQueued)
+    {
+        bStreamingBatchQueued = false;
+        if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(StreamingBatchTimerHandle);
+    }
     if (bIsDestroyed)
     {
         bAsyncLoading = false;
@@ -1238,6 +1296,7 @@ void AStaticActor::LaunchNextStreamingBatch()
     GroupBudget = FMath::Clamp(GroupBudget, 1, 16);
     const int32 AvailableSlots = FMath::Max(
         0, GroupBudget - ActiveStreamActions.Num());
+    if (AvailableSlots == 0) return; // The next completion will queue one backfill pump.
 
     // Both readiness and stream planning use the same bounded, world-scale-aware policy.
     const float EffectiveStreamDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
@@ -1310,7 +1369,12 @@ void AStaticActor::LaunchNextStreamingBatch()
 
     int32 LaunchedThisBatch = 0;
     int32 ExaminedThisBatch = 0;
-    const double LaunchDeadline = FPlatformTime::Seconds() + 0.0015;
+    const double LaunchStart = FPlatformTime::Seconds();
+    const double LaunchBudget = FMath::Min(0.0015, FV3DStreamingBudget::RemainingSceneSeconds());
+    if (LaunchBudget <= 0.0) { QueueStreamingBatch(); return; }
+    ON_SCOPE_EXIT { FV3DStreamingBudget::ChargeSceneSeconds(FPlatformTime::Seconds() - LaunchStart); };
+    const uint64 RequestSerial = MetadataRequestSerial;
+    const double LaunchDeadline = LaunchStart + LaunchBudget;
     TArray<FName> FailedGroups;
     while (LaunchedThisBatch < AvailableSlots && ExaminedThisBatch++ < 64
         && FPlatformTime::Seconds() < LaunchDeadline
@@ -1327,11 +1391,13 @@ void AStaticActor::LaunchNextStreamingBatch()
             SetStreamGroupProgress(GroupName, 1.0f);
             continue;
         }
+        if (bIsDestroyed || MetadataRequestSerial != RequestSerial) return;
         if (ActiveStreamActions.Contains(GroupName)) ++LaunchedThisBatch;
     }
     for (const FName GroupName : FailedGroups)
     {
         RemoveInstancedMeshGroup(GroupName);
+        if (bIsDestroyed || MetadataRequestSerial != RequestSerial) return;
     }
 
     if (LaunchedThisBatch < AvailableSlots && bPendingWaterStream)
@@ -1350,21 +1416,16 @@ void AStaticActor::LaunchNextStreamingBatch()
         }
     }
 
-    if (ActiveStreamActions.IsEmpty())
+    if (bIsDestroyed || MetadataRequestSerial != RequestSerial) return;
+    const bool bHasPendingGroups = PendingStreamGroupIndex < PendingStreamGroupNames.Num() || bPendingWaterStream;
+    if (bHasPendingGroups && ActiveStreamActions.Num() < GroupBudget)
     {
-        if (PendingStreamGroupIndex < PendingStreamGroupNames.Num() || bPendingWaterStream)
-        {
-            if (UWorld* World = GetWorld())
-            {
-                World->GetTimerManager().SetTimerForNextTick(
-                    this, &AStaticActor::LaunchNextStreamingBatch);
-            }
-            else
-            {
-                LaunchNextStreamingBatch();
-            }
-            return;
-        }
+        // A time-sliced launch may have started only one group. Keep filling free slots on the
+        // next frame while that group reads/builds, instead of accidentally serializing the wave.
+        QueueStreamingBatch();
+    }
+    else if (!bHasPendingGroups && ActiveStreamActions.IsEmpty())
+    {
         FinishStreamingCycle();
     }
 }
@@ -1372,6 +1433,8 @@ void AStaticActor::LaunchNextStreamingBatch()
 void AStaticActor::FinishStreamingCycle()
 {
     check(IsInGameThread());
+    bStreamingBatchQueued = false;
+    if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(StreamingBatchTimerHandle);
     PendingStreamGroupNames.Empty();
     PendingStreamGroupIndex = 0;
     bPendingWaterStream = false;
@@ -1415,15 +1478,7 @@ void AStaticActor::OnStreamCompleted(
         // Back-fill a completed slot on the next game-thread tick instead of waiting for every
         // action in the current wave. Deferring one tick avoids re-entrant Activate()/Completed()
         // chains for empty groups while keeping archive I/O and native finalizers continuously fed.
-        if (UWorld* World = GetWorld())
-        {
-            World->GetTimerManager().SetTimerForNextTick(
-                this, &AStaticActor::LaunchNextStreamingBatch);
-        }
-        else
-        {
-            LaunchNextStreamingBatch();
-        }
+        QueueStreamingBatch();
         return;
     }
     if (ActiveStreamActions.IsEmpty())
@@ -1431,3 +1486,48 @@ void AStaticActor::OnStreamCompleted(
         FinishStreamingCycle();
     }
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "Engine/World.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DStaticStreamingSchedulingTest,
+    "V3DSimulator.Streaming.Memory.StaticSchedulingLifetime",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DStaticStreamingSchedulingTest::RunTest(const FString&)
+{
+    const UWorld::InitializationValues Values = UWorld::InitializationValues()
+        .AllowAudioPlayback(false).CreatePhysicsScene(false).CreateNavigation(false)
+        .CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Transient streaming test world"), World)) return false;
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    AStaticActor* Actor = World->SpawnActor<AStaticActor>();
+    if (!TestNotNull(TEXT("Transient scene actor"), Actor)) return false;
+    Actor->bAsyncLoading = true;
+    // Keep one long-running group active while more than one launch slice can examine waits.
+    // The next pump must fill spare slots without waiting for this held group to complete.
+    Actor->ActiveStreamActions.Add(TEXT("HeldBuild"), NewObject<UWorldSceneStreamAction>(Actor));
+    for (int32 Index = 0; Index < 128; ++Index)
+        Actor->PendingStreamGroupNames.Add(FName(*FString::Printf(TEXT("Pending_%d"), Index)));
+    Actor->LaunchNextStreamingBatch();
+    TestTrue(TEXT("A partial launch backfills spare slots while another group remains active"),
+        Actor->bStreamingBatchQueued && Actor->ActiveStreamActions.Num() == 1
+        && Actor->PendingStreamGroupIndex < Actor->PendingStreamGroupNames.Num());
+    const FTimerHandle First = Actor->StreamingBatchTimerHandle;
+    for (int32 Completion = 0; Completion < 16; ++Completion) Actor->QueueStreamingBatch();
+    TestTrue(TEXT("A wave of completions queues one next-frame pump"),
+        Actor->bStreamingBatchQueued && First == Actor->StreamingBatchTimerHandle);
+    Actor->WorkCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    const auto DetachedWorkerToken = Actor->WorkCancellation;
+    Actor->ReleaseRuntimeResourcesForWorldExit();
+    TestFalse(TEXT("World exit removes the queued pump"), World->GetTimerManager().TimerExists(First));
+    TestFalse(TEXT("World exit clears scheduling state"), Actor->bStreamingBatchQueued);
+    TestTrue(TEXT("Detached metadata/group workers can stop without touching the actor"),
+        DetachedWorkerToken->GetValue() != 0);
+    Actor->QueueStreamingBatch();
+    TestFalse(TEXT("Teardown cannot schedule a new pump"), Actor->bStreamingBatchQueued);
+    return true;
+}
+#endif

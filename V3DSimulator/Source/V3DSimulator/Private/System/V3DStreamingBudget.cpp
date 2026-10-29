@@ -14,7 +14,7 @@ namespace V3DStreamingBudgetPrivate
 {
     constexpr int64 MiB = 1024ll * 1024ll;
     TAutoConsoleVariable<int32> MaxRequests(TEXT("gltfsim.Streaming.MaxResidentBuilds"), 0,
-        TEXT("End-to-end baked load concurrency: 0 = cores - 1 (2..8), explicit 1..16. Memory budget still applies."), ECVF_Default);
+        TEXT("End-to-end baked/entity load concurrency: 0 = cores - 1 (2..16), explicit 1..16. Memory budget still applies."), ECVF_Default);
     TAutoConsoleVariable<int32> BudgetMiB(TEXT("gltfsim.Streaming.BuildBudgetMiB"), 256,
         TEXT("Estimated transient CPU admission budget. A single oversized request runs alone."), ECVF_Default);
     TAutoConsoleVariable<float> SceneMs(TEXT("gltfsim.Streaming.SceneFrameBudgetMs"), 3.0f,
@@ -26,6 +26,7 @@ namespace V3DStreamingBudgetPrivate
         TFunction<int64()> Estimate;
         TFunction<void(FV3DStreamingBudget::FPermit)> Start;
         TFunction<void()> Reject;
+        TFunction<bool()> IsStillNeeded;
         int32 Bypasses = 0;
     };
     struct FState
@@ -47,14 +48,36 @@ namespace V3DStreamingBudgetPrivate
         if (S.bShutdown) return false;
         const int32 Configured = MaxRequests.GetValueOnGameThread();
         const int32 Limit = Configured > 0 ? FMath::Clamp(Configured, 1, 16)
-            : FMath::Clamp(FPlatformMisc::NumberOfCores() - 1, 2, 8);
+            : FMath::Clamp(FPlatformMisc::NumberOfCores() - 1, 2, 16);
         const int64 Budget = int64(FMath::Clamp(BudgetMiB.GetValueOnGameThread(), 32, 4096)) * MiB;
         const double Deadline = FPlatformTime::Seconds() + 0.001;
+        // Cancel queued payloads before admission even if all permits are held. A facade can
+        // outlive the actor/request that asked for its data; waiting for facade GC would otherwise
+        // retain completion captures and perform obsolete disk reads after a world switch.
+        TArray<FPending> Rejected;
+        int32 Kept = 0;
+        for (int32 I = 0; I < S.Queue.Num(); ++I)
+        {
+            auto& Entry = S.Queue[I];
+            if (!Entry.Owner.IsValid() || (Entry.IsStillNeeded && !Entry.IsStillNeeded()))
+                Rejected.Add(MoveTemp(Entry));
+            else
+            {
+                if (Kept != I) S.Queue[Kept] = MoveTemp(Entry);
+                ++Kept;
+            }
+        }
+        S.Queue.SetNum(Kept, EAllowShrinking::No);
+        // Callbacks can enqueue or shut down the pump. Never invoke them while holding an array
+        // element, or from a RemoveAll predicate whose iteration they could invalidate.
+        for (auto& Entry : Rejected) if (Entry.Reject) Entry.Reject();
+        if (S.bShutdown) return false;
         int32 Examined = 0;
         // Fit ready work into spare memory, then drain for the oldest request after 8 bypasses.
         while (!S.bShutdown && !S.Queue.IsEmpty() && Examined++ < 64 && FPlatformTime::Seconds() < Deadline)
         {
-            if (!S.Queue[0].Owner.IsValid())
+            if (!S.Queue[0].Owner.IsValid()
+                || (S.Queue[0].IsStillNeeded && !S.Queue[0].IsStillNeeded()))
             {
                 FPending Dead = MoveTemp(S.Queue[0]);
                 S.Queue.RemoveAt(0, 1, EAllowShrinking::No);
@@ -74,7 +97,8 @@ namespace V3DStreamingBudgetPrivate
             if (Index > 0) ++S.Queue[0].Bypasses;
             FPending Next = MoveTemp(S.Queue[Index]);
             S.Queue.RemoveAt(Index, 1, EAllowShrinking::No);
-            if (!Next.Owner.IsValid()) { if (Next.Reject) Next.Reject(); continue; }
+            if (!Next.Owner.IsValid() || (Next.IsStillNeeded && !Next.IsStillNeeded()))
+            { if (Next.Reject) Next.Reject(); continue; }
             const int64 Estimate = FMath::Max<int64>(MiB, Next.Estimate());
             Next.Start(MakeShared<FV3DStreamingBudget::FLease, ESPMode::ThreadSafe>(Estimate));
         }
@@ -87,7 +111,7 @@ namespace V3DStreamingBudgetPrivate
         return true;
     }
     FAutoConsoleCommand Dump(TEXT("gltfsim.Streaming.DumpBudget"),
-        TEXT("Print queued/active baked loads and their estimated transient CPU reservation."),
+        TEXT("Print queued/active baked/entity loads and their estimated transient CPU reservation."),
         FConsoleCommandDelegate::CreateLambda([]()
         {
             check(IsInGameThread());
@@ -109,12 +133,13 @@ FV3DStreamingBudget::FLease::~FLease()
 }
 
 void FV3DStreamingBudget::Enqueue(UObject* Owner, TFunction<int64()> EstimateBytes,
-    TFunction<void(FPermit)> Start, TFunction<void()> Reject)
+    TFunction<void(FPermit)> Start, TFunction<void()> Reject, TFunction<bool()> IsStillNeeded)
 {
     check(IsInGameThread());
     using namespace V3DStreamingBudgetPrivate;
     FState& S = State();
-    if (S.bShutdown || !IsValid(Owner) || !EstimateBytes || !Start || S.Queue.Num() >= 4096)
+    if (S.bShutdown || !IsValid(Owner) || !EstimateBytes || !Start || S.Queue.Num() >= 4096
+        || (IsStillNeeded && !IsStillNeeded()))
     {
         if (Reject) Reject();
         return;
@@ -124,6 +149,7 @@ void FV3DStreamingBudget::Enqueue(UObject* Owner, TFunction<int64()> EstimateByt
     Entry.Estimate = MoveTemp(EstimateBytes);
     Entry.Start = MoveTemp(Start);
     Entry.Reject = MoveTemp(Reject);
+    Entry.IsStillNeeded = MoveTemp(IsStillNeeded);
     S.Queue.Add(MoveTemp(Entry));
     // A ticker, rather than an inline recursive pump, lets native callbacks fully unwind first.
     if (!S.Ticker.IsValid())
@@ -228,6 +254,26 @@ bool FV3DBakedAdmissionTest::RunTest(const FString&)
     TestEqual(TEXT("Oversized request is fully charged"), S.Bytes.load(), int64(64 * MiB));
     Held.Empty();
     TestEqual(TEXT("Every reservation is released"), S.Bytes.load(), int64(0));
+
+    Submit(16 * MiB); Submit(16 * MiB);
+    if (S.Ticker.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(S.Ticker);
+    S.Ticker.Reset();
+    Tick(0);
+    bool bNeeded = true;
+    int32 Cancelled = 0;
+    int32 Started = 0;
+    FV3DStreamingBudget::Enqueue(Owner.Get(), []() { return MiB; },
+        [&Started](FV3DStreamingBudget::FPermit) { ++Started; },
+        [&Cancelled]() { ++Cancelled; }, [&bNeeded]() { return bNeeded; });
+    if (S.Ticker.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(S.Ticker);
+    S.Ticker.Reset();
+    bNeeded = false;
+    Tick(0);
+    TestEqual(TEXT("Cancelled request rejects while every worker is occupied"), Cancelled, 1);
+    TestEqual(TEXT("Cancelled payload never allocates"), Started, 0);
+    TestTrue(TEXT("Cancellation releases queue captures before unrelated loads finish"), S.Queue.IsEmpty());
+    Tick(0);
+    TestEqual(TEXT("Cancellation completion is delivered exactly once"), Cancelled, 1);
     return true;
 }
 #endif

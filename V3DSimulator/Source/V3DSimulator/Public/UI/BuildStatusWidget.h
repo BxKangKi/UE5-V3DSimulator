@@ -8,7 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/ResponsiveHUDWidget.h"
 #include "BuildStatusWidget.generated.h"
 
 class UGameManagerSubSystem;
@@ -17,6 +17,7 @@ class UPanelWidget;
 class UProgressBar;
 class UScrollBox;
 class UTextBlock;
+class UButton;
 
 UENUM(BlueprintType)
 enum class EProjectBuildPhase : uint8
@@ -36,17 +37,17 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FBuildStatusConfirmed);
 
 /**
- * Displays project build progress while keeping Blueprint responsible for layout.
- *
- * Status text/progress widgets can be assigned from Blueprint. The terminal Confirm control is a
- * separate WBP derived from UMenuButtonWidget, so its complete visual design stays in Blueprint.
+ * Native, resolution-independent build output with a designer preview in Blueprint children.
+ * Explicit setters remain available for projects using a custom layout.
  */
 UCLASS(Blueprintable, BlueprintType)
-class V3DSIMULATOR_API UBuildStatusWidget : public UUserWidget
+class V3DSIMULATOR_API UBuildStatusWidget : public UResponsiveHUDWidget
 {
     GENERATED_BODY()
 
 public:
+    UBuildStatusWidget(const FObjectInitializer& ObjectInitializer);
+    virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
 
     UPROPERTY(BlueprintAssignable, Category="Build Status")
@@ -83,13 +84,13 @@ public:
     FString GetBuildOutputText() const { return BuildOutputText; }
 
     /**
-     * Assigns an already placed WBP instance derived from UMenuButtonWidget as the Confirm button.
-     * Use this when the Confirm WBP is authored directly in the BuildStatus designer hierarchy.
+     * Assigns an already placed UMenuButtonWidget as the Confirm button in a custom layout.
+     * A Blueprint child can still provide its own styling and interactions explicitly.
      */
     UFUNCTION(BlueprintCallable, Category="Build Status|Confirm Button")
     void SetConfirmButtonWidget(UMenuButtonWidget* InWidget);
 
-    /** Assigns the panel/content host that receives a generated Confirm WBP instance. */
+    /** Optional custom-layout host for a generated native Confirm button; no component asset is loaded. */
     UFUNCTION(BlueprintCallable, Category="Build Status|Confirm Button")
     void SetConfirmButtonHost(UPanelWidget* InHost);
 
@@ -99,6 +100,10 @@ public:
     /** Starts observing the build that was already started by ProjectSelectionWidget. */
     UFUNCTION(BlueprintCallable, Category="Build Status")
     void BeginObservingBuild(const FString& ProjectName);
+
+    /** Provides a terminal, confirmable error when a request is rejected before workers start. */
+    UFUNCTION(BlueprintCallable, Category="Build Status")
+    void ReportBuildRejected(const FString& Message);
 
     UFUNCTION(BlueprintCallable, Category="Build Status")
     void StopObservingBuild();
@@ -129,6 +134,10 @@ public:
     FString GetObservedProjectName() const { return ObservedProjectName; }
 
 protected:
+    virtual void BuildNativeLayout() override;
+    virtual void BindNativeWidgets() override;
+    virtual void ApplyNativeStyle() override;
+
     /** Maximum number of terminal output lines retained in the status text block. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Build Status|Output", meta=(ClampMin="1", ClampMax="512"))
     int32 MaxOutputLines = 64;
@@ -142,6 +151,19 @@ protected:
     bool bAutoCloseOnSuccess = true;
 
 private:
+    UPROPERTY(Transient)
+    TObjectPtr<UTextBlock> NativeStatusText;
+    UPROPERTY(Transient)
+    TObjectPtr<UTextBlock> NativeProjectText;
+    UPROPERTY(Transient)
+    TObjectPtr<UTextBlock> NativePercentText;
+    UPROPERTY(Transient)
+    TObjectPtr<UProgressBar> NativeProgressBar;
+    UPROPERTY(Transient)
+    TObjectPtr<UScrollBox> NativeOutputScroll;
+    UPROPERTY(Transient)
+    TObjectPtr<UButton> NativeConfirmButton;
+
     UFUNCTION()
     void HandleBuildProgress(float Progress);
 
@@ -184,9 +206,6 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UMenuButtonWidget> ConfirmButtonWidget;
 
-    UPROPERTY(Transient)
-    TObjectPtr<UClass> ResolvedConfirmButtonWidgetClass;
-
     bool bGeneratedConfirmButtonWidget = false;
 
     TArray<FString> OutputLines;
@@ -199,4 +218,6 @@ private:
     EProjectBuildPhase BuildPhase = EProjectBuildPhase::Idle;
     bool bLastBuildSucceeded = false;
     bool bHasTerminalResult = false;
+    bool bConfirmationSent = false;
+    uint64 ObservationRevision = 0;
 };

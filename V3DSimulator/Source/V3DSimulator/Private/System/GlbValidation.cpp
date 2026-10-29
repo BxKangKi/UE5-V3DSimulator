@@ -12,6 +12,7 @@
 #include "HAL/CriticalSection.h"
 
 #include "Dom/JsonObject.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
@@ -551,7 +552,8 @@ namespace
         const FString& NormalizedModelPath,
         const FString& Uri,
         const int64 DeclaredMinimumBytes,
-        FString& OutReason)
+        FString& OutReason,
+        const bool bImageUri = false)
     {
         if (Uri.IsEmpty())
         {
@@ -565,18 +567,33 @@ namespace
             return true;
         }
 
+        // Match glTFRuntime's image loader: a literal '%' filename takes precedence, otherwise
+        // URL-decode once before containment checks. Checking only the undecoded name could miss
+        // an encoded parent path while rejecting valid names containing encoded spaces.
+        const FString ModelDirectory = FPaths::GetPath(NormalizedModelPath);
+        const FString LocalUri = bImageUri && Uri.Contains(TEXT("%"))
+            && !IFileManager::Get().FileExists(*FPaths::Combine(ModelDirectory, Uri))
+            ? FGenericPlatformHttp::UrlDecode(Uri) : Uri;
+        for (const TCHAR Character : LocalUri)
+        {
+            if (Character < 32)
+            {
+                OutReason = TEXT("external URI contains a control character");
+                return false;
+            }
+        }
+
         // Runtime entity files may only reference files beside/below the model. Remote URLs and
         // absolute paths would bypass the selected world's asset root and are deliberately rejected.
-        if (!FPaths::IsRelative(Uri)
-            || Uri.Contains(TEXT("://"), ESearchCase::IgnoreCase)
-            || Uri.StartsWith(TEXT("file:"), ESearchCase::IgnoreCase))
+        if (!FPaths::IsRelative(LocalUri)
+            || LocalUri.Contains(TEXT("://"), ESearchCase::IgnoreCase)
+            || LocalUri.StartsWith(TEXT("file:"), ESearchCase::IgnoreCase))
         {
             OutReason = FString::Printf(TEXT("external URI is not a local relative path: %s"), *Uri);
             return false;
         }
 
-        const FString ModelDirectory = FPaths::GetPath(NormalizedModelPath);
-        FString CandidatePath = FPaths::Combine(ModelDirectory, Uri);
+        FString CandidatePath = FPaths::Combine(ModelDirectory, LocalUri);
         CandidatePath = FPaths::ConvertRelativePathToFull(CandidatePath);
         FPaths::NormalizeFilename(CandidatePath);
         FPaths::CollapseRelativeDirectories(CandidatePath);
@@ -667,7 +684,7 @@ namespace
                     }
                     continue;
                 }
-                if (!ValidateGltfExternalUri(NormalizedModelPath, Uri, 0, OutReason))
+                if (!ValidateGltfExternalUri(NormalizedModelPath, Uri, 0, OutReason, true))
                 {
                     return false;
                 }
@@ -1390,6 +1407,12 @@ bool GlbValidation::ValidateFile(const FString& FilePath, FString& OutReason)
 
 bool GlbValidation::ValidateBuildSourceFile(const FString& FilePath, FString& OutReason)
 {
+    // The strict embedded-GLB accessor checks below remain available for old runtime callers.
+    // Authoring glTF files may legally contain external buffers and extension-owned accessors.
+    if (FPaths::GetExtension(FilePath).Equals(TEXT("gltf"), ESearchCase::IgnoreCase))
+    {
+        return ValidateSourceFile(FilePath, OutReason);
+    }
     const FString NormalizedPath = NormalizePath(FilePath);
     const FString ValidationCacheKey = MakeRuntimeValidationCacheKey(NormalizedPath);
     const int64 FileSize = IFileManager::Get().FileSize(*NormalizedPath);
@@ -1439,4 +1462,95 @@ bool GlbValidation::ValidateBuildSourceFile(const FString& FilePath, FString& Ou
     OutReason.Reset();
     CacheRuntimeValidation(ValidationCacheKey, FileSize, Timestamp, true, OutReason);
     return true;
+}
+
+bool GlbValidation::ValidateSourceFile(const FString& FilePath, FString& OutReason)
+{
+    OutReason.Reset();
+    const FString Path = NormalizePath(FilePath);
+    const bool bBinary = FPaths::GetExtension(Path).Equals(TEXT("glb"), ESearchCase::IgnoreCase);
+    const bool bJson = FPaths::GetExtension(Path).Equals(TEXT("gltf"), ESearchCase::IgnoreCase);
+    if (!bBinary && !bJson)
+    {
+        OutReason = TEXT("expected a .glb or .gltf source file");
+        return false;
+    }
+
+    FParsedGlbJson Parsed;
+    if (bBinary)
+    {
+        if (!ValidateFile(Path, OutReason) || !LoadRootJsonForValidation(Path, Parsed, OutReason)) return false;
+    }
+    else
+    {
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = MAX_RUNTIME_JSON_CHUNK_BYTES;
+        Limits.MaxDepth = 96;
+        Limits.MaxValues = 4000000;
+        Limits.MaxContainerEntries = 1000000;
+        Limits.MaxStringCharacters = 8 * 1024 * 1024;
+        Limits.bAllowBackupRecovery = false;
+        const FSafeJsonLoadResult Json = FSafeFileIO::LoadJsonBlocking(Path, Limits);
+        if (!Json.IsSuccess() || !Json.JsonObject.IsValid())
+        {
+            OutReason = Json.Error.IsEmpty() ? TEXT("source glTF JSON is invalid") : Json.Error;
+            return false;
+        }
+        Parsed.Root = Json.JsonObject;
+    }
+
+    const TSharedPtr<FJsonObject>* Asset = nullptr;
+    FString Version;
+    if (!Parsed.Root->TryGetObjectField(TEXT("asset"), Asset) || !Asset || !Asset->IsValid()
+        || !(*Asset)->TryGetStringField(TEXT("version"), Version) || Version != TEXT("2.0"))
+    {
+        OutReason = TEXT("source must declare glTF asset.version 2.0");
+        return false;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* Buffers = nullptr;
+    if (Parsed.Root->HasField(TEXT("buffers"))
+        && (!Parsed.Root->TryGetArrayField(TEXT("buffers"), Buffers) || !Buffers
+            || Buffers->Num() > MAX_RUNTIME_EXTERNAL_RESOURCE_COUNT))
+    {
+        OutReason = TEXT("source buffers array is invalid or exceeds the resource limit");
+        return false;
+    }
+    if (Buffers)
+    {
+        for (int32 Index = 0; Index < Buffers->Num(); ++Index)
+        {
+            TSharedPtr<FJsonObject> Buffer;
+            int64 ByteLength = 0;
+            if (!TryGetJsonObjectValue((*Buffers)[Index], Buffer)
+                || !TryGetIntegerField(Buffer, TEXT("byteLength"), true, 0, 1, MAX_int32, ByteLength))
+            {
+                OutReason = FString::Printf(TEXT("buffer %d has an invalid byteLength"), Index);
+                return false;
+            }
+            FString Uri;
+            if (Buffer->HasField(TEXT("uri")))
+            {
+                if (!Buffer->TryGetStringField(TEXT("uri"), Uri)
+                    || !ValidateGltfExternalUri(Path, Uri, ByteLength, OutReason)) return false;
+            }
+            else if (!bBinary || Index != 0 || Parsed.BinaryChunkSize < ByteLength)
+            {
+                OutReason = FString::Printf(TEXT("buffer %d has neither a valid URI nor an embedded BIN chunk"), Index);
+                return false;
+            }
+        }
+    }
+    const TArray<TSharedPtr<FJsonValue>>* Views = nullptr;
+    if (Parsed.Root->HasField(TEXT("bufferViews"))
+        && (!Parsed.Root->TryGetArrayField(TEXT("bufferViews"), Views) || !Views
+            || Views->Num() > MAX_RUNTIME_BUFFER_VIEW_COUNT))
+    {
+        OutReason = TEXT("source bufferViews array is invalid or exceeds the safety limit");
+        return false;
+    }
+    // Re-evaluate external files every build. A cache keyed only by the main source timestamp
+    // would miss replacement/deletion of a .bin or image while an authoring tool is exporting.
+    return ValidateGltfImageResources(Path, Parsed.Root, Views ? Views->Num() : 0,
+        Buffers ? Buffers->Num() : 0, OutReason);
 }

@@ -11,6 +11,7 @@
 
 #include "CoreMinimal.h"
 #include "Model/ModelData.h"
+#include "System/V3DStreamingEvaluation.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
 #include "WorldSceneStreamingSubsystem.generated.h"
@@ -113,6 +114,10 @@ private:
     TMap<FString, TObjectPtr<AStaticActor>> ActiveSceneActors;
 
     TArray<FWorldSceneStreamRecord> SceneRecords;
+    // One immutable view plan reused by startup bursts; no actor/UObject references on workers.
+    FV3DStreamingEvaluation SceneEvaluation;
+    TArray<int32> SceneLoadOrder;
+    TArray<uint8> SceneUnloadRange;
     TArray<FWorldCharacterStreamRecord> CharacterRecords;
     TSet<FString> FailedCharacterReferences;
 
@@ -123,6 +128,10 @@ private:
     int32 CurrentCharacterIndex = INDEX_NONE;
     int32 PendingCharacterIndex = INDEX_NONE;
 
+    uint64 StreamingGeneration = 0;
+    // UObject construction and teardown can invoke Blueprint callbacks that re-enter streaming.
+    bool bUpdatingStreaming = false;
+    bool bStoppingStreaming = false;
     bool bActive = false;
     bool bStartupFailed = false;
     bool bInitialScenePassComplete = false;

@@ -3,9 +3,9 @@
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/ProjectWorkspace.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "UObject/UObjectGlobals.h"
-#include "Engine/World.h"
 #include "System/SimulatorFileServices.h"
 
 void UV3DSimulatorGameInstance::Init()
@@ -92,16 +92,40 @@ UV3DSimulatorAssetRegistry* UV3DSimulatorGameInstance::GetAssetRegistry() const
 
 UV3DSimulatorAssetRegistry* UV3DSimulatorGameInstance::GetAssetRegistryFromContext(const UObject* WorldContextObject)
 {
-    if (!IsValid(WorldContextObject) || !IsInGameThread() || IsGarbageCollecting())
+    if (!IsInGameThread() || IsGarbageCollecting())
     {
         return nullptr;
     }
 
-    UGameInstance* GameInstance = Cast<UGameInstance>(const_cast<UObject*>(WorldContextObject));
-    if (!GameInstance)
+    UGameInstance* GameInstance = IsValid(WorldContextObject)
+        ? Cast<UGameInstance>(const_cast<UObject*>(WorldContextObject))
+        : nullptr;
+    if (!GameInstance && IsValid(WorldContextObject))
+    {
+        GameInstance = WorldContextObject->GetTypedOuter<UGameInstance>();
+    }
+    if (!GameInstance && IsValid(WorldContextObject))
     {
         const UWorld* World = WorldContextObject->GetWorld();
+        if (!IsValid(World))
+        {
+            World = WorldContextObject->GetTypedOuter<UWorld>();
+        }
         GameInstance = IsValid(World) ? World->GetGameInstance() : nullptr;
+    }
+    if (!GameInstance && GEngine)
+    {
+        for (const FWorldContext& Context : GEngine->GetWorldContexts())
+        {
+            if (UV3DSimulatorGameInstance* Candidate = Cast<UV3DSimulatorGameInstance>(Context.OwningGameInstance))
+            {
+                GameInstance = Candidate;
+                if (Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+                {
+                    break;
+                }
+            }
+        }
     }
 
     if (UV3DSimulatorGameInstance* SimulatorGameInstance = Cast<UV3DSimulatorGameInstance>(GameInstance))

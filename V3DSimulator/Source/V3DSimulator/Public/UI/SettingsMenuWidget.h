@@ -10,7 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/ResponsiveHUDWidget.h"
 #include "Components/Button.h"
 #include "Components/ComboBoxString.h"
 #include "Components/Slider.h"
@@ -101,19 +101,19 @@ private:
 /**
  * Blueprint-editable settings menu backed by UGameSettings.
  *
- * A Settings WBP can pass a dedicated VerticalBox through SetSettingsListBox(). Native code then
- * generates one Blueprint-authored row WBP per settings field using shared Boolean, Float, or
- * Enum classes resolved from the central AssetRegistry. Direct-control registration remains a
- * current option for WBPs that author individual controls instead of generated rows.
+ * The native layout is visible in WBP children and its appearance is editable in class defaults.
+ * Custom WBP layouts remain available by disabling bUseNativeLayout and assigning control setters.
  */
 UCLASS(Blueprintable, BlueprintType)
-class V3DSIMULATOR_API USettingsMenuWidget : public UUserWidget
+class V3DSIMULATOR_API USettingsMenuWidget : public UResponsiveHUDWidget
 {
     GENERATED_BODY()
 
 public:
+    USettingsMenuWidget(const FObjectInitializer& ObjectInitializer);
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
+    virtual void ReleaseSlateResources(bool bReleaseChildren) override;
 
     /** Shared close contract used by both MainGameMode and the gameplay pause menu. */
     UPROPERTY(BlueprintAssignable, Category="Settings")
@@ -134,11 +134,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
     void SetCancelButton(UButton* InButton);
 
-    /** Dedicated VerticalBox host. Generated setting WBP rows are created inside this box. */
+    /** Custom-layout VerticalBox host for code-only setting rows; authored children are retained. */
     UFUNCTION(BlueprintCallable, Category="Settings|Generated Widgets")
     void SetSettingsListBox(UVerticalBox* InVerticalBox);
 
-    /** Rebuilds every generated row using the currently assigned WBP classes. */
+    /** Rebuilds generated native rows using the current field metadata and menu palette. */
     UFUNCTION(BlueprintCallable, Category="Settings|Generated Widgets")
     void RebuildGeneratedSettingWidgets();
 
@@ -326,7 +326,22 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleReflectionMethodFromUI();
 
+protected:
+    virtual void BuildNativeLayout() override;
+    virtual void ApplyNativeStyle() override;
+    virtual void BindNativeWidgets() override;
+
 private:
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeTitle;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeApply;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeBack;
+    UPROPERTY(Transient) TArray<TObjectPtr<UWidget>> NativeControls;
+    UPROPERTY(Transient) TArray<TWeakObjectPtr<UTextBlock>> NativeOptionLabels;
+    UFUNCTION() UWidget* GenerateNativeOption(FString Option);
+    UPROPERTY(Transient) TArray<TObjectPtr<UTextBlock>> NativeValueLabels;
+    UPROPERTY(Transient) TArray<TObjectPtr<UTextBlock>> NativeFieldLabels;
+    TArray<ESettingsField> NativeControlFields;
+
     void CollectAssignedWidgetReferences();
     void BindButtonEvents();
     void UnbindButtonEvents();
@@ -338,7 +353,6 @@ private:
     void RefreshRegisteredControls();
     void RefreshGeneratedSettingWidgets();
     USettingControlWidget* CreateGeneratedSettingWidget(ESettingsField Field);
-    UClass* ResolveGeneratedSettingWidgetClass(ESettingsControlType ControlType);
     void RemoveControlBinding(ESettingsField Field);
     float GetPendingNumericValue(ESettingsField Field) const;
     void CopySettingsToPending(const UGameSettings* Settings);
@@ -379,15 +393,7 @@ private:
     UPROPERTY(Transient)
     TArray<TObjectPtr<USettingControlWidget>> GeneratedSettingWidgets;
 
-    UPROPERTY(Transient)
-    TObjectPtr<UClass> ResolvedBooleanSettingWidgetClass;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UClass> ResolvedFloatSettingWidgetClass;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UClass> ResolvedEnumSettingWidgetClass;
-
+    float PendingMouseSensitivity = 1.0f;
     float PendingBloomIntensity = 0.675f;
     float PendingBloomThreshold = -1.0f;
     float PendingAmbientOcclusionIntensity = 0.5f;

@@ -10,6 +10,15 @@
 #include "System/MultiplayerWorldSubSystem.h"
 
 #include "Engine/GameInstance.h"
+#include "Engine/Engine.h"
+#include "Engine/PendingNetGame.h"
+#include "Blueprint/WidgetBlueprintLibrary.h"
+#include "GameMode/MainGameMode.h"
+#include "HAL/PlatformTime.h"
+#include "System/V3DSimulatorGameInstance.h"
+#include "System/V3DSimulatorAssetRegistry.h"
+#include "UI/LoadingHUDWidget.h"
+#include "UObject/UObjectGlobals.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
@@ -73,6 +82,215 @@ namespace
             *Candidate.Left(256));
         return false;
     }
+}
+
+void UMultiplayerWorldSubSystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+    if (GEngine)
+    {
+        NetworkFailureHandle = GEngine->OnNetworkFailure().AddUObject(this, &UMultiplayerWorldSubSystem::HandleNetworkFailure);
+        TravelFailureHandle = GEngine->OnTravelFailure().AddUObject(this, &UMultiplayerWorldSubSystem::HandleTravelFailure);
+    }
+    PreLoadMapHandle = FCoreUObjectDelegates::PreLoadMapWithContext.AddUObject(this, &UMultiplayerWorldSubSystem::HandlePreLoadMap);
+    PostLoadMapHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(this, &UMultiplayerWorldSubSystem::HandlePostLoadMap);
+}
+
+void UMultiplayerWorldSubSystem::Deinitialize()
+{
+    StopConnectionTicker();
+    bConnectionPending = false;
+    bConnectionFailed = false;
+    RemoveConnectionWidget();
+    if (GEngine)
+    {
+        GEngine->OnNetworkFailure().Remove(NetworkFailureHandle);
+        GEngine->OnTravelFailure().Remove(TravelFailureHandle);
+    }
+    FCoreUObjectDelegates::PreLoadMapWithContext.Remove(PreLoadMapHandle);
+    FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapHandle);
+    NetworkFailureHandle.Reset();
+    TravelFailureHandle.Reset();
+    PreLoadMapHandle.Reset();
+    PostLoadMapHandle.Reset();
+    Super::Deinitialize();
+}
+
+void UMultiplayerWorldSubSystem::StopConnectionTicker()
+{
+    FTSTicker::GetCoreTicker().RemoveTicker(ConnectionTickerHandle);
+    ConnectionTickerHandle.Reset();
+}
+
+void UMultiplayerWorldSubSystem::RemoveConnectionWidget()
+{
+    if (IsValid(ConnectionWidget)) ConnectionWidget->RemoveFromParent();
+    ConnectionWidget = nullptr;
+}
+
+void UMultiplayerWorldSubSystem::ShowConnectionWidget()
+{
+    APlayerController* Controller = UGameplayStatics::GetPlayerController(this, 0);
+    if (bConnectionMapLoading || !IsValid(Controller) || !Controller->IsLocalController()) return;
+    if (!IsValid(ConnectionWidget) || ConnectionWidget->GetWorld() != GetWorld())
+    {
+        RemoveConnectionWidget();
+        // Always available, including maps whose WBP loading screen still has legacy graph logic.
+        ConnectionWidget = CreateWidget<ULoadingHUDWidget>(Controller, ULoadingHUDWidget::StaticClass());
+    }
+    if (!IsValid(ConnectionWidget)) return;
+    if (!ConnectionWidget->IsInViewport()) ConnectionWidget->AddToPlayerScreen(200);
+    ConnectionWidget->RefreshLoadingStatus();
+    UWidgetBlueprintLibrary::SetInputMode_UIOnlyEx(Controller, ConnectionWidget, EMouseLockMode::DoNotLock, true);
+    Controller->bShowMouseCursor = true;
+    Controller->bEnableClickEvents = true;
+    Controller->bEnableMouseOverEvents = true;
+}
+
+FText UMultiplayerWorldSubSystem::GetConnectionStatusText() const
+{
+    if (bConnectionFailed) return ConnectionFailureText;
+    return FText::Format(NSLOCTEXT("V3DMultiplayer", "Connecting", "Connecting to {0}..."), FText::FromString(ServerAddress));
+}
+
+void UMultiplayerWorldSubSystem::CancelPendingConnectionTravel(UWorld* World)
+{
+    if (!GEngine || !IsValid(World)) return;
+    if (FWorldContext* Context = GEngine->GetWorldContextFromWorld(World))
+    {
+        // ClientTravel is queued before the PendingNetGame exists. Clear both stages so clicking
+        // Back on the same frame as Join cannot start a connection on the following engine tick.
+        Context->TravelURL.Reset();
+        // The FWorldContext overload is engine-internal; use the public world overload.
+        GEngine->CancelPending(World, nullptr);
+    }
+}
+
+void UMultiplayerWorldSubSystem::FailConnection(const FText& Message)
+{
+    if (!bConnectionPending) return;
+    bConnectionPending = false;
+    bConnectionFailed = true;
+    bConnectionMapLoading = false;
+    ConnectionFailureText = Message;
+    CancelPendingConnectionTravel(GetWorld());
+    ClearRequestedWorld();
+    SelectedWorldFolderName.Reset();
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this)) Manager->SetCurrentWorldName(FString());
+    ShowConnectionWidget();
+}
+
+bool UMultiplayerWorldSubSystem::TickConnection(float)
+{
+    if (!CanCancelConnection())
+    {
+        ConnectionTickerHandle.Reset();
+        return false;
+    }
+    if (bConnectionPending && FPlatformTime::Seconds() - ConnectionStartSeconds >= 30.0)
+    {
+        FailConnection(NSLOCTEXT("V3DMultiplayer", "ConnectionTimeout", "Server did not respond. Select Back to return."));
+    }
+    if (bConnectionMapLoading) return true;
+    // Recreate the overlay if Unreal opened its default failure map. Do not retain the old world.
+    if (!IsValid(ConnectionWidget) || ConnectionWidget->GetWorld() != GetWorld() || !ConnectionWidget->IsInViewport())
+        ShowConnectionWidget();
+    if (IsValid(ConnectionWidget)) ConnectionWidget->RefreshLoadingStatus();
+    return true;
+}
+
+void UMultiplayerWorldSubSystem::HandlePreLoadMap(const FWorldContext& Context, const FString&)
+{
+    if (Context.OwningGameInstance != GetGameInstance() || !CanCancelConnection()) return;
+    bConnectionMapLoading = true;
+    // Drop the owning player/widget graph before LoadMap performs old-world garbage collection.
+    RemoveConnectionWidget();
+}
+
+void UMultiplayerWorldSubSystem::HandlePostLoadMap(UWorld* LoadedWorld)
+{
+    if (!IsValid(LoadedWorld) || LoadedWorld->GetGameInstance() != GetGameInstance()) return;
+    bConnectionMapLoading = false;
+    RemoveConnectionWidget();
+    if (bConnectionPending && LoadedWorld->GetNetMode() == NM_Client)
+    {
+        bConnectionPending = false;
+        bConnectionFailed = false;
+        StopConnectionTicker();
+    }
+    else if (CanCancelConnection()) ShowConnectionWidget();
+}
+
+void UMultiplayerWorldSubSystem::HandleNetworkFailure(UWorld* World, UNetDriver* NetDriver, ENetworkFailure::Type, const FString& Error)
+{
+    if (!bConnectionPending) return;
+    const FWorldContext* Context = GEngine ? GEngine->GetWorldContextFromWorld(GetWorld()) : nullptr;
+    const bool bOwnPendingDriver = Context && Context->PendingNetGame && NetDriver
+        && Context->PendingNetGame->NetDriver == NetDriver;
+    if ((!IsValid(World) || World->GetGameInstance() != GetGameInstance()) && !bOwnPendingDriver) return;
+    UE_LOG(LogTemp, Warning, TEXT("[Multiplayer] Connection failed: %s"), *Error.Left(1024));
+    FailConnection(NSLOCTEXT("V3DMultiplayer", "ConnectionFailed", "Could not connect to the server. Select Back to return."));
+}
+
+void UMultiplayerWorldSubSystem::HandleTravelFailure(UWorld* World, ETravelFailure::Type, const FString& Error)
+{
+    if (!bConnectionPending) return;
+    if (IsValid(World))
+    {
+        if (World->GetGameInstance() != GetGameInstance()) return;
+    }
+    else
+    {
+        // LoadMap may report failure after tearing down the old world. With no world/driver in
+        // this delegate, accept only an unambiguous game context; multi-PIE falls back to timeout.
+        const FWorldContext* OnlyGameContext = nullptr;
+        if (!GEngine) return;
+        for (const FWorldContext& Context : GEngine->GetWorldContexts())
+        {
+            if (!Context.OwningGameInstance) continue;
+            if (OnlyGameContext) return;
+            OnlyGameContext = &Context;
+        }
+        if (!OnlyGameContext || OnlyGameContext->OwningGameInstance != GetGameInstance()) return;
+    }
+    bConnectionMapLoading = false;
+    UE_LOG(LogTemp, Warning, TEXT("[Multiplayer] Connection travel failed: %s"), *Error.Left(1024));
+    FailConnection(NSLOCTEXT("V3DMultiplayer", "ConnectionTravelFailed", "The server world could not be opened. Select Back to return."));
+}
+
+bool UMultiplayerWorldSubSystem::CancelClientConnection(const UObject* WorldContextObject)
+{
+    check(IsInGameThread());
+    if (!CanCancelConnection() || !IsValid(WorldContextObject) || WorldContextObject->GetWorld() != GetWorld()) return false;
+    UWorld* World = GetWorld();
+    const UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    AMainGameMode* Menu = IsValid(World) ? Cast<AMainGameMode>(World->GetAuthGameMode()) : nullptr;
+    if (!IsValid(Menu) && (!IsValid(Registry) || Registry->MainWorld.IsNull())) return false;
+
+    // Invalidate state before cancellation: engine failure delegates can fire synchronously.
+    bConnectionPending = false;
+    bConnectionFailed = false;
+    StopConnectionTicker();
+    CancelPendingConnectionTravel(World);
+    ClearRequestedWorld();
+    SelectedWorldFolderName.Reset();
+    WorldMode = EMultiplayerWorldMode::SinglePlayer;
+    ConnectionFailureText = FText::GetEmpty();
+    RemoveConnectionWidget();
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        Manager->SetCurrentWorldName(FString());
+        Manager->SetGamePaused(false);
+        Manager->SetWorldLoading(false);
+        // Unregister through the public owner API, which also removes the widget and its pins.
+        Manager->SetLoadingWidget(nullptr);
+    }
+    if (IsValid(Menu))
+    {
+        Menu->ShowMultiplayerMenu();
+        return true;
+    }
+    return UGameManagerSubSystem::TryOpenWorldSelectionScreen(this, Registry->MainWorld);
 }
 
 UMultiplayerWorldSubSystem* UMultiplayerWorldSubSystem::Get(const UObject* WorldContextObject)
@@ -240,27 +458,29 @@ bool UMultiplayerWorldSubSystem::JoinMultiplayerWorld(
         return false;
     }
 
-    // A client does not select the authoritative GameMode. The server's active map/travel URL does.
+    // Reject duplicate WBP/native clicks while one attempt owns the pending net game.
+    if (CanCancelConnection()) return false;
+    UWorld* World = WorldContextObject->GetWorld();
+    APlayerController* PlayerController = World ? UGameplayStatics::GetPlayerController(WorldContextObject, 0) : nullptr;
+    if (!IsValid(PlayerController) || !PlayerController->IsLocalController()) return false;
+
     WorldMode = EMultiplayerWorldMode::Client;
     ClearRequestedWorld();
     SelectedWorldFolderName = NormalizedWorldFolderName;
     if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
-    {
         Manager->SetCurrentWorldName(NormalizedWorldFolderName);
-    }
 
-    ServerAddress = InServerAddress.IsEmpty() ? ServerAddress : InServerAddress;
-    if (ServerAddress.IsEmpty())
-    {
-        ServerAddress = TEXT("127.0.0.1:7777");
-    }
-
-    UWorld* World = WorldContextObject->GetWorld();
-    APlayerController* PlayerController = World ? UGameplayStatics::GetPlayerController(WorldContextObject, 0) : nullptr;
-    if (!PlayerController)
-    {
-        return false;
-    }
+    ServerAddress = InServerAddress.TrimStartAndEnd().IsEmpty() ? ServerAddress : InServerAddress.TrimStartAndEnd();
+    if (ServerAddress.IsEmpty()) ServerAddress = TEXT("127.0.0.1:7777");
+    bConnectionMapLoading = false;
+    bConnectionPending = true;
+    bConnectionFailed = false;
+    ConnectionFailureText = FText::GetEmpty();
+    ConnectionStartSeconds = FPlatformTime::Seconds();
+    ShowConnectionWidget();
+    StopConnectionTicker();
+    ConnectionTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateUObject(this, &UMultiplayerWorldSubSystem::TickConnection), 0.1f);
 
     FString TravelAddress = ServerAddress;
     if (!SelectedWorldFolderName.IsEmpty() && !TravelAddress.Contains(TEXT("?World=")))

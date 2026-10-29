@@ -36,6 +36,14 @@ public:
     virtual TSharedRef<FJsonObject> Serialization() override;
     virtual bool Deserialization(TSharedPtr<FJsonObject> Json) override;
 
+    /** Camera input multiplier. 1.0 preserves the controller's configured look speed. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Input", meta=(ClampMin="0.05", ClampMax="5.0", UIMin="0.05", UIMax="5.0"))
+    float MouseSensitivity = 1.0f;
+
+    /** Also validates values assigned by Blueprint or hand-edited settings.json files. */
+    UFUNCTION(BlueprintPure, Category="Settings|Input")
+    float GetClampedMouseSensitivity() const;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess")
     float BloomIntensity = 0.675f;
 

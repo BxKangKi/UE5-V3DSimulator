@@ -20,6 +20,7 @@ struct V3DSIMULATOR_API FModelDefinition
     FGuid UUID;
     FString Name;
     FString DisplayName;
+    /** Legacy archive/member name; stores the real GLB, glTF, OBJ, FBX or STL source path. */
     FString GlbPath;
     FString JsonPath;
     EModelDefinitionType ModelType = EModelDefinitionType::Invalid;
@@ -40,16 +41,16 @@ struct V3DSIMULATOR_API FModelDefinition
  * Disk-side helpers for model definition JSON files.
  *
  * The model directory is intentionally category-free. Every subdirectory is
- * scanned recursively, and a GLB is paired only with the JSON that has the
+ * scanned recursively, and a source model is paired only with the JSON that has the
  * same base filename in the same directory.
  */
 namespace ModelDefinitionJson
 {
     /**
-     * Creates missing sibling JSON for every recursively discovered GLB.
+     * Creates missing sibling JSON for every recursively discovered supported model format.
      * New metadata is persisted to disk before validation, and the default ModelType comes
      * from ProjectBuildPolicy. Existing author-owned fields are preserved.
-     * OutDiscoveredGlbFiles receives the exact normalized, de-duplicated source snapshot.
+     * OutDiscoveredModelFiles receives the exact normalized, de-duplicated source snapshot.
      *
      * This function performs file-system work only and is safe to call from a
      * worker thread. It never touches UObjects or world state.
@@ -58,7 +59,7 @@ namespace ModelDefinitionJson
         const FString& ModelRootDirectory,
         EV3DSimulatorProjectType ProjectType,
         TArray<FString>* OutUpdatedJsonFiles = nullptr,
-        TArray<FString>* OutDiscoveredGlbFiles = nullptr);
+        TArray<FString>* OutDiscoveredModelFiles = nullptr);
 
     /**
      * Strictly validates a canonical definition. Missing required metadata, unknown types,
@@ -67,7 +68,7 @@ namespace ModelDefinitionJson
      */
     V3DSIMULATOR_API bool LoadDefinition(
         const FString& JsonPath,
-        const FString& ExpectedGlbPath,
+        const FString& ExpectedSourcePath,
         FModelDefinition& OutDefinition,
         FString& OutError,
         FString* OutCanonicalJson = nullptr);

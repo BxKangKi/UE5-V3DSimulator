@@ -19,13 +19,9 @@ class UCreatorHUDWidget;
 class UPauseMenuWidget;
 class USettingsMenuWidget;
 class UBuildStatusWidget;
-class UStartWorldWidget;
+class UMainWorldWidget;
 class UWorldSelectionWidget;
 class UProjectSelectionWidget;
-class UMenuButtonWidget;
-class UBooleanSettingWidget;
-class UFloatSettingWidget;
-class UEnumSettingWidget;
 class UMaterialInterface;
 class UMaterialParameterCollection;
 class UStaticMesh;
@@ -106,6 +102,9 @@ public:
     /** Supplies current built-in menu classes when a class reference is empty. */
     void EnsureMenuDefaults();
 
+    /** Synchronously resolves TerrainMaterial on the game thread. */
+    UMaterialInterface* ResolveTerrainMaterial() const;
+
     // Native actor classes can be replaced by Blueprint subclasses without forcing them to load at startup.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Actors")
     TSoftClassPtr<AStaticActor> StaticActorClass;
@@ -131,15 +130,16 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Actors")
     TSoftClassPtr<AActor> RainWeatherActorClass;
 
-    // UI classes are soft references. GameMode/PlayerController create missing top-level instances automatically at runtime.
+    // Only screen classes are configurable assets. Reusable buttons/settings rows are native
+    // components, so opening a menu never synchronously loads separate component Blueprints.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
-    TSoftClassPtr<UStartWorldWidget> StartMenuWidgetClass;
+    TSoftClassPtr<UMainWorldWidget> StartMenuWidgetClass;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UWorldSelectionWidget> WorldSelectionWidgetClass;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
-    TSoftClassPtr<UStartWorldWidget> MultiplayerMenuWidgetClass;
+    TSoftClassPtr<UMainWorldWidget> MultiplayerMenuWidgetClass;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UProjectSelectionWidget> ProjectSelectionWidgetClass;
@@ -154,32 +154,14 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UBuildStatusWidget> BuildStatusWidgetClass;
 
-    /** Shared generated selection-entry WBP used by Project and World selection lists. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI|Common")
-    TSoftClassPtr<UMenuButtonWidget> SelectionEntryWidgetClass;
-
-    /** Shared generated Confirm button WBP used by the build-status view. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI|Common")
-    TSoftClassPtr<UMenuButtonWidget> BuildStatusConfirmWidgetClass;
-
-    /** Shared generated row WBP for boolean settings. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI|Common")
-    TSoftClassPtr<UBooleanSettingWidget> BooleanSettingWidgetClass;
-
-    /** Shared generated row WBP for ranged numeric settings. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI|Common")
-    TSoftClassPtr<UFloatSettingWidget> FloatSettingWidgetClass;
-
-    /** Shared generated row WBP for discrete/enum settings. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI|Common")
-    TSoftClassPtr<UEnumSettingWidget> EnumSettingWidgetClass;
-
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UCreatorHUDWidget> CreatorHUDWidgetClass;
 
+    /** Use a Blueprint child of UDebugHUDWidget; legacy plain UserWidgets fall back to the native HUD. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UUserWidget> DebugWidgetClass;
 
+    /** Use a Blueprint child of ULoadingHUDWidget; legacy plain UserWidgets fall back to the native HUD. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UUserWidget> LoadingWidgetClass;
 
@@ -210,6 +192,10 @@ public:
     /** Default glTF material soft references live directly in this one central data object. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     FV3DMaterialSoftAssetReferences V3DMaterials;
+
+    /** Base material used by baked V3D terrain palettes (Texture2DArray + vertex-color layer weights). */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UMaterialInterface> TerrainMaterial;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> StaticDecalLightMaterial;

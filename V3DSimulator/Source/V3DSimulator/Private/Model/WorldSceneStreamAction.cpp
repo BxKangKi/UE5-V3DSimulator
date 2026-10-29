@@ -107,13 +107,20 @@ namespace
         const float Distance,
         const double MaxDistanceCm,
         const float UnloadDistanceMultiplier,
-        const bool bRenderOnly)
+        const bool bRenderOnly,
+        const TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe>& Cancellation)
     {
+        uint32 Examined = 0;
+        const auto IsCancelled = [&Cancellation, &Examined]()
+        {
+            return (Examined++ & 255) == 0 && Cancellation.IsValid() && Cancellation->GetValue() != 0;
+        };
         // Everything in this routine is detached native data. It is intentionally safe to execute
         // on a worker and must never dereference a UObject or Actor.
         Plan.InvalidWaterNodes.Reset();
         for (auto It = Plan.WaterNodeMap.CreateIterator(); It; ++It)
         {
+            if (IsCancelled()) return;
             const FWaterStreamNodeData& Water = It.Value();
             if (It.Key().IsNone() || Water.Transform.ContainsNaN()
                 || !FMath::IsFinite(Water.StreamRadius) || Water.StreamRadius <= 0.0f)
@@ -125,6 +132,7 @@ namespace
         }
         for (auto It = Plan.LoadedWaterNodes.CreateIterator(); It; ++It)
         {
+            if (IsCancelled()) return;
             if (!Plan.WaterNodeMap.Contains(*It)) It.RemoveCurrent();
         }
 
@@ -132,6 +140,7 @@ namespace
         ReferencedMeshes.Reserve(Plan.MeshMap.Num());
         for (auto It = Plan.NodeMap.CreateIterator(); It; ++It)
         {
+            if (IsCancelled()) return;
             const FModelNodeData& Node = It.Value();
             if (It.Key().IsNone() || Node.MeshName.IsNone() || Node.Transform.ContainsNaN())
             {
@@ -143,6 +152,7 @@ namespace
 
         for (auto It = Plan.MeshMap.CreateIterator(); It; ++It)
         {
+            if (IsCancelled()) return;
             const FModelMeshData& Mesh = It.Value();
             const bool bHasRuntimeMesh = Mesh.LOD0 != INDEX_NONE || Mesh.LOD1 != INDEX_NONE
                 || Mesh.LOD2 != INDEX_NONE || Mesh.LOD3 != INDEX_NONE;
@@ -153,6 +163,7 @@ namespace
         }
         for (auto It = Plan.NodeMap.CreateIterator(); It; ++It)
         {
+            if (IsCancelled()) return;
             if (!Plan.MeshMap.Contains(It.Value().MeshName)) It.RemoveCurrent();
         }
 
@@ -192,6 +203,7 @@ namespace
         TMap<FIntVector, FChunkSelection> Chunks;
         for (const auto& Pair : Plan.NodeMap)
         {
+            if (IsCancelled()) return;
             const FModelNodeData& Node = Pair.Value;
             const FModelMeshData* Mesh = Plan.MeshMap.Find(Node.MeshName);
             if (!Mesh) continue;
@@ -209,6 +221,7 @@ namespace
         }
         for (auto& Pair : Chunks)
         {
+            if (IsCancelled()) return;
             FChunkSelection& Chunk = Pair.Value;
             Chunk.bSelected = V3DHISMChunkPolicy::InRange(Chunk.Bounds, ObserverLocations,
                 FMath::Min(MaxDistanceCm, Chunk.Radius * (Chunk.bResident ? SafeUnloadMultiplier : 1.0f)));
@@ -216,6 +229,7 @@ namespace
         }
         for (const TPair<FName, FModelNodeData>& NodePair : Plan.NodeMap)
         {
+            if (IsCancelled()) return;
             const FModelNodeData& Info = NodePair.Value;
             const FModelMeshData* MeshPtr = Plan.MeshMap.Find(Info.MeshName);
             if (!MeshPtr) continue;
@@ -255,6 +269,7 @@ namespace
         const float WaterDistanceRadius = FMath::Max(Distance * 1024.0f, 2048.0f);
         for (const TPair<FName, FWaterStreamNodeData>& WaterPair : Plan.WaterNodeMap)
         {
+            if (IsCancelled()) return;
             const FVector WaterWorldLocation =
                 (WaterPair.Value.Transform * OwnerWorldTransform).GetLocation();
             const double CurrentDist = NearestObserverDistanceSq(WaterWorldLocation);
@@ -274,6 +289,7 @@ namespace
                 Plan.PendingLoadWaterNodes.Add(WaterPair.Key);
             }
         }
+        if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
         const auto ChunkOrder = [&Plan, &Chunks, &OwnerWorldTransform, &NodeDistanceSqCache](FName A, FName B, bool bUnload)
         {
             const FIntVector CA = V3DHISMChunkPolicy::Key((Plan.NodeMap.FindChecked(A).Transform * OwnerWorldTransform).GetLocation());
@@ -299,12 +315,15 @@ namespace
 
 void UWorldGeneratedStaticMeshContext::Initialize(UWorld* InWorld)
 {
+    CancelBuild();
+    BuildCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
     PinnedWorld = nullptr;
     World = InWorld;
 }
 
 bool UWorldGeneratedStaticMeshContext::PinWorldForBuild()
 {
+    if (IsBuildCancelled()) return false;
     UWorld* RuntimeWorld = World.Get();
     if (!IsValid(RuntimeWorld) || !RuntimeWorld->IsGameWorld())
     {
@@ -319,6 +338,18 @@ bool UWorldGeneratedStaticMeshContext::PinWorldForBuild()
 void UWorldGeneratedStaticMeshContext::ReleaseWorldPin()
 {
     PinnedWorld = nullptr;
+}
+
+void UWorldGeneratedStaticMeshContext::CancelBuild()
+{
+    check(IsInGameThread());
+    if (BuildCancellation.IsValid() && BuildCancellation->GetValue() == 0) BuildCancellation->Increment();
+}
+
+bool UWorldGeneratedStaticMeshContext::IsBuildCancelled() const
+{
+    check(IsInGameThread());
+    return BuildCancellation.IsValid() && BuildCancellation->GetValue() != 0;
 }
 
 UWorld* UWorldGeneratedStaticMeshContext::GetWorld() const
@@ -463,6 +494,8 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 
     bAbortRequested = true;
     bPreparationInFlight = false;
+    if (PreparationCancellation.IsValid()) PreparationCancellation->Increment();
+    PreparationCancellation.Reset();
     ++PreparationSerial;
 
     UWorld* World = nullptr;
@@ -482,6 +515,24 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 
     Progress.Clear();
     Completed.Clear();
+    if (IsValid(GeneratedMeshWorldContext)) GeneratedMeshWorldContext->CancelBuild();
+
+    // Planning rows and actor references are no longer needed by a cancelled terminal callback.
+    // Release them immediately even if an admitted read/native build still needs its own pins.
+    NodeMap.Empty();
+    WaterNodeMap.Empty();
+    MeshMap.Empty();
+    LoadedWaterNodes.Empty();
+    WaterActorMap.Empty();
+    PendingUnavailableRegions.Empty();
+    PendingLoadNodes.Empty();
+    PendingUnloadNodes.Empty();
+    PendingLoadWaterNodes.Empty();
+    PendingUnloadWaterNodes.Empty();
+    MeshActor = nullptr;
+    DecalLight = nullptr;
+    ObserverLocations.Empty();
+    CurrentRenderObservers.Empty();
 
     // Do not release the facade/action while its .dat read or mesh finalizer is still active.
     // SetStaticMesh receives the terminal callback and completes deferred cleanup.
@@ -498,17 +549,7 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
         OrphanedMesh->ClearFlags(RF_Public | RF_Standalone);
     }
 
-    NodeMap.Empty();
-    WaterNodeMap.Empty();
-    MeshMap.Empty();
-    LoadedWaterNodes.Empty();
-    WaterActorMap.Empty();
-    PendingUnavailableRegions.Empty();
     CurrentUnavailableRegionIndex = 0;
-    PendingLoadNodes.Empty();
-    PendingUnloadNodes.Empty();
-    PendingLoadWaterNodes.Empty();
-    PendingUnloadWaterNodes.Empty();
     TotalOperationCount = 0;
     TotalSkippedOperationCount = 0;
     CurrentSkippedOperationIndex = 0;
@@ -542,6 +583,8 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 void UWorldSceneStreamAction::Activate()
 {
     if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::Activate"))) return;
+    if (bActivated || bAbortRequested) return;
+    bActivated = true;
 
     bAbortRequested = false;
     bGroupFailed = false;
@@ -585,6 +628,8 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
     const float PlanningUnloadMultiplier = UnloadDistanceMultiplier;
     const bool bPlanningRenderOnly = bRenderOnly;
     const uint32 Serial = ++PreparationSerial;
+    PreparationCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    const auto Cancellation = PreparationCancellation;
     bPreparationInFlight = true;
     if (!Definitions.IsValid() && Plan.NodeMap.IsEmpty() && Plan.WaterNodeMap.IsEmpty())
     {
@@ -597,8 +642,9 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
 
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
         [WeakThis, Serial, Plan = MoveTemp(Plan), Definitions, LoadedMeshNodes, PlanningRadius,
-            OwnerTransform, PlanningObserverLocations, PlanningDistance, PlanningMaxDistanceCm, PlanningUnloadMultiplier, bPlanningRenderOnly]() mutable
+            OwnerTransform, PlanningObserverLocations, PlanningDistance, PlanningMaxDistanceCm, PlanningUnloadMultiplier, bPlanningRenderOnly, Cancellation]() mutable
         {
+            if (Cancellation->GetValue() != 0) return;
             const TSet<FName> EmptyLoaded;
             const TSet<FName>& Loaded = LoadedMeshNodes.IsValid() ? *LoadedMeshNodes : EmptyLoaded;
             if (Definitions.IsValid())
@@ -606,6 +652,7 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
                 TMap<FName, FModelNodeData> ObserverNodes;
                 for (const FVector& Observer : PlanningObserverLocations)
                 {
+                    if (Cancellation->GetValue() != 0) return;
                     AInstancedMeshActor::BuildNativeNodeSnapshot(*Definitions, Loaded, Observer,
                         OwnerTransform, PlanningRadius, ObserverNodes);
                     Plan.NodeMap.Append(ObserverNodes);
@@ -613,7 +660,8 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
             }
             Plan.OriginalNodeWorkCount = Plan.NodeMap.Num() + Plan.WaterNodeMap.Num();
             BuildNativeStreamPlan(Plan, Loaded, OwnerTransform, PlanningObserverLocations,
-                PlanningDistance, PlanningMaxDistanceCm, PlanningUnloadMultiplier, bPlanningRenderOnly);
+                PlanningDistance, PlanningMaxDistanceCm, PlanningUnloadMultiplier, bPlanningRenderOnly, Cancellation);
+            if (Cancellation->GetValue() != 0) return;
             FSafeFileIO::DispatchTrackedGameThread(
                 [WeakThis, Serial, Plan = MoveTemp(Plan)]() mutable
                 {
@@ -633,9 +681,13 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
 void UWorldSceneStreamAction::ApplyPreparedPlan(FWorldSceneStreamPlan&& Plan, const uint32 Serial)
 {
     if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::ApplyPreparedPlan"))) return;
-    if (Serial != PreparationSerial || bAbortRequested || !bPreparationInFlight
-        || !IsValid(OwnerActor) || (!bWaterGroup && !IsValid(MeshActor)))
+    if (Serial != PreparationSerial || bAbortRequested || !bPreparationInFlight) return;
+    if (!IsValid(OwnerActor) || !IsValid(OwnerActor->GetWorld())
+        || (!bWaterGroup && !IsValid(MeshActor)))
     {
+        // A planning worker can finish after its actor/world has gone away. This action is rooted
+        // until its terminal path runs, so silently discarding the current plan leaks the root.
+        AbortAndRelease();
         return;
     }
     bPreparationInFlight = false;
@@ -688,6 +740,8 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
     }
 
     bPreparationInFlight = false;
+    if (PreparationCancellation.IsValid()) PreparationCancellation->Increment();
+    PreparationCancellation.Reset();
     ++PreparationSerial;
     UWorld* World = IsValid(OwnerActor) ? OwnerActor->GetWorld() : (IsValid(WorldContextObject) ? WorldContextObject->GetWorld() : nullptr);
     if (World)
@@ -739,7 +793,8 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
 void UWorldSceneStreamAction::ProcessChunk()
 {
     if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::ProcessChunk"))) return;
-    if (bAbortRequested || !IsValid(OwnerActor)) { AbortAndRelease(); return; }
+    if (bAbortRequested || !IsValid(OwnerActor) || !IsValid(OwnerActor->GetWorld()))
+    { AbortAndRelease(); return; }
     const double SliceStartSeconds = FPlatformTime::Seconds();
     const double SliceBudgetSeconds = FMath::Min(
         static_cast<double>(FMath::Clamp(FrameTimeBudgetMs, 0.25f, 4.0f)) * 0.001,
@@ -804,6 +859,10 @@ void UWorldSceneStreamAction::ProcessChunk()
         && CurrentUnloadIndex >= PendingUnloadNodes.Num() && !bIsLoading;
     if (IsValid(MeshActor)) MeshActor->FlushInstanceRenderUpdates(bNodeWorkFinished);
     if (bProgressChanged) BroadcastProgress();
+    // Blueprint progress handlers may cancel this action or tear down the owning scene. Never
+    // dereference references or reschedule the action after a user callback invalidates them.
+    if (bAbortRequested || !IsValid(OwnerActor) || !IsValid(OwnerActor->GetWorld()))
+    { AbortAndRelease(); return; }
     if (CurrentUnavailableRegionIndex >= PendingUnavailableRegions.Num()
         && CurrentSkippedOperationIndex >= TotalSkippedOperationCount
         && CurrentLoadIndex >= PendingLoadNodes.Num() && CurrentUnloadIndex >= PendingUnloadNodes.Num()
@@ -1121,7 +1180,7 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
         // AddInstance creates the per-instance body. Avoid a second explicit physics-state rebuild;
         // it can overlap Chaos scene insertion while the generated mesh is being finalized.
         AddTransform(CurrentLoadingNode);
-        MeshActor->FlushInstanceRenderUpdates();
+        if (!bAbortRequested && IsValid(MeshActor)) MeshActor->FlushInstanceRenderUpdates();
     }
     else
     {
@@ -1520,3 +1579,48 @@ void UWorldSceneStreamAction::BroadcastProgress()
         0.0f,
         1.0f));
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "UObject/StrongObjectPtr.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DSceneActionLifetimeTest,
+    "V3DSimulator.Streaming.Memory.SceneActionLifetime",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DSceneActionLifetimeTest::RunTest(const FString&)
+{
+    TStrongObjectPtr<UWorldSceneStreamAction> Action(NewObject<UWorldSceneStreamAction>());
+    Action->AddToRoot();
+    Action->bPreparationInFlight = true;
+    Action->PreparationCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    const auto PlanningCancellation = Action->PreparationCancellation;
+    Action->PreparationSerial = 1;
+    FWorldSceneStreamPlan Plan;
+    Action->ApplyPreparedPlan(MoveTemp(Plan), 1);
+    TestFalse(TEXT("Planning completion after owner loss releases its root"), Action->IsRooted());
+    TestFalse(TEXT("Invalid current plan no longer occupies a planning slot"), Action->bPreparationInFlight);
+    TestTrue(TEXT("A lost owner cancels the detached planning token"), PlanningCancellation->GetValue() != 0);
+
+    TStrongObjectPtr<UWorldSceneStreamAction> InFlight(NewObject<UWorldSceneStreamAction>());
+    InFlight->AddToRoot();
+    InFlight->bActivated = true;
+    InFlight->bStaticMeshLoadInFlight = true;
+    InFlight->GeneratedMeshWorldContext = NewObject<UWorldGeneratedStaticMeshContext>();
+    InFlight->GeneratedMeshWorldContext->Initialize(nullptr);
+    const auto Cancellation = InFlight->GeneratedMeshWorldContext->GetBuildCancellationToken();
+    InFlight->NodeMap.Add(TEXT("DeferredNode"), FModelNodeData());
+    InFlight->PendingLoadNodes.Add(TEXT("DeferredNode"));
+    InFlight->Activate();
+    TestTrue(TEXT("Duplicate activation preserves native build lifetime"), InFlight->bStaticMeshLoadInFlight);
+    InFlight->CancelAndRelease();
+    TestTrue(TEXT("Cancellation waits for the native callback"), InFlight->IsRooted());
+    TestTrue(TEXT("Queued/read work observes detached cancellation"), Cancellation.IsValid() && Cancellation->GetValue() != 0);
+    TestTrue(TEXT("Cancelled native wait releases scene rows immediately"), InFlight->NodeMap.IsEmpty() && InFlight->PendingLoadNodes.IsEmpty());
+    TestFalse(TEXT("A cancelled context cannot start a later build"), InFlight->GeneratedMeshWorldContext->PinWorldForBuild());
+    InFlight->Activate();
+    TestTrue(TEXT("A cancelled action cannot be revived"), InFlight->bAbortRequested);
+    InFlight->SetStaticMesh(nullptr);
+    TestFalse(TEXT("Terminal callback releases the cancelled action"), InFlight->IsRooted());
+    return true;
+}
+#endif

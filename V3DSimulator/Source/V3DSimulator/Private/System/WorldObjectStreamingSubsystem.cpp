@@ -63,6 +63,7 @@ FWorldChunkCoordinate UWorldObjectStreamingSubsystem::ToChunk(const FVector& Loc
 void UWorldObjectStreamingSubsystem::Start(const FString& InWorldRoot, const float InLoadRadiusMeters)
 {
     check(IsInGameThread());
+    if (bStopInProgress) return;
     Stop();
     if (InWorldRoot.TrimStartAndEnd().IsEmpty())
     {
@@ -139,6 +140,8 @@ void UWorldObjectStreamingSubsystem::SetLoadRadiusMeters(const float InLoadRadiu
 void UWorldObjectStreamingSubsystem::Stop()
 {
     check(IsInGameThread());
+    if (bStopInProgress) return;
+    TGuardValue<bool> StopGuard(bStopInProgress, true);
     ++Generation;
     bRunning = false;
     CommandEntityIndex.Empty(); NextCommandIndexAt = 0;
@@ -238,11 +241,14 @@ void UWorldObjectStreamingSubsystem::Stop()
     {
         for (const FWorldChunkCoordinate& Coordinate : ChangedCoordinates)
         {
-            CommitSnapshots.Add(Coordinate, FinalSnapshots.FindRef(Coordinate));
+            if (TArray<FWorldChunkObject>* Snapshot = FinalSnapshots.Find(Coordinate))
+                CommitSnapshots.Add(Coordinate, MoveTemp(*Snapshot));
+            else CommitSnapshots.Add(Coordinate);
             WriteOrders.Add(Coordinate, Store->ReserveChunkWrite(Coordinate));
         }
         const bool bQueued = FSafeFileIO::RunTrackedWorker(
-            [Store, CommitSnapshots, WriteOrders, NeedsDiskMerge]() mutable
+            [Store, CommitSnapshots = MoveTemp(CommitSnapshots),
+                WriteOrders = MoveTemp(WriteOrders), NeedsDiskMerge = MoveTemp(NeedsDiskMerge)]() mutable
         {
             // Only destinations absent from memory require an on-demand disk merge. This prevents
             // a teleport or last-frame placement from overwriting entities already in that chunk.
@@ -257,7 +263,7 @@ void UWorldObjectStreamingSubsystem::Stop()
                         *Error);
                     return;
                 }
-                const TArray<FWorldChunkObject> Incoming = CommitSnapshots.FindRef(Coordinate);
+                const TArray<FWorldChunkObject>& Incoming = CommitSnapshots.FindChecked(Coordinate);
                 for (const FWorldChunkObject& Object : Incoming)
                 {
                     Existing.RemoveAllSwap(
@@ -363,9 +369,18 @@ bool UWorldObjectStreamingSubsystem::IsAreaLoaded(
 void UWorldObjectStreamingSubsystem::EnsureLocationLoaded(const FVector& WorldLocation)
 {
     check(IsInGameThread());
-    if (!HasPersistenceAuthority()) return;
+    if (!bRunning || !HasPersistenceAuthority() || !FMath::IsFinite(WorldLocation.X)
+        || !FMath::IsFinite(WorldLocation.Y) || !FMath::IsFinite(WorldLocation.Z)) return;
     const FWorldChunkCoordinate Coordinate = ToChunk(WorldLocation);
-    if (!LoadedChunks.Contains(Coordinate) && !LoadingChunks.Contains(Coordinate))
+    if (FRuntimeChunk* Existing = LoadedChunks.Find(Coordinate))
+    {
+        if (Existing->bTransientBoundaryLoad)
+        {
+            Existing->TransientKeepAliveUntil = FPlatformTime::Seconds() + TransientChunkKeepAliveSeconds;
+            Existing->bUnloadAfterSave = false;
+        }
+    }
+    else if (!LoadingChunks.Contains(Coordinate))
     {
         QueueLoad(Coordinate, true);
         PumpLoads();
@@ -420,12 +435,14 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
     // additional players can grow normally without penalizing the dominant single-player path.
     NewDesired.Reserve(Diameter * Diameter * Diameter);
     const double RadiusSq = FMath::Square(static_cast<double>(LoadRadiusCentimeters));
-    const auto AddObserver = [this, Radius, RadiusSq, &NewDesired](const FVector& Observer)
+    TArray<FVector> Observers;
+    const auto AddObserver = [this, Radius, RadiusSq, &NewDesired, &Observers](const FVector& Observer)
     {
         if (!FMath::IsFinite(Observer.X) || !FMath::IsFinite(Observer.Y) || !FMath::IsFinite(Observer.Z))
         {
             return;
         }
+        Observers.Add(Observer);
         const FWorldChunkCoordinate Center = ToChunk(Observer);
         for (int32 DeltaZ = -Radius; DeltaZ <= Radius; ++DeltaZ)
             for (int32 DeltaY = -Radius; DeltaY <= Radius; ++DeltaY)
@@ -475,13 +492,38 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
     PendingLoads.Reserve(PendingLoads.Num() + NewDesired.Num());
     for (const FWorldChunkCoordinate& Coordinate : NewDesired)
     {
-        if (FRuntimeChunk* Existing = LoadedChunks.Find(Coordinate)) Existing->bTransientBoundaryLoad = false;
+        if (FRuntimeChunk* Existing = LoadedChunks.Find(Coordinate))
+        {
+            Existing->bTransientBoundaryLoad = false;
+            // An observer may return while the departing cell's save is still active.
+            Existing->bUnloadAfterSave = false;
+        }
         else if (!LoadingChunks.Contains(Coordinate)) QueueLoad(Coordinate, false);
     }
+    // TSet iteration has no spatial order. Keep the tail nearest-first for O(1) dispatch so
+    // dense distant cells cannot occupy every disk slot before the player's collision area.
+    const auto NearestDistanceSq = [&Observers](const FWorldChunkCoordinate& Coordinate)
+    {
+        const FVector Center((static_cast<double>(Coordinate.X) + 0.5) * ChunkSizeCentimeters,
+            (static_cast<double>(Coordinate.Y) + 0.5) * ChunkSizeCentimeters,
+            (static_cast<double>(Coordinate.Z) + 0.5) * ChunkSizeCentimeters);
+        double Best = TNumericLimits<double>::Max();
+        for (const FVector& Observer : Observers)
+            Best = FMath::Min(Best, static_cast<double>(FVector::DistSquared(Center, Observer)));
+        return Best;
+    };
+    PendingLoads.Sort([&NearestDistanceSq](const FPendingLoad& A, const FPendingLoad& B)
+    {
+        if (A.bTransientBoundaryLoad != B.bTransientBoundaryLoad) return !A.bTransientBoundaryLoad;
+        return NearestDistanceSq(A.Coordinate) > NearestDistanceSq(B.Coordinate);
+    });
     TArray<FWorldChunkCoordinate> NoLongerDesired;
     NoLongerDesired.Reserve(LoadedChunks.Num());
+    const double Now = FPlatformTime::Seconds();
     for (const TPair<FWorldChunkCoordinate, FRuntimeChunk>& Pair : LoadedChunks)
-        if (!NewDesired.Contains(Pair.Key) && !Pair.Value.bTransientBoundaryLoad) NoLongerDesired.Add(Pair.Key);
+        if (!NewDesired.Contains(Pair.Key)
+            && (!Pair.Value.bTransientBoundaryLoad || Now >= Pair.Value.TransientKeepAliveUntil))
+            NoLongerDesired.Add(Pair.Key);
 
     // A caller can destroy a just-placed actor before its destination range finishes loading.
     // Remove that weak registration now so it cannot retain retry/readiness state indefinitely.
@@ -582,44 +624,47 @@ void UWorldObjectStreamingSubsystem::PumpLoads()
             continue;
         }
 
-        ++ActiveLoads;
-        const bool bQueued = FSafeFileIO::RunTrackedWorker(
-            [WeakThis, Store, Coordinate, bTransient, RequestGeneration]() mutable
-            {
-                TArray<FWorldChunkObject> Entities;
-                FString Error;
-                const bool bSuccess = Store->LoadChunk(Coordinate, Entities, Error);
-                FSafeFileIO::DispatchTrackedGameThread(
-                    [WeakThis, Coordinate, bTransient, RequestGeneration, bSuccess,
-                        Entities = MoveTemp(Entities), Error = MoveTemp(Error)]() mutable
-                {
-                    if (UWorldObjectStreamingSubsystem* StrongThis = WeakThis.Get())
-                    {
-                        StrongThis->FinishLoad(Coordinate, bTransient, bSuccess,
-                            MoveTemp(Entities), MoveTemp(Error), RequestGeneration);
-                    }
-                });
-            });
-        if (!bQueued)
+        ++ActiveLoads; // Includes requests waiting for shared memory admission.
+        const auto Reject = [WeakThis, Coordinate, RequestGeneration]()
         {
-            // Queue rejection is synchronous. Drain rejected requests in this loop instead of
-            // calling FinishLoad(), whose normal completion path pumps again and could recurse once
-            // per pending chunk while the worker pool is shutting down.
-            ActiveLoads = FMath::Max(0, ActiveLoads - 1);
-            LoadingChunks.Remove(Coordinate);
-            const double RetryAt = FPlatformTime::Seconds() + FailedLoadRetryDelaySeconds;
-            FailedLoadRetryAt.Add(Coordinate, RetryAt);
-            UE_LOG(LogTemp, Error,
-                TEXT("Entity chunk request rejected because the .dat worker queue is shutting down. Chunk=(%d,%d,%d)"),
+            UWorldObjectStreamingSubsystem* Self = WeakThis.Get();
+            if (!Self || !Self->bRunning || Self->Generation != RequestGeneration) return;
+            Self->ActiveLoads = FMath::Max(0, Self->ActiveLoads - 1);
+            Self->LoadingChunks.Remove(Coordinate);
+            Self->FailedLoadRetryAt.Add(Coordinate,
+                FPlatformTime::Seconds() + FailedLoadRetryDelaySeconds);
+            // Tick retries; never recursively pump a synchronously rejected queue.
+            UE_LOG(LogTemp, Warning, TEXT("Entity chunk deferred after streaming worker/admission rejection. Chunk=(%d,%d,%d)"),
                 Coordinate.X, Coordinate.Y, Coordinate.Z);
-            for (const FPendingLoad& Pending : PendingLoads)
+        };
+        // Dynamic .dat ranges share the same transient memory budget as baked meshes/textures.
+        // Eight legal 256 MiB cells must not allocate alongside all baked terrain builds at once.
+        FV3DStreamingBudget::Enqueue(this,
+            [Store, Coordinate]() { return Store->EstimateChunkLoadBytes(Coordinate); },
+            [WeakThis, Store, Coordinate, bTransient, RequestGeneration, Reject](FV3DStreamingBudget::FPermit Permit) mutable
             {
-                LoadingChunks.Remove(Pending.Coordinate);
-                FailedLoadRetryAt.Add(Pending.Coordinate, RetryAt);
-            }
-            PendingLoads.Empty();
-            break;
-        }
+                const bool bQueued = FSafeFileIO::RunTrackedWorker(
+                    [WeakThis, Store, Coordinate, bTransient, RequestGeneration, Permit]() mutable
+                    {
+                        TArray<FWorldChunkObject> Entities;
+                        FString Error;
+                        const bool bSuccess = Store->LoadChunk(Coordinate, Entities, Error, Permit->Bytes);
+                        FSafeFileIO::DispatchTrackedGameThread(
+                            [WeakThis, Coordinate, bTransient, RequestGeneration, bSuccess, Permit,
+                                Entities = MoveTemp(Entities), Error = MoveTemp(Error)]() mutable
+                            {
+                                if (UWorldObjectStreamingSubsystem* Self = WeakThis.Get())
+                                    Self->FinishLoad(Coordinate, bTransient, bSuccess,
+                                        MoveTemp(Entities), MoveTemp(Error), RequestGeneration);
+                            });
+                    });
+                if (!bQueued) Reject();
+            }, Reject,
+            [WeakThis, RequestGeneration]()
+            {
+                const UWorldObjectStreamingSubsystem* Self = WeakThis.Get();
+                return Self && Self->bRunning && Self->Generation == RequestGeneration;
+            });
     }
 }
 
@@ -636,6 +681,9 @@ void UWorldObjectStreamingSubsystem::InstallLoadedChunk(
     Chunk.Objects = MoveTemp(Entities);
     Chunk.Actors.SetNum(Chunk.Objects.Num());
     Chunk.bTransientBoundaryLoad = bTransient && !DesiredChunks.Contains(Coordinate);
+    // Predicted movement may be cancelled before a crossing occurs. Retain speculative cells
+    // briefly, then let the regular radius pass release their actors and decoded payload.
+    Chunk.TransientKeepAliveUntil = FPlatformTime::Seconds() + TransientChunkKeepAliveSeconds;
     Chunk.InstallId = NextInstallId++;
     Chunk.PendingSpawnIndices.Reserve(Chunk.Objects.Num());
     for (int32 Index = Chunk.Objects.Num() - 1; Index >= 0; --Index)
@@ -1209,7 +1257,8 @@ void UWorldObjectStreamingSubsystem::BeginSaveBatch(
     const uint64 SavedGeneration = Generation;
     TWeakObjectPtr<UWorldObjectStreamingSubsystem> WeakThis(this);
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, Store, Snapshots, WriteOrders, SavedRows, SavedGeneration]()
+        [WeakThis, Store, Snapshots = MoveTemp(Snapshots),
+            WriteOrders = MoveTemp(WriteOrders), SavedRows, SavedGeneration]()
     {
         const FSafeFileWriteResult Result = Store->SaveChunks(Snapshots, WriteOrders);
         FSafeFileIO::DispatchTrackedGameThread(
@@ -1397,3 +1446,52 @@ void UWorldObjectStreamingSubsystem::Tick(float DeltaTime)
             }
     BeginSaveBatch(Dirty);
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DTransientChunkLifetimeTest,
+    "V3DSimulator.Streaming.Memory.TransientBoundaryLifetime",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DTransientChunkLifetimeTest::RunTest(const FString&)
+{
+    const UWorld::InitializationValues Values = UWorld::InitializationValues()
+        .AllowAudioPlayback(false).CreatePhysicsScene(false).CreateNavigation(false)
+        .CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Test world"), World)) return false;
+    UWorldObjectStreamingSubsystem* Streamer = World->GetSubsystem<UWorldObjectStreamingSubsystem>();
+    if (!TestNotNull(TEXT("Object streamer"), Streamer))
+    {
+        World->DestroyWorld(false);
+        return false;
+    }
+    const FVector Location(1.e7, 0, 0);
+    Streamer->EnsureLocationLoaded(Location);
+    TestTrue(TEXT("A stopped streamer cannot enqueue speculative reads"), Streamer->PendingLoads.IsEmpty());
+    TestTrue(TEXT("A stopped streamer cannot retain pending coordinate keys"), Streamer->LoadingChunks.IsEmpty());
+
+    Streamer->bRunning = true;
+    const FWorldChunkCoordinate Coordinate = Streamer->ToChunk(Location);
+    Streamer->InstallLoadedChunk(Coordinate, true, TArray<FWorldChunkObject>());
+    Streamer->RebuildDesiredChunks();
+    TestTrue(TEXT("A fresh prefetch survives the next radius pass"), Streamer->LoadedChunks.Contains(Coordinate));
+    if (auto* Chunk = Streamer->LoadedChunks.Find(Coordinate))
+    {
+        Chunk->TransientKeepAliveUntil = -1.0;
+        Chunk->bUnloadAfterSave = true;
+    }
+    Streamer->EnsureLocationLoaded(Location);
+    if (const auto* Chunk = Streamer->LoadedChunks.Find(Coordinate))
+        TestFalse(TEXT("A renewed prefetch is rescued from a pending unload"), Chunk->bUnloadAfterSave);
+    Streamer->RebuildDesiredChunks();
+    TestTrue(TEXT("An active prediction renews its prefetch"), Streamer->LoadedChunks.Contains(Coordinate));
+    if (auto* Chunk = Streamer->LoadedChunks.Find(Coordinate)) Chunk->TransientKeepAliveUntil = -1.0;
+    Streamer->RebuildDesiredChunks();
+    TestFalse(TEXT("A cancelled prediction releases the speculative chunk"), Streamer->LoadedChunks.Contains(Coordinate));
+    Streamer->Stop();
+    World->DestroyWorld(false);
+    return true;
+}
+#endif

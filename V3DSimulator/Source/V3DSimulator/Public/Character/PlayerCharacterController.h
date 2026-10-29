@@ -28,6 +28,26 @@ class UPauseMenuWidget;
 class USettingsMenuWidget;
 class UGameUpdateSubSystem;
 class UWorld;
+class USurvivalHUDWidget;
+
+/** Owner-only presentation mirror of the server's persisted player record and map-authored limit. */
+USTRUCT(BlueprintType)
+struct V3DSIMULATOR_API FPlayerHealthDisplayState
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadOnly, Category="Player|Health")
+    bool bHasState = false;
+
+    UPROPERTY(BlueprintReadOnly, Category="Player|Health")
+    bool bSurvivalMode = false;
+
+    UPROPERTY(BlueprintReadOnly, Category="Player|Health")
+    float CurrentHealth = 0.0f;
+
+    UPROPERTY(BlueprintReadOnly, Category="Player|Health")
+    float MaximumHealth = 0.0f;
+};
 
 USTRUCT(BlueprintType)
 struct V3DSIMULATOR_API FPlayerInputMappingContextConfig
@@ -87,9 +107,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_Move(const FVector2D& MoveValue);
 
-    /** 2D axis. X = yaw, Y = pitch. */
+    /** 2D axis. X = yaw, Y = pitch. Applies the saved mouse sensitivity immediately. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_Look(const FVector2D& LookValue);
+
+    /** Saved input multiplier times LookSensitivity; shared by character and vehicle cameras. */
+    UFUNCTION(BlueprintPure, Category="Input|Mouse")
+    float GetEffectiveLookSensitivity() const;
 
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_JumpStarted();
@@ -202,15 +226,21 @@ public:
     UFUNCTION(BlueprintCallable, Category="Gameplay")
     UGameManagerSubSystem* GetGameManager();
 
+    /** No state is available until the authority has restored the active player record. */
+    UFUNCTION(BlueprintPure, Category="Player|Health")
+    FPlayerHealthDisplayState GetPlayerHealthDisplayState() const { return PlayerHealthDisplayState; }
+
 protected:
     virtual void UpdateRotation(float DeltaTime) override;
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void SetupInputComponent() override;
     virtual void BeginPlayingState() override;
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
     /** Reasserts gameplay input after the controller possesses a newly loaded or replaced pawn. */
     virtual void OnPossess(APawn* InPawn) override;
+    virtual void OnUnPossess() override;
     /** Owning-client counterpart to OnPossess for replicated Pawn assignment. */
     virtual void AcknowledgePossession(APawn* InPawn) override;
 
@@ -323,6 +353,7 @@ public:
     UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> RagdollAction;
 
+    /** Base camera multiplier; the player's saved MouseSensitivity multiplies this value. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
     float LookSensitivity = 1.0f;
 
@@ -456,5 +487,18 @@ private:
     /** Registry-created Creator HUD, or an explicitly registered override. */
     UPROPERTY(Transient)
     TObjectPtr<UCreatorHUDWidget> CreatorHUDWidget;
+
+    UPROPERTY(Transient)
+    TObjectPtr<USurvivalHUDWidget> SurvivalHUDWidget;
+
+    UPROPERTY(ReplicatedUsing=OnRep_PlayerHealthDisplayState)
+    FPlayerHealthDisplayState PlayerHealthDisplayState;
+
+    UFUNCTION()
+    void OnRep_PlayerHealthDisplayState();
+
+    void RefreshAuthoritativePlayerHealthDisplay();
+    void RefreshSurvivalHUD();
+    float HealthDisplayRefreshElapsed = 0.0f;
 
 };

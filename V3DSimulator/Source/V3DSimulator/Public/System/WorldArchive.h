@@ -127,6 +127,9 @@ struct V3DSIMULATOR_API FGWorldSoundRecord
 };
 
 /**
+ * Unreal adapter for the portable, single-header format declared in Format/v3d.hpp.
+ * New files use the V3D binary signature (revision 6); legacy GWORLD v4/v5 remains readable.
+ *
  * Thread-safe immutable .v3d reader.
  *
  * Open() reads the fixed header and bounded directory only. Every subsequent call opens a private
@@ -181,7 +184,9 @@ public:
         FString& OutError) const;
 
     /** Reads requested LODs and their dependencies. Dependency-only queries return IDs/materials,
-     * without vertex arrays, skin data or pixels; normal payload reads perform full validation. */
+     * without vertex arrays, skin data or pixels; normal payload reads perform full validation.
+     * ShouldCancel may run on multiple archive shards: capture only thread-safe native state.
+     * Cancellation returns false and discards all partially decoded output. */
     bool ReadMeshBundle(
         const FGuid& UUID,
         const FGWorldModelManifest& Manifest,
@@ -193,7 +198,8 @@ public:
         const TSet<int32>* SkipTextureIds = nullptr,
         const TSet<int32>* SkipMaterialIds = nullptr,
         int32 MaxTextureResolution = 0,
-        bool bDependenciesOnly = false) const;
+        bool bDependenciesOnly = false,
+        TFunction<bool()> ShouldCancel = TFunction<bool()>()) const;
 
     /** Re-read one validated immutable texture member for resource recreation. */
     bool ReadTextureRange(const FGWorldArchiveRange& Range, FGWorldBakedTexture& OutTexture,

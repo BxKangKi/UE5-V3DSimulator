@@ -13,7 +13,7 @@
 #include "HAL/FileManager.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
-#include "System/GlbValidation.h"
+#include "System/SourceModelImport.h"
 #include "System/ProjectConfig.h"
 #include "System/ProjectBuildPolicy.h"
 #include "System/ProjectWorkspace.h"
@@ -307,11 +307,20 @@ namespace ModelDatabasePrivate
         for (const FString& Candidate : PreflightFiles)
         {
             const FString Extension = FPaths::GetExtension(Candidate).ToLower();
-            if (Extension != TEXT("glb") && Extension != TEXT("wav")) continue;
+            const bool bModel = V3DSourceModelImport::IsModelSource(Candidate);
+            if (!bModel && Extension != TEXT("wav")) continue;
             const FString JsonKey = FPaths::ChangeExtension(
                 FSafeFileIO::NormalizeFilePath(Candidate), TEXT("json")).ToLower();
             if (JsonKey.IsEmpty()) continue;
-            if (Extension == TEXT("glb")) ModelJsonKeys.Add(JsonKey);
+            if (bModel)
+            {
+                if (ModelJsonKeys.Contains(JsonKey))
+                {
+                    Result.Error = FString::Printf(TEXT("Two model sources cannot share one sibling JSON: %s"), *JsonKey);
+                    return;
+                }
+                ModelJsonKeys.Add(JsonKey);
+            }
             else SoundJsonKeys.Add(JsonKey);
         }
         for (const FString& JsonKey : SoundJsonKeys)
@@ -319,7 +328,7 @@ namespace ModelDatabasePrivate
             if (ModelJsonKeys.Contains(JsonKey))
             {
                 Result.Error = FString::Printf(
-                    TEXT("Asset basename collision: a Model GLB and Sound WAV cannot share one sibling JSON: %s"),
+                    TEXT("Asset basename collision: a Model and Sound WAV cannot share one sibling JSON: %s"),
                     *JsonKey);
                 return;
             }
@@ -330,13 +339,13 @@ namespace ModelDatabasePrivate
 
         // Discovery and canonical JSON normalization use recursive scans within the project resources
         // tree only. Runtime mode never enters this function and never touches authoring resources.
-        TArray<FString> GlbFiles;
+        TArray<FString> SourceFiles;
         TArray<FString> UpdatedDefinitions;
         if (!ModelDefinitionJson::EnsureDefinitions(
-                ModelRoot, ProjectConfig.ProjectType, &UpdatedDefinitions, &GlbFiles))
+                ModelRoot, ProjectConfig.ProjectType, &UpdatedDefinitions, &SourceFiles))
         {
             Result.Error = FString::Printf(
-                TEXT("One or more GLB definition files could not be generated under: %s"),
+                TEXT("One or more source model definition files could not be generated under: %s"),
                 *ModelRoot);
             return;
         }
@@ -348,51 +357,53 @@ namespace ModelDatabasePrivate
             return;
         }
 
-        if (GlbFiles.IsEmpty() && WavFiles.IsEmpty())
+        if (SourceFiles.IsEmpty() && WavFiles.IsEmpty())
         {
-            Result.Error = FString::Printf(TEXT("No Model GLB or Sound WAV assets were found while recursively scanning: %s"), *ModelRoot);
+            Result.Error = FString::Printf(TEXT("No supported Model (GLB/glTF/OBJ/FBX/STL) or Sound WAV assets were found while recursively scanning: %s"), *ModelRoot);
             return;
         }
-        if (GlbFiles.Num() > FGWorldArchive::MaxModels || WavFiles.Num() > FGWorldArchive::MaxSounds)
+        if (SourceFiles.Num() > FGWorldArchive::MaxModels || WavFiles.Num() > FGWorldArchive::MaxSounds)
         {
             Result.Error = TEXT("Authoring asset count exceeds the .v3d safety limit");
             return;
         }
         if (Cancellation->Load()) return;
-        GlbFiles.Sort();
+        SourceFiles.Sort();
 
         UE_LOG(LogTemp, Display,
-            TEXT("Project discovery found %d GLB file(s) and %d WAV file(s) recursively under '%s' (%d asset JSON file(s) normalized)."),
-            GlbFiles.Num(), WavFiles.Num(), *ModelRoot, UpdatedDefinitions.Num() + UpdatedSoundDefinitions.Num());
-        for (const FString& GlbPath : GlbFiles)
+            TEXT("Project discovery found %d source model file(s) and %d WAV file(s) recursively under '%s' (%d asset JSON file(s) normalized)."),
+            SourceFiles.Num(), WavFiles.Num(), *ModelRoot, UpdatedDefinitions.Num() + UpdatedSoundDefinitions.Num());
+        for (const FString& SourcePath : SourceFiles)
         {
-            UE_LOG(LogTemp, Verbose, TEXT("Project source GLB: %s"), *GlbPath);
+            UE_LOG(LogTemp, Verbose, TEXT("Project source model: %s"), *SourcePath);
         }
 
         TArray<FParsedDefinitionResult> Parsed;
-        Parsed.SetNum(GlbFiles.Num());
-        // At most four simultaneous JSON/GLB readers, even on many-core workstations. Each lane
+        Parsed.SetNum(SourceFiles.Num());
+        // At most four simultaneous JSON/model readers, even on many-core workstations. Each lane
         // owns disjoint output slots; the deterministic merge runs after ParallelFor joins.
-        const int32 LaneCount = FMath::Min(4, GlbFiles.Num());
-        ParallelFor(LaneCount, [&GlbFiles, &Parsed, Cancellation, LaneCount](const int32 Lane)
+        const int32 LaneCount = FMath::Min(4, SourceFiles.Num());
+        ParallelFor(LaneCount, [&SourceFiles, &Parsed, Cancellation, LaneCount](const int32 Lane)
         {
-            for (int32 Index = Lane; Index < GlbFiles.Num(); Index += LaneCount)
+            for (int32 Index = Lane; Index < SourceFiles.Num(); Index += LaneCount)
             {
                 if (Cancellation->Load()) return;
-                const FString& GlbPath = GlbFiles[Index];
+                const FString& SourcePath = SourceFiles[Index];
                 FParsedDefinitionResult& Item = Parsed[Index];
-                if (!GlbValidation::ValidateFile(GlbPath, Item.Error)) continue;
-                const FString JsonPath = FPaths::ChangeExtension(GlbPath, TEXT("json"));
+                // Discovery/preflight never loads a plugin or touches UObject state on a worker.
+                // Optional module availability is checked on GT by the build worker before decode.
+                if (!V3DSourceModelImport::ValidateSourceFile(SourcePath, Item.Error)) continue;
+                const FString JsonPath = FPaths::ChangeExtension(SourcePath, TEXT("json"));
                 Item.bValid = ModelDefinitionJson::LoadDefinition(
-                    JsonPath, GlbPath, Item.Definition, Item.Error, &Item.DefinitionJson);
+                    JsonPath, SourcePath, Item.Definition, Item.Error, &Item.DefinitionJson);
             }
         });
         if (Cancellation->Load()) return;
 
-        for (int32 Index = 0; Index < GlbFiles.Num(); ++Index)
+        for (int32 Index = 0; Index < SourceFiles.Num(); ++Index)
         {
             FParsedDefinitionResult& Item = Parsed[Index];
-            const FString JsonPath = FPaths::ChangeExtension(GlbFiles[Index], TEXT("json"));
+            const FString JsonPath = FPaths::ChangeExtension(SourceFiles[Index], TEXT("json"));
             if (!Item.bValid)
             {
                 const FString Message = FString::Printf(

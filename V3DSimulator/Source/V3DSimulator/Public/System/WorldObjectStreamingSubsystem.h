@@ -75,6 +75,8 @@ public:
         FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());
 
 private:
+    friend class FV3DTransientChunkLifetimeTest;
+
     struct FRuntimeChunk
     {
         TArray<FWorldChunkObject> Objects;
@@ -99,6 +101,7 @@ private:
         bool bSaving = false;
         bool bUnloadAfterSave = false;
         bool bTransientBoundaryLoad = false;
+        double TransientKeepAliveUntil = 0.0;
     };
 
     struct FPendingLoad
@@ -125,6 +128,7 @@ private:
     float LoadRadiusCentimeters = 51200.0f;
     uint64 Generation = 0;
     bool bRunning = false;
+    bool bStopInProgress = false;
     // Keep across Stop/Start: a nested session must wait for the current tick stack to unwind.
     bool bTickInProgress = false;
     bool bHasPriorityStreamingFocus = false;
@@ -134,6 +138,7 @@ private:
     static constexpr int32 MaxConcurrentLoads = 8;
     static constexpr double PeriodicSaveIntervalSeconds = 1.0;
     static constexpr double FailedLoadRetryDelaySeconds = 1.0;
+    static constexpr double TransientChunkKeepAliveSeconds = 2.0;
     static constexpr float DesiredRefreshIntervalSeconds = 0.25f;
 
     TMap<FWorldChunkCoordinate, FRuntimeChunk> LoadedChunks;

@@ -8,12 +8,26 @@
  */
 
 using UnrealBuildTool;
+using System.IO;
 
 public class V3DSimulator : ModuleRules
 {
     public V3DSimulator(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        // v3d.hlsl is the public shader source. Unreal shader includes use .ush;
+        // keep a byte-identical alias so editing the public file is sufficient.
+        string TerrainShaderDirectory = Path.GetFullPath(Path.Combine(ModuleDirectory, "../../Shaders"));
+        string TerrainHlsl = Path.Combine(TerrainShaderDirectory, "v3d.hlsl");
+        string TerrainUsh = Path.Combine(TerrainShaderDirectory, "v3d.ush");
+        ExternalDependencies.Add(TerrainHlsl);
+        ExternalDependencies.Add(TerrainUsh);
+        if (File.Exists(TerrainHlsl)
+            && (!File.Exists(TerrainUsh) || File.ReadAllText(TerrainHlsl) != File.ReadAllText(TerrainUsh)))
+        {
+            File.Copy(TerrainHlsl, TerrainUsh, true);
+        }
 
         PublicDependencyModuleNames.AddRange(
             new string[]
@@ -39,8 +53,13 @@ public class V3DSimulator : ModuleRules
                 "RenderCore", // Shipping-safe PSO readiness diagnostics.
                 "ProceduralMeshComponent",
                 "PhysicsCore",
+                // Optional glTFRuntime format extensions are discovered at runtime; their modules
+                // are not hard dependencies, so an uninstalled importer cannot break the build.
+                "Projects",
+                "HTTP", // Match glTFRuntime's local image-URI decoding during source preflight.
                 // MoviePlayer renders a pure-Slate loading screen while blocking map loads run.
-                "MoviePlayer"
+                "MoviePlayer",
+                "PropertyPath"
             });
 
     }

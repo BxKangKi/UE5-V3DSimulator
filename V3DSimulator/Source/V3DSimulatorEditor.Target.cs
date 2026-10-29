@@ -17,5 +17,6 @@ public class V3DSimulatorEditorTarget : TargetRules
         DefaultBuildSettings = BuildSettingsVersion.Latest;
         IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
         ExtraModuleNames.Add("V3DSimulator");
+        ExtraModuleNames.Add("V3DSimulatorEditor");
     }
 }

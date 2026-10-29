@@ -3,7 +3,7 @@
 #include "Misc/AutomationTest.h"
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/V3DSimulatorGameInstance.h"
-#include "UI/StartWorldWidget.h"
+#include "UI/MainWorldWidget.h"
 #include "UI/WorldSelectionWidget.h"
 #include "UI/SettingsMenuWidget.h"
 #include "UI/ProjectSelectionWidget.h"
@@ -24,16 +24,10 @@ bool FV3DMenuClassDefaultsTest::RunTest(const FString& Parameters)
         Registry->ProjectSelectionWidgetClass.ToSoftObjectPath().ToString(), CanonicalPath);
     Registry->StartMenuWidgetClass.Reset();
     Registry->SettingsMenuWidgetClass.Reset();
-    Registry->BooleanSettingWidgetClass.Reset();
-    Registry->FloatSettingWidgetClass.Reset();
-    Registry->EnumSettingWidgetClass.Reset();
     Registry->ProjectSelectionWidgetClass.Reset();
     Registry->EnsureMenuDefaults();
     TestFalse(TEXT("Missing start menu repaired"), Registry->StartMenuWidgetClass.IsNull());
     TestFalse(TEXT("Missing settings menu repaired"), Registry->SettingsMenuWidgetClass.IsNull());
-    TestFalse(TEXT("Missing toggle repaired"), Registry->BooleanSettingWidgetClass.IsNull());
-    TestFalse(TEXT("Missing slider repaired"), Registry->FloatSettingWidgetClass.IsNull());
-    TestFalse(TEXT("Missing dropdown repaired"), Registry->EnumSettingWidgetClass.IsNull());
     TestEqual(TEXT("Missing project browser receives canonical default"),
         Registry->ProjectSelectionWidgetClass.ToSoftObjectPath().ToString(), CanonicalPath);
     const FSoftObjectPath CustomPath(TEXT("/Game/Custom/ProjectBrowser.ProjectBrowser_C"));
@@ -55,14 +49,10 @@ bool FV3DMenuAssetsLoadTest::RunTest(const FString& Parameters)
     {
         TestTrue(Label, IsValid(Loaded) && Loaded->IsChildOf(Expected));
     };
-    CheckClass(TEXT("Start menu"), Registry->StartMenuWidgetClass.LoadSynchronous(), UStartWorldWidget::StaticClass());
+    CheckClass(TEXT("Start menu"), Registry->StartMenuWidgetClass.LoadSynchronous(), UMainWorldWidget::StaticClass());
     CheckClass(TEXT("World selection"), Registry->WorldSelectionWidgetClass.LoadSynchronous(), UWorldSelectionWidget::StaticClass());
     CheckClass(TEXT("Settings"), Registry->SettingsMenuWidgetClass.LoadSynchronous(), USettingsMenuWidget::StaticClass());
     CheckClass(TEXT("Project selection"), Registry->ProjectSelectionWidgetClass.LoadSynchronous(), UProjectSelectionWidget::StaticClass());
-    CheckClass(TEXT("Generated button"), Registry->SelectionEntryWidgetClass.LoadSynchronous(), UMenuButtonWidget::StaticClass());
-    CheckClass(TEXT("Settings toggle"), Registry->BooleanSettingWidgetClass.LoadSynchronous(), UBooleanSettingWidget::StaticClass());
-    CheckClass(TEXT("Settings slider"), Registry->FloatSettingWidgetClass.LoadSynchronous(), UFloatSettingWidget::StaticClass());
-    CheckClass(TEXT("Settings dropdown"), Registry->EnumSettingWidgetClass.LoadSynchronous(), UEnumSettingWidget::StaticClass());
     CheckClass(TEXT("GameInstance Blueprint"), LoadClass<UV3DSimulatorGameInstance>(nullptr,
         TEXT("/Game/Blueprints/BP_GameInstance.BP_GameInstance_C")), UV3DSimulatorGameInstance::StaticClass());
     CheckClass(TEXT("AssetRegistry Blueprint"), LoadClass<UV3DSimulatorAssetRegistry>(nullptr,
@@ -75,7 +65,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DNativeMenuRowsTest,
 
 bool FV3DNativeMenuRowsTest::RunTest(const FString& Parameters)
 {
-    // Exercise the asset-independent fallback tree and post-Construct label binding.
+    // Shared controls are code-only: these trees must work without component Blueprint assets.
+    // Configure before TakeWidget to exercise the label's post-Construct binding as menus do.
     TStrongObjectPtr<UMenuButtonWidget> Button(NewObject<UMenuButtonWidget>());
     TestTrue(TEXT("Native button initializes"), Button->Initialize());
     Button->ConfigureButton(TEXT("create"), TEXT("Create Project"));

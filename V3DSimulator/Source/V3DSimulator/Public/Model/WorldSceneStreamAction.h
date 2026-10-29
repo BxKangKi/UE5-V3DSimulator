@@ -52,6 +52,10 @@ public:
     void Initialize(UWorld* InWorld);
     bool PinWorldForBuild();
     void ReleaseWorldPin();
+    /** Cancels queued/read work; an already-active native collision build keeps its world pin. */
+    void CancelBuild();
+    bool IsBuildCancelled() const;
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> GetBuildCancellationToken() const { return BuildCancellation; }
     virtual UWorld* GetWorld() const override;
 
 private:
@@ -60,6 +64,8 @@ private:
 
     UPROPERTY(Transient)
     TWeakObjectPtr<UWorld> World;
+
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> BuildCancellation;
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
@@ -115,6 +121,8 @@ public:
     void CancelAndRelease();
 
 private:
+    friend class FV3DSceneActionLifetimeTest;
+
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
 
@@ -155,12 +163,15 @@ private:
     TObjectPtr<AStaticActor> OwnerActor;
     UPROPERTY()
     TObjectPtr<AInstancedMeshActor> MeshActor;
+    // Actions are single-use; duplicate activation must never discard an active native build.
+    bool bActivated = false;
     bool bIsLoading = false;
     bool bAbortRequested = false;
     bool bStaticMeshLoadInFlight = false;
     bool bWaitingForMeshCallback = false;
     bool bPreparationInFlight = false;
     uint32 PreparationSerial = 0;
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> PreparationCancellation;
 
     bool bRenderOnly = false;
     FName GroupName = NAME_None;

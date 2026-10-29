@@ -8,6 +8,7 @@
  */
 
 #include "System/ProjectSourceModelBuilder.h"
+#include "System/V3DTerrain.h"
 
 #include "Containers/Ticker.h"
 #include "Animation/Skeleton.h"
@@ -19,6 +20,7 @@
 #include "HAL/PlatformTime.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Misc/Paths.h"
 #include "Model/V3DMaterialOverrideUtils.h"
 #include "Serialization/JsonReader.h"
@@ -30,6 +32,7 @@
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/GlbValidation.h"
+#include "System/SourceModelImport.h"
 #include "System/SafeFileIO.h"
 #include "System/StringHelper.h"
 #include "System/V3DRuntimeSafety.h"
@@ -149,8 +152,23 @@ namespace ProjectSourceModelBuilderPrivate
         return false;
     }
 
+    bool SourceContainsOnlyTerrainMaterials(UglTFRuntimeAsset* Source)
+    {
+        if (!Source || !Source->GetParser().IsValid()) return false;
+        const auto& Materials = Source->GetParser()->GetMaterials();
+        if (Materials.IsEmpty()) return false;
+        for (const auto& Material : Materials)
+        {
+            FString Name;
+            // GetMaterials returns non-null TSharedRef rows, not nullable TSharedPtr rows.
+            if (!Material->TryGetStringField(TEXT("name"), Name)
+                || !V3DTerrain::IsTerrainName(Name)) return false;
+        }
+        return true;
+    }
+
     /** Build-only material policy shared by every mesh decoded from the current source GLB. */
-    FglTFRuntimeMaterialsConfig MakeMaterialsConfig(UProjectSourceModelBuilder* Builder)
+    FglTFRuntimeMaterialsConfig MakeMaterialsConfig(UProjectSourceModelBuilder* Builder, UglTFRuntimeAsset* Source)
     {
         FglTFRuntimeMaterialsConfig Config;
         Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -164,14 +182,26 @@ namespace ProjectSourceModelBuilderPrivate
         Config.bGeneratesMipMaps = true;
         Config.bLoadMipMaps = true;
         Config.SpecularFactor = 0.0f;
-        Config.ImagesConfig.bCompressMips = true;
+        // Terrain array construction needs CPU pixels, before platform compression.
+        const bool bTerrainSource = V3DTerrain::SourceHasTerrain(Source);
+        Config.ImagesConfig.bCompressMips = !bTerrainSource;
         // Build-time textures are captured immediately from FTexturePlatformData on the game thread.
         // Keep glTFRuntime texture streaming disabled here. On UE 5.8, bStreaming=true attaches
         // glTFRuntime's custom mip provider before UpdateResource(); the provider can report a
         // different tiled layout from the transient texture and triggers StreamableTextureResource
         // validation. CaptureTexture() locks BulkData directly and no longer relies on the provider.
         Config.ImagesConfig.bStreaming = false;
-        const int32 TextureLimit = UGameSettings::ResolveMaxTextureResolution(Builder);
+        int32 TextureLimit = UGameSettings::ResolveMaxTextureResolution(Builder);
+        if (bTerrainSource && SourceContainsOnlyTerrainMaterials(Source))
+        {
+            int32 TerrainLimit = 1024;
+            if (GConfig) GConfig->GetInt(TEXT("V3D.Terrain"), TEXT("MaxTextureSize"), TerrainLimit, GGameIni);
+            // Terrain-only sources can apply the palette's cap during decode too, avoiding
+            // full 8K CPU mip chains that will immediately be reduced to a 1K array. The image
+            // config is shared across the source: mixed world GLBs retain the user's texture
+            // cap so buildings/props keep their authored quality. Bake caps just their palette.
+            TextureLimit = FMath::Min(TextureLimit, FMath::Clamp(TerrainLimit, 1, 2048));
+        }
         Config.ImagesConfig.MaxWidth = TextureLimit;
         Config.ImagesConfig.MaxHeight = TextureLimit;
         return Config;
@@ -404,18 +434,24 @@ bool UProjectSourceModelBuilder::Start(
         || SourcePath.IsEmpty()
         || InDefinitionJson.IsEmpty())
     {
-        Complete(false, TEXT("source definition, GLB path, or JSON snapshot is invalid"));
+        Complete(false, TEXT("source definition, model path, or JSON snapshot is invalid"));
         return false;
     }
 
     Definition = InDefinition;
     Definition.GlbPath = SourcePath;
     DefinitionJson = InDefinitionJson;
+    FString ImportError;
+    if (!V3DSourceModelImport::CheckAvailability(SourcePath, ImportError))
+    {
+        Complete(false, ImportError);
+        return false;
+    }
     SourceFileSize = IFileManager::Get().FileSize(*SourcePath);
     SourceTimestamp = IFileManager::Get().GetTimeStamp(*SourcePath);
     if (SourceFileSize <= 0)
     {
-        Complete(false, TEXT("source GLB is missing or empty"));
+        Complete(false, TEXT("source model is missing or empty"));
         return false;
     }
 
@@ -435,6 +471,7 @@ void UProjectSourceModelBuilder::BeginParserLoad(const uint64 Generation)
     const FString SourcePath = Definition.GlbPath;
     FglTFRuntimeConfig Config;
     Config.bAllowExternalFiles = true;
+    Config.bAsBlob = V3DSourceModelImport::UsesBlob(V3DSourceModelImport::GetFormat(SourcePath));
     if (Definition.ModelType == EModelDefinitionType::Character)
     {
         // glTFRuntime's default glTF basis is correct for ordinary scene assets, but Unreal's
@@ -451,20 +488,19 @@ void UProjectSourceModelBuilder::BeginParserLoad(const uint64 Generation)
         {
             FString Error;
             TSharedPtr<FglTFRuntimeParser> Parser;
-            // Validate the bounded GLB container, then let glTFRuntime interpret the format and the
-            // extensions it actually supports. The former semantic pre-validator rejected valid
-            // compressed/extension-based meshes before glTFRuntime was allowed to read them.
-            if (!GlbValidation::ValidateFile(SourcePath, Error))
+            // Dispatch by the real source format. Optional importers consume a glTFRuntime blob;
+            // their FBX/OBJ/STL bytes must never pass through the GLB header or JSON parser.
+            if (!V3DSourceModelImport::ValidateSourceFile(SourcePath, Error))
             {
                 Error = FString::Printf(
-                    TEXT("source GLB preflight failed: %s"), *Error);
+                    TEXT("source model preflight failed: %s"), *Error);
             }
             else
             {
                 Parser = FV3DRuntimeSafety::CreateParserSafely(SourcePath, Config, &Error);
                 if (!Parser.IsValid() && Error.IsEmpty())
                 {
-                    Error = TEXT("glTFRuntime could not open the validated source GLB");
+                    Error = TEXT("glTFRuntime could not open the validated source model");
                 }
             }
 
@@ -579,31 +615,18 @@ void UProjectSourceModelBuilder::BeginDecodedCapture()
     SkinMeshIndices.Reset();
     CurrentMeshIndex = 0;
 
-    const int32 MeshCount = SourceAsset->GetNumMeshes();
-    SourceMeshNames.SetNum(MeshCount);
-    for (int32 MeshIndex = 0; MeshIndex < MeshCount; ++MeshIndex)
+    ImportSession = MakeShared<V3DSourceModelImport::FSession>(
+        V3DSourceModelImport::GetFormat(Definition.GlbPath));
+    FString ImportError;
+    if (!ImportSession->Initialize(SourceAsset, Definition.GlbPath, ImportError))
     {
-        SourceMeshNames[MeshIndex] = FString::Printf(
-            TEXT("Mesh_%d"), MeshIndex);
+        Complete(false, ImportError);
+        return;
     }
-
-    if (SourceAsset->GetParser().IsValid())
-    {
-        const TArray<TSharedRef<FJsonObject>> MeshObjects =
-            SourceAsset->GetParser()->GetMeshes();
-        const int32 NamedMeshCount = FMath::Min(MeshCount, MeshObjects.Num());
-        for (int32 MeshIndex = 0; MeshIndex < NamedMeshCount; ++MeshIndex)
-        {
-            FString Name;
-            if (MeshObjects[MeshIndex]->TryGetStringField(TEXT("name"), Name)
-                && !Name.TrimStartAndEnd().IsEmpty())
-            {
-                SourceMeshNames[MeshIndex] = Name.TrimStartAndEnd();
-            }
-        }
-    }
-
-    const TArray<FglTFRuntimeNode>& Nodes = SourceAsset->GetNodes();
+    SourceMeshNames = ImportSession->MeshNames;
+    const bool bExtensionSource = V3DSourceModelImport::UsesBlob(ImportSession->Format);
+    const int32 MeshCount = SourceMeshNames.Num();
+    const TArray<FglTFRuntimeNode>& Nodes = ImportSession->Nodes;
     for (const FglTFRuntimeNode& Node : Nodes)
     {
         FString UnsupportedLod;
@@ -678,7 +701,9 @@ void UProjectSourceModelBuilder::BeginDecodedCapture()
     }
     for (int32 MeshIndex = 0; MeshIndex < MeshCount; ++MeshIndex)
     {
-        if (SourceSeenByNode[MeshIndex] && !SourceHasNonInstanceUse[MeshIndex]
+        // An extension reports skeletal ownership only during decode. Retain its mesh payloads
+        // until then; an ;INST alias must never accidentally point at another mesh's joint map.
+        if (!bExtensionSource && SourceSeenByNode[MeshIndex] && !SourceHasNonInstanceUse[MeshIndex]
             && InstanceOnlyCanAlias[MeshIndex])
         {
             SourceMeshesToCapture.Remove(MeshIndex);
@@ -698,7 +723,7 @@ void UProjectSourceModelBuilder::BeginDecodedCapture()
         int32 Lod = 0; bool bInstance = false;
         const FString Key = MakeCanonicalKey(Node, Lod, bInstance);
         int32 SourceForNode = Node.MeshIndex;
-        if (bInstance)
+        if (bInstance && !bExtensionSource)
         {
             if (const int32* Canonical = CanonicalSourceByKey.Find(Key)) SourceForNode = *Canonical;
         }
@@ -815,7 +840,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
         return;
     }
 
-    const int32 MeshCount = SourceAsset->GetNumMeshes();
+    const int32 MeshCount = SourceMeshNames.Num();
     if (CurrentMeshIndex >= MeshCount)
     {
         CaptureSkinsAndMetadata();
@@ -823,7 +848,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
     }
 
     FglTFRuntimeMaterialsConfig MaterialsConfig =
-        ProjectSourceModelBuilderPrivate::MakeMaterialsConfig(this);
+        ProjectSourceModelBuilderPrivate::MakeMaterialsConfig(this, SourceAsset);
 
     // Character materials must be baked against the same master material used by the runtime
     // character loader. Resolve this once per native batch instead of reconstructing the override
@@ -897,7 +922,34 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
             }
         }
 
-        if (bCharacterMeshUsesSkin)
+        const bool bBlob = ImportSession.IsValid()
+            && V3DSourceModelImport::UsesBlob(ImportSession->Format);
+        if (bBlob)
+        {
+            bool bSkeletal = false;
+            bDecoded = ImportSession->DecodeMesh(SourceAsset, MeshIndex, MaterialsConfig,
+                RuntimeLOD, bSkeletal, Error);
+            if (bDecoded && bSkeletal)
+            {
+                FGWorldBakedSkin Skin;
+                bDecoded = ImportSession->CaptureSkin(RuntimeLOD, MeshIndex,
+                    Definition.Bones, CharacterSkeletonOverride.Get(), Skin, Error)
+                    && ProjectSourceModelBuilderPrivate::ValidateAuthoritativeBoneMaps(RuntimeLOD, Error);
+                if (bDecoded)
+                {
+                    // Optional importers use their source mesh index as a build-local skin id.
+                    // The .v3d reader consumes the same baked structure as ordinary glTF skins.
+                    BakedData.Skins.Add(MoveTemp(Skin));
+                    SkinMeshIndices.FindOrAdd(MeshIndex).Add(BakedMeshIndex);
+                }
+            }
+            else if (bDecoded && Definition.ModelType == EModelDefinitionType::Character)
+            {
+                Error = TEXT("Character source has no skeleton; OBJ/STL are static formats, use a skinned FBX or glTF");
+                bDecoded = false;
+            }
+        }
+        else if (bCharacterMeshUsesSkin)
         {
             FString CharacterNodeName;
             int32 CharacterSkinIndex = INDEX_NONE;
@@ -1028,8 +1080,11 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
     TArray<int32> SkinIndices;
     SkinMeshIndices.GetKeys(SkinIndices);
     SkinIndices.Sort();
+    const bool bBlob = ImportSession.IsValid()
+        && V3DSourceModelImport::UsesBlob(ImportSession->Format);
     for (const int32 SkinIndex : SkinIndices)
     {
+        if (bBlob) continue; // Captured from each extension RuntimeLOD, not glTF skin JSON.
         // Called only from CaptureNextMeshUnderGate; do not acquire the same gate twice.
         const bool bCaptured = FGWorldBakedDataCapture::CaptureSkin(
             SourceAsset, SkinIndex, SkinMeshIndices.FindChecked(SkinIndex),
@@ -1044,6 +1099,8 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
 
     FGWorldModelMetadata Metadata;
     if (!BakedData.IsSane(&Error)
+        || (!bBlob && !V3DTerrain::Bake(SourceAsset, BakedData, Error, this))
+        || !BakedData.IsSane(&Error)
         || !BuildMetadata(Metadata, Error)
         || !Metadata.IsSane(&Error)
         || Metadata.SourceMeshCount != BakedData.Meshes.Num()
@@ -1076,7 +1133,7 @@ bool UProjectSourceModelBuilder::BuildMetadata(
     FModelData AuthoredSettings;
     if (!ParseModelSettings(DefinitionJson, AuthoredSettings, OutError)) return false;
 
-    const TArray<FglTFRuntimeNode>& Nodes = SourceAsset->GetNodes();
+    const TArray<FglTFRuntimeNode>& Nodes = ImportSession->Nodes;
     const int32 BakedMeshCount = BakedData.Meshes.Num();
     OutMetadata.SourceNodeCount = Nodes.Num();
     OutMetadata.SourceMeshCount = BakedMeshCount;
@@ -1499,7 +1556,7 @@ void UProjectSourceModelBuilder::Complete(
                 && CurrentTimestamp != SourceTimestamp))
         {
             bSuccess = false;
-            FailureReason = TEXT("source GLB changed while it was being decoded");
+            FailureReason = TEXT("source model changed while it was being decoded");
         }
     }
     if (!bSuccess)
@@ -1510,7 +1567,7 @@ void UProjectSourceModelBuilder::Complete(
         CompletedModel = FGWorldBuildModel();
         BakedData.Reset();
         FString ExistingQuarantineReason;
-        if (!FV3DRuntimeSafety::IsPathQuarantined(
+        if (bRunning && !FV3DRuntimeSafety::IsPathQuarantined(
                 Definition.GlbPath, &ExistingQuarantineReason))
         {
             FV3DRuntimeSafety::ReportRecoverableFailure(
@@ -1518,7 +1575,7 @@ void UProjectSourceModelBuilder::Complete(
         }
         FSimulatorFileServices::WriteLogAsync(
             TEXT("ProjectSourceModelBuilder"),
-            FString::Printf(TEXT("Build failed. GLB=%s Reason=%s"),
+            FString::Printf(TEXT("Build failed. Source=%s Reason=%s"),
                 *Definition.GlbPath, *FailureReason));
     }
 
@@ -1542,6 +1599,7 @@ void UProjectSourceModelBuilder::ReleaseSourceAsset()
         FV3DRuntimeSafety::RequestAssetRelease(SourceAsset);
     }
     SourceAsset = nullptr;
+    ImportSession.Reset();
     MaterialIds.Reset();
     TextureIds.Reset();
     SourceMeshNames.Reset();

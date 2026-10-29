@@ -9,6 +9,7 @@
  */
 
 #include "Setting/GameSettings.h"
+#include "Character/MouseLookPolicy.h"
 #include "System/SafeFileIO.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -34,6 +35,7 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(V3DSimulatorJsonMetadata::Version, V3DSimulatorJsonMetadata::SchemaVersion);
+    Json->SetNumberField(TEXT("MouseSensitivity"), GetClampedMouseSensitivity());
     Json->SetNumberField(TEXT("BloomIntensity"), BloomIntensity);
     Json->SetNumberField(TEXT("BloomThreshold"), BloomThreshold);
     Json->SetNumberField(TEXT("AmbientOcclusionIntensity"), AmbientOcclusionIntensity);
@@ -63,6 +65,9 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
 {
     if (Json.IsValid())
     {
+        // Older settings files have no input section. Retain the current/default value.
+        Json->TryGetNumberField(TEXT("MouseSensitivity"), MouseSensitivity);
+        MouseSensitivity = GetClampedMouseSensitivity();
         Json->TryGetNumberField(TEXT("BloomIntensity"), BloomIntensity);
         Json->TryGetNumberField(TEXT("BloomThreshold"), BloomThreshold);
         Json->TryGetNumberField(TEXT("AmbientOcclusionIntensity"), AmbientOcclusionIntensity);
@@ -111,6 +116,11 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
     return false;
 }
 
+
+float UGameSettings::GetClampedMouseSensitivity() const
+{
+    return V3DMouseLook::NormalizeSensitivity(MouseSensitivity);
+}
 
 int32 UGameSettings::GetClampedMaxTextureResolution() const
 {
@@ -361,6 +371,7 @@ void UGameSettings::SaveSettingsData()
 
 void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
 {
+    MouseSensitivity = GetClampedMouseSensitivity();
     MaxRenderDistanceMeters = GetClampedMaxRenderDistanceMeters();
     if (!IsValid(GEngine))
         return;

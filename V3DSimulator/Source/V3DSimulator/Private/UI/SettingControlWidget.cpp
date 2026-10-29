@@ -1,15 +1,66 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/SettingControlWidget.h"
+#include "UI/NativeWidgetTreeNames.h"
+#include "UI/HUDLegacyStyle.h"
+#include "UI/WidgetStyleSafety.h"
 #include "UI/SettingsMenuWidget.h"
 
 #include "Components/Button.h"
+#include "Components/ButtonSlot.h"
 #include "Components/ComboBoxString.h"
 #include "Components/Slider.h"
 #include "Components/TextBlock.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
+#include "Components/SizeBox.h"
+#include "Components/ScaleBox.h"
+#include "Components/ScaleBoxSlot.h"
+#include "Components/HorizontalBox.h"
+#include "Components/HorizontalBoxSlot.h"
+#include "Components/Widget.h"
+#include "Brushes/SlateColorBrush.h"
+
+namespace
+{
+    void ApplySettingRowComboTheme(UComboBoxString* Dropdown, FLinearColor Panel, FLinearColor Accent, FLinearColor Text)
+    {
+        FComboBoxStyle Style = Dropdown->GetWidgetStyle();
+        Style.ComboButtonStyle.ButtonStyle.Normal = FSlateColorBrush(Panel);
+        Style.ComboButtonStyle.ButtonStyle.Hovered = FSlateColorBrush(Accent);
+        Style.ComboButtonStyle.ButtonStyle.Pressed = FSlateColorBrush(
+            FLinearColor(Panel.R * .5f, Panel.G * .5f, Panel.B * .5f, Panel.A));
+        Style.ComboButtonStyle.DownArrowImage.ImageSize = FVector2D(32.f, 32.f);
+        Style.ComboButtonStyle.DownArrowImage.TintColor = FSlateColor(Text);
+        Style.ComboButtonStyle.MenuBorderPadding = FMargin(5.f);
+        Style.MenuRowPadding = FMargin(4.f);
+        V3DWidgetStyle::SetOwnedStyle(*Dropdown, Style);
+        FTableRowStyle Item = Dropdown->GetItemStyle();
+        Item.TextColor = FSlateColor(Text);
+        Item.SelectedTextColor = FSlateColor(Text);
+        V3DWidgetStyle::SetOwnedItemStyle(*Dropdown, Item);
+    }
+}
+
+USettingControlWidget::USettingControlWidget(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    FontObject = V3DHUDLegacyStyle::FindFontForConstructor();
+}
+
+UBooleanSettingWidget::UBooleanSettingWidget(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    FontSize = 32;
+    ValueFontSize = 16;
+}
+
+UFloatSettingWidget::UFloatSettingWidget(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    ValueFontSize = 12;
+}
 
 void USettingControlWidget::ConfigureSetting(USettingsMenuWidget* InOwner, ESettingsField InField)
 {
@@ -34,16 +85,37 @@ FText USettingControlWidget::GetSettingValueText() const
 
 TSharedRef<SWidget> UBooleanSettingWidget::RebuildWidget()
 {
-    if (GetClass() == StaticClass() && IsValid(WidgetTree) && !WidgetTree->RootWidget)
+    const bool bBuildNativeTree = NeedsNativeRow();
+    if (bBuildNativeTree)
     {
-        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), NAME_None);
-        WidgetTree->RootWidget = Root;
-        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Label"));
-        Root->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
-        UButton* Control = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), TEXT("Button"));
-        Root->AddChildToVerticalBox(Control)->SetPadding(FMargin(8.f));
-        UTextBlock* Value = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Value"));
-        Control->AddChild(Value);
+        BeginNativeRow();
+        UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>();
+        NativeRow = Row;
+        NativeRoot->SetContent(Row);
+        UHorizontalBoxSlot* LabelSlot = Row->AddChildToHorizontalBox(NativeLabel);
+        LabelSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        LabelSlot->SetVerticalAlignment(VAlign_Center);
+        UButton* Control = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(),
+            TEXT("Button"));
+        Row->AddChildToHorizontalBox(Control)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        UTextBlock* Value = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(),
+            TEXT("Value"));
+        Control->SetContent(Value);
+        UButtonSlot* ButtonSlot = CastChecked<UButtonSlot>(Value->Slot);
+        ButtonSlot->SetPadding(FMargin(0.f, 8.f, 0.f, 8.f));
+        ButtonSlot->SetHorizontalAlignment(HAlign_Fill);
+        ButtonSlot->SetVerticalAlignment(VAlign_Center);
+        Value->SetJustification(ETextJustify::Center);
+        NativeControl = Control;
+        NativeValue = Value;
+    }
+    BindNativeRowWidgets();
+    ApplyNativeRowStyle();
+    RefreshSettingWidget();
+    if (bBuildNativeTree)
+    {
+        V3DNativeWidgetTree::StabilizeNames(WidgetTree);
+        V3DNativeWidgetTree::BindBlueprintWidgets(this);
     }
     return Super::RebuildWidget();
 }
@@ -51,6 +123,7 @@ TSharedRef<SWidget> UBooleanSettingWidget::RebuildWidget()
 void UBooleanSettingWidget::NativeConstruct()
 {
     Super::NativeConstruct();
+    BindNativeRowWidgets();
     if (!AssignedToggleButton.IsValid()) SetToggleButton(Cast<UButton>(GetWidgetFromName(TEXT("Button"))));
     if (!AssignedLabelText.IsValid()) SetLabelTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Label"))));
     if (!AssignedValueText.IsValid()) SetValueTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Value"))));
@@ -82,7 +155,12 @@ void UBooleanSettingWidget::ConfigureSetting(USettingsMenuWidget* InOwner, ESett
 
 void UBooleanSettingWidget::RefreshSettingWidget()
 {
-    if (!IsValid(OwnerMenu)) return;
+    if (!IsValid(OwnerMenu))
+    {
+        if (UTextBlock* Text = AssignedLabelText.Get()) Text->SetText(PreviewLabel);
+        if (UTextBlock* Text = AssignedValueText.Get()) Text->SetText(NSLOCTEXT("V3DUI", "TogglePreview", "On"));
+        return;
+    }
 
     const FText Label = OwnerMenu->GetSettingLabelText(SettingField);
     const FText ValueText = OwnerMenu->GetPendingSettingValueText(SettingField);
@@ -90,11 +168,12 @@ void UBooleanSettingWidget::RefreshSettingWidget()
 
     if (UTextBlock* Text = AssignedLabelText.Get()) Text->SetText(Label);
     if (UTextBlock* Text = AssignedValueText.Get()) Text->SetText(ValueText);
-    BP_OnBooleanSettingUpdated(Label, bValue, ValueText);
+    if (!IsDesignTime()) BP_OnBooleanSettingUpdated(Label, bValue, ValueText);
 }
 
 void UBooleanSettingWidget::SetToggleButton(UButton* InButton)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InButton && InButton != NativeControl.Get()) return;
     if (UButton* Existing = AssignedToggleButton.Get())
     {
         Existing->OnClicked.RemoveDynamic(this, &UBooleanSettingWidget::HandleToggleClicked);
@@ -109,12 +188,14 @@ void UBooleanSettingWidget::SetToggleButton(UButton* InButton)
 
 void UBooleanSettingWidget::SetLabelTextBlock(UTextBlock* InTextBlock)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InTextBlock && InTextBlock != NativeLabel.Get()) return;
     AssignedLabelText = InTextBlock;
     RefreshSettingWidget();
 }
 
 void UBooleanSettingWidget::SetValueTextBlock(UTextBlock* InTextBlock)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InTextBlock && InTextBlock != NativeValue.Get()) return;
     AssignedValueText = InTextBlock;
     RefreshSettingWidget();
 }
@@ -139,16 +220,40 @@ void UBooleanSettingWidget::HandleToggleClicked()
 
 TSharedRef<SWidget> UFloatSettingWidget::RebuildWidget()
 {
-    if (GetClass() == StaticClass() && IsValid(WidgetTree) && !WidgetTree->RootWidget)
+    const bool bBuildNativeTree = NeedsNativeRow();
+    if (bBuildNativeTree)
     {
-        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), NAME_None);
-        WidgetTree->RootWidget = Root;
-        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Label"));
-        Root->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
-        USlider* Control = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), TEXT("Slider"));
-        Root->AddChildToVerticalBox(Control)->SetPadding(FMargin(8.f));
-        UTextBlock* Value = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Value"));
-        Root->AddChildToVerticalBox(Value)->SetPadding(FMargin(8.f));
+        BeginNativeRow();
+        UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>();
+        NativeRow = Row;
+        NativeRoot->SetContent(Row);
+        UHorizontalBoxSlot* LabelSlot = Row->AddChildToHorizontalBox(NativeLabel);
+        LabelSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        LabelSlot->SetVerticalAlignment(VAlign_Center);
+        NativeLabel->SetJustification(ETextJustify::Center);
+        UVerticalBox* ValueColumn = WidgetTree->ConstructWidget<UVerticalBox>();
+        Row->AddChildToHorizontalBox(ValueColumn)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        USlider* Control = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(),
+            TEXT("Slider"));
+        Control->SetMinValue(0.f);
+        Control->SetMaxValue(1.f);
+        Control->SetValue(.5f);
+        ValueColumn->AddChildToVerticalBox(Control)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        NativeControl = Control;
+        NativeValue = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(),
+            TEXT("Value"));
+        UVerticalBoxSlot* ValueSlot = ValueColumn->AddChildToVerticalBox(NativeValue);
+        ValueSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        ValueSlot->SetVerticalAlignment(VAlign_Center);
+        NativeValue->SetJustification(ETextJustify::Center);
+    }
+    BindNativeRowWidgets();
+    ApplyNativeRowStyle();
+    RefreshSettingWidget();
+    if (bBuildNativeTree)
+    {
+        V3DNativeWidgetTree::StabilizeNames(WidgetTree);
+        V3DNativeWidgetTree::BindBlueprintWidgets(this);
     }
     return Super::RebuildWidget();
 }
@@ -156,6 +261,7 @@ TSharedRef<SWidget> UFloatSettingWidget::RebuildWidget()
 void UFloatSettingWidget::NativeConstruct()
 {
     Super::NativeConstruct();
+    BindNativeRowWidgets();
     if (!AssignedSlider.IsValid()) SetSlider(Cast<USlider>(GetWidgetFromName(TEXT("Slider"))));
     if (!AssignedLabelText.IsValid()) SetLabelTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Label"))));
     if (!AssignedValueText.IsValid()) SetValueTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Value"))));
@@ -187,7 +293,12 @@ void UFloatSettingWidget::ConfigureSetting(USettingsMenuWidget* InOwner, ESettin
 
 void UFloatSettingWidget::RefreshSettingWidget()
 {
-    if (!IsValid(OwnerMenu)) return;
+    if (!IsValid(OwnerMenu))
+    {
+        if (UTextBlock* Text = AssignedLabelText.Get()) Text->SetText(PreviewLabel);
+        if (UTextBlock* Text = AssignedValueText.Get()) Text->SetText(NSLOCTEXT("V3DUI", "FloatPreview", "0.50"));
+        return;
+    }
 
     float MinValue = 0.0f;
     float MaxValue = 1.0f;
@@ -209,11 +320,12 @@ void UFloatSettingWidget::RefreshSettingWidget()
 
     if (UTextBlock* Text = AssignedLabelText.Get()) Text->SetText(Label);
     if (UTextBlock* Text = AssignedValueText.Get()) Text->SetText(ValueText);
-    BP_OnFloatSettingUpdated(Label, Value, MinValue, MaxValue, Step, ValueText);
+    if (!IsDesignTime()) BP_OnFloatSettingUpdated(Label, Value, MinValue, MaxValue, Step, ValueText);
 }
 
 void UFloatSettingWidget::SetSlider(USlider* InSlider)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InSlider && InSlider != NativeControl.Get()) return;
     if (USlider* Existing = AssignedSlider.Get())
     {
         Existing->OnValueChanged.RemoveDynamic(this, &UFloatSettingWidget::HandleSliderValueChanged);
@@ -229,12 +341,14 @@ void UFloatSettingWidget::SetSlider(USlider* InSlider)
 
 void UFloatSettingWidget::SetLabelTextBlock(UTextBlock* InTextBlock)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InTextBlock && InTextBlock != NativeLabel.Get()) return;
     AssignedLabelText = InTextBlock;
     RefreshSettingWidget();
 }
 
 void UFloatSettingWidget::SetValueTextBlock(UTextBlock* InTextBlock)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InTextBlock && InTextBlock != NativeValue.Get()) return;
     AssignedValueText = InTextBlock;
     RefreshSettingWidget();
 }
@@ -267,14 +381,39 @@ void UFloatSettingWidget::HandleSliderValueChanged(float Value)
 
 TSharedRef<SWidget> UEnumSettingWidget::RebuildWidget()
 {
-    if (GetClass() == StaticClass() && IsValid(WidgetTree) && !WidgetTree->RootWidget)
+    const bool bBuildNativeTree = NeedsNativeRow();
+    if (bBuildNativeTree)
     {
-        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), NAME_None);
-        WidgetTree->RootWidget = Root;
-        UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("Label"));
-        Root->AddChildToVerticalBox(Label)->SetPadding(FMargin(8.f));
-        UComboBoxString* Control = WidgetTree->ConstructWidget<UComboBoxString>(UComboBoxString::StaticClass(), TEXT("Dropdown"));
-        Root->AddChildToVerticalBox(Control)->SetPadding(FMargin(8.f));
+        BeginNativeRow();
+        UVerticalBox* Root = WidgetTree->ConstructWidget<UVerticalBox>();
+        NativeRow = Root;
+        NativeRoot->SetContent(Root);
+        NativeLabel->SetJustification(ETextJustify::Center);
+        NativeLabel->SetMinDesiredWidth(64.f);
+        UVerticalBoxSlot* LabelSlot = Root->AddChildToVerticalBox(NativeLabel);
+        LabelSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        LabelSlot->SetPadding(FMargin(8.f));
+        UComboBoxString* Control = WidgetTree->ConstructWidget<UComboBoxString>(UComboBoxString::StaticClass(),
+            TEXT("Dropdown"));
+        Control->OnGenerateWidgetEvent.BindDynamic(this, &UEnumSettingWidget::GenerateNativeOption);
+        Control->AddOption(TEXT("Low"));
+        Control->AddOption(TEXT("Medium"));
+        Control->AddOption(TEXT("High"));
+        Control->AddOption(TEXT("Epic"));
+        Control->SetSelectedOption(TEXT("High"));
+        UVerticalBoxSlot* DropdownSlot = Root->AddChildToVerticalBox(Control);
+        DropdownSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        DropdownSlot->SetPadding(FMargin(8.f));
+        NativeControl = Control;
+        NativeValue = nullptr;
+    }
+    BindNativeRowWidgets();
+    ApplyNativeRowStyle();
+    RefreshSettingWidget();
+    if (bBuildNativeTree)
+    {
+        V3DNativeWidgetTree::StabilizeNames(WidgetTree);
+        V3DNativeWidgetTree::BindBlueprintWidgets(this);
     }
     return Super::RebuildWidget();
 }
@@ -282,6 +421,7 @@ TSharedRef<SWidget> UEnumSettingWidget::RebuildWidget()
 void UEnumSettingWidget::NativeConstruct()
 {
     Super::NativeConstruct();
+    BindNativeRowWidgets();
     if (!AssignedDropdown.IsValid()) SetDropdown(Cast<UComboBoxString>(GetWidgetFromName(TEXT("Dropdown"))));
     if (!AssignedLabelText.IsValid()) SetLabelTextBlock(Cast<UTextBlock>(GetWidgetFromName(TEXT("Label"))));
     RefreshSettingWidget();
@@ -313,7 +453,11 @@ void UEnumSettingWidget::ConfigureSetting(USettingsMenuWidget* InOwner, ESetting
 
 void UEnumSettingWidget::RefreshSettingWidget()
 {
-    if (!IsValid(OwnerMenu)) return;
+    if (!IsValid(OwnerMenu))
+    {
+        if (UTextBlock* Text = AssignedLabelText.Get()) Text->SetText(PreviewLabel);
+        return;
+    }
 
     const FText Label = OwnerMenu->GetSettingLabelText(SettingField);
     const FText ValueText = OwnerMenu->GetPendingSettingValueText(SettingField);
@@ -334,11 +478,12 @@ void UEnumSettingWidget::RefreshSettingWidget()
 
     if (UTextBlock* Text = AssignedLabelText.Get()) Text->SetText(Label);
     if (UTextBlock* Text = AssignedValueText.Get()) Text->SetText(ValueText);
-    BP_OnEnumSettingUpdated(Label, Options, ValueText);
+    if (!IsDesignTime()) BP_OnEnumSettingUpdated(Label, Options, ValueText);
 }
 
 void UEnumSettingWidget::SetDropdown(UComboBoxString* InDropdown)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InDropdown && InDropdown != NativeControl.Get()) return;
     if (UComboBoxString* Existing = AssignedDropdown.Get())
     {
         Existing->OnSelectionChanged.RemoveDynamic(this, &UEnumSettingWidget::HandleSelectionChanged);
@@ -355,12 +500,14 @@ void UEnumSettingWidget::SetDropdown(UComboBoxString* InDropdown)
 
 void UEnumSettingWidget::SetLabelTextBlock(UTextBlock* InTextBlock)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InTextBlock && InTextBlock != NativeLabel.Get()) return;
     AssignedLabelText = InTextBlock;
     RefreshSettingWidget();
 }
 
 void UEnumSettingWidget::SetValueTextBlock(UTextBlock* InTextBlock)
 {
+    if (bUseNativeLayout && IsValid(NativeRoot) && InTextBlock && InTextBlock != NativeValue.Get()) return;
     AssignedValueText = InTextBlock;
     RefreshSettingWidget();
 }
@@ -398,4 +545,164 @@ void UEnumSettingWidget::RebuildDropdownOptions()
         Dropdown->AddOption(Option.ToString());
     }
     bInternalRefresh = false;
+}
+
+
+bool USettingControlWidget::NeedsNativeRow() const
+{
+    return bUseNativeLayout && IsValid(WidgetTree)
+        && (!IsValid(NativeScaleRoot) || WidgetTree->RootWidget != NativeScaleRoot);
+}
+
+void USettingControlWidget::BeginNativeRow()
+{
+    WidgetTree = NewObject<UWidgetTree>(this, NAME_None, RF_Transient);
+    NativeScaleRoot = WidgetTree->ConstructWidget<UScaleBox>();
+    // The enclosing HUD scales for resolution; this root must not distort its fonts.
+    NativeScaleRoot->SetStretch(EStretch::None);
+    WidgetTree->RootWidget = NativeScaleRoot;
+    NativeRoot = WidgetTree->ConstructWidget<USizeBox>();
+    NativeRoot->SetMinDesiredHeight(FMath::Clamp(FMath::IsFinite(RowMinHeight) ? RowMinHeight : 80.f, 32.f, 256.f));
+    NativeRoot->SetMinDesiredWidth(FMath::Clamp(FMath::IsFinite(RowMinWidth) ? RowMinWidth : 240.f, 1.f, 16384.f));
+    UScaleBoxSlot* ScaleSlot = CastChecked<UScaleBoxSlot>(NativeScaleRoot->AddChild(NativeRoot));
+    ScaleSlot->SetHorizontalAlignment(HAlign_Fill);
+    ScaleSlot->SetVerticalAlignment(VAlign_Fill);
+    NativeLabel = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(),
+        TEXT("Label"));
+    NativeLabel->SetText(PreviewLabel);
+    NativeValue = nullptr;
+}
+
+void USettingControlWidget::BindNativeRowWidgets()
+{
+}
+
+void USettingControlWidget::SynchronizeProperties()
+{
+    Super::SynchronizeProperties();
+    BindNativeRowWidgets();
+    ApplyNativeRowStyle();
+    RefreshSettingWidget();
+}
+
+void USettingControlWidget::NativePreConstruct()
+{
+    Super::NativePreConstruct();
+    BindNativeRowWidgets();
+    ApplyNativeRowStyle();
+    RefreshSettingWidget();
+}
+
+void USettingControlWidget::ApplyNativeRowStyle()
+{
+    if (!bUseNativeLayout) return;
+    if (IsValid(NativeRoot))
+    {
+        NativeRoot->SetMinDesiredHeight(FMath::Clamp(FMath::IsFinite(RowMinHeight) ? RowMinHeight : 80.f, 32.f, 256.f));
+        NativeRoot->SetMinDesiredWidth(FMath::Clamp(FMath::IsFinite(RowMinWidth) ? RowMinWidth : 240.f, 1.f, 16384.f));
+    }
+    for (UTextBlock* Text : {NativeLabel.Get(), NativeValue.Get()})
+    {
+        if (!IsValid(Text)) continue;
+        FSlateFontInfo Font = Text->GetFont();
+        V3DHUDLegacyStyle::ApplyFont(Font, FontObject,
+            FMath::Clamp(Text == NativeLabel.Get() ? FontSize : ValueFontSize, 8, 96), FontOutlineSize);
+        Text->SetFont(Font);
+        Text->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });
+    for (const TWeakObjectPtr<UTextBlock>& WeakText : NativeOptionLabels)
+    {
+        UTextBlock* Text = WeakText.Get();
+        if (!IsValid(Text)) continue;
+        FSlateFontInfo Font = Text->GetFont();
+        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
+        Text->SetFont(Font);
+        Text->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    if (UButton* Button = Cast<UButton>(NativeControl))
+    {
+        V3DHUDLegacyStyle::ApplyButton(*Button, PanelColor);
+        FButtonStyle Style = Button->GetStyle();
+        Style.Hovered.TintColor = FSlateColor(AccentColor);
+        V3DWidgetStyle::SetOwnedStyle(*Button, Style);
+    }
+    if (UComboBoxString* Dropdown = Cast<UComboBoxString>(NativeControl))
+        ApplySettingRowComboTheme(Dropdown, PanelColor, AccentColor, TextColor);
+}
+
+void UFloatSettingWidget::ApplyNativeRowStyle()
+{
+    Super::ApplyNativeRowStyle();
+    USlider* Slider = bUseNativeLayout ? Cast<USlider>(NativeControl) : nullptr;
+    if (!IsValid(Slider)) return;
+    FSliderStyle Style = Slider->GetWidgetStyle();
+    Style.NormalBarImage.TintColor = FSlateColor(SliderBarColor);
+    Style.HoveredBarImage.TintColor = FSlateColor(SliderHoveredBarColor);
+    const FVector2D ThumbSize(
+        FMath::Clamp(FMath::IsFinite(SliderThumbSize.X) ? SliderThumbSize.X : 16.0, 1.0, 512.0),
+        FMath::Clamp(FMath::IsFinite(SliderThumbSize.Y) ? SliderThumbSize.Y : 32.0, 1.0, 512.0));
+    Style.NormalThumbImage.ImageSize = ThumbSize;
+    Style.HoveredThumbImage.ImageSize = ThumbSize;
+    Style.DisabledThumbImage.ImageSize = ThumbSize;
+    Style.BarThickness = FMath::Clamp(FMath::IsFinite(SliderBarThickness) ? SliderBarThickness : 24.f, 1.f, 128.f);
+    V3DWidgetStyle::SetOwnedStyle(*Slider, Style);
+    Slider->SetSliderBarColor(FLinearColor::White);
+    Slider->SetSliderHandleColor(SliderHandleColor);
+}
+
+void USettingControlWidget::ApplyControlTheme(UObject* InFontObject, int32 InOutlineSize, FLinearColor InTextColor,
+    FLinearColor InPanelColor, FLinearColor InAccentColor, float InMinHeight)
+{
+    FontObject = InFontObject;
+    FontOutlineSize = FMath::Clamp(InOutlineSize, 0, 8);
+    TextColor = InTextColor;
+    PanelColor = InPanelColor;
+    AccentColor = InAccentColor;
+    RowMinHeight = FMath::Clamp(FMath::IsFinite(InMinHeight) ? InMinHeight : 80.f, 32.f, 256.f);
+    ApplyNativeRowStyle();
+}
+
+void UBooleanSettingWidget::BindNativeRowWidgets()
+{
+    if (!bUseNativeLayout || !IsValid(NativeRoot)) return;
+    if (AssignedToggleButton.Get() != NativeControl.Get()) SetToggleButton(Cast<UButton>(NativeControl));
+    AssignedLabelText = NativeLabel.Get();
+    AssignedValueText = NativeValue.Get();
+}
+
+void UFloatSettingWidget::BindNativeRowWidgets()
+{
+    if (!bUseNativeLayout || !IsValid(NativeRoot)) return;
+    if (AssignedSlider.Get() != NativeControl.Get()) SetSlider(Cast<USlider>(NativeControl));
+    AssignedLabelText = NativeLabel.Get();
+    AssignedValueText = NativeValue.Get();
+}
+
+void UEnumSettingWidget::BindNativeRowWidgets()
+{
+    if (!bUseNativeLayout || !IsValid(NativeRoot)) return;
+    if (AssignedDropdown.Get() != NativeControl.Get()) SetDropdown(Cast<UComboBoxString>(NativeControl));
+    AssignedLabelText = NativeLabel.Get();
+    AssignedValueText = NativeValue.Get();
+}
+
+
+UWidget* USettingControlWidget::GenerateNativeOption(FString Option)
+{
+    UTextBlock* Text = NewObject<UTextBlock>(this);
+    Text->SetText(FText::FromString(Option));
+    FSlateFontInfo Font = Text->GetFont();
+    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
+    Text->SetFont(Font);
+    Text->SetColorAndOpacity(FSlateColor(TextColor));
+    NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });
+    NativeOptionLabels.Add(Text);
+    return Text;
+}
+
+void USettingControlWidget::ReleaseSlateResources(bool bReleaseChildren)
+{
+    Super::ReleaseSlateResources(bReleaseChildren);
+    NativeOptionLabels.Reset();
 }

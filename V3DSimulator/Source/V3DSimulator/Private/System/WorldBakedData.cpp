@@ -15,12 +15,18 @@
 #include "Engine/Texture2D.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/ScopeExit.h"
 #include "PixelFormat.h"
 #include "Serialization/BulkData.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeParser.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Misc/AutomationTest.h"
+#include "UObject/StrongObjectPtr.h"
+#endif
 
 #include <type_traits>
 
@@ -156,14 +162,14 @@ namespace WorldBakedDataPrivate
     {
         OutBytes = 0;
         if (PixelFormat <= PF_Unknown || PixelFormat >= PF_MAX
-            || Mip.SizeX <= 0 || Mip.SizeY <= 0 || Mip.SizeZ != 1)
+            || Mip.SizeX <= 0 || Mip.SizeY <= 0 || Mip.SizeZ <= 0 || Mip.SizeZ > 2048)
         {
             return false;
         }
 
         const FPixelFormatInfo& Format = GPixelFormats[PixelFormat];
         if (!Format.Supported || Format.BlockSizeX <= 0 || Format.BlockSizeY <= 0
-            || Format.BlockSizeZ <= 0 || Format.BlockBytes <= 0)
+            || Format.BlockSizeZ != 1 || Format.BlockBytes <= 0)
         {
             return false;
         }
@@ -198,6 +204,30 @@ namespace WorldBakedDataPrivate
         {
             OutError = TEXT("A runtime material referenced an invalid texture");
             return false;
+        }
+
+        // glTFRuntime's built-in neutral textures are shader defaults, not external file
+        // dependencies. Embed their known constant pixels even when cooked CPU bulk is absent.
+        const FString ObjectPath = Texture->GetPathName();
+        const FString BuiltinName = Texture->GetName();
+        if (ObjectPath.StartsWith(TEXT("/glTFRuntime/"))
+            && (BuiltinName == TEXT("T_glTFRuntimeOne") || BuiltinName == TEXT("T_glTFRuntimeOne_sRGB")
+                || BuiltinName == TEXT("T_glTFRuntimeZero") || BuiltinName == TEXT("T_glTFRuntimeZero_sRGB")
+                || BuiltinName == TEXT("T_glTFRuntimeNormal")))
+        {
+            OutTexture.TextureId = TextureId; OutTexture.Name = BuiltinName;
+            OutTexture.SizeX = 1; OutTexture.SizeY = 1; OutTexture.PixelFormat = PF_R8G8B8A8;
+            OutTexture.AddressX = static_cast<uint8>(Texture->AddressX.GetValue());
+            OutTexture.AddressY = static_cast<uint8>(Texture->AddressY.GetValue());
+            OutTexture.Filter = static_cast<uint8>(Texture->Filter.GetValue());
+            OutTexture.LODGroup = static_cast<uint8>(Texture->LODGroup.GetValue());
+            OutTexture.bSRGB = Texture->SRGB;
+            FGWorldBakedTextureMip& Mip = OutTexture.Mips.AddDefaulted_GetRef();
+            Mip.SizeX = 1; Mip.SizeY = 1; Mip.SizeZ = 1;
+            if (BuiltinName == TEXT("T_glTFRuntimeNormal")) Mip.Bytes = {128,128,255,0};
+            else if (BuiltinName.StartsWith(TEXT("T_glTFRuntimeZero"))) Mip.Bytes = {0,0,0,0};
+            else Mip.Bytes = {255,255,255,255};
+            return true;
         }
 
         FTexturePlatformData* PlatformData = Texture->GetPlatformData();
@@ -288,6 +318,9 @@ namespace WorldBakedDataPrivate
             // reject solely on IsBulkDataLoaded(); the authoritative checks are payload size and
             // whether the lock returns a valid pointer.
             const void* SourceBytes = SourceMip.BulkData.LockReadOnly();
+            // A failed data load can still acquire BulkData's logical read lock. Release it on
+            // every exit so a failed terrain bake can be retried or destroyed safely.
+            ON_SCOPE_EXIT { SourceMip.BulkData.Unlock(); };
             if (!SourceBytes)
             {
                 OutError = FString::Printf(
@@ -303,7 +336,6 @@ namespace WorldBakedDataPrivate
             Mip.SizeZ = 1;
             Mip.Bytes.SetNumUninitialized(static_cast<int32>(BulkSize));
             FMemory::Memcpy(Mip.Bytes.GetData(), SourceBytes, static_cast<SIZE_T>(BulkSize));
-            SourceMip.BulkData.Unlock();
         }
         return true;
     }
@@ -407,6 +439,19 @@ namespace WorldBakedDataPrivate
             float Value = 0.0f;
             if (Material->GetScalarParameterValue(Info, Value) && FMath::IsFinite(Value))
             {
+                // FadeDistance is a shader policy (negative disables the near-camera fade), not
+                // glTF surface data. Baking an inherited default turns it into a permanent MID
+                // override and prevents later parent edits, such as restoring -1, from taking
+                // effect. Keep non-default instance values, including an authored positive fade.
+                if (Info.Name == TEXT("FadeDistance"))
+                {
+                    float ParentDefault = 0.0f;
+                    if (BaseMaterial->GetScalarParameterValue(Info, ParentDefault)
+                        && Value == ParentDefault)
+                    {
+                        continue;
+                    }
+                }
                 FGWorldBakedScalarParameter& Parameter = Captured.Scalars.AddDefaulted_GetRef();
                 Parameter.Name = Info.Name.ToString();
                 Parameter.Value = Value;
@@ -450,19 +495,13 @@ namespace WorldBakedDataPrivate
 
             FGWorldBakedTextureParameter& Parameter = Captured.Textures.AddDefaulted_GetRef();
             Parameter.Name = Info.Name.ToString();
-            if (IsPersistentCookedAsset(Texture))
-            {
-                // Engine/project defaults already ship as cooked assets. Referencing their stable
-                // object path avoids duplicating them into every model archive.
-                Parameter.AssetPath = Texture->GetPathName();
-                continue;
-            }
-
+            // Embed texture pixels for external readers, including persistent project defaults.
+            // Legacy archives can still contain AssetPath references; new captures do not emit them.
             UTexture2D* Texture2D = Cast<UTexture2D>(Texture);
             if (!Texture2D)
             {
                 OutError = FString::Printf(
-                    TEXT("Unsupported transient texture type on material %s parameter %s"),
+                    TEXT("Unsupported source texture type on material %s parameter %s; expected a readable UTexture2D"),
                     *GetNameSafe(Material), *Parameter.Name);
                 return INDEX_NONE;
             }
@@ -647,6 +686,8 @@ bool FGWorldBakedModel::IsSane(FString* OutError) const
     {
         const FGWorldBakedTexture& Texture = Textures[Index];
         if (Texture.TextureId != Index || Texture.SizeX <= 0 || Texture.SizeY <= 0
+            || Texture.NumLayers <= 0 || Texture.NumLayers > 2048
+            || (!Texture.bTextureArray && Texture.NumLayers != 1)
             || Texture.PixelFormat <= PF_Unknown || Texture.PixelFormat >= PF_MAX
             || Texture.AddressX >= static_cast<uint8>(TA_MAX)
             || Texture.AddressY >= static_cast<uint8>(TA_MAX)
@@ -662,6 +703,7 @@ bool FGWorldBakedModel::IsSane(FString* OutError) const
         {
             int64 ExpectedBytes = 0;
             if (Mip.SizeX != ExpectedSizeX || Mip.SizeY != ExpectedSizeY
+                || Mip.SizeZ != Texture.NumLayers
                 || !GetExpectedMipBytes(Texture.PixelFormat, Mip, ExpectedBytes)
                 || Mip.Bytes.Num() != ExpectedBytes)
             {
@@ -1034,3 +1076,51 @@ bool FGWorldBakedDataCapture::CaptureSkin(
     InOutModel.Skins.Add(MoveTemp(Skin));
     return true;
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedFadeDistanceInheritanceTest,
+    "V3DSimulator.Streaming.Materials.FadeDistanceInheritance",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedFadeDistanceInheritanceTest::RunTest(const FString&)
+{
+    UMaterialInterface* Parent = LoadObject<UMaterialInterface>(nullptr,
+        TEXT("/Game/Resources/Materials/V3D/MI_Opaque.MI_Opaque"));
+    if (!TestNotNull(TEXT("World material parent is available"), Parent)) return false;
+    TStrongObjectPtr<UMaterialInstanceDynamic> Instance(
+        UMaterialInstanceDynamic::Create(Parent, GetTransientPackage()));
+    if (!TestNotNull(TEXT("Source material instance is available"), Instance.Get())) return false;
+    const FMaterialParameterInfo FadeInfo(FName(TEXT("FadeDistance")));
+    float DefaultFade = 0.0f;
+    if (!TestTrue(TEXT("World shader exposes FadeDistance"),
+        Parent->GetMaterial()->GetScalarParameterValue(FadeInfo, DefaultFade))) return false;
+    TestEqual(TEXT("World shader disables camera fade by default"), DefaultFade, -1.0f);
+
+    const auto Capture = [this](UMaterialInterface* Material, FGWorldBakedModel& Model)
+    {
+        TMap<TWeakObjectPtr<UMaterialInterface>, int32> Materials;
+        TMap<TWeakObjectPtr<UTexture2D>, int32> Textures;
+        FString Error;
+        const int32 Id = WorldBakedDataPrivate::FindOrCaptureMaterial(Material,
+            TEXT("Fade inheritance regression"), Model, Materials, Textures, Error);
+        if (Id == INDEX_NONE) AddError(Error);
+        return Model.Materials.IsValidIndex(Id);
+    };
+    FGWorldBakedModel Inherited;
+    if (!Capture(Instance.Get(), Inherited)) return false;
+    TestFalse(TEXT("Inherited shader policy is not frozen into the archive"),
+        Inherited.Materials[0].Scalars.ContainsByPredicate([](const auto& Parameter)
+        { return Parameter.Name == TEXT("FadeDistance"); }));
+    TestTrue(TEXT("Imported surface scalars remain embedded"),
+        Inherited.Materials[0].Scalars.ContainsByPredicate([](const auto& Parameter)
+        { return Parameter.Name == TEXT("metallicFactor"); }));
+
+    constexpr float AuthoredFade = 250.0f;
+    Instance->SetScalarParameterValue(FadeInfo.Name, AuthoredFade);
+    FGWorldBakedModel Authored;
+    if (!Capture(Instance.Get(), Authored)) return false;
+    TestTrue(TEXT("A non-default authored fade remains an explicit archive value"),
+        Authored.Materials[0].Scalars.ContainsByPredicate([AuthoredFade](const auto& Parameter)
+        { return Parameter.Name == TEXT("FadeDistance") && Parameter.Value == AuthoredFade; }));
+    return true;
+}
+#endif

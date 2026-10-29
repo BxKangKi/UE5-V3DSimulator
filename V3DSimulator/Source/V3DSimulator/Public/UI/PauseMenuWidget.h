@@ -10,7 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Blueprint/UserWidget.h"
+#include "UI/ResponsiveHUDWidget.h"
 #include "PauseMenuWidget.generated.h"
 
 class UButton;
@@ -19,15 +19,20 @@ class UTextBlock;
 /**
  * Blueprint-editable pause menu base widget.
  *
- * Create the visual tree in a WBP child and pass widget references explicitly from the
- * WBP Construct event. This class does not use automatic widget-name binding or widget-tree lookup.
+ * Supplies its visual tree in C++, including the Blueprint designer preview. Class Defaults expose
+ * resolution, sizes and colours. Explicit setters remain available for custom Blueprint layouts.
  */
 UCLASS(Blueprintable, BlueprintType)
-class V3DSIMULATOR_API UPauseMenuWidget : public UUserWidget
+class V3DSIMULATOR_API UPauseMenuWidget : public UResponsiveHUDWidget
 {
     GENERATED_BODY()
 
 public:
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
+    FLinearColor PauseAccentColor = FLinearColor(.1f, .3f, .7f, .3f);
+
+    UPauseMenuWidget(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
 
@@ -55,6 +60,11 @@ public:
     /** Re-enables Exit after a rejected/failed level-travel request restores this cached widget. */
     void ResetExitRequestState();
 
+protected:
+    virtual void BuildNativeLayout() override;
+    virtual void ApplyNativeStyle() override;
+    virtual void BindNativeWidgets() override;
+
 private:
     void BindButtonEvents();
     void UnbindButtonEvents();
@@ -63,6 +73,13 @@ private:
     TWeakObjectPtr<UButton> AssignedContinueButton;
     TWeakObjectPtr<UButton> AssignedSettingsButton;
     TWeakObjectPtr<UButton> AssignedExitButton;
+
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativePanel;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativePauseAccent;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeTitle;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeContinue;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeSettings;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeExit;
 
     /** Prevents one click or duplicate Blueprint bindings from issuing more than one level travel. */
     bool bExitRequestInProgress = false;

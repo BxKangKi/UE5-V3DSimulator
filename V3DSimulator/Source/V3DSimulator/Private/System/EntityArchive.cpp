@@ -31,6 +31,12 @@ namespace EntityArchivePrivate
     constexpr uint32 StatePayloadMagic = 0x31545345u; // "EST1"
     constexpr uint16 PayloadVersion = 2;
     constexpr int32 MaxObjectsPerChunk = 1000000;
+    // Decoder UUID set, actor weak slots, spawn indices and allocator slack overlap the payload.
+    constexpr int64 EstimatedDecodedRowBytes = static_cast<int64>(sizeof(FWorldChunkObject)) + 128;
+    int64 EstimateChunkPeakBytes(const int64 Bytes)
+    {
+        return Bytes + (Bytes / 212) * EstimatedDecodedRowBytes;
+    }
     constexpr int32 MaxPlayers = 10000;
     constexpr int32 MaxItemsPerPlayer = 65536;
     constexpr int32 MaxNameBytes = 4096;
@@ -1020,10 +1026,22 @@ bool FEntityArchiveStore::ContainsChunk(
     return ChunkRecords.Contains(Coordinate);
 }
 
+int64 FEntityArchiveStore::EstimateChunkLoadBytes(const FWorldChunkCoordinate& Coordinate) const
+{
+    FScopeLock Lock(&Mutex);
+    const FRecord* Record = ChunkRecords.Find(Coordinate);
+    if (!Record) return 0;
+    // The bounded decoder requires at least 212 encoded bytes for every output object. Both
+    // arrays overlap while decoding; reserve both instead of charging only the on-disk range.
+    const int64 Bytes = static_cast<int64>(Record->Size);
+    return EntityArchivePrivate::EstimateChunkPeakBytes(Bytes);
+}
+
 bool FEntityArchiveStore::LoadChunk(
     const FWorldChunkCoordinate& Coordinate,
     TArray<FWorldChunkObject>& OutObjects,
-    FString& OutError) const
+    FString& OutError,
+    const int64 MaxTransientBytes) const
 {
     using namespace EntityArchivePrivate;
     OutObjects.Reset();
@@ -1033,6 +1051,15 @@ bool FEntityArchiveStore::LoadChunk(
         const FRecord* Found = ChunkRecords.Find(Coordinate);
         if (!Found) return true; // A missing spatial chunk is a valid empty chunk.
         Record = *Found;
+    }
+    const int64 EncodedBytes = static_cast<int64>(Record.Size);
+    const int64 RequiredBytes = EstimateChunkPeakBytes(EncodedBytes);
+    if (RequiredBytes > MaxTransientBytes)
+    {
+        // A concurrent append may publish a larger cell after admission examined the directory.
+        // Retry with its new estimate instead of allocating beyond the granted reservation.
+        OutError = TEXT("Entity chunk changed size after memory admission; retry required");
+        return false;
     }
     TArray<uint8> Bytes;
     return ReadRecordPayload(Path, Record, MaxChunkPayloadBytes, Bytes, OutError)

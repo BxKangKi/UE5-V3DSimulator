@@ -31,7 +31,7 @@
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/ProjectConfig.h"
 #include "TimerManager.h"
-#include "UI/StartWorldWidget.h"
+#include "UI/MainWorldWidget.h"
 #include "UI/WorldSelectionWidget.h"
 #include "UI/SettingsMenuWidget.h"
 #include "UI/ProjectSelectionWidget.h"
@@ -45,7 +45,7 @@
 
 namespace
 {
-    FString NormalizeStartWorldString(FString Value)
+    FString NormalizeMainWorldString(FString Value)
     {
         Value.TrimStartAndEndInline();
         return Value;
@@ -129,7 +129,7 @@ AMainGameMode::AMainGameMode()
     // compatibility/override path for projects that explicitly construct a custom instance.
 }
 
-void AMainGameMode::SetStartMenuWidget(UStartWorldWidget* InWidget)
+void AMainGameMode::SetStartMenuWidget(UMainWorldWidget* InWidget)
 {
     StartMenuWidget = InWidget;
     if (IsValid(InWidget))
@@ -148,7 +148,7 @@ void AMainGameMode::SetWorldSelectionWidget(UWorldSelectionWidget* InWidget)
     }
 }
 
-void AMainGameMode::SetMultiplayerMenuWidget(UStartWorldWidget* InWidget)
+void AMainGameMode::SetMultiplayerMenuWidget(UMainWorldWidget* InWidget)
 {
     MultiplayerMenuWidget = InWidget;
     if (IsValid(InWidget))
@@ -188,9 +188,7 @@ bool AMainGameMode::EnsureSettingsMenuWidget()
         UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous();
         if (!IsUsableWidgetClass(WidgetClass, USettingsMenuWidget::StaticClass()))
         {
-            UE_LOG(LogTemp, Error, TEXT("Cannot load settings menu class: %s"),
-                *Registry->SettingsMenuWidgetClass.ToSoftObjectPath().ToString());
-            return false;
+            WidgetClass = USettingsMenuWidget::StaticClass();
         }
         SetSettingsWidget(CreateWidget<USettingsMenuWidget>(PlayerController, WidgetClass));
     }
@@ -414,16 +412,11 @@ bool AMainGameMode::InitializeRegistryDrivenUI()
     if (!IsValid(StartMenuWidget))
     {
         UClass* WidgetClass = Registry->StartMenuWidgetClass.LoadSynchronous();
-        if (!IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
+        if (!IsUsableWidgetClass(WidgetClass, UMainWorldWidget::StaticClass()))
         {
-            LastStartScreenFailure = FString::Printf(
-                TEXT("StartMenu class load/validation failed: path=%s resolved=%s expectedBase=%s flags=0x%08x"),
-                *Registry->StartMenuWidgetClass.ToSoftObjectPath().ToString(),
-                *GetPathNameSafe(WidgetClass), *UStartWorldWidget::StaticClass()->GetPathName(),
-                IsValid(WidgetClass) ? static_cast<uint32>(WidgetClass->GetClassFlags()) : 0u);
-            return false;
+            WidgetClass = UMainWorldWidget::StaticClass();
         }
-        UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
+        UMainWorldWidget* Widget = CreateWidget<UMainWorldWidget>(PlayerController, WidgetClass);
         if (!IsValid(Widget))
         {
             LastStartScreenFailure = FString::Printf(
@@ -437,30 +430,28 @@ bool AMainGameMode::InitializeRegistryDrivenUI()
         if (bStartupEnding) return false;
     }
 
-    if (!IsValid(WorldSelectionWidget) && !Registry->WorldSelectionWidgetClass.IsNull())
+    if (!IsValid(WorldSelectionWidget))
     {
-        if (UClass* WidgetClass = Registry->WorldSelectionWidgetClass.LoadSynchronous();
-            IsUsableWidgetClass(WidgetClass, UWorldSelectionWidget::StaticClass()))
-        {
-            UWorldSelectionWidget* Widget = CreateWidget<UWorldSelectionWidget>(PlayerController, WidgetClass);
-            if (bStartupEnding) return false;
-            SetWorldSelectionWidget(Widget);
-            AddTopLevelWidget(Widget, 11);
-            if (bStartupEnding) return false;
-        }
+        UClass* WidgetClass = Registry->WorldSelectionWidgetClass.LoadSynchronous();
+        if (!IsUsableWidgetClass(WidgetClass, UWorldSelectionWidget::StaticClass()))
+            WidgetClass = UWorldSelectionWidget::StaticClass();
+        UWorldSelectionWidget* Widget = CreateWidget<UWorldSelectionWidget>(PlayerController, WidgetClass);
+        if (bStartupEnding) return false;
+        SetWorldSelectionWidget(Widget);
+        AddTopLevelWidget(Widget, 11);
+        if (bStartupEnding) return false;
     }
 
-    if (!IsValid(MultiplayerMenuWidget) && !Registry->MultiplayerMenuWidgetClass.IsNull())
+    if (!IsValid(MultiplayerMenuWidget))
     {
-        if (UClass* WidgetClass = Registry->MultiplayerMenuWidgetClass.LoadSynchronous();
-            IsUsableWidgetClass(WidgetClass, UStartWorldWidget::StaticClass()))
-        {
-            UStartWorldWidget* Widget = CreateWidget<UStartWorldWidget>(PlayerController, WidgetClass);
-            if (bStartupEnding) return false;
-            SetMultiplayerMenuWidget(Widget);
-            AddTopLevelWidget(Widget, 12);
-            if (bStartupEnding) return false;
-        }
+        UClass* WidgetClass = Registry->MultiplayerMenuWidgetClass.LoadSynchronous();
+        if (!IsUsableWidgetClass(WidgetClass, UMainWorldWidget::StaticClass()))
+            WidgetClass = UMultiplayerMenuWidget::StaticClass();
+        UMainWorldWidget* Widget = CreateWidget<UMainWorldWidget>(PlayerController, WidgetClass);
+        if (bStartupEnding) return false;
+        SetMultiplayerMenuWidget(Widget);
+        AddTopLevelWidget(Widget, 12);
+        if (bStartupEnding) return false;
     }
 
     EnsureSettingsMenuWidget();
@@ -629,7 +620,7 @@ void AMainGameMode::ShowWorldSelectionMenu()
     ApplyMenuInputMode(WorldSelectionWidget.Get());
     if (bWorldSelectionReturnInputGuardActive)
     {
-        StartWorldSelectionReturnInputGuard();
+        BeginWorldSelectionReturnInputGuard();
     }
 }
 
@@ -688,7 +679,7 @@ bool AMainGameMode::TryResolveWorldFolderKey(const FString& WorldFolderKey, FStr
 
 const FV3DWorldLaunchProfile* AMainGameMode::FindWorldLaunchProfile(const FString& WorldFolderName) const
 {
-    const FString NormalizedFolderName = NormalizeStartWorldString(WorldFolderName);
+    const FString NormalizedFolderName = NormalizeMainWorldString(WorldFolderName);
     if (NormalizedFolderName.IsEmpty())
     {
         return nullptr;
@@ -704,7 +695,7 @@ const FV3DWorldLaunchProfile* AMainGameMode::FindWorldLaunchProfile(const FStrin
     const FV3DWorldLaunchProfile* Match = nullptr;
     for (const FV3DWorldLaunchProfile& Profile : Registry->WorldLaunchProfiles)
     {
-        const FString ProfileFolderName = NormalizeStartWorldString(Profile.WorldFolderName);
+        const FString ProfileFolderName = NormalizeMainWorldString(Profile.WorldFolderName);
         if (!ProfileFolderName.Equals(NormalizedFolderName, ESearchCase::IgnoreCase))
         {
             continue;
@@ -950,7 +941,7 @@ void AMainGameMode::OpenClientConnectionWorld(const FString& InServerAddress)
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
         Multiplayer->SetServerAddress(PendingServerAddress);
-        Multiplayer->OpenClientConnectionWorld(this, ClientWorld);
+        if (!Multiplayer->OpenClientConnectionWorld(this, ClientWorld)) ShowMultiplayerMenu();
     }
 }
 
@@ -971,7 +962,8 @@ void AMainGameMode::JoinMultiplayerServer(const FString& InServerAddress, const 
     PrepareMenuForWorldTravel();
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        Multiplayer->JoinMultiplayerWorld(this, PendingServerAddress, OptionalWorldFolderName);
+        if (!Multiplayer->JoinMultiplayerWorld(this, PendingServerAddress, OptionalWorldFolderName)
+            && !Multiplayer->CanCancelConnection()) ShowMultiplayerMenu();
     }
 }
 
@@ -1013,7 +1005,7 @@ void AMainGameMode::HandleGameplayTravelWatchdogExpired()
     ShowWorldSelectionMenu();
 }
 
-void AMainGameMode::StartWorldSelectionReturnInputGuard()
+void AMainGameMode::BeginWorldSelectionReturnInputGuard()
 {
     bWorldSelectionReturnInputGuardActive = true;
     if (IsValid(WorldSelectionWidget))

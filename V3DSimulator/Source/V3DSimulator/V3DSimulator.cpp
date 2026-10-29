@@ -23,6 +23,9 @@
 #include "System/V3DRuntimeSafety.h"
 #include "System/V3DStreamingBudget.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/CoreRedirects.h"
+#include "Misc/Paths.h"
+#include "ShaderCore.h"
 
 namespace
 {
@@ -42,6 +45,22 @@ namespace
 void FV3DSimulatorModule::StartupModule()
 {
     FDefaultGameModuleImpl::StartupModule();
+    // Register before loading any menu Blueprint. This preserves existing saved parent-class
+    // references without replacing the user's DefaultEngine.ini during a source-only upgrade.
+    TArray<FCoreRedirect> MainWorldRedirects;
+    MainWorldRedirects.Emplace(ECoreRedirectFlags::Type_Class,
+        TEXT("/Script/V3DSimulator.StartWorldWidget"), TEXT("/Script/V3DSimulator.MainWorldWidget"));
+    MainWorldRedirects.Emplace(ECoreRedirectFlags::Type_Enum,
+        TEXT("/Script/V3DSimulator.EStartWorldScreen"), TEXT("/Script/V3DSimulator.EMainWorldScreen"));
+    FCoreRedirects::AddRedirectList(MainWorldRedirects, TEXT("V3DSimulator.MainWorldRename"));
+    // Materials compile during editor/cook; packaged games use their cooked
+    // shaders and need not ship the plaintext source directory.
+    const FString V3DShaderDirectory = FPaths::Combine(FPaths::ProjectDir(), TEXT("Shaders"));
+    if (FPaths::DirectoryExists(V3DShaderDirectory)
+        && !AllShaderSourceDirectoryMappings().Contains(TEXT("/V3D")))
+    {
+        AddShaderSourceDirectoryMapping(TEXT("/V3D"), V3DShaderDirectory);
+    }
     FSimulatorFileServices::WriteStartupLog(TEXT("=== V3DSimulator module started ==="));
     PostLoadMapHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddRaw(
         this, &FV3DSimulatorModule::HandlePostLoadMap);

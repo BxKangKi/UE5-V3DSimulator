@@ -1,22 +1,117 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/BuildStatusWidget.h"
+#include "UI/HUDLegacyStyle.h"
+#include "Components/Overlay.h"
+#include "Components/OverlaySlot.h"
+#include "Components/SizeBox.h"
 
+#include "Blueprint/WidgetTree.h"
+#include "Components/Border.h"
+#include "Components/Button.h"
 #include "Components/PanelWidget.h"
 #include "Components/ProgressBar.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
+#include "Components/VerticalBox.h"
+#include "Components/VerticalBoxSlot.h"
 #include "Engine/World.h"
 #include "TimerManager.h"
 #include "System/GameManagerSubSystem.h"
-#include "System/V3DSimulatorAssetRegistry.h"
-#include "System/V3DSimulatorGameInstance.h"
 #include "UI/MenuButtonWidget.h"
+
+UBuildStatusWidget::UBuildStatusWidget(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    PanelSize = FVector2D(1920.f, 1080.f);
+    BackgroundColor = V3DHUDLegacyStyle::LoadingBackground;
+    AccentColor = V3DHUDLegacyStyle::ProgressFill;
+    BodyFontSize = 16;
+    ButtonHeight = 44.f;
+    FontOutlineSize = 1;
+    SetIsFocusable(true);
+}
+
+void UBuildStatusWidget::BuildNativeLayout()
+{
+    UBorder* Panel = AddPanel(PanelSize, FVector2D::ZeroVector);
+    UOverlay* Body = WidgetTree->ConstructWidget<UOverlay>();
+    Panel->SetContent(Body);
+    NativeProgressBar = WidgetTree->ConstructWidget<UProgressBar>();
+    UOverlaySlot* ProgressSlot = Body->AddChildToOverlay(NativeProgressBar);
+    ProgressSlot->SetHorizontalAlignment(HAlign_Fill);
+    ProgressSlot->SetVerticalAlignment(VAlign_Bottom);
+    ProgressSlot->SetPadding(FMargin(0.f, 0.f, 0.f, 20.f));
+
+    USizeBox* OutputSize = WidgetTree->ConstructWidget<USizeBox>();
+    OutputSize->SetWidthOverride(900.f);
+    UOverlaySlot* OutputPlacement = Body->AddChildToOverlay(OutputSize);
+    OutputPlacement->SetHorizontalAlignment(HAlign_Right);
+    OutputPlacement->SetVerticalAlignment(VAlign_Bottom);
+    OutputPlacement->SetPadding(FMargin(60.f));
+    UVerticalBox* Output = WidgetTree->ConstructWidget<UVerticalBox>();
+    OutputSize->SetContent(Output);
+    NativeProjectText = AddText(Output, FText::GetEmpty());
+    NativeProjectText->SetJustification(ETextJustify::Right);
+    NativePercentText = AddText(Output, FText::GetEmpty());
+    NativePercentText->SetJustification(ETextJustify::Right);
+    USizeBox* TerminalSize = WidgetTree->ConstructWidget<USizeBox>();
+    TerminalSize->SetHeightOverride(180.f);
+    Output->AddChildToVerticalBox(TerminalSize);
+    NativeOutputScroll = WidgetTree->ConstructWidget<UScrollBox>();
+    TerminalSize->SetContent(NativeOutputScroll);
+    NativeStatusText = AddText(NativeOutputScroll, FText::GetEmpty());
+    NativeStatusText->SetAutoWrapText(true);
+    NativeStatusText->SetJustification(ETextJustify::Right);
+    NativeConfirmButton = AddButton(Output, NSLOCTEXT("V3DHUD", "Confirm", "Confirm"));
+}
+
+void UBuildStatusWidget::BindNativeWidgets()
+{
+    if (!IsUsingNativeLayout()) return;
+    StatusTextBlock = NativeStatusText;
+    OutputScrollBox = NativeOutputScroll;
+    AssignedProgressBar = NativeProgressBar;
+    PercentTextBlock = NativePercentText;
+    ProjectNameTextBlock = NativeProjectText;
+    if (IsValid(NativeConfirmButton) && !IsDesignTime())
+    {
+        NativeConfirmButton->OnClicked.AddUniqueDynamic(this, &UBuildStatusWidget::RequestConfirm);
+    }
+}
+
+void UBuildStatusWidget::ApplyNativeStyle()
+{
+    Super::ApplyNativeStyle();
+    if (!IsUsingNativeLayout()) return;
+    if (IsValid(NativeProgressBar)) NativeProgressBar->SetFillColorAndOpacity(AccentColor);
+    if (IsDesignTime())
+    {
+        if (IsValid(NativeProjectText)) NativeProjectText->SetText(NSLOCTEXT("V3DHUD", "BuildExampleProject", "Example project"));
+        if (IsValid(NativeStatusText)) NativeStatusText->SetText(NSLOCTEXT("V3DHUD", "BuildExampleStatus", "Reading project metadata...\nBuilding models in parallel...\nWriting archive data..."));
+        if (IsValid(NativeProgressBar)) NativeProgressBar->SetPercent(0.62f);
+        if (IsValid(NativePercentText)) NativePercentText->SetText(FText::FromString(TEXT("62%")));
+        if (IsValid(NativeConfirmButton)) NativeConfirmButton->SetVisibility(ESlateVisibility::Visible);
+        return;
+    }
+    UpdateAssignedWidgets();
+}
+
+void UBuildStatusWidget::NativeConstruct()
+{
+    Super::NativeConstruct();
+    if (!IsDesignTime()) UpdateAssignedWidgets();
+}
 
 void UBuildStatusWidget::NativeDestruct()
 {
+    ++ObservationRevision;
     CancelAutoClose();
     UnbindManager();
+    if (IsValid(NativeConfirmButton))
+    {
+        NativeConfirmButton->OnClicked.RemoveDynamic(this, &UBuildStatusWidget::RequestConfirm);
+    }
 
     if (IsValid(ConfirmButtonWidget))
     {
@@ -26,7 +121,6 @@ void UBuildStatusWidget::NativeDestruct()
     ConfirmButtonWidget = nullptr;
 
     ConfirmButtonHost.Reset();
-    ResolvedConfirmButtonWidgetClass = nullptr;
     StatusTextBlock.Reset();
     OutputScrollBox.Reset();
     AssignedProgressBar.Reset();
@@ -37,30 +131,35 @@ void UBuildStatusWidget::NativeDestruct()
 
 void UBuildStatusWidget::SetStatusTextBlock(UTextBlock* InTextBlock)
 {
+    if (!AcceptWidgetAssignment(InTextBlock)) return;
     StatusTextBlock = InTextBlock;
     UpdateAssignedWidgets();
 }
 
 void UBuildStatusWidget::SetOutputScrollBox(UScrollBox* InScrollBox)
 {
+    if (!AcceptWidgetAssignment(InScrollBox)) return;
     OutputScrollBox = InScrollBox;
     UpdateAssignedWidgets();
 }
 
 void UBuildStatusWidget::SetProgressBar(UProgressBar* InProgressBar)
 {
+    if (!AcceptWidgetAssignment(InProgressBar)) return;
     AssignedProgressBar = InProgressBar;
     UpdateAssignedWidgets();
 }
 
 void UBuildStatusWidget::SetPercentTextBlock(UTextBlock* InTextBlock)
 {
+    if (!AcceptWidgetAssignment(InTextBlock)) return;
     PercentTextBlock = InTextBlock;
     UpdateAssignedWidgets();
 }
 
 void UBuildStatusWidget::SetProjectNameTextBlock(UTextBlock* InTextBlock)
 {
+    if (!AcceptWidgetAssignment(InTextBlock)) return;
     ProjectNameTextBlock = InTextBlock;
     UpdateAssignedWidgets();
 }
@@ -74,6 +173,7 @@ void UBuildStatusWidget::ClearBuildOutput()
 
 void UBuildStatusWidget::SetConfirmButtonWidget(UMenuButtonWidget* InWidget)
 {
+    if (!AcceptWidgetAssignment(InWidget)) return;
     if (ConfirmButtonWidget.Get() == InWidget && !bGeneratedConfirmButtonWidget)
     {
         UpdateAssignedWidgets();
@@ -99,6 +199,7 @@ void UBuildStatusWidget::SetConfirmButtonWidget(UMenuButtonWidget* InWidget)
 
 void UBuildStatusWidget::SetConfirmButtonHost(UPanelWidget* InHost)
 {
+    if (!AcceptWidgetAssignment(InHost)) return;
     if (ConfirmButtonHost.Get() == InHost)
     {
         EnsureConfirmButtonWidget();
@@ -122,6 +223,7 @@ void UBuildStatusWidget::SetConfirmButtonHost(UPanelWidget* InHost)
 
 UMenuButtonWidget* UBuildStatusWidget::EnsureConfirmButtonWidget()
 {
+    if (IsDesignTime() || IsUsingNativeLayout()) return nullptr;
     if (IsValid(ConfirmButtonWidget))
     {
         return ConfirmButtonWidget.Get();
@@ -133,37 +235,25 @@ UMenuButtonWidget* UBuildStatusWidget::EnsureConfirmButtonWidget()
         return nullptr;
     }
 
-    UClass* ConfirmClass = ResolvedConfirmButtonWidgetClass.Get();
-    if (!IsValid(ConfirmClass))
-    {
-        UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
-        if (!IsValid(Registry) || Registry->BuildStatusConfirmWidgetClass.IsNull())
-        {
-            return nullptr;
-        }
-        ConfirmClass = Registry->BuildStatusConfirmWidgetClass.LoadSynchronous();
-        if (!IsValid(ConfirmClass) || !ConfirmClass->IsChildOf(UMenuButtonWidget::StaticClass()))
-        {
-            UE_LOG(LogTemp, Error, TEXT("AssetRegistry BuildStatusConfirmWidgetClass is invalid."));
-            return nullptr;
-        }
-        ResolvedConfirmButtonWidgetClass = ConfirmClass;
-    }
-
+    // Custom top-level layouts may keep their host API, but shared controls are code-only.
     UMenuButtonWidget* const Widget = Cast<UMenuButtonWidget>(
-        UUserWidget::CreateWidgetInstance(*this, ConfirmClass, NAME_None));
+        UUserWidget::CreateWidgetInstance(*this, UMenuButtonWidget::StaticClass(), NAME_None));
 
     if (!IsValid(Widget))
     {
-        UE_LOG(LogTemp, Warning, TEXT("BuildStatusWidget failed to create AssetRegistry.BuildStatusConfirmWidgetClass."));
+        UE_LOG(LogTemp, Warning, TEXT("BuildStatusWidget failed to create its native Confirm button."));
         return nullptr;
     }
 
-    Host->AddChild(Widget);
     ConfirmButtonWidget = Widget;
     bGeneratedConfirmButtonWidget = true;
     BindConfirmButtonWidget(Widget);
     Widget->ConfigureButton(TEXT("Confirm"), TEXT("Confirm"));
+    Widget->ButtonMinSize.X = 0.0;
+    Widget->FontObject = FontObject;
+    Widget->FontOutlineSize = FontOutlineSize;
+    Widget->ApplyButtonTheme(TextColor, ButtonColor, HoveredButtonTint, BodyFontSize, ButtonHeight);
+    Host->AddChild(Widget);
     return Widget;
 }
 
@@ -203,6 +293,9 @@ void UBuildStatusWidget::UnbindConfirmButtonWidget(UMenuButtonWidget* InWidget)
 
 void UBuildStatusWidget::BeginObservingBuild(const FString& ProjectName)
 {
+    if (IsDesignTime()) return;
+    ++ObservationRevision;
+    bConfirmationSent = false;
     CancelAutoClose();
     ObservedProjectName = ProjectName.TrimStartAndEnd();
     bHasTerminalResult = false;
@@ -220,10 +313,17 @@ void UBuildStatusWidget::BeginObservingBuild(const FString& ProjectName)
 
 void UBuildStatusWidget::StopObservingBuild()
 {
+    ++ObservationRevision;
     CancelAutoClose();
     UnbindManager();
     ObservedProjectName.Reset();
     BuildPhase = EProjectBuildPhase::Idle;
+}
+
+void UBuildStatusWidget::ReportBuildRejected(const FString& Message)
+{
+    if (IsDesignTime() || bHasTerminalResult || IsBuildActive()) return;
+    HandleBuildCompleted(false, Message);
 }
 
 bool UBuildStatusWidget::IsBuildActive() const
@@ -263,13 +363,16 @@ void UBuildStatusWidget::UnbindManager()
 
 void UBuildStatusWidget::HandleBuildProgress(const float Progress)
 {
-    DisplayedProgress = FMath::Max(DisplayedProgress, FMath::Clamp(Progress, 0.0f, 1.0f));
+    if (bHasTerminalResult || bConfirmationSent) return;
+    if (FMath::IsFinite(Progress))
+        DisplayedProgress = FMath::Max(DisplayedProgress, FMath::Clamp(Progress, 0.0f, 1.0f));
     bHasTerminalResult = false;
     RefreshBuildStatus();
 }
 
 void UBuildStatusWidget::HandleBuildCompleted(const bool bSuccess, const FString& Message)
 {
+    const uint64 CompletedRevision = ObservationRevision;
     CancelAutoClose();
     bHasTerminalResult = true;
     bLastBuildSucceeded = bSuccess;
@@ -280,10 +383,13 @@ void UBuildStatusWidget::HandleBuildCompleted(const bool bSuccess, const FString
     BuildPhase = bSuccess ? EProjectBuildPhase::Completed : EProjectBuildPhase::Failed;
     AppendOutputLine(DisplayedMessage);
     UpdateAssignedWidgets();
-    OnBuildStatusUpdated.Broadcast(DisplayedProgress, DisplayedMessage, BuildPhase);
-    OnBuildFinished.Broadcast(bSuccess, DisplayedMessage);
+    const FString TerminalMessage = DisplayedMessage;
+    const EProjectBuildPhase TerminalPhase = BuildPhase;
+    OnBuildStatusUpdated.Broadcast(1.0f, TerminalMessage, TerminalPhase);
+    OnBuildFinished.Broadcast(bSuccess, TerminalMessage);
 
-    if (bSuccess && bAutoCloseOnSuccess)
+    // Blueprint callbacks may confirm this result, begin another build, or remove this view.
+    if (CompletedRevision == ObservationRevision && !bConfirmationSent && bSuccess && bAutoCloseOnSuccess)
     {
         ScheduleAutoClose();
     }
@@ -322,15 +428,16 @@ EProjectBuildPhase UBuildStatusWidget::ResolvePhase() const
 
 void UBuildStatusWidget::RefreshBuildStatus()
 {
+    if (IsDesignTime()) return;
     if (!IsValid(Manager))
     {
         BindManager(UGameManagerSubSystem::GetSubSystem(this));
     }
     if (IsValid(Manager))
     {
-        DisplayedProgress = FMath::Max(
-            DisplayedProgress,
-            FMath::Clamp(Manager->GetProjectBuildProgress(), 0.0f, 1.0f));
+        const float Progress = Manager->GetProjectBuildProgress();
+        if (FMath::IsFinite(Progress))
+            DisplayedProgress = FMath::Max(DisplayedProgress, FMath::Clamp(Progress, 0.0f, 1.0f));
         const FString Message = Manager->GetLastMessage();
         if (!Message.IsEmpty() && Message != DisplayedMessage)
         {
@@ -391,6 +498,7 @@ void UBuildStatusWidget::RebuildOutputText()
 
 void UBuildStatusWidget::ScheduleAutoClose()
 {
+    if (IsDesignTime()) return;
     CancelAutoClose();
 
     if (!bHasTerminalResult || !bLastBuildSucceeded || !bAutoCloseOnSuccess)
@@ -398,7 +506,7 @@ void UBuildStatusWidget::ScheduleAutoClose()
         return;
     }
 
-    if (AutoCloseDelaySeconds <= KINDA_SMALL_NUMBER)
+    if (!FMath::IsFinite(AutoCloseDelaySeconds) || AutoCloseDelaySeconds <= KINDA_SMALL_NUMBER)
     {
         HandleAutoCloseTimer();
         return;
@@ -435,11 +543,15 @@ void UBuildStatusWidget::HandleAutoCloseTimer()
 
 void UBuildStatusWidget::UpdateAssignedWidgets()
 {
+    if (IsDesignTime()) return;
+    bool bOutputChanged = false;
     if (UTextBlock* Text = StatusTextBlock.Get())
     {
-        Text->SetText(FText::FromString(BuildOutputText.IsEmpty() ? DisplayedMessage : BuildOutputText));
+        const FText Value = FText::FromString(BuildOutputText.IsEmpty() ? DisplayedMessage : BuildOutputText);
+        bOutputChanged = !Text->GetText().EqualTo(Value);
+        if (bOutputChanged) Text->SetText(Value);
     }
-    if (UScrollBox* ScrollBox = OutputScrollBox.Get())
+    if (UScrollBox* ScrollBox = OutputScrollBox.Get(); bOutputChanged && IsValid(ScrollBox))
     {
         ScrollBox->ScrollToEnd();
     }
@@ -457,9 +569,14 @@ void UBuildStatusWidget::UpdateAssignedWidgets()
         Text->SetText(FText::FromString(ObservedProjectName));
     }
 
-    if (UMenuButtonWidget* ConfirmWidget = EnsureConfirmButtonWidget())
+    const bool bShowConfirm = bHasTerminalResult && !bConfirmationSent && !IsBuildActive();
+    if (IsUsingNativeLayout() && IsValid(NativeConfirmButton))
     {
-        const bool bShowConfirm = bHasTerminalResult && !IsBuildActive();
+        NativeConfirmButton->SetIsEnabled(bShowConfirm);
+        NativeConfirmButton->SetVisibility(bShowConfirm ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    }
+    else if (UMenuButtonWidget* ConfirmWidget = EnsureConfirmButtonWidget())
+    {
         ConfirmWidget->SetIsEnabled(bShowConfirm);
         ConfirmWidget->SetVisibility(bShowConfirm ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
     }
@@ -467,17 +584,19 @@ void UBuildStatusWidget::UpdateAssignedWidgets()
 
 void UBuildStatusWidget::RequestConfirm()
 {
-    if (IsBuildActive() || !bHasTerminalResult)
+    if (IsBuildActive() || !bHasTerminalResult || bConfirmationSent)
     {
         return;
     }
 
     CancelAutoClose();
+    bConfirmationSent = true;
+    const uint64 ConfirmedRevision = ObservationRevision;
     SetVisibility(ESlateVisibility::Collapsed);
     OnConfirmed.Broadcast();
 
     // Keep the terminal result available during the callbacks, then detach from the manager.
-    if (IsValid(Manager))
+    if (ConfirmedRevision == ObservationRevision && IsValid(Manager))
     {
         StopObservingBuild();
     }

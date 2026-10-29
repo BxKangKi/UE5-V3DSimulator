@@ -20,6 +20,10 @@ namespace GlbValidation
     /** Validates a binary glTF container without parsing mesh data. */
     V3DSIMULATOR_API bool ValidateFile(const FString& FilePath, FString& OutReason);
 
+    /** Bounded GLB/glTF authoring container and local-resource validation, without rejecting
+     * extension-owned mesh encodings. Pure file/JSON work; safe on a worker thread. */
+    V3DSIMULATOR_API bool ValidateSourceFile(const FString& FilePath, FString& OutReason);
+
     /**
      * Performs the expensive authoring preflight on a worker before the build-only glTFRuntime
      * parser is called. JSON types, buffer ranges, accessors, primitives and allocation estimates

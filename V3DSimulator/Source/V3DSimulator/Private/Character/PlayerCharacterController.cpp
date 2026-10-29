@@ -9,6 +9,7 @@
  */
 
 #include "Character/PlayerCharacterController.h"
+#include "Character/MouseLookPolicy.h"
 #include "Character/CharacterControllerMovementComponent.h"
 #include "Camera/PlayerCameraManager.h"
 #include "Character/CharacterController.h"
@@ -21,9 +22,13 @@
 #include "InputMappingContext.h"
 #include "InputCoreTypes.h"
 #include "Model/WorldSceneStreamingSubsystem.h"
+#include "Setting/GameSettings.h"
 #include "UI/CreatorHUDWidget.h"
+#include "UI/DebugHUDWidget.h"
+#include "UI/LoadingHUDWidget.h"
 #include "UI/PauseMenuWidget.h"
 #include "UI/SettingsMenuWidget.h"
+#include "UI/SurvivalHUDWidget.h"
 #include "Vehicle/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/V3DSimulatorGameInstance.h"
@@ -40,6 +45,10 @@
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
+#include "Misc/Paths.h"
+#include "Net/UnrealNetwork.h"
+#include "World/PlayerData.h"
+#include "World/WorldData.h"
 
 namespace
 {
@@ -127,6 +136,7 @@ void APlayerCharacterController::OpenSimulationChat()
     if (!IsValid(SimulationChat)) SimulationChat = CreateWidget<USimulatorChatWidget>(this, USimulatorChatWidget::StaticClass());
     if (!SimulationChat) return;
     if (!SimulationChat->IsInViewport()) SimulationChat->AddToViewport(1000);
+    RefreshSurvivalHUD();
     ClearLatchedMovementInput();
     UWidgetBlueprintLibrary::SetInputMode_UIOnlyEx(this, SimulationChat, EMouseLockMode::DoNotLock, true);
     bShowMouseCursor = true;
@@ -209,8 +219,7 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
     UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
     if (!IsValid(Registry))
     {
-        UE_LOG(LogTemp, Error, TEXT("PlayerCharacterController cannot initialize registry-driven UI because the central AssetRegistry is unavailable."));
-        return;
+        UE_LOG(LogTemp, Warning, TEXT("AssetRegistry unavailable; using native gameplay HUD defaults."));
     }
 
     const auto AddTopLevelWidget = [](UUserWidget* Widget, const int32 ZOrder)
@@ -221,53 +230,57 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
         }
     };
 
-    if (!IsValid(CreatorHUDWidget) && !Registry->CreatorHUDWidgetClass.IsNull())
+    // Native defaults keep every HUD available when a stale or missing Blueprint is configured.
+    if (IsValid(Registry)) Registry->EnsureMenuDefaults();
+    const auto ResolveWidgetClass = [](UClass* Candidate, UClass* NativeClass)
     {
-        if (UClass* WidgetClass = Registry->CreatorHUDWidgetClass.LoadSynchronous();
-            IsUsablePlayerWidgetClass(WidgetClass, UCreatorHUDWidget::StaticClass()))
-        {
-            UCreatorHUDWidget* Widget = CreateWidget<UCreatorHUDWidget>(this, WidgetClass);
-            SetCreatorHUDWidget(Widget);
-            AddTopLevelWidget(Widget, 0);
-        }
+        return IsUsablePlayerWidgetClass(Candidate, NativeClass) ? Candidate : NativeClass;
+    };
+
+    if (!IsValid(CreatorHUDWidget))
+    {
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->CreatorHUDWidgetClass.LoadSynchronous() : nullptr, UCreatorHUDWidget::StaticClass());
+        UCreatorHUDWidget* Widget = CreateWidget<UCreatorHUDWidget>(this, WidgetClass);
+        SetCreatorHUDWidget(Widget);
+        AddTopLevelWidget(Widget, 0);
     }
 
-    if (!IsValid(DebugWidget) && !Registry->DebugWidgetClass.IsNull())
+    // This HUD has no Blueprint dependency, including in projects with an older central registry.
+    if (!IsValid(SurvivalHUDWidget))
     {
-        if (UClass* WidgetClass = Registry->DebugWidgetClass.LoadSynchronous();
-            IsUsablePlayerWidgetClass(WidgetClass, UUserWidget::StaticClass()))
-        {
-            UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
-            SetDebugWidget(Widget);
-            AddTopLevelWidget(Widget, 40);
-        }
+        SurvivalHUDWidget = CreateWidget<USurvivalHUDWidget>(this, USurvivalHUDWidget::StaticClass());
+        AddTopLevelWidget(SurvivalHUDWidget, 10);
+        RefreshSurvivalHUD();
     }
 
-    if (!IsValid(PauseMenuWidget) && !Registry->PauseMenuWidgetClass.IsNull())
+    if (!IsValid(DebugWidget) || !DebugWidget->IsA<UDebugHUDWidget>())
     {
-        if (UClass* WidgetClass = Registry->PauseMenuWidgetClass.LoadSynchronous();
-            IsUsablePlayerWidgetClass(WidgetClass, UPauseMenuWidget::StaticClass()))
-        {
-            UPauseMenuWidget* Widget = CreateWidget<UPauseMenuWidget>(this, WidgetClass);
-            SetPauseMenuWidget(Widget);
-            AddTopLevelWidget(Widget, 50);
-        }
+        if (IsValid(DebugWidget)) DebugWidget->RemoveFromParent();
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->DebugWidgetClass.LoadSynchronous() : nullptr, UDebugHUDWidget::StaticClass());
+        UDebugHUDWidget* Widget = CreateWidget<UDebugHUDWidget>(this, WidgetClass);
+        SetDebugWidget(Widget);
+        AddTopLevelWidget(Widget, 40);
+    }
+
+    if (!IsValid(PauseMenuWidget))
+    {
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->PauseMenuWidgetClass.LoadSynchronous() : nullptr, UPauseMenuWidget::StaticClass());
+        UPauseMenuWidget* Widget = CreateWidget<UPauseMenuWidget>(this, WidgetClass);
+        SetPauseMenuWidget(Widget);
+        AddTopLevelWidget(Widget, 50);
     }
 
     EnsurePauseSettingsWidget();
 
-    if (IsValid(SubSystem) && !SubSystem->HasLoadingWidget() && !Registry->LoadingWidgetClass.IsNull())
+    if (IsValid(SubSystem) && !SubSystem->HasLoadingWidget())
     {
-        if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous();
-            IsUsablePlayerWidgetClass(WidgetClass, UUserWidget::StaticClass()))
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->LoadingWidgetClass.LoadSynchronous() : nullptr, ULoadingHUDWidget::StaticClass());
+        ULoadingHUDWidget* Widget = CreateWidget<ULoadingHUDWidget>(this, WidgetClass);
+        if (IsValid(Widget))
         {
-            UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
-            if (IsValid(Widget))
-            {
-                Widget->SetVisibility(ESlateVisibility::Collapsed);
-                AddTopLevelWidget(Widget, 100);
-                SubSystem->SetLoadingWidget(Widget);
-            }
+            Widget->SetVisibility(ESlateVisibility::Collapsed);
+            AddTopLevelWidget(Widget, 100);
+            SubSystem->SetLoadingWidget(Widget);
         }
     }
 }
@@ -458,6 +471,8 @@ void APlayerCharacterController::OnPossess(APawn* InPawn)
     Super::OnPossess(InPawn);
 
     RegisterPrimaryCharacterPawn(InPawn);
+    RefreshAuthoritativePlayerHealthDisplay();
+    RefreshSurvivalHUD();
 
     // A streamed character or vehicle can be possessed after the original loading UI has already
     // changed focus. Clear stale held state and recover mappings/focus on the next game-thread tick.
@@ -495,10 +510,17 @@ void APlayerCharacterController::OnPossess(APawn* InPawn)
     }
 }
 
+void APlayerCharacterController::OnUnPossess()
+{
+    Super::OnUnPossess();
+    RefreshSurvivalHUD();
+}
+
 void APlayerCharacterController::AcknowledgePossession(APawn* InPawn)
 {
     Super::AcknowledgePossession(InPawn);
     RegisterPrimaryCharacterPawn(InPawn);
+    RefreshSurvivalHUD();
 }
 
 void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
@@ -554,10 +576,12 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
     if (IsValid(SimulationChat)) SimulationChat->RemoveFromParent();
     SimulationChat = nullptr;
     if (IsValid(CreatorHUDWidget)) CreatorHUDWidget->RemoveFromParent();
+    if (IsValid(SurvivalHUDWidget)) SurvivalHUDWidget->RemoveFromParent();
     if (IsValid(DebugWidget)) DebugWidget->RemoveFromParent();
     if (IsValid(PauseMenuWidget)) PauseMenuWidget->RemoveFromParent();
     if (IsValid(SettingsMenuWidget)) SettingsMenuWidget->RemoveFromParent();
     CreatorHUDWidget = nullptr;
+    SurvivalHUDWidget = nullptr;
     DebugWidget = nullptr;
     PauseMenuWidget = nullptr;
     SettingsMenuWidget = nullptr;
@@ -589,6 +613,81 @@ void APlayerCharacterController::UpdateFromGameUpdate(float DeltaSeconds)
     bPrevWorldLoading = bWorldLoadingNow;
     bPrevGamePaused = bGamePausedNow;
 
+    if (HasAuthority())
+    {
+        if (FMath::IsFinite(DeltaSeconds) && DeltaSeconds > 0.0f)
+            HealthDisplayRefreshElapsed += DeltaSeconds;
+        if (HealthDisplayRefreshElapsed >= 0.1f)
+        {
+            HealthDisplayRefreshElapsed = 0.0f;
+            RefreshAuthoritativePlayerHealthDisplay();
+        }
+    }
+    RefreshSurvivalHUD();
+}
+
+void APlayerCharacterController::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME_CONDITION(APlayerCharacterController, PlayerHealthDisplayState, COND_OwnerOnly);
+}
+
+void APlayerCharacterController::RefreshAuthoritativePlayerHealthDisplay()
+{
+    if (!HasAuthority()) return;
+
+    FPlayerHealthDisplayState NextState;
+    const UGameManagerSubSystem* Manager = IsValid(SubSystem)
+        ? SubSystem.Get() : UGameManagerSubSystem::FindGameManager(this);
+    const UWorldData* WorldData = IsValid(Manager) ? Manager->GetWorldData() : nullptr;
+    const UPlayerData* PlayerData = IsValid(Manager) ? Manager->GetPlayerData() : nullptr;
+    if (IsValid(Manager) && IsValid(WorldData) && IsValid(PlayerData) && !Manager->IsWorldLoading())
+    {
+        NextState.bSurvivalMode = Manager->GetPlayMode() == EPlayMode::RealLife;
+        // The existing save format keys health by the world's selected character record. Read it
+        // afresh, rather than retaining a pointer into Players across loads or character switches.
+        const FString PlayerId = WorldData->Player.IsEmpty()
+            ? FString(TEXT("Player")) : FPaths::GetCleanFilename(WorldData->Player);
+        const FWorldPlayerRecord* Record = PlayerData->FindPlayer(PlayerId);
+        const float MaximumHealth = WorldData->Gameplay.PlayerMaxHealth;
+        if (Record && FMath::IsFinite(Record->Health)
+            && FMath::IsFinite(MaximumHealth) && MaximumHealth > 0.0f)
+        {
+            NextState.bHasState = true;
+            NextState.MaximumHealth = MaximumHealth;
+            NextState.CurrentHealth = FMath::Clamp(Record->Health, 0.0f, MaximumHealth);
+        }
+    }
+
+    if (PlayerHealthDisplayState.bHasState != NextState.bHasState
+        || PlayerHealthDisplayState.bSurvivalMode != NextState.bSurvivalMode
+        || PlayerHealthDisplayState.CurrentHealth != NextState.CurrentHealth
+        || PlayerHealthDisplayState.MaximumHealth != NextState.MaximumHealth)
+    {
+        PlayerHealthDisplayState = NextState;
+        ForceNetUpdate();
+        RefreshSurvivalHUD();
+    }
+}
+
+void APlayerCharacterController::OnRep_PlayerHealthDisplayState()
+{
+    RefreshSurvivalHUD();
+}
+
+void APlayerCharacterController::RefreshSurvivalHUD()
+{
+    if (!IsValid(SurvivalHUDWidget)) return;
+    const bool bShowHealth = IsLocalController() && IsValid(GetPawn())
+        && PlayerHealthDisplayState.bHasState && PlayerHealthDisplayState.bSurvivalMode
+        && IsValid(SubSystem) && !SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()
+        && !bUIInputMode && !bMenuWorldTravelPending
+        && !(IsValid(SimulationChat) && SimulationChat->IsInViewport());
+    const ESlateVisibility Visibility = bShowHealth
+        ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed;
+    if (SurvivalHUDWidget->GetVisibility() != Visibility) SurvivalHUDWidget->SetVisibility(Visibility);
+    if (bShowHealth)
+        SurvivalHUDWidget->SetHealth(PlayerHealthDisplayState.CurrentHealth, PlayerHealthDisplayState.MaximumHealth);
 }
 
 void APlayerCharacterController::ApplyGameInputMode()
@@ -620,6 +719,7 @@ void APlayerCharacterController::ApplyGameInputMode()
     }
 
     bUIInputMode = false;
+    RefreshSurvivalHUD();
     UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
     UWidgetBlueprintLibrary::SetFocusToGameViewport();
     bShowMouseCursor = !bHideMouseCursorDuringGameplay;
@@ -655,6 +755,7 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
     }
 
     bUIInputMode = true;
+    RefreshSurvivalHUD();
     UUserWidget* SafeFocusWidget = IsValid(WidgetToFocus) && WidgetToFocus->IsFocusable()
         ? WidgetToFocus
         : nullptr;
@@ -674,6 +775,7 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
 void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocus)
 {
     bUIInputMode = true;
+    RefreshSurvivalHUD();
     // Loading-screen roots are commonly non-focusable. Passing one to SetInputMode causes Slate
     // to emit "Attempting to focus Non-Focusable widget SObjectWidget" on every build/load.
     UUserWidget* SafeFocusWidget = IsValid(WidgetToFocus) && WidgetToFocus->IsFocusable()
@@ -768,6 +870,7 @@ void APlayerCharacterController::FinalizeGameplayInputRecovery()
 void APlayerCharacterController::LockInputForMenuWorldTravel()
 {
     bUIInputMode = true;
+    RefreshSurvivalHUD();
     StopGameplayMotionForUI();
 
     // Remove the old menu from hit testing and prevent its initiating click/key release from being
@@ -1204,21 +1307,42 @@ void APlayerCharacterController::Input_Move(const FVector2D& MoveValue)
     }
 }
 
+float APlayerCharacterController::GetEffectiveLookSensitivity() const
+{
+    // Do not call GetGameManager here: that helper can start a client gameplay session.
+    // Reading the live settings also applies slider changes without a graphics refresh,
+    // an input rebind, or a per-frame settings-file read.
+    const UGameManagerSubSystem* Manager = IsValid(SubSystem.Get())
+        ? SubSystem.Get() : UGameManagerSubSystem::FindGameManager(this);
+    const UGameSettings* Settings = IsValid(Manager) ? Manager->GetGameSettings() : nullptr;
+    return V3DMouseLook::EffectiveSensitivity(LookSensitivity,
+        IsValid(Settings) ? Settings->GetClampedMouseSensitivity() : 1.0f);
+}
+
 void APlayerCharacterController::Input_Look(const FVector2D& LookValue)
 {
-    if (bUIInputMode)
+    if (bUIInputMode || IsLookInputIgnored())
+    {
+        return;
+    }
+
+    float Yaw = 0.0f;
+    float Pitch = 0.0f;
+    // A Blueprint caller can bypass Enhanced Input's normal value range. Validate before
+    // narrowing to float so an invalid vehicle/free-camera delta never poisons RotationInput.
+    if (!V3DMouseLook::TryScaleInput(LookValue.X, LookValue.Y, GetEffectiveLookSensitivity(), Yaw, Pitch))
     {
         return;
     }
 
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
-        CharacterCtrl->CameraInput(LookValue.X, LookValue.Y, LookSensitivity);
+        CharacterCtrl->CameraInput(Yaw, Pitch, 1.0f);
     }
     else
     {
-        AddYawInput(LookValue.X * LookSensitivity);
-        AddPitchInput(LookValue.Y * LookSensitivity);
+        AddYawInput(Yaw);
+        AddPitchInput(Pitch);
     }
 }
 
@@ -1544,7 +1668,7 @@ void APlayerCharacterController::Input_DebugPressed()
     }
 
     bIsDebug = !bIsDebug;
-    DebugWidget->SetVisibility(bIsDebug ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    DebugWidget->SetVisibility(bIsDebug ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
 }
 
 void APlayerCharacterController::Input_PausePressed()
@@ -1661,14 +1785,11 @@ bool APlayerCharacterController::EnsurePauseSettingsWidget()
     if (!IsValid(SettingsMenuWidget))
     {
         UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
-        if (!IsValid(Registry)) return false;
-        Registry->EnsureMenuDefaults();
-        UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous();
+        if (IsValid(Registry)) Registry->EnsureMenuDefaults();
+        UClass* WidgetClass = IsValid(Registry) ? Registry->SettingsMenuWidgetClass.LoadSynchronous() : nullptr;
         if (!IsUsablePlayerWidgetClass(WidgetClass, USettingsMenuWidget::StaticClass()))
         {
-            UE_LOG(LogTemp, Error, TEXT("Cannot load pause settings menu class: %s"),
-                *Registry->SettingsMenuWidgetClass.ToSoftObjectPath().ToString());
-            return false;
+            WidgetClass = USettingsMenuWidget::StaticClass();
         }
         SetSettingsMenuWidget(CreateWidget<USettingsMenuWidget>(this, WidgetClass));
     }
