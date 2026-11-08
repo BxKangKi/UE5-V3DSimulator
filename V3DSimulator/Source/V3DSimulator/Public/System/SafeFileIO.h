@@ -145,6 +145,13 @@ public:
      */
     static bool DispatchTrackedGameThread(FTrackedTask Task, bool bCompleteDuringShutdown = false);
 
+    /**
+     * Always queues through the bounded normal-frame pump, including game-thread callers.
+     * Requeued work may run later in the same pump slice, but never recursively inline.
+     * Shutdown suppression and terminal-cleanup rules match DispatchTrackedGameThread.
+     */
+    static bool DispatchTrackedGameThreadDeferred(FTrackedTask Task, bool bCompleteDuringShutdown = false);
+
     /** Returns true after BeginShutdown has stopped new asynchronous work. */
     static bool IsShuttingDown();
 

@@ -20,6 +20,7 @@
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/GameUpdateSubSystem.h"
 #include "System/SafeFileIO.h"
+#include "System/SimulatorFileServices.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
@@ -203,20 +204,24 @@ ACharacterController::ACharacterController(const FObjectInitializer& ObjectIniti
 
 void ACharacterController::BeginPlay()
 {
+    const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Character.BeginPlay: ") + GetName());
     Super::BeginPlay();
     if (UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this))
     {
-        DefaultPhysicsAsset = Registry->DefaultCharacterPhysicsAsset.IsNull()
-            ? nullptr : Registry->DefaultCharacterPhysicsAsset.LoadSynchronous();
-        DefaultSkeleton = Registry->DefaultCharacterSkeleton.IsNull()
-            ? nullptr : Registry->DefaultCharacterSkeleton.LoadSynchronous();
-        DefaultMaterial = Registry->DefaultCharacterMaterial.IsNull()
-            ? nullptr : Registry->DefaultCharacterMaterial.LoadSynchronous();
-        DefaultSkeletalMesh = Registry->DefaultCharacterSkeletalMesh.IsNull()
-            ? nullptr : Registry->DefaultCharacterSkeletalMesh.LoadSynchronous();
+        // These authored pawn defaults can also load before GameMode's BeginPlay. Record each
+        // boundary separately so a package/AnimBP stall is visible without the editor's log UI.
+        const auto LoadDefault = [](const auto& Reference)
+        {
+            const FScopedSimulatorLoadCheckpoint AssetCheckpoint(
+                TEXT("Character.DefaultAsset: ") + Reference.ToSoftObjectPath().ToString());
+            return Reference.IsNull() ? nullptr : Reference.LoadSynchronous();
+        };
+        DefaultPhysicsAsset = LoadDefault(Registry->DefaultCharacterPhysicsAsset);
+        DefaultSkeleton = LoadDefault(Registry->DefaultCharacterSkeleton);
+        DefaultMaterial = LoadDefault(Registry->DefaultCharacterMaterial);
+        DefaultSkeletalMesh = LoadDefault(Registry->DefaultCharacterSkeletalMesh);
 
-        UClass* ResolvedAnimClass = Registry->DefaultCharacterAnimInstanceClass.IsNull()
-            ? nullptr : Registry->DefaultCharacterAnimInstanceClass.LoadSynchronous();
+        UClass* ResolvedAnimClass = LoadDefault(Registry->DefaultCharacterAnimInstanceClass);
         DefaultAnimInstanceClass = IsValid(ResolvedAnimClass)
             && ResolvedAnimClass->IsChildOf(UAnimInstance::StaticClass())
             && !ResolvedAnimClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)

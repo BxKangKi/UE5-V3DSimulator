@@ -11,6 +11,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "TimerManager.h"
 #include "CharacterLoadAsyncAction.generated.h"
@@ -79,8 +80,13 @@ private:
     FTimerHandle GameThreadStageTimer;
     bool bCancelled = false;
     bool bFinished = false;
+    /** Native-only archive table work remains alive until its tracked GT cleanup callback. */
+    bool bTableReadInFlight = false;
+    TSharedPtr<TAtomic<bool>, ESPMode::ThreadSafe> TableReadCancellation;
     /** A requested .dat bundle read / mesh finalizer is active. Game-thread owned. */
     bool bMeshLoadInFlight = false;
+    /** Cancels only this request's queued reads/material work, never the shared facade. */
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> MeshLoadCancellation;
     int32 ModelDatabaseRetryCount = 0;
 
     /** Mesh/skin pair selected from the baked node table. */

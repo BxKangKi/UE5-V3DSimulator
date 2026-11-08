@@ -75,7 +75,7 @@ bool FResolvedRuntimeModel::IsValid() const
         && !DefinitionJson.IsEmpty() && ArchiveReader.IsValid();
 }
 
-bool FRuntimeModelResolver::Resolve(
+bool FRuntimeModelResolver::ResolveDirectory(
     const UObject* WorldContextObject,
     const FString& Reference,
     FResolvedRuntimeModel& OutModel,
@@ -112,9 +112,7 @@ bool FRuntimeModelResolver::Resolve(
 
     if (!Database->FindUUIDForReference(Reference, OutModel.UUID)
         || !Database->ResolveLoadable(
-            OutModel.UUID, OutModel.Definition, OutModel.Reference)
-        || !Database->LoadDefinitionDetails(
-            OutModel.UUID, OutModel.Definition, OutModel.DefinitionJson, OutError))
+            OutModel.UUID, OutModel.Definition, OutModel.Reference))
     {
         if (OutError.IsEmpty())
         {
@@ -124,9 +122,30 @@ bool FRuntimeModelResolver::Resolve(
         return false;
     }
     OutModel.ArchiveReader = Database->GetArchiveReaderForModel(OutModel.UUID);
-    if (!OutModel.IsValid())
+    if (!OutModel.ArchiveReader.IsValid())
     {
         OutError = FString::Printf(TEXT("built model record is incomplete: %s"), *Reference);
+        OutModel = FResolvedRuntimeModel();
+        return false;
+    }
+    return true;
+}
+
+bool FRuntimeModelResolver::Resolve(
+    const UObject* WorldContextObject,
+    const FString& Reference,
+    FResolvedRuntimeModel& OutModel,
+    FString& OutError)
+{
+    if (!ResolveDirectory(WorldContextObject, Reference, OutModel, OutError)) return false;
+    const UModelDatabaseSubsystem* Database = WorldContextObject->GetWorld()->GetGameInstance()
+        ->GetSubsystem<UModelDatabaseSubsystem>();
+    if (!Database->LoadDefinitionDetails(
+            OutModel.UUID, OutModel.Definition, OutModel.DefinitionJson, OutError)
+        || !OutModel.IsValid())
+    {
+        if (OutError.IsEmpty())
+            OutError = FString::Printf(TEXT("built model record is incomplete: %s"), *Reference);
         OutModel = FResolvedRuntimeModel();
         return false;
     }

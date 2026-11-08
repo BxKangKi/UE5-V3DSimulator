@@ -10,12 +10,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "glTFRuntimeAsset.h"
 #include "System/WorldArchive.h"
 #include "WorldBakedModelAsset.generated.h"
 
 struct FResolvedRuntimeModel;
 struct FWorldBakedBuildReferenceGuard;
+struct FWorldBakedMaterialAttachment;
 struct FWorldBakedDependencyReadState;
 class UWorldBakedModelAsset;
 
@@ -179,13 +181,16 @@ public:
         int32 MeshIndex,
         int32 SkinIndex,
         FGWorldBakedSkeletalMeshNativeCallback Callback,
-        const FglTFRuntimeSkeletalMeshConfig& Config);
+        const FglTFRuntimeSkeletalMeshConfig& Config,
+        TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation = nullptr);
 
 private:
     friend class UWorldBakedMeshFinalizeRequest;
     friend class FV3DBakedRequestReferencesTest;
     friend class FV3DTerrainRuntimeBindingsTest;
     friend class FV3DBakedFadeDistancePolicyTest;
+    friend class FV3DBakedMaterialAttachmentSlicesTest;
+    friend struct FWorldBakedMaterialAttachment;
 
     FGuid UUID;
     FString Reference;
@@ -220,7 +225,8 @@ private:
     void LoadStaticMeshLODsAdmitted(const TArray<int32>& MeshIndices,
         FGWorldBakedStaticMeshNativeCallback Callback, const FglTFRuntimeStaticMeshConfig& Config);
     void LoadSkeletalMeshAdmitted(int32 MeshIndex, int32 SkinIndex,
-        FGWorldBakedSkeletalMeshNativeCallback Callback, const FglTFRuntimeSkeletalMeshConfig& Config);
+        FGWorldBakedSkeletalMeshNativeCallback Callback, const FglTFRuntimeSkeletalMeshConfig& Config,
+        TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation);
 
     /**
      * Pending/active decoded-data finalizers. Archive I/O and RuntimeLOD conversion are completed
@@ -276,7 +282,8 @@ private:
         const FglTFRuntimeSkeletalMeshConfig& Config,
         FGWorldBakedSkeletalMeshNativeCallback Callback,
         const FString& SourceReference,
-        const FWorldBakedBuildReferenceGuard& ReferenceGuard);
+        const FWorldBakedBuildReferenceGuard& ReferenceGuard,
+        TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation = nullptr);
     void RetainAsyncBuildReferences(
         UglTFRuntimeAsset* Builder,
         const FWorldBakedBuildReferenceGuard& ReferenceGuard);

@@ -14,3 +14,17 @@ public:
     static TSharedPtr<FJsonObject> LoadJson(const FString& Path);
     static void SaveJsonAsync(TSharedRef<FJsonObject> Json, const FString& Path);
 };
+
+/** Flushes a BEGIN checkpoint before potentially slow load work, even if the editor stops ticking. */
+class V3DSIMULATOR_API FScopedSimulatorLoadCheckpoint final
+{
+public:
+    explicit FScopedSimulatorLoadCheckpoint(FString InStage);
+    ~FScopedSimulatorLoadCheckpoint();
+    FScopedSimulatorLoadCheckpoint(const FScopedSimulatorLoadCheckpoint&) = delete;
+    FScopedSimulatorLoadCheckpoint& operator=(const FScopedSimulatorLoadCheckpoint&) = delete;
+
+private:
+    FString Stage;
+    double StartedAtSeconds = 0.0;
+};

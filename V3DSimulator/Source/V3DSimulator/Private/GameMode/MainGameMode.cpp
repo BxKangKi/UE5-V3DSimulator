@@ -735,6 +735,7 @@ void AMainGameMode::ResolveWorldLaunch(
 
 void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName)
 {
+    const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("World.SinglePlayerSelection: ") + WorldFolderName);
     if (IsWorldSelectionReturnBlocked())
     {
         UE_LOG(LogTemp, Display,

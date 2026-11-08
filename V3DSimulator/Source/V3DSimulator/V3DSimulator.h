@@ -17,8 +17,8 @@
  * Primary game module.
  *
  * Besides draining tracked runtime work during shutdown, the module prepares a pure-Slate
- * MoviePlayer screen before the initial map and every blocking map load. The screen contains no
- * UObjects, so it is safe while the game thread is occupied by package loading.
+ * MoviePlayer screen for blocking game map loads outside the editor. PIE retains normal UMG
+ * loading UI. File checkpoints are registered in both paths so a stalled editor leaves evidence.
  */
 class FV3DSimulatorModule final : public FDefaultGameModuleImpl
 {

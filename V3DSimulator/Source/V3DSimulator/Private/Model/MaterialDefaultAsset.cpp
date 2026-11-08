@@ -16,7 +16,8 @@ namespace
     UMaterialInterface* ResolveMaterialReference(
         const TSoftObjectPtr<UMaterialInterface>& Reference,
         const FString& Label,
-        TArray<FString>& OutFailures)
+        TArray<FString>& OutFailures,
+        const bool bAllowSynchronousLoading)
     {
         if (Reference.IsNull())
         {
@@ -24,7 +25,7 @@ namespace
         }
 
         UMaterialInterface* Material = Reference.Get();
-        if (!IsValid(Material))
+        if (!IsValid(Material) && bAllowSynchronousLoading)
         {
             Material = Reference.LoadSynchronous();
         }
@@ -44,7 +45,8 @@ namespace
 
 bool FV3DMaterialSoftAssetReferences::Resolve(
     FV3DMaterialAssetReferences& OutReferences,
-    TArray<FString>& OutFailures) const
+    TArray<FString>& OutFailures,
+    const bool bAllowSynchronousLoading) const
 {
     OutReferences.Reset();
     OutFailures.Reset();
@@ -54,15 +56,15 @@ bool FV3DMaterialSoftAssetReferences::Resolve(
         return false;
     }
 
-    OutReferences.Opaque = ResolveMaterialReference(Opaque, TEXT("Opaque"), OutFailures);
-    OutReferences.Masked = ResolveMaterialReference(Masked, TEXT("Masked"), OutFailures);
-    OutReferences.TwoSided = ResolveMaterialReference(TwoSided, TEXT("TwoSided"), OutFailures);
-    OutReferences.TwoSidedMasked = ResolveMaterialReference(TwoSidedMasked, TEXT("TwoSidedMasked"), OutFailures);
-    OutReferences.Translucent = ResolveMaterialReference(Translucent, TEXT("Translucent"), OutFailures);
+    OutReferences.Opaque = ResolveMaterialReference(Opaque, TEXT("Opaque"), OutFailures, bAllowSynchronousLoading);
+    OutReferences.Masked = ResolveMaterialReference(Masked, TEXT("Masked"), OutFailures, bAllowSynchronousLoading);
+    OutReferences.TwoSided = ResolveMaterialReference(TwoSided, TEXT("TwoSided"), OutFailures, bAllowSynchronousLoading);
+    OutReferences.TwoSidedMasked = ResolveMaterialReference(TwoSidedMasked, TEXT("TwoSidedMasked"), OutFailures, bAllowSynchronousLoading);
+    OutReferences.Translucent = ResolveMaterialReference(Translucent, TEXT("Translucent"), OutFailures, bAllowSynchronousLoading);
     OutReferences.TwoSidedTranslucent = ResolveMaterialReference(
         TwoSidedTranslucent,
         TEXT("TwoSidedTranslucent"),
-        OutFailures);
+        OutFailures, bAllowSynchronousLoading);
 
     // This is editor-authored trusted data, but cap the runtime map so a damaged/corrupt asset cannot
     // trigger an unbounded allocation during world bootstrap.
@@ -87,7 +89,7 @@ bool FV3DMaterialSoftAssetReferences::Resolve(
         if (UMaterialInterface* Material = ResolveMaterialReference(
             Pair.Value,
             FString::Printf(TEXT("ByMaterialName[%s]"), *MaterialName),
-            OutFailures))
+            OutFailures, bAllowSynchronousLoading))
         {
             OutReferences.ByMaterialName.Add(MoveTemp(MaterialName), Material);
         }

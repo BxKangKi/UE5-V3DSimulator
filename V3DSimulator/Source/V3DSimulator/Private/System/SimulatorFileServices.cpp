@@ -7,6 +7,8 @@
 #include "Misc/FileHelper.h"
 #include "Misc/ScopeLock.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
+#include "HAL/PlatformTLS.h"
 
 namespace
 {
@@ -24,10 +26,27 @@ void FSimulatorFileServices::WriteStartupLog(const FString& Message)
     IFileManager::Get().MakeDirectory(*Root, true);
     const FString Path = FPaths::Combine(Root, TEXT("startup.log"));
     if (!FFileHelper::SaveStringToFile(Line, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM,
-        &IFileManager::Get(), FILEWRITE_Append))
+        &IFileManager::Get(), FILEWRITE_Append | FILEWRITE_AllowRead))
     {
         UE_LOG(LogTemp, Error, TEXT("Startup log write failed. Path=%s"), *Path);
     }
+}
+
+FScopedSimulatorLoadCheckpoint::FScopedSimulatorLoadCheckpoint(FString InStage)
+    : Stage(MoveTemp(InStage)), StartedAtSeconds(FPlatformTime::Seconds())
+{
+    // This closes the file on every checkpoint; it does not depend on a queued game-thread
+    // callback or the asynchronous log writer completing after the potentially blocking call.
+    FSimulatorFileServices::WriteStartupLog(FString::Printf(
+        TEXT("[WorldLoad] BEGIN %s Thread=%u"), *Stage, FPlatformTLS::GetCurrentThreadId()));
+}
+
+FScopedSimulatorLoadCheckpoint::~FScopedSimulatorLoadCheckpoint()
+{
+    FSimulatorFileServices::WriteStartupLog(FString::Printf(
+        TEXT("[WorldLoad] END %s ElapsedMs=%.2f Thread=%u"), *Stage,
+        (FPlatformTime::Seconds() - StartedAtSeconds) * 1000.0,
+        FPlatformTLS::GetCurrentThreadId()));
 }
 
 void FSimulatorFileServices::WriteLogAsync(const FString& Category, const FString& Message)

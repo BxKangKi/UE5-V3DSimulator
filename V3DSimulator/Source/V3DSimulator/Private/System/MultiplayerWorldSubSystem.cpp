@@ -23,6 +23,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/SimulatorFileServices.h"
 
 namespace
 {
@@ -355,6 +356,7 @@ bool UMultiplayerWorldSubSystem::OpenWorldByReference(
     TSoftObjectPtr<UWorld> WorldAsset,
     const FString& Options) const
 {
+    const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("World.TravelRequest: ") + WorldAsset.ToSoftObjectPath().ToString());
     if (!IsValid(WorldContextObject) || WorldAsset.IsNull())
     {
         return false;

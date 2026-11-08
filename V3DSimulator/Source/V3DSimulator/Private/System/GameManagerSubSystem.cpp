@@ -82,6 +82,8 @@
 #include "UObject/UObjectGlobals.h"
 #include "UObject/GarbageCollection.h"
 #include "Engine/GameInstance.h"
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 
@@ -268,6 +270,13 @@ UMaterialDefaultRuntimeCache* UGameManagerSubSystem::AcquireMaterialDefaultRefer
         return nullptr;
     }
 
+    // Placed actors can ask for glTF defaults before the asynchronous package gate finishes.
+    // They must neither turn that request into a blocking load nor seal a partial material table.
+    if (bGameplayAssetPreloadPending && !bRuntimeAssetsPreloaded)
+    {
+        return IsValid(MaterialDefaultRuntimeCache) ? MaterialDefaultRuntimeCache.Get() : nullptr;
+    }
+
     if (!bMaterialDefaultAssetResolved && !bMaterialDefaultAssetResolving)
     {
         ResolveMaterialDefaultAsset();
@@ -315,8 +324,10 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
     TArray<FString> Failures;
     const bool bResolveCallSucceeded = Registry->V3DMaterials.Resolve(
         NewCache->References,
-        Failures);
-    NewCache->References.Terrain = Registry->ResolveTerrainMaterial();
+        Failures,
+        !bRuntimeAssetsPreloaded);
+    NewCache->References.Terrain = bRuntimeAssetsPreloaded
+        ? Registry->TerrainMaterial.Get() : Registry->ResolveTerrainMaterial();
     if (!Registry->TerrainMaterial.IsNull() && !IsValid(NewCache->References.Terrain))
     {
         Failures.Add(FString::Printf(
@@ -724,6 +735,7 @@ FString UGameManagerSubSystem::GetFramerateInfoText(FString InString)
 
 void UGameManagerSubSystem::ApplyGameModeConfig(const AV3DSimulatorGameplayGameModeBase* InConfigGameMode)
 {
+    FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Apply gameplay config and loaded material references"));
     if (!IsValid(InConfigGameMode))
     {
         return;
@@ -757,34 +769,34 @@ void UGameManagerSubSystem::ApplyGameModeConfig(const AV3DSimulatorGameplayGameM
             && !Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
     };
 
-    UClass* ResolvedStatic = Registry ? Registry->StaticActorClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedStatic = Registry ? Registry->StaticActorClass.Get() : nullptr;
     StaticActorClass = IsUsableClass(ResolvedStatic, AStaticActor::StaticClass())
         ? ResolvedStatic : AStaticActor::StaticClass();
 
-    UClass* ResolvedDynamic = Registry ? Registry->DynamicActorClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedDynamic = Registry ? Registry->DynamicActorClass.Get() : nullptr;
     DynamicActorClass = IsUsableClass(ResolvedDynamic, ADynamicActor::StaticClass())
         ? ResolvedDynamic : ADynamicActor::StaticClass();
 
-    UClass* ResolvedVehicle = Registry ? Registry->VehiclePawnClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedVehicle = Registry ? Registry->VehiclePawnClass.Get() : nullptr;
     VehiclePawnClass = IsUsableClass(ResolvedVehicle, AVehiclePawn::StaticClass())
         ? ResolvedVehicle : AVehiclePawn::StaticClass();
 
-    UClass* ResolvedWeapon = Registry ? Registry->WeaponActorClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedWeapon = Registry ? Registry->WeaponActorClass.Get() : nullptr;
     WeaponActorClass = IsUsableClass(ResolvedWeapon, AWeaponActor::StaticClass())
         ? ResolvedWeapon : AWeaponActor::StaticClass();
 
-    UClass* ResolvedEnv = Registry ? Registry->WorldEnvManagerClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedEnv = Registry ? Registry->WorldEnvManagerClass.Get() : nullptr;
     WorldEnvManagerClass = IsUsableClass(ResolvedEnv, AWorldEnvManager::StaticClass())
         ? ResolvedEnv : AWorldEnvManager::StaticClass();
 
-    UClass* ResolvedWater = Registry ? Registry->WaterActorClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedWater = Registry ? Registry->WaterActorClass.Get() : nullptr;
     WaterClass = IsUsableClass(ResolvedWater, AWaterActor::StaticClass())
         ? ResolvedWater : AWaterActor::StaticClass();
 
-    UClass* ResolvedRain = Registry ? Registry->RainWeatherActorClass.LoadSynchronous() : nullptr;
+    UClass* ResolvedRain = Registry ? Registry->RainWeatherActorClass.Get() : nullptr;
     RainWeatherActorClass = IsUsableClass(ResolvedRain, AActor::StaticClass()) ? ResolvedRain : nullptr;
 
-    PlacementGridMaterial = Registry ? Registry->PlacementGridMaterial.LoadSynchronous() : nullptr;
+    PlacementGridMaterial = Registry ? Registry->PlacementGridMaterial.Get() : nullptr;
 
     if (!bMaterialDefaultAssetResolved)
     {
@@ -914,6 +926,19 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         return;
     }
 
+    if (bGameplayAssetPreloadPending && SessionOwner.Get() == InOwnerActor)
+    {
+        // Replicated GameMode defaults can arrive while the client is loading dependencies.
+        // The registry dependency set is unchanged; use the latest defaults when it completes.
+        GameplayPreloadConfig = InConfigGameMode;
+        GameplayPreloadConfigClass = InConfigGameMode->GetClass();
+        return;
+    }
+
+    if (bGameplayAssetPreloadPending)
+    {
+        StopGameplaySession(EEndPlayReason::Destroyed);
+    }
     if (bManagerStarted && SessionOwner.Get() != InOwnerActor)
     {
         StopGameplaySession(EEndPlayReason::Destroyed);
@@ -921,10 +946,151 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
 
     SessionOwner = InOwnerActor;
     ConfigGameMode = Cast<AV3DSimulatorGameplayGameModeBase>(InOwnerActor);
+    GameplayPreloadConfig = InConfigGameMode;
+    GameplayPreloadConfigClass = InConfigGameMode->GetClass();
+    bGameplayAssetPreloadPending = true;
+    bRuntimeAssetsPreloaded = false;
+    const uint64 Generation = ++GameplayAssetPreloadGeneration;
+    SetWorldLoading(true);
+    SetLoadingStatus(0.005f);
+    ShowLoadingWidget(true);
+    if (GameplayAssetPreloadGeneration != Generation || SessionOwner.Get() != InOwnerActor
+        || GetWorld() != World) return;
+
+    GameplayPreloadPaths.Reset();
+    TSet<FSoftObjectPath> UniquePaths;
+    const auto AddPath = [this, &UniquePaths](const FSoftObjectPath& Path)
+    {
+        if (Path.IsValid() && !UniquePaths.Contains(Path))
+        {
+            UniquePaths.Add(Path);
+            GameplayPreloadPaths.Add(Path);
+        }
+    };
+    if (const UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this))
+    {
+        AddPath(Registry->StaticActorClass.ToSoftObjectPath());
+        AddPath(Registry->DynamicActorClass.ToSoftObjectPath());
+        AddPath(Registry->VehiclePawnClass.ToSoftObjectPath());
+        AddPath(Registry->WeaponActorClass.ToSoftObjectPath());
+        AddPath(Registry->WorldEnvManagerClass.ToSoftObjectPath());
+        AddPath(Registry->WaterActorClass.ToSoftObjectPath());
+        AddPath(Registry->RainWeatherActorClass.ToSoftObjectPath());
+        AddPath(Registry->PlacementGridMaterial.ToSoftObjectPath());
+        AddPath(Registry->LoadingWidgetClass.ToSoftObjectPath());
+        AddPath(Registry->TerrainMaterial.ToSoftObjectPath());
+        const FV3DMaterialSoftAssetReferences& Materials = Registry->V3DMaterials;
+        AddPath(Materials.Opaque.ToSoftObjectPath());
+        AddPath(Materials.Masked.ToSoftObjectPath());
+        AddPath(Materials.TwoSided.ToSoftObjectPath());
+        AddPath(Materials.TwoSidedMasked.ToSoftObjectPath());
+        AddPath(Materials.Translucent.ToSoftObjectPath());
+        AddPath(Materials.TwoSidedTranslucent.ToSoftObjectPath());
+        int32 NamedCount = 0;
+        for (const auto& Pair : Materials.ByMaterialName)
+        {
+            if (NamedCount++ >= 4096) break; // Same bound as material resolution.
+            if (!Pair.Key.TrimStartAndEnd().IsEmpty()) AddPath(Pair.Value.ToSoftObjectPath());
+        }
+    }
+
+    TArray<FString> PathNames;
+    PathNames.Reserve(GameplayPreloadPaths.Num());
+    for (const FSoftObjectPath& Path : GameplayPreloadPaths) PathNames.Add(Path.ToString());
+    FSimulatorFileServices::WriteStartupLog(FString::Printf(
+        TEXT("Gameplay dependency preload queued. Generation=%llu Owner=%s Assets=%d Paths=%s"),
+        Generation, *GetNameSafe(InOwnerActor), PathNames.Num(), *FString::Join(PathNames, TEXT(", "))));
+
+    const TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+    const TWeakObjectPtr<AActor> StartupOwner(InOwnerActor);
+    const TWeakObjectPtr<UWorld> StartupWorld(World);
+    const FStreamableDelegate Complete = FStreamableDelegate::CreateLambda(
+        [WeakThis, StartupOwner, StartupWorld, Generation]()
+        {
+            if (UGameManagerSubSystem* Manager = WeakThis.Get())
+                Manager->CompleteGameplayAssetPreload(Generation, StartupOwner, StartupWorld);
+        });
+    if (!GameplayPreloadPaths.IsEmpty())
+    {
+        FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Queue gameplay dependency packages"));
+        GameplayAssetPreloadHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(
+            GameplayPreloadPaths, Complete);
+        if (GameplayAssetPreloadHandle.IsValid()) return;
+        FSimulatorFileServices::WriteStartupLog(
+            TEXT("Gameplay dependency preload could not be queued; using available assets and native class fallbacks."));
+    }
+    // Even an empty/already-loaded set resumes on a following tick, allowing the native loading
+    // screen to be built before world components and the archive session are initialized.
+    World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this,
+        [this, StartupOwner, StartupWorld, Generation]()
+        {
+            CompleteGameplayAssetPreload(Generation, StartupOwner, StartupWorld);
+        }));
+}
+
+void UGameManagerSubSystem::CancelGameplayAssetPreload()
+{
+    ++GameplayAssetPreloadGeneration;
+    bGameplayAssetPreloadPending = false;
+    GameplayPreloadConfig.Reset();
+    GameplayPreloadConfigClass = nullptr;
+    GameplayPreloadPaths.Reset();
+    if (GameplayAssetPreloadHandle.IsValid())
+    {
+        GameplayAssetPreloadHandle->CancelHandle();
+        GameplayAssetPreloadHandle.Reset();
+    }
+}
+
+void UGameManagerSubSystem::CompleteGameplayAssetPreload(const uint64 ExpectedGeneration,
+    TWeakObjectPtr<AActor> StartupOwner, TWeakObjectPtr<UWorld> StartupWorld)
+{
+    check(IsInGameThread());
+    if (!bGameplayAssetPreloadPending || GameplayAssetPreloadGeneration != ExpectedGeneration) return;
+    AActor* Owner = StartupOwner.Get();
+    const AV3DSimulatorGameplayGameModeBase* Config = GameplayPreloadConfig.Get();
+    if (!IsValid(Owner) || Owner->IsActorBeingDestroyed() || !IsValid(Config)
+        || !StartupWorld.IsValid() || Owner->GetWorld() != StartupWorld.Get()
+        || GetWorld() != StartupWorld.Get() || SessionOwner != StartupOwner)
+    {
+        CancelGameplayAssetPreload();
+        HideLoadingWidget();
+        SetWorldLoading(false);
+        return;
+    }
+
+    int32 ReadyCount = 0;
+    for (const FSoftObjectPath& Path : GameplayPreloadPaths)
+        if (IsValid(Path.ResolveObject())) ++ReadyCount;
+    FSimulatorFileServices::WriteStartupLog(FString::Printf(
+        TEXT("Gameplay dependency preload completed. Generation=%llu Ready=%d Requested=%d Owner=%s"),
+        ExpectedGeneration, ReadyCount, GameplayPreloadPaths.Num(), *GetNameSafe(Owner)));
+
+    // Keep packages pinned while UPROPERTY fields/material guards adopt them. No failed optional
+    // reference is synchronously retried during runtime bootstrap.
+    TSharedPtr<FStreamableHandle> CompletedHandle = MoveTemp(GameplayAssetPreloadHandle);
+    bRuntimeAssetsPreloaded = true;
+    FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Initialize gameplay after dependency preload"));
+    ContinueGameplaySessionAfterAssetPreload(Owner, Config);
+    if (GameplayAssetPreloadGeneration == ExpectedGeneration) CancelGameplayAssetPreload();
+}
+
+void UGameManagerSubSystem::ContinueGameplaySessionAfterAssetPreload(
+    AActor* InOwnerActor, const AV3DSimulatorGameplayGameModeBase* InConfigGameMode)
+{
+    UWorld* World = InOwnerActor->GetWorld();
+    const uint64 StartupGeneration = GameplayAssetPreloadGeneration;
+    const auto IsCurrentStartup = [this, InOwnerActor, World, StartupGeneration]()
+    {
+        return bGameplayAssetPreloadPending && GameplayAssetPreloadGeneration == StartupGeneration
+            && IsValid(InOwnerActor) && !InOwnerActor->IsActorBeingDestroyed()
+            && SessionOwner.Get() == InOwnerActor && GetWorld() == World;
+    };
     ApplyGameModeConfig(InConfigGameMode);
 
     // World environment is a rendering prerequisite and intentionally starts before .v3d I/O.
     SpawnWorldEnvManager();
+    if (!IsCurrentStartup()) return; // Blueprint actor construction can request travel/stop.
 
     bMenuTravelStatePrepared = false;
     bMenuTravelSaveCompleted = false;
@@ -1091,7 +1257,9 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
 
     SetWorldLoading(true);
     SetLoadingStatus(0.01f);
+    if (!IsCurrentStartup()) return;
     ShowLoadingWidget();
+    if (!IsCurrentStartup()) return; // Configured WBP Construct can replace the session.
 
     UModelDatabaseSubsystem* ModelDatabase = GetGameInstance()
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
@@ -1140,6 +1308,7 @@ void UGameManagerSubSystem::ContinueWorldStartupAfterDatabase()
 {
     check(IsInGameThread());
     if (!bManagerStarted || bWorldStartupContinued) return;
+    FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Continue world startup after archive index"));
 
     UModelDatabaseSubsystem* Database = GetGameInstance()
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
@@ -1195,7 +1364,9 @@ void UGameManagerSubSystem::FailWorldStartup(const FString& Message)
 {
     check(IsInGameThread());
 
+    CancelGameplayAssetPreload();
     LastSaveMessage = Message;
+    FSimulatorFileServices::WriteStartupLog(TEXT("ERROR: ") + Message);
     UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
 
     // Never destroy WorldEnvManager here. Its dependency-free atmosphere is intentionally kept
@@ -1211,15 +1382,16 @@ void UGameManagerSubSystem::StopGameplaySession(
 {
     // An old map actor can finish EndPlay after the destination map has already started its own
     // manager. Never let that stale callback tear down the destination world's streaming session.
-    if (RequestingGameMode && ConfigGameMode.IsValid() && ConfigGameMode.Get() != RequestingGameMode)
+    if (RequestingGameMode && SessionOwner.IsValid() && SessionOwner.Get() != RequestingGameMode)
     {
         UE_LOG(LogTemp, Display,
             TEXT("[Gameplay] Ignored stale GameplayGameMode EndPlay. Requester=%s Active=%s"),
             *GetNameSafe(RequestingGameMode),
-            *GetNameSafe(ConfigGameMode.Get()));
+            *GetNameSafe(SessionOwner.Get()));
         return;
     }
 
+    CancelGameplayAssetPreload();
     CancelProjectBuild();
     CompactTrackedEntityReferences();
 
@@ -1308,6 +1480,9 @@ void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
 
 void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
 {
+    CancelGameplayAssetPreload();
+    bRuntimeAssetsPreloaded = false;
+    bUsingBootstrapLoadingWidget = false;
     if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this)) Surfaces->Reset();
     if (GetWorld()) if (auto* Scripts = GetWorld()->GetSubsystem<USimulationScriptSubsystem>()) Scripts->Reset();
     // GameInstance subsystems survive level travel, so every UPROPERTY reference held here can keep
@@ -1433,6 +1608,9 @@ void UGameManagerSubSystem::CompactTrackedEntityReferences()
 
 void UGameManagerSubSystem::ResetWorldRuntimeReferences()
 {
+    CancelGameplayAssetPreload();
+    bRuntimeAssetsPreloaded = false;
+    bUsingBootstrapLoadingWidget = false;
     StaticActorClass = nullptr;
     ConfigGameMode.Reset();
     SessionOwner.Reset();
@@ -1522,6 +1700,13 @@ void UGameManagerSubSystem::ValidatePostLoadGameplayLifecycle(UWorld* LoadedWorl
         return;
     }
 
+    // A dependency preload owns this destination already. Do not adopt/spawn an environment
+    // with stale class defaults or create a second client startup while its packages are pending.
+    if (bGameplayAssetPreloadPending && SessionOwner.IsValid()
+        && !SessionOwner->IsActorBeingDestroyed() && SessionOwner->GetWorld() == LoadedWorld)
+    {
+        return;
+    }
     if (bManagerStarted && SessionOwner.IsValid() && SessionOwner->GetWorld() == LoadedWorld)
     {
         SpawnWorldEnvManager();
@@ -1575,8 +1760,9 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
     }
 
     UWorld* CurrentWorld = GetWorld();
-    const bool bNewWorldEnvManagerIsActive = bManagerStarted && SessionOwner.IsValid() &&
-        SessionOwner->GetWorld() == CurrentWorld;
+    const bool bNewWorldEnvManagerIsActive = (bManagerStarted || bGameplayAssetPreloadPending)
+        && SessionOwner.IsValid() && !SessionOwner->IsActorBeingDestroyed()
+        && SessionOwner->GetWorld() == CurrentWorld;
     if (bNewWorldEnvManagerIsActive)
     {
         // PostLoadMap runs before/around BeginPlay depending on the travel path. A deferred cleanup
@@ -1723,6 +1909,8 @@ void UGameManagerSubSystem::SpawnWorldEnvManager()
         WorldEnvManagerActor = nullptr;
         bSpawnedWorldEnvManager = false;
     }
+
+    FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Spawn or adopt world environment"));
 
     UClass* EffectiveWorldEnvManagerClass = WorldEnvManagerClass.Get();
     if (!IsValid(EffectiveWorldEnvManagerClass)
@@ -2727,6 +2915,7 @@ void UGameManagerSubSystem::SetLoadingWidget(UUserWidget* InWidget)
         LoadingWidgetInstance->RemoveFromParent();
     }
     LoadingWidgetInstance = InWidget;
+    bUsingBootstrapLoadingWidget = false;
     if (IsValid(LoadingWidgetInstance.Get()))
     {
         LoadingWidgetInstance->SetVisibility(bIsWorldLoading
@@ -2735,8 +2924,18 @@ void UGameManagerSubSystem::SetLoadingWidget(UUserWidget* InWidget)
     }
 }
 
-void UGameManagerSubSystem::ShowLoadingWidget()
+void UGameManagerSubSystem::ShowLoadingWidget(const bool bUseNativeBootstrap)
 {
+    UV3DSimulatorAssetRegistry* Registry = bUseNativeBootstrap ? nullptr
+        : UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    UClass* PreferredClass = IsValid(Registry) ? Registry->LoadingWidgetClass.Get() : nullptr;
+    if (bUsingBootstrapLoadingWidget && !bUseNativeBootstrap && IsValid(PreferredClass)
+        && PreferredClass->IsChildOf(ULoadingHUDWidget::StaticClass())
+        && !PreferredClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)
+        && IsValid(LoadingWidgetInstance.Get()) && LoadingWidgetInstance->GetClass() != PreferredClass)
+    {
+        SetLoadingWidget(nullptr);
+    }
     if (IsValid(LoadingWidgetInstance.Get()) && !LoadingWidgetInstance->IsA<ULoadingHUDWidget>())
     {
         LoadingWidgetInstance->RemoveFromParent();
@@ -2744,11 +2943,10 @@ void UGameManagerSubSystem::ShowLoadingWidget()
     }
     if (!IsValid(LoadingWidgetInstance.Get()))
     {
-        UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
         APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
         if (IsValid(PlayerController) && PlayerController->IsLocalController())
         {
-            UClass* WidgetClass = IsValid(Registry) ? Registry->LoadingWidgetClass.LoadSynchronous() : nullptr;
+            UClass* WidgetClass = PreferredClass;
             if (!IsValid(WidgetClass) || !WidgetClass->IsChildOf(ULoadingHUDWidget::StaticClass())
                 || WidgetClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
             {
@@ -2759,6 +2957,7 @@ void UGameManagerSubSystem::ShowLoadingWidget()
             {
                 Widget->AddToPlayerScreen(100);
                 SetLoadingWidget(Widget);
+                bUsingBootstrapLoadingWidget = bUseNativeBootstrap;
             }
         }
     }

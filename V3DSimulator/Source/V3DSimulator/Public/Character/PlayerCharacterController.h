@@ -29,6 +29,7 @@ class USettingsMenuWidget;
 class UGameUpdateSubSystem;
 class UWorld;
 class USurvivalHUDWidget;
+struct FStreamableHandle;
 
 /** Owner-only presentation mirror of the server's persisted player record and map-authored limit. */
 USTRUCT(BlueprintType)
@@ -414,8 +415,13 @@ private:
     TObjectPtr<USettingsMenuWidget> SettingsMenuWidget;
 
     void ResolveCentralAssets();
-    /** Creates missing gameplay UI directly from the central registry and registers the loading widget with GameManager. */
+    /** Loads startup UI classes together without synchronously flushing gameplay packages. */
     void InitializeRegistryDrivenUI();
+    void CompleteRegistryDrivenUIInitialization(uint64 ExpectedGeneration, TWeakObjectPtr<UWorld> StartupWorld);
+    void CancelRegistryDrivenUIInitialization();
+    TSharedPtr<FStreamableHandle> RegistryUIPreloadHandle;
+    uint64 RegistryUIPreloadGeneration = 0;
+    bool bRegistryUIInitializationStarted = false;
     bool EnsurePauseSettingsWidget();
     void BindConfiguredInputActions();
     /** Direct placement mouse buttons are intentional gameplay input, independent of Enhanced Input mappings. */

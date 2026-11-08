@@ -30,6 +30,7 @@
 #include "Setting/GameSettings.h"
 #include "Simulator/RuntimeModelResolver.h"
 #include "System/SafeFileIO.h"
+#include "System/SimulatorFileServices.h"
 #include "System/V3DRuntimeSafety.h"
 #include "UObject/GCObject.h"
 #include "UObject/StrongObjectPtr.h"
@@ -667,6 +668,217 @@ namespace WorldBakedModelAssetPrivate
     }
 }
 
+/**
+ * A decoded request keeps its admission permit/config pins until Completion runs. Resource
+ * publication is split into small, tracked GT continuations so a parallel decode burst cannot
+ * upload every texture/material before Slate gets another frame. The guard spans all slices;
+ * a raw native map alone would allow GC to collect resources between frames.
+ */
+struct FWorldBakedMaterialAttachment final
+    : public TSharedFromThis<FWorldBakedMaterialAttachment, ESPMode::ThreadSafe>
+{
+    using FCompletion = TFunction<void(FWorldBakedMaterialAttachment&, bool)>;
+
+    FWorldBakedMaterialAttachment(UWorldBakedModelAsset* InOwner, UObject* InOuter,
+        const uint64 InReadId, FGWorldBakedAssetBundle&& InBundle,
+        TArray<FglTFRuntimeMeshLOD>&& InLODs, TArray<TArray<int32>>&& InMaterialIds,
+        const FglTFRuntimeMaterialsConfig& InConfig, FCompletion InCompletion,
+        TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> InCancellation = nullptr)
+        : Owner(InOwner), Outer(InOuter), bHadOuter(InOuter != nullptr), ReadId(InReadId)
+        , Bundle(MoveTemp(InBundle)), LODs(MoveTemp(InLODs)), MaterialIds(MoveTemp(InMaterialIds))
+        , Config(InConfig), Completion(MoveTemp(InCompletion)), Cancellation(MoveTemp(InCancellation))
+    {
+        check(IsInGameThread());
+        Guard.Add(Owner);
+        Guard.Add(InOuter);
+    }
+
+    ~FWorldBakedMaterialAttachment()
+    {
+        check(IsInGameThread());
+        if (ReadId != 0) Owner->ReleaseReadReferences(ReadId);
+    }
+
+    void Schedule()
+    {
+        check(IsInGameThread());
+        // DispatchTrackedGameThread executes inline on GT. Always queue this continuation to
+        // share the normal-frame 2 ms publication budget rather than recursively draining it.
+        const auto Self = AsShared();
+        if (!FSafeFileIO::DispatchTrackedGameThreadDeferred([Self]() { Self->RunSlice(); }, true))
+        {
+            bCancelled = true;
+            Finish(false);
+        }
+    }
+
+    void RunSlice()
+    {
+        AdvanceOneUnit();
+        if (!bFinished) Schedule();
+    }
+
+    void AdvanceOneUnit()
+    {
+        check(IsInGameThread());
+        if (bFinished) return;
+        if (FSafeFileIO::IsShuttingDown() || (Cancellation.IsValid() && Cancellation->GetValue() != 0) || (bHadOuter
+            && (!Outer.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(Outer.Get()))))
+        {
+            bCancelled = true;
+            Finish(false);
+            return;
+        }
+        if (!bInitialized)
+        {
+            bInitialized = true;
+            Owner->RememberDependencies(Bundle);
+            if (MaterialIds.Num() != LODs.Num())
+            {
+                Error = TEXT("Prepared RuntimeLOD material layout is inconsistent");
+                Finish(false);
+                return;
+            }
+            Guard.Reserve(Bundle.Textures.Num() + Bundle.Materials.Num() * 2 + 16);
+            Textures.Reserve(Bundle.Textures.Num());
+            Materials.Reserve(Bundle.Materials.Num());
+        }
+        if (Config.bSkipLoad)
+        {
+            Finish(true);
+            return;
+        }
+
+        if (TextureIndex < Bundle.Textures.Num())
+        {
+            SetStage(TEXT("Textures"), Bundle.Textures.Num());
+            auto& Baked = Bundle.Textures[TextureIndex++];
+            UTexture* Texture = Owner->CreateTexture(Baked, Guard, Error, Bundle.MaxTextureResolution);
+            Baked.Mips.Empty();
+            if (!Texture) { Finish(false); return; }
+            Textures.Add(Baked.TextureId, Texture);
+            return;
+        }
+        if (MaterialIndex < Bundle.Materials.Num())
+        {
+            SetStage(TEXT("Materials"), Bundle.Materials.Num());
+            const auto& Baked = Bundle.Materials[MaterialIndex++];
+            for (const auto& Parameter : Baked.Textures)
+            {
+                if (Parameter.TextureId == INDEX_NONE || Textures.Contains(Parameter.TextureId)) continue;
+                UTexture* Texture = Owner->FindCachedTexture(Parameter.TextureId, Guard, Bundle.MaxTextureResolution);
+                if (!IsValid(Texture))
+                {
+                    Error = FString::Printf(TEXT("Texture %d was omitted from archive I/O but is no longer resident"),
+                        Parameter.TextureId);
+                    Finish(false);
+                    return;
+                }
+                Textures.Add(Parameter.TextureId, Texture);
+            }
+            UMaterialInterface* Material = Owner->CreateMaterial(Baked, Textures, Config, Guard, Error);
+            if (!Material) { Finish(false); return; }
+            Materials.Add(Baked.MaterialId, Material);
+            return;
+        }
+
+        // Material cache hits can omit material.dat entirely. Resolve those references lazily
+        // while binding, and bound large multi-primitive meshes just like the resource stages.
+        SetStage(TEXT("MaterialBindings"), LODs.Num());
+        int32 BoundPrimitives = 0;
+        constexpr int32 MaxPrimitivesPerSlice = 256;
+        while (LODIndex < LODs.Num() && BoundPrimitives < MaxPrimitivesPerSlice)
+        {
+            auto& LOD = LODs[LODIndex];
+            if (MaterialIds[LODIndex].Num() != LOD.Primitives.Num())
+            {
+                Error = TEXT("Prepared RuntimeLOD primitive/material layout is inconsistent");
+                Finish(false);
+                return;
+            }
+            if (PrimitiveIndex >= LOD.Primitives.Num())
+            {
+                ++LODIndex;
+                PrimitiveIndex = 0;
+                continue;
+            }
+            const int32 MaterialId = MaterialIds[LODIndex][PrimitiveIndex];
+            if (MaterialId != INDEX_NONE)
+            {
+                UMaterialInterface** Found = Materials.Find(MaterialId);
+                if (!Found)
+                {
+                    UMaterialInterface* Cached = Owner->FindCachedMaterial(MaterialId, Config, Guard);
+                    if (IsValid(Cached)) Found = &Materials.Add(MaterialId, Cached);
+                }
+                if (!Found || !IsValid(*Found))
+                {
+                    Error = TEXT("A mesh references a missing baked material");
+                    Finish(false);
+                    return;
+                }
+                LOD.Primitives[PrimitiveIndex].Material = *Found;
+            }
+            ++PrimitiveIndex;
+            ++BoundPrimitives;
+        }
+        if (LODIndex >= LODs.Num()) Finish(true);
+    }
+
+    void Finish(const bool bReady)
+    {
+        check(IsInGameThread());
+        if (bFinished) return;
+        bFinished = true;
+        StageCheckpoint.Reset();
+        auto Callback = MoveTemp(Completion);
+        if (Callback) Callback(*this, bReady);
+        if (ReadId != 0)
+        {
+            Owner->ReleaseReadReferences(ReadId);
+            ReadId = 0;
+        }
+        Bundle.Reset();
+        LODs.Reset();
+        MaterialIds.Reset();
+        Textures.Reset();
+        Materials.Reset();
+    }
+
+    void SetStage(const TCHAR* Name, const int32 Count)
+    {
+        if (Stage == Name) return;
+        StageCheckpoint.Reset();
+        Stage = Name;
+        StageCheckpoint = MakeUnique<FScopedSimulatorLoadCheckpoint>(FString::Printf(
+            TEXT("BakedResources.%s Source=%s Count=%d"), Name, *Owner->Reference, Count));
+    }
+
+    UWorldBakedModelAsset* Owner; // Kept alive by Guard across every queued continuation.
+    TWeakObjectPtr<UObject> Outer;
+    bool bHadOuter = false;
+    uint64 ReadId = 0;
+    FGWorldBakedAssetBundle Bundle;
+    TArray<FglTFRuntimeMeshLOD> LODs;
+    TArray<TArray<int32>> MaterialIds;
+    FglTFRuntimeMaterialsConfig Config;
+    FWorldBakedBuildReferenceGuard Guard;
+    FCompletion Completion;
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation;
+    TMap<int32, UTexture*> Textures;
+    TMap<int32, UMaterialInterface*> Materials;
+    FString Error;
+    FString Stage;
+    TUniquePtr<FScopedSimulatorLoadCheckpoint> StageCheckpoint;
+    bool bCancelled = false;
+    bool bInitialized = false;
+    bool bFinished = false;
+    int32 TextureIndex = 0;
+    int32 MaterialIndex = 0;
+    int32 LODIndex = 0;
+    int32 PrimitiveIndex = 0;
+};
+
 bool UWorldBakedModelAsset::Initialize(const FResolvedRuntimeModel& Model, FString& OutError)
 {
     check(IsInGameThread());
@@ -1106,6 +1318,9 @@ UTexture* UWorldBakedModelAsset::CreateTexture(
         }
         WeakTextureCache.Remove(TextureCacheKey);
     }
+    FScopedSimulatorLoadCheckpoint Checkpoint(FString::Printf(
+        TEXT("BakedTexture.Create Source=%s Id=%d Size=%dx%dx%d Mips=%d Limit=%d"),
+        *Reference, Baked.TextureId, Baked.SizeX, Baked.SizeY, Baked.NumLayers, Baked.Mips.Num(), TextureLimit));
 
     // Existing .v3d archives can contain larger source mips. Select the first stored mip that
     // satisfies the current user cap instead of rebuilding/resampling pixels at load time. This
@@ -1246,6 +1461,9 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     {
         return Cached;
     }
+    FScopedSimulatorLoadCheckpoint Checkpoint(FString::Printf(
+        TEXT("BakedMaterial.Create Source=%s Id=%d Name=%s Parent=%s"),
+        *Reference, Baked.MaterialId, *Baked.Name, *Baked.BaseMaterialPath));
 
     UMaterialInterface* Base =
         WorldBakedModelAssetPrivate::SelectBaseMaterial(Baked, Config, this);
@@ -1260,9 +1478,13 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     {
         // Every built-world scene is drawn by an ISM/HISM component. A parent can expose all
         // four array parameters yet still render the engine's fallback material if its instanced
-        // vertex-factory permutation was never compiled. In editor this public check requests it;
-        // cooked builds must carry it from the editor's terrain material preparation pass.
-        if (FApp::CanEverRender() && !Base->CheckMaterialUsage(MATUSAGE_InstancedStaticMeshes))
+        // vertex-factory permutation was never compiled. Check the prepared usage flag without
+        // mutating/compiling materials during world loading: CheckMaterialUsage can synchronously
+        // compile shaders on the game thread and freeze PIE's entire editor. The editor's terrain
+        // material preparation pass is responsible for enabling/saving this usage before cooking.
+        UMaterial* RootMaterial = Base->GetMaterial();
+        if (FApp::CanEverRender() && (!IsValid(RootMaterial)
+            || !RootMaterial->GetUsageByFlag(MATUSAGE_InstancedStaticMeshes)))
         {
             OutError = FString::Printf(
                 TEXT("Terrain parent %s has no instanced-static-mesh shader. Open/save the terrain material in the updated editor, then cook again."),
@@ -1597,6 +1819,8 @@ void UWorldBakedMeshFinalizeRequest::BeginStatic(
     const FglTFRuntimeStaticMeshConfig& Config)
 {
     check(IsInGameThread());
+    FScopedSimulatorLoadCheckpoint Checkpoint(FString::Printf(
+        TEXT("StaticMeshNativeAsyncLaunch Source=%s LODs=%d"), *SourceReference, LODs.Num()));
     Ticket = InTicket;
     if (!IsValid(Owner.Get()) || !IsValid(Builder.Get()))
     {
@@ -1621,6 +1845,8 @@ void UWorldBakedMeshFinalizeRequest::BeginSkeletal(
     const FglTFRuntimeSkeletalMeshConfig& Config)
 {
     check(IsInGameThread());
+    FScopedSimulatorLoadCheckpoint Checkpoint(FString::Printf(
+        TEXT("SkeletalMeshNativeAsyncLaunch Source=%s LODs=%d"), *SourceReference, LODs.Num()));
     Ticket = InTicket;
     if (!IsValid(Owner.Get()) || !IsValid(Builder.Get()))
     {
@@ -1742,9 +1968,15 @@ void UWorldBakedModelAsset::QueueSkeletalRuntimeLODFinalizer(
     const FglTFRuntimeSkeletalMeshConfig& Config,
     FGWorldBakedSkeletalMeshNativeCallback Callback,
     const FString& SourceReference,
-    const FWorldBakedBuildReferenceGuard& ReferenceGuard)
+    const FWorldBakedBuildReferenceGuard& ReferenceGuard,
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation)
 {
     check(IsInGameThread());
+    if (Cancellation.IsValid() && Cancellation->GetValue() != 0)
+    {
+        if (Callback) Callback(nullptr);
+        return;
+    }
     FString Error;
     UglTFRuntimeAsset* Builder = CreateMeshBuilder(Error);
     if (!IsValid(Builder))
@@ -1771,13 +2003,14 @@ void UWorldBakedModelAsset::QueueSkeletalRuntimeLODFinalizer(
         this,
         Builder,
         TEXT("Finalize streamed baked skeletal mesh asynchronously"),
-        [WeakRequest, LODs = MoveTemp(LODs), Config,
+        [WeakRequest, LODs = MoveTemp(LODs), Config, Cancellation,
             WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]
             (const uint64 Ticket) mutable
         {
             if (UWorldBakedMeshFinalizeRequest* StrongRequest = WeakRequest.Get())
             {
-                if (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())))
+                if ((Cancellation.IsValid() && Cancellation->GetValue() != 0)
+                    || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))))
                 {
                     StrongRequest->RejectBeforeStart(TEXT("Mesh outer was cancelled or expired while queued"));
                     FV3DRuntimeSafety::CompleteOperation(Ticket);
@@ -2155,7 +2388,12 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAdmitted(
                         MaterialIds = MoveTemp(MaterialIds), Error = MoveTemp(Error)]() mutable
                     {
                         UWorldBakedModelAsset* Self = WeakThis.Get();
-                        ON_SCOPE_EXIT { if (auto* Owner = WeakThis.Get()) Owner->ReleaseReadReferences(ReadId); };
+                        bool bTransferredReadReferences = false;
+                        ON_SCOPE_EXIT
+                        {
+                            if (!bTransferredReadReferences)
+                                if (auto* Owner = WeakThis.Get()) Owner->ReleaseReadReferences(ReadId);
+                        };
                         if (!IsValid(Self) || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))) || FSafeFileIO::IsShuttingDown())
                         {
                             if (Callback) Callback(nullptr);
@@ -2163,18 +2401,28 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAdmitted(
                         }
                         if (bPrepared)
                         {
-                            FWorldBakedBuildReferenceGuard ReferenceGuard;
-                            ReferenceGuard.Add(Config.Outer);
-                            if (Self->AttachRuntimeMaterials(
-                                    Bundle, Config.MaterialsConfig, MaterialIds,
-                                    ReferenceGuard, LODs, Error))
-                            {
-                                Bundle.Reset();
-                                Self->QueueStaticRuntimeLODFinalizer(
-                                    MoveTemp(LODs), Config, Callback,
-                                    LocalReference, ReferenceGuard);
-                                return;
-                            }
+                            auto Attachment = MakeShared<FWorldBakedMaterialAttachment, ESPMode::ThreadSafe>(
+                                Self, Config.Outer, ReadId, MoveTemp(Bundle), MoveTemp(LODs), MoveTemp(MaterialIds),
+                                Config.MaterialsConfig,
+                                [Config, Callback, LocalReference](FWorldBakedMaterialAttachment& Work, const bool bReady)
+                                {
+                                    if (bReady)
+                                    {
+                                        Work.Bundle.Reset();
+                                        Work.Owner->QueueStaticRuntimeLODFinalizer(MoveTemp(Work.LODs), Config,
+                                            Callback, LocalReference, Work.Guard);
+                                        return;
+                                    }
+                                    if (!Work.bCancelled)
+                                    {
+                                        if (Work.Error.IsEmpty()) Work.Error = TEXT("Streamed baked static material preparation failed");
+                                        FV3DRuntimeSafety::ReportRecoverableFailure(LocalReference, Work.Error);
+                                    }
+                                    if (Callback) Callback(nullptr);
+                                });
+                            bTransferredReadReferences = true;
+                            Attachment->Schedule();
+                            return;
                         }
                         if (Error.IsEmpty()) Error = TEXT("Streamed baked static mesh preparation failed");
                         FV3DRuntimeSafety::ReportRecoverableFailure(LocalReference, Error);
@@ -2314,9 +2562,15 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAsyncNative(
     const int32 MeshIndex,
     const int32 SkinIndex,
     FGWorldBakedSkeletalMeshNativeCallback Callback,
-    const FglTFRuntimeSkeletalMeshConfig& InConfig)
+    const FglTFRuntimeSkeletalMeshConfig& InConfig,
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation)
 {
     check(IsInGameThread());
+    if (Cancellation.IsValid() && Cancellation->GetValue() != 0)
+    {
+        if (Callback) Callback(nullptr);
+        return;
+    }
     FglTFRuntimeSkeletalMeshConfig Config = InConfig;
     const int32 TextureLimit = WorldBakedModelAssetPrivate::ResolveRequestTextureLimit(Config.MaterialsConfig, this);
     Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureLimit;
@@ -2325,38 +2579,41 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAsyncNative(
     // A native lambda capture is invisible to GC. Pin the complete reflected config (including
     // material overrides, skeleton, physics asset and custom objects) before the admission wait.
     const uint64 ConfigId = RetainRequestConfig(Config);
-    Callback = [WeakOwner, ConfigId, Completion = MoveTemp(Callback)](USkeletalMesh* Mesh)
+    Callback = [WeakOwner, ConfigId, Cancellation, Completion = MoveTemp(Callback)](USkeletalMesh* Mesh)
     {
         ON_SCOPE_EXIT { if (auto* Owner = WeakOwner.Get()) Owner->ReleaseReadReferences(ConfigId); };
-        if (Completion) Completion(Mesh);
+        if (Completion) Completion(Cancellation.IsValid() && Cancellation->GetValue() != 0 ? nullptr : Mesh);
     };
     const uint32 MaterialSignature = WorldBakedModelAssetPrivate::BuildMaterialConfigSignature(Config.MaterialsConfig);
-    const auto SubmitPayload = [WeakOwner, MeshIndex, SkinIndex, TextureLimit, MaterialSignature, Config, Callback](const bool bReady)
+    const auto SubmitPayload = [WeakOwner, MeshIndex, SkinIndex, TextureLimit, MaterialSignature, Config, Callback, Cancellation](const bool bReady)
     {
         UWorldBakedModelAsset* Owner = WeakOwner.Get();
-        if (!bReady || !Owner || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(Config.Outer))
+        if (!bReady || !Owner || (Cancellation.IsValid() && Cancellation->GetValue() != 0)
+            || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(Config.Outer))
         { if (Callback) Callback(nullptr); return; }
         FV3DStreamingBudget::Enqueue(Config.Outer ? Config.Outer : Owner,
             [WeakOwner, MeshIndex, SkinIndex, TextureLimit, MaterialSignature, bMaterials = !Config.MaterialsConfig.bSkipLoad]()
             { return WeakOwner.IsValid() ? WeakOwner->EstimateLoadBytes({MeshIndex}, bMaterials, SkinIndex, TextureLimit, MaterialSignature) : int64(0); },
-            [WeakOwner, MeshIndex, SkinIndex, Config, Callback,
+            [WeakOwner, MeshIndex, SkinIndex, Config, Callback, Cancellation,
                 WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]
                 (FV3DStreamingBudget::FPermit Permit) mutable
             {
-                if (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())))
+                if ((Cancellation.IsValid() && Cancellation->GetValue() != 0)
+                    || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))))
                 {
                     if (Callback) Callback(nullptr);
                     return;
                 }
                 if (auto* Self = WeakOwner.Get())
                     Self->LoadSkeletalMeshAdmitted(MeshIndex, SkinIndex,
-                        [Permit, Callback](USkeletalMesh* Mesh) { if (Callback) Callback(Mesh); }, Config);
+                        [Permit, Callback](USkeletalMesh* Mesh) { if (Callback) Callback(Mesh); }, Config, Cancellation);
                 else if (Callback) Callback(nullptr);
             },
             [Callback]() { if (Callback) Callback(nullptr); },
-            [WeakOwner, WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]()
+            [WeakOwner, Cancellation, WeakOuter = TWeakObjectPtr<UObject>(Config.Outer), bHadOuter = Config.Outer != nullptr]()
             {
-                return WeakOwner.IsValid() && (!bHadOuter || (WeakOuter.IsValid()
+                return WeakOwner.IsValid() && (!Cancellation.IsValid() || Cancellation->GetValue() == 0)
+                    && (!bHadOuter || (WeakOuter.IsValid()
                     && WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get())));
             });
     };
@@ -2366,7 +2623,8 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAsyncNative(
 
 void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
     const int32 MeshIndex, const int32 SkinIndex, FGWorldBakedSkeletalMeshNativeCallback Callback,
-    const FglTFRuntimeSkeletalMeshConfig& Config)
+    const FglTFRuntimeSkeletalMeshConfig& Config,
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation)
 {
     check(IsInGameThread());
     const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> LocalReader = Reader;
@@ -2391,24 +2649,29 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
     const TWeakObjectPtr<UObject> WeakOuter(Config.Outer);
     const bool bHadOuter = Config.Outer != nullptr;
     const auto* GeneratedContext = Cast<UWorldGeneratedStaticMeshContext>(Config.Outer);
-    const TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> Cancellation = GeneratedContext
+    const TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> OuterCancellation = GeneratedContext
         ? GeneratedContext->GetBuildCancellationToken() : nullptr;
     const bool bQueued = LocalReader.IsValid() && LocalManifest.IsValid()
         && FSafeFileIO::RunTrackedWorker(
             [WeakThis, LocalReader, LocalManifest, LocalUUID, LocalReference, WeakOuter, bHadOuter,
-                MeshIndices, SkinIndex, Callback, Config, CachedTextureIds, CachedMaterialIds, TextureResolution, ReadId, Cancellation]() mutable
+                MeshIndices, SkinIndex, Callback, Config, CachedTextureIds, CachedMaterialIds, TextureResolution, ReadId, Cancellation, OuterCancellation]() mutable
             {
                 FGWorldBakedAssetBundle Bundle;
                 TArray<FglTFRuntimeMeshLOD> LODs;
                 TArray<TArray<int32>> MaterialIds;
                 FString Error;
-                const bool bRead = LocalReader->ReadMeshBundle(
+                const auto IsCancelled = [Cancellation, OuterCancellation]()
+                {
+                    return FSafeFileIO::IsShuttingDown()
+                        || (Cancellation.IsValid() && Cancellation->GetValue() != 0)
+                        || (OuterCancellation.IsValid() && OuterCancellation->GetValue() != 0);
+                };
+                const bool bRead = !IsCancelled() && LocalReader->ReadMeshBundle(
                     LocalUUID, *LocalManifest, MeshIndices, SkinIndex,
                     !Config.MaterialsConfig.bSkipLoad, Bundle, Error,
                     &CachedTextureIds, &CachedMaterialIds, TextureResolution, false,
-                    [Cancellation]() { return FSafeFileIO::IsShuttingDown()
-                        || (Cancellation.IsValid() && Cancellation->GetValue() != 0); });
-                const bool bPrepared = bRead
+                    IsCancelled);
+                const bool bPrepared = bRead && !IsCancelled()
                     && WorldBakedModelAssetPrivate::BuildRuntimeLODsDetached(
                         Bundle, SkinIndex, !Config.MaterialsConfig.bSkipLoad,
                         LODs, MaterialIds, Error);
@@ -2419,36 +2682,51 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
                 }
 
                 FSafeFileIO::DispatchTrackedGameThread(
-                    [WeakThis, LocalReference, Callback, Config, bPrepared, ReadId, WeakOuter, bHadOuter,
+                    [WeakThis, LocalReference, Callback, Config, bPrepared, ReadId, WeakOuter, bHadOuter, Cancellation,
                         Bundle = MoveTemp(Bundle), LODs = MoveTemp(LODs),
                         MaterialIds = MoveTemp(MaterialIds), Error = MoveTemp(Error)]() mutable
                     {
                         UWorldBakedModelAsset* Self = WeakThis.Get();
-                        ON_SCOPE_EXIT { if (auto* Owner = WeakThis.Get()) Owner->ReleaseReadReferences(ReadId); };
-                        if (!IsValid(Self) || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))) || FSafeFileIO::IsShuttingDown())
+                        bool bTransferredReadReferences = false;
+                        ON_SCOPE_EXIT
+                        {
+                            if (!bTransferredReadReferences)
+                                if (auto* Owner = WeakThis.Get()) Owner->ReleaseReadReferences(ReadId);
+                        };
+                        if (!IsValid(Self) || (Cancellation.IsValid() && Cancellation->GetValue() != 0)
+                            || (bHadOuter && (!WeakOuter.IsValid() || !WorldBakedModelAssetPrivate::IsRequestOuterUsable(WeakOuter.Get()))) || FSafeFileIO::IsShuttingDown())
                         {
                             if (Callback) Callback(nullptr);
                             return;
                         }
                         if (bPrepared)
                         {
-                            FWorldBakedBuildReferenceGuard ReferenceGuard;
-                            ReferenceGuard.Add(Config.Outer);
-                            if (Self->AttachRuntimeMaterials(
-                                    Bundle, Config.MaterialsConfig, MaterialIds,
-                                    ReferenceGuard, LODs, Error))
-                            {
-                                Bundle.Reset();
-                                FglTFRuntimeSkeletalMeshConfig LocalConfig = Config;
-                                // Skeleton + authoritative joint maps are embedded in RuntimeLODs.
-                                // Never re-read a parser skin during final reconstruction.
-                                LocalConfig.bIgnoreSkin = true;
-                                LocalConfig.OverrideSkinIndex = INDEX_NONE;
-                                Self->QueueSkeletalRuntimeLODFinalizer(
-                                    MoveTemp(LODs), LocalConfig, Callback,
-                                    LocalReference, ReferenceGuard);
-                                return;
-                            }
+                            auto Attachment = MakeShared<FWorldBakedMaterialAttachment, ESPMode::ThreadSafe>(
+                                Self, Config.Outer, ReadId, MoveTemp(Bundle), MoveTemp(LODs), MoveTemp(MaterialIds),
+                                Config.MaterialsConfig,
+                                [Config, Callback, LocalReference](FWorldBakedMaterialAttachment& Work, const bool bReady)
+                                {
+                                    if (bReady)
+                                    {
+                                        Work.Bundle.Reset();
+                                        FglTFRuntimeSkeletalMeshConfig LocalConfig = Config;
+                                        // The authoritative skin/joint maps are already in RuntimeLODs.
+                                        LocalConfig.bIgnoreSkin = true;
+                                        LocalConfig.OverrideSkinIndex = INDEX_NONE;
+                                        Work.Owner->QueueSkeletalRuntimeLODFinalizer(MoveTemp(Work.LODs), LocalConfig,
+                                            Callback, LocalReference, Work.Guard, Work.Cancellation);
+                                        return;
+                                    }
+                                    if (!Work.bCancelled)
+                                    {
+                                        if (Work.Error.IsEmpty()) Work.Error = TEXT("Streamed baked skeletal material preparation failed");
+                                        FV3DRuntimeSafety::ReportRecoverableFailure(LocalReference, Work.Error);
+                                    }
+                                    if (Callback) Callback(nullptr);
+                                }, Cancellation);
+                            bTransferredReadReferences = true;
+                            Attachment->Schedule();
+                            return;
                         }
                         if (Error.IsEmpty()) Error = TEXT("Streamed baked skeletal mesh preparation failed");
                         FV3DRuntimeSafety::ReportRecoverableFailure(LocalReference, Error);
@@ -2488,6 +2766,129 @@ bool FV3DBakedInvalidRuntimeLODsTest::RunTest(const FString&)
         TestNull(TEXT("Invalid geometry never publishes a mesh"), Result);
         TestEqual(TEXT("Rejected consuming load releases input storage"), LODs.Num(), 0);
     }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedMaterialAttachmentSlicesTest,
+    "V3DSimulator.Streaming.Materials.AttachmentSlices",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedMaterialAttachmentSlicesTest::RunTest(const FString&)
+{
+    // Advance actual work units directly, leaving the live editor's ticker/other requests alone.
+    // The deferred queue itself has separate SafeFileIO scheduling/shutdown coverage.
+    TStrongObjectPtr<UWorldBakedModelAsset> Owner(NewObject<UWorldBakedModelAsset>());
+    TStrongObjectPtr<UMaterialInterface> Parent(LoadObject<UMaterialInterface>(nullptr,
+        TEXT("/Game/Resources/Materials/V3D/MI_Opaque.MI_Opaque")));
+    if (!TestNotNull(TEXT("World shader parent is available"), Parent.Get())) return false;
+    FglTFRuntimeMaterialsConfig Config;
+    Config.ForceMaterial = Parent.Get();
+    const auto MakeMaterial = [&Parent](const int32 Id)
+    {
+        FGWorldBakedMaterial Material;
+        Material.MaterialId = Id;
+        Material.Name = FString::Printf(TEXT("Slice test %d"), Id);
+        Material.BaseMaterialPath = Parent->GetMaterial()->GetPathName();
+        return Material;
+    };
+    uint64 ReadId = 0;
+    TWeakObjectPtr<UMaterialInterface> Cached;
+    {
+        FWorldBakedBuildReferenceGuard ReadGuard;
+        FString Error;
+        Cached = Owner->CreateMaterial(MakeMaterial(0), {}, Config, ReadGuard, Error);
+        if (!TestTrue(TEXT("Cached fixture material is available"), Cached.IsValid()))
+        { AddError(Error); return false; }
+        ReadId = Owner->RetainReadReferences(ReadGuard);
+    }
+    FGWorldBakedAssetBundle Bundle;
+    Bundle.Materials.Add(MakeMaterial(1));
+    Bundle.Materials.Add(MakeMaterial(2));
+    TArray<FglTFRuntimeMeshLOD> LODs;
+    LODs.AddDefaulted_GetRef().Primitives.SetNum(513);
+    TArray<TArray<int32>> MaterialIds;
+    auto& Ids = MaterialIds.AddDefaulted_GetRef();
+    for (int32 Index = 0; Index < 513; ++Index) Ids.Add(Index % 3);
+    int32 Completions = 0;
+    bool bAllBound = false;
+    auto Work = MakeShared<FWorldBakedMaterialAttachment, ESPMode::ThreadSafe>(
+        Owner.Get(), nullptr, ReadId, MoveTemp(Bundle), MoveTemp(LODs), MoveTemp(MaterialIds), Config,
+        [&Completions, &bAllBound](FWorldBakedMaterialAttachment& State, const bool bReady)
+        {
+            ++Completions;
+            bAllBound = bReady && State.LODs.Num() == 1;
+            if (bAllBound)
+                for (const auto& Primitive : State.LODs[0].Primitives)
+                    bAllBound &= IsValid(Primitive.Material);
+        });
+    Work->AdvanceOneUnit();
+    TestEqual(TEXT("One publication unit creates one material"), Work->MaterialIndex, 1);
+    TestEqual(TEXT("A partial request has no terminal callback"), Completions, 0);
+    CollectGarbage(RF_NoFlags);
+    TestTrue(TEXT("Read pin retains a material omitted from the worker payload"), Cached.IsValid());
+    TestTrue(TEXT("Publication guard retains a newly created MID between frames"),
+        Work->Materials.Contains(1) && IsValid(Work->Materials.FindRef(1)));
+    TestEqual(TEXT("The read pin spans publication slices"), Owner->PendingReadReferences.Num(), 1);
+    Work->AdvanceOneUnit();
+    TestEqual(TEXT("The next publication unit creates the next material"), Work->MaterialIndex, 2);
+    Work->AdvanceOneUnit();
+    TestEqual(TEXT("One binding unit stops after 256 primitives"), Work->PrimitiveIndex, 256);
+    Work->AdvanceOneUnit();
+    TestEqual(TEXT("A large mesh keeps yielding during binding"), Work->PrimitiveIndex, 512);
+    Work->AdvanceOneUnit();
+    TestEqual(TEXT("Successful attachment completes once"), Completions, 1);
+    TestTrue(TEXT("Every primitive resolves both cached and new material dependencies"), bAllBound);
+    TestEqual(TEXT("Successful publication releases the read pin"), Owner->PendingReadReferences.Num(), 0);
+    Work->AdvanceOneUnit();
+    TestEqual(TEXT("Completed slices cannot deliver another callback"), Completions, 1);
+
+    TStrongObjectPtr<UWorldGeneratedStaticMeshContext> Context(NewObject<UWorldGeneratedStaticMeshContext>());
+    Context->Initialize(nullptr);
+    Context->CancelBuild();
+    FWorldBakedBuildReferenceGuard CancelGuard;
+    CancelGuard.Add(Context.Get());
+    const uint64 CancelId = Owner->RetainReadReferences(CancelGuard);
+    int32 Cancellations = 0;
+    auto Cancelled = MakeShared<FWorldBakedMaterialAttachment, ESPMode::ThreadSafe>(Owner.Get(), Context.Get(),
+        CancelId, FGWorldBakedAssetBundle(), TArray<FglTFRuntimeMeshLOD>(), TArray<TArray<int32>>(), Config,
+        [&Cancellations, this](FWorldBakedMaterialAttachment& State, const bool bReady)
+        {
+            ++Cancellations;
+            TestFalse(TEXT("Cancelled request never publishes resources"), bReady);
+            TestTrue(TEXT("Cancellation is distinct from corrupt content"), State.bCancelled);
+        });
+    Cancelled->AdvanceOneUnit();
+    Cancelled->AdvanceOneUnit();
+    TestEqual(TEXT("Cancellation completes exactly once"), Cancellations, 1);
+    TestEqual(TEXT("Cancellation releases its read pin"), Owner->PendingReadReferences.Num(), 0);
+    TestEqual(TEXT("Cancellation creates no texture resources"), Cancelled->TextureIndex, 0);
+    TestEqual(TEXT("Cancellation creates no material resources"), Cancelled->MaterialIndex, 0);
+
+    // Character configs use the transient package as Outer, so request cancellation must also
+    // work independently of a generated world context's cancellation flag.
+    auto RequestCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    RequestCancellation->Increment();
+    int32 TokenCompletions = 0;
+    auto TokenCancelled = MakeShared<FWorldBakedMaterialAttachment, ESPMode::ThreadSafe>(Owner.Get(),
+        GetTransientPackage(), uint64(0), FGWorldBakedAssetBundle(), TArray<FglTFRuntimeMeshLOD>(),
+        TArray<TArray<int32>>(), Config,
+        [&TokenCompletions, this](FWorldBakedMaterialAttachment& State, const bool bReady)
+        {
+            ++TokenCompletions;
+            TestFalse(TEXT("A cancelled character request cannot publish"), bReady);
+            TestTrue(TEXT("Request token cancels even with a live transient-package outer"), State.bCancelled);
+        }, RequestCancellation);
+    TokenCancelled->AdvanceOneUnit();
+    TokenCancelled->AdvanceOneUnit();
+    TestEqual(TEXT("A request token completes once"), TokenCompletions, 1);
+    int32 RejectedNativeRequests = 0;
+    Owner->LoadSkeletalMeshAsyncNative(INDEX_NONE, INDEX_NONE,
+        [&RejectedNativeRequests, this](USkeletalMesh* Mesh)
+        {
+            ++RejectedNativeRequests;
+            TestNull(TEXT("Already-cancelled native requests never read/build a mesh"), Mesh);
+        }, FglTFRuntimeSkeletalMeshConfig(), RequestCancellation);
+    TestEqual(TEXT("Native cancellation rejects before archive/config allocation"), RejectedNativeRequests, 1);
+    TestEqual(TEXT("Native early cancellation retains no config pins"), Owner->PendingReadReferences.Num(), 0);
     return true;
 }
 

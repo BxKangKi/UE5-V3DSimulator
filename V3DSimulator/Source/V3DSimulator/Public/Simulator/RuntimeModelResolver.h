@@ -36,6 +36,16 @@ struct V3DSIMULATOR_API FResolvedRuntimeModel
 class V3DSIMULATOR_API FRuntimeModelResolver
 {
 public:
+    /**
+     * Game-thread directory lookup only. DefinitionJson/Bones remain unread so a worker can
+     * prepare the definition, metadata and manifest without blocking the editor/game thread.
+     */
+    static bool ResolveDirectory(
+        const UObject* WorldContextObject,
+        const FString& Reference,
+        FResolvedRuntimeModel& OutModel,
+        FString& OutError);
+
     /** Game-thread lookup against the immutable model directory. */
     static bool Resolve(
         const UObject* WorldContextObject,

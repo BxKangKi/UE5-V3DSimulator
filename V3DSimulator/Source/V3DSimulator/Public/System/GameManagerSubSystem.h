@@ -41,6 +41,7 @@ class UPostProcessComponent;
 class AV3DSimulatorGameplayGameModeBase;
 class UWorld;
 class APlayerController;
+struct FStreamableHandle;
 
 UENUM(BlueprintType)
 enum class EToolMode : uint8
@@ -590,6 +591,17 @@ private:
     /** Game-thread session owner: authority GameMode or client PlayerController. */
     TWeakObjectPtr<AActor> SessionOwner;
 
+    /** Pending loads never retain an old world/actor. Pin the config class for client CDOs only. */
+    TWeakObjectPtr<const AV3DSimulatorGameplayGameModeBase> GameplayPreloadConfig;
+    UPROPERTY(Transient)
+    TObjectPtr<UClass> GameplayPreloadConfigClass;
+    TSharedPtr<FStreamableHandle> GameplayAssetPreloadHandle;
+    TArray<FSoftObjectPath> GameplayPreloadPaths;
+    uint64 GameplayAssetPreloadGeneration = 0;
+    bool bGameplayAssetPreloadPending = false;
+    bool bRuntimeAssetsPreloaded = false;
+    bool bUsingBootstrapLoadingWidget = false;
+
     FTimerManager& GetWorldTimerManager() const;
     FVector GetSessionOwnerLocation() const;
     void EnsureRuntimeComponents();
@@ -857,6 +869,9 @@ private:
     FTimerHandle ProjectBuildProgressTimerHandle;
 
     void StartGameplaySessionInternal(AActor* InOwnerActor, const AV3DSimulatorGameplayGameModeBase* InConfigGameMode);
+    void ContinueGameplaySessionAfterAssetPreload(AActor* InOwnerActor, const AV3DSimulatorGameplayGameModeBase* InConfigGameMode);
+    void CompleteGameplayAssetPreload(uint64 ExpectedGeneration, TWeakObjectPtr<AActor> StartupOwner, TWeakObjectPtr<UWorld> StartupWorld);
+    void CancelGameplayAssetPreload();
     void ClearTransientRuntimeReferences();
     void DestroyTrackedRuntimeActors();
     void CompactTrackedEntityReferences();
@@ -935,7 +950,7 @@ private:
     bool ValidateResolvedGameMode() const;
     void LoadWorldAsync();
     void UpdateWorldTime(float DeltaSeconds);
-    void ShowLoadingWidget();
+    void ShowLoadingWidget(bool bUseNativeBootstrap = false);
     void HideLoadingWidget();
     void NotifyStateChanged();
     void NotifyToolbarChanged();

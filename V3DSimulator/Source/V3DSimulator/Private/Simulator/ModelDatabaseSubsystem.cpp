@@ -19,6 +19,7 @@
 #include "System/ProjectWorkspace.h"
 #include "System/SafeFileIO.h"
 #include "System/SimulatorPaths.h"
+#include "System/SimulatorFileServices.h"
 #include "Simulator/SoundDefinitionJson.h"
 
 namespace ModelDatabasePrivate
@@ -506,9 +507,13 @@ void UModelDatabaseSubsystem::InitializeForWorld(
         if (Cancellation->Load()) return;
         using namespace ModelDatabasePrivate;
         FDatabaseBuildResult Result;
-        LoadBuiltArchive(RequestedRoot, Result);
+        {
+            const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Database.OpenWorldArchive: ") + RequestedRoot);
+            LoadBuiltArchive(RequestedRoot, Result);
+        }
         if (Result.ArchiveReader.IsValid() && Result.Error.IsEmpty())
         {
+            const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Database.OpenResourceArchives: ") + RequestedRoot);
             LoadAllowedProjectArchives(Result);
         }
         if (Cancellation->Load()) return;
@@ -522,6 +527,7 @@ void UModelDatabaseSubsystem::InitializeForWorld(
             {
                 return;
             }
+            const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Database.InstallWorldIndex: ") + RequestedRoot);
             StrongThis->Definitions = MoveTemp(Result.Definitions);
             StrongThis->SoundDefinitions = MoveTemp(Result.SoundDefinitions);
             StrongThis->Summaries = MoveTemp(Result.Summaries);

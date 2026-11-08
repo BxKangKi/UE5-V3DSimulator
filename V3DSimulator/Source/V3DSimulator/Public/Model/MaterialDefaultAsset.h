@@ -68,8 +68,9 @@ struct V3DSIMULATOR_API FV3DMaterialSoftAssetReferences
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="glTF Material Assets|By glTF Name")
     TMap<FString, TSoftObjectPtr<UMaterialInterface>> ByMaterialName;
 
-    /** Resolves configured soft references on the game thread. Missing assets are skipped safely. */
-    bool Resolve(FV3DMaterialAssetReferences& OutReferences, TArray<FString>& OutFailures) const;
+    /** Runtime callers preload packages asynchronously and disable synchronous fallback here. */
+    bool Resolve(FV3DMaterialAssetReferences& OutReferences, TArray<FString>& OutFailures,
+        bool bAllowSynchronousLoading = true) const;
 
     int32 NumConfiguredReferences() const;
 };

@@ -26,16 +26,19 @@
 #include "UObject/CoreRedirects.h"
 #include "Misc/Paths.h"
 #include "ShaderCore.h"
+#include "CoreGlobals.h"
 
 namespace
 {
     /**
      * Commandlets and dedicated servers do not create a game viewport. Avoid touching MoviePlayer
      * in those processes, and respect platforms/build modes where the engine disables it.
+     * PIE shares the editor's Slate/rendering loop; it uses the normal UMG load screen instead
+     * of taking over that loop with the standalone MoviePlayer.
      */
     bool CanUseV3DSimulatorLoadingScreen()
     {
-        return !IsRunningCommandlet() &&
+        return !GIsEditor && !IsRunningCommandlet() &&
             !IsRunningDedicatedServer() &&
             IsMoviePlayerEnabled();
     }
@@ -65,16 +68,15 @@ void FV3DSimulatorModule::StartupModule()
     PostLoadMapHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddRaw(
         this, &FV3DSimulatorModule::HandlePostLoadMap);
 
-    if (!CanUseV3DSimulatorLoadingScreen())
-    {
-        return;
-    }
-
     // Arm only for an actual map load. The global OnPrepareLoadingScreen hook
     // also runs for startup movies; continuously re-arming it can obscure the
     // game viewport after loading has completed on packaged launch paths.
     PreLoadMapHandle = FCoreUObjectDelegates::PreLoadMap.AddRaw(
         this, &FV3DSimulatorModule::HandlePreLoadMap);
+    // Keep file diagnostics registered in PIE too, even though MoviePlayer is bypassed there.
+    FSimulatorFileServices::WriteStartupLog(GIsEditor
+        ? TEXT("Editor map travel: MoviePlayer bypassed; UMG loading UI remains active")
+        : TEXT("Game map travel: MoviePlayer loading screen available when enabled"));
 }
 
 void FV3DSimulatorModule::PrepareLoadingScreen()
@@ -122,6 +124,7 @@ void FV3DSimulatorModule::PrepareLoadingScreen()
 
 void FV3DSimulatorModule::HandlePreLoadMap(const FString& MapName)
 {
+    const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Map.PreLoad: ") + MapName);
     FSimulatorFileServices::WriteStartupLog(TEXT("Loading map: ") + MapName);
     // MapName is intentionally not dereferenced or resolved here: package lookup can create UObjects,
     // while this callback only needs to arm the already self-contained Slate loading screen.
@@ -131,6 +134,7 @@ void FV3DSimulatorModule::HandlePreLoadMap(const FString& MapName)
 
 void FV3DSimulatorModule::HandlePostLoadMap(UWorld* World)
 {
+    const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Map.PostLoad: ") + GetPathNameSafe(World));
     // Finish only our map-loading screen. Never wait here: the engine must
     // regain the game thread so local-player/UMG initialization can continue.
     if (bOwnsLoadingScreen)

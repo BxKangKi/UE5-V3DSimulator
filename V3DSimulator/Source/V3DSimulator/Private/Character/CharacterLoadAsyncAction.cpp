@@ -15,6 +15,7 @@
 #include "Character/CharacterBoneSchema.h"
 #include "Character/CharacterFunctionLibrary.h"
 #include "Engine/SkeletalMesh.h"
+#include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Materials/MaterialInterface.h"
 #include "PhysicsEngine/PhysicsAsset.h"
@@ -24,6 +25,8 @@
 #include "System/V3DRuntimeSafety.h"
 #include "System/MacroLibrary.h"
 #include "Simulator/RuntimeModelResolver.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
+#include "System/WorldArchive.h"
 #include "System/WorldBakedModelAsset.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
@@ -108,6 +111,7 @@ void UCharacterLoadAsyncAction::Activate()
         return;
     }
 
+    if (HasAsyncWorkInFlight() || bFinished) return;
     bCancelled = false;
     bFinished = false;
     bMeshLoadInFlight = false;
@@ -158,7 +162,7 @@ void UCharacterLoadAsyncAction::ResolveAndLoadModel()
     // loading only after the verified model database is open, so the owner pawn is the
     // authoritative UWorld/UGameInstance source for the gworld:// lookup.
     const ACharacterController* ResolveContext = OwnerCharacter.Get();
-    if (!FRuntimeModelResolver::Resolve(ResolveContext, FilePath, Model, ResolveError))
+    if (!FRuntimeModelResolver::ResolveDirectory(ResolveContext, FilePath, Model, ResolveError))
     {
         const bool bDatabaseNotReady = ResolveError.Equals(
             TEXT("a verified .v3d model database is not open"), ESearchCase::IgnoreCase);
@@ -185,27 +189,96 @@ void UCharacterLoadAsyncAction::ResolveAndLoadModel()
     }
 
     FilePath = Model.Reference;
-    PendingBoneMap = MoveTemp(Model.Definition.Bones);
-    FString BoneMapError;
-    if (!CharacterBoneSchema::ValidateSourceToCanonicalMap(PendingBoneMap, BoneMapError))
+    const auto Cancellation = MakeShared<TAtomic<bool>, ESPMode::ThreadSafe>(false);
+    TableReadCancellation = Cancellation;
+    bTableReadInFlight = true;
+    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+    const TWeakObjectPtr<UWorld> ExpectedWorld(ResolveContext->GetWorld());
+    // The immutable reader and value-only directory row outlive cancellation/world teardown.
+    // Read sequentially to avoid holding three maximum-size decompression buffers together.
+    const bool bQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakThis, ExpectedWorld, Model = MoveTemp(Model), Cancellation]() mutable
+        {
+            const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Character.PrepareArchiveTables: ") + Model.Reference);
+            FGWorldModelMetadata Metadata;
+            FGWorldModelManifest Manifest;
+            FString Error;
+            const auto ShouldCancel = [&Cancellation]()
+            { return Cancellation->Load() || FSafeFileIO::IsShuttingDown(); };
+            bool bSuccess = !ShouldCancel()
+                && Model.ArchiveReader->ReadModelDefinition(
+                    Model.UUID, Model.Definition.Bones, Model.DefinitionJson, Error);
+            if (bSuccess && !Model.IsValid())
+            {
+                bSuccess = false;
+                Error = TEXT("The character archive definition is incomplete");
+            }
+            if (bSuccess && !ShouldCancel())
+                bSuccess = CharacterBoneSchema::ValidateSourceToCanonicalMap(Model.Definition.Bones, Error);
+            if (bSuccess && !ShouldCancel())
+                bSuccess = Model.ArchiveReader->ReadModelMetadata(Model.UUID, Metadata, Error);
+            if (bSuccess && !ShouldCancel())
+                bSuccess = Model.ArchiveReader->ReadModelManifest(Model.UUID, Manifest, Error);
+            bSuccess = bSuccess && !ShouldCancel();
+            // Prepared facade publication needs only the validated bone map and native tables.
+            // Do not leave the potentially large source JSON waiting in the GT callback queue.
+            Model.DefinitionJson.Empty();
+            if (!bSuccess)
+            {
+                Model.Definition.Bones.Empty();
+                Metadata = FGWorldModelMetadata();
+                Manifest = FGWorldModelManifest();
+            }
+            // Cleanup must drain even during shutdown, so the action's in-flight guard cannot
+            // retain its registration forever after its native worker has finished.
+            FSafeFileIO::DispatchTrackedGameThread(
+                [WeakThis, ExpectedWorld, Model = MoveTemp(Model), Cancellation, bSuccess,
+                    Metadata = MoveTemp(Metadata), Manifest = MoveTemp(Manifest), Error = MoveTemp(Error)]() mutable
+                {
+                    UCharacterLoadAsyncAction* Self = WeakThis.Get();
+                    if (!Self || Self->TableReadCancellation.Get() != &Cancellation.Get()) return;
+                    Self->bTableReadInFlight = false;
+                    Self->TableReadCancellation.Reset();
+                    ACharacterController* Owner = Self->OwnerCharacter.Get();
+                    UWorld* World = IsValid(Owner) ? Owner->GetWorld() : nullptr;
+                    const UModelDatabaseSubsystem* Database = World && World->GetGameInstance()
+                        ? World->GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+                    if (Self->bCancelled || Self->bFinished || Cancellation->Load()
+                        || FSafeFileIO::IsShuttingDown() || !ExpectedWorld.IsValid()
+                        || World != ExpectedWorld.Get() || World->bIsTearingDown
+                        || !Database || Database->GetArchiveReaderForModel(Model.UUID) != Model.ArchiveReader)
+                    {
+                        Self->CancelAndRelease();
+                        return;
+                    }
+                    if (!bSuccess)
+                    {
+                        Self->FailLoad(FString::Printf(
+                            TEXT("Character archive table preparation failed. Reference=%s Reason=%s"),
+                            *Self->FilePath, *Error));
+                        return;
+                    }
+                    Self->PendingBoneMap = MoveTemp(Model.Definition.Bones);
+                    const FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Character.InstallPreparedFacade: ") + Model.Reference);
+                    UWorldBakedModelAsset* Asset = FRuntimeModelResolver::LoadAssetFromPreparedTables(
+                        Model.UUID, Model.Reference, Model.ArchiveReader,
+                        MoveTemp(Metadata), MoveTemp(Manifest), Error);
+                    if (!IsValid(Asset))
+                    {
+                        Self->FailLoad(FString::Printf(
+                            TEXT("Character baked-data initialization failed. Reference=%s Reason=%s"),
+                            *Self->FilePath, *Error));
+                        return;
+                    }
+                    Self->OnBakedAssetLoaded(Asset);
+                }, true);
+        }, true);
+    if (!bQueued)
     {
-        FailLoad(FString::Printf(
-            TEXT("Character archive contains an invalid canonical bone map: %s"),
-            *BoneMapError));
-        return;
+        bTableReadInFlight = false;
+        TableReadCancellation.Reset();
+        FailLoad(TEXT("Character archive table worker queue is shutting down"));
     }
-
-    // This creates only the lightweight baked-world facade and reads its node/range tables.
-    // No source GLB bytes are opened, parsed, or retained on the gameplay path.
-    UWorldBakedModelAsset* Asset = FRuntimeModelResolver::LoadAssetSynchronously(Model, ResolveError);
-    if (!IsValid(Asset))
-    {
-        FailLoad(FString::Printf(
-            TEXT("Character baked-data initialization failed. Reference=%s Reason=%s"),
-            *FilePath, *ResolveError));
-        return;
-    }
-    OnBakedAssetLoaded(Asset);
 }
 
 void UCharacterLoadAsyncAction::ScheduleModelDatabaseRetry()
@@ -401,6 +474,12 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     Config.bAllowCPUAccess = false;
 
     OnProgress.Broadcast(0.55f);
+    if (bCancelled || bFinished || !OwnerCharacter.IsValid())
+    {
+        FinishAndRelease();
+        return;
+    }
+    MeshLoadCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
     bMeshLoadInFlight = true;
 
     FglTFRuntimeSkeletalMeshAsync MeshDelegate;
@@ -408,11 +487,12 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     // The facade range-reads only this mesh, its selected skin, and directly referenced
     // material/texture .dat members on a worker, prepares RuntimeLODs there, then uses
     // glTFRuntime's asynchronous RuntimeLOD finalizer.
-    CurrentLoadedAsset->LoadSkeletalMeshAsync(
+    CurrentLoadedAsset->LoadSkeletalMeshAsyncNative(
         DetectedMeshIndex,
         DetectedSkinIndex,
-        MeshDelegate,
-        Config);
+        [MeshDelegate](USkeletalMesh* Mesh) { MeshDelegate.ExecuteIfBound(Mesh); },
+        Config,
+        MeshLoadCancellation);
 }
 
 void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
@@ -423,6 +503,7 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
     }
 
     bMeshLoadInFlight = false;
+    MeshLoadCancellation.Reset();
 
     if (bCancelled || bFinished)
     {
@@ -840,6 +921,8 @@ void UCharacterLoadAsyncAction::CancelAndRelease()
     }
 
     bCancelled = true;
+    if (TableReadCancellation.IsValid()) TableReadCancellation->Store(true);
+    if (MeshLoadCancellation.IsValid()) MeshLoadCancellation->Increment();
     ClearGameThreadStageTimer();
     OnCompleted.Clear();
     OnProgress.Clear();
@@ -852,7 +935,7 @@ void UCharacterLoadAsyncAction::CancelAndRelease()
 
 bool UCharacterLoadAsyncAction::HasAsyncWorkInFlight() const
 {
-    return bMeshLoadInFlight;
+    return bTableReadInFlight || bMeshLoadInFlight;
 }
 
 void UCharacterLoadAsyncAction::TryFinishCancelledRequest()
@@ -885,12 +968,16 @@ void UCharacterLoadAsyncAction::FinishAndRelease()
         // Cancellation may arrive while parser/JSON/glTFRuntime work is still running. Keep this
         // action registered and its UObject references alive until every GT drain callback fires.
         bCancelled = true;
+        if (TableReadCancellation.IsValid()) TableReadCancellation->Store(true);
+        if (MeshLoadCancellation.IsValid()) MeshLoadCancellation->Increment();
         return;
     }
 
     bFinished = true;
     bCancelled = true;
     bMeshLoadInFlight = false;
+    TableReadCancellation.Reset();
+    MeshLoadCancellation.Reset();
     ClearGameThreadStageTimer();
     ReleaseCurrentAsset();
     OnCompleted.Clear();

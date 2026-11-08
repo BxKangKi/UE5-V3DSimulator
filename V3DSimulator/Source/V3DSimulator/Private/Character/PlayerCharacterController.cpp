@@ -15,7 +15,9 @@
 #include "Character/CharacterController.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
+#include "Engine/AssetManager.h"
 #include "Engine/LocalPlayer.h"
+#include "Engine/StreamableManager.h"
 #include "EngineUtils.h"
 #include "InputAction.h"
 #include "InputActionValue.h"
@@ -37,6 +39,7 @@
 #include "UI/SimulatorChatWidget.h"
 #include "HAL/PlatformTime.h"
 #include "System/GameUpdateSubSystem.h"
+#include "System/SimulatorFileServices.h"
 #include "TimerManager.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/UserWidget.h"
@@ -211,12 +214,70 @@ void APlayerCharacterController::ResolveCentralAssets()
 void APlayerCharacterController::InitializeRegistryDrivenUI()
 {
     UWorld* World = GetWorld();
-    if (!IsLocalController() || !GetLocalPlayer() || !IsValid(World) || !World->GetGameViewport())
+    if (bRegistryUIInitializationStarted || !IsLocalController() || !GetLocalPlayer()
+        || !IsValid(World) || !World->GetGameViewport())
     {
         return;
     }
 
+    bRegistryUIInitializationStarted = true;
+    const uint64 Generation = ++RegistryUIPreloadGeneration;
+    const TWeakObjectPtr<UWorld> StartupWorld(World);
     UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    TArray<FSoftObjectPath> Paths;
+    if (IsValid(Registry))
+    {
+        Registry->EnsureMenuDefaults();
+        for (const FSoftObjectPath& Path : {Registry->CreatorHUDWidgetClass.ToSoftObjectPath(),
+                Registry->DebugWidgetClass.ToSoftObjectPath(), Registry->PauseMenuWidgetClass.ToSoftObjectPath(),
+                Registry->LoadingWidgetClass.ToSoftObjectPath()})
+            if (Path.IsValid()) Paths.AddUnique(Path);
+    }
+    const TWeakObjectPtr<APlayerCharacterController> WeakThis(this);
+    if (!Paths.IsEmpty())
+    {
+        FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Queue gameplay UI packages"));
+        RegistryUIPreloadHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(Paths,
+            FStreamableDelegate::CreateLambda([WeakThis, StartupWorld, Generation]()
+            {
+                if (APlayerCharacterController* Controller = WeakThis.Get())
+                    Controller->CompleteRegistryDrivenUIInitialization(Generation, StartupWorld);
+            }));
+        if (RegistryUIPreloadHandle.IsValid()) return;
+        UE_LOG(LogTemp, Warning, TEXT("Startup UI preload could not be queued; using available classes and native HUD defaults."));
+    }
+    World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this,
+        [this, StartupWorld, Generation]()
+        {
+            CompleteRegistryDrivenUIInitialization(Generation, StartupWorld);
+        }));
+}
+
+void APlayerCharacterController::CancelRegistryDrivenUIInitialization()
+{
+    ++RegistryUIPreloadGeneration;
+    if (RegistryUIPreloadHandle.IsValid())
+    {
+        RegistryUIPreloadHandle->CancelHandle();
+        RegistryUIPreloadHandle.Reset();
+    }
+}
+
+void APlayerCharacterController::CompleteRegistryDrivenUIInitialization(
+    const uint64 ExpectedGeneration, const TWeakObjectPtr<UWorld> StartupWorld)
+{
+    if (RegistryUIPreloadGeneration != ExpectedGeneration) return;
+    if (IsActorBeingDestroyed() || !IsLocalController() || !GetLocalPlayer()
+        || !StartupWorld.IsValid() || GetWorld() != StartupWorld.Get() || !GetWorld()->GetGameViewport())
+    {
+        CancelRegistryDrivenUIInitialization();
+        return;
+    }
+    // Keep successfully loaded classes pinned until the widgets' UPROPERTY references adopt them.
+    TSharedPtr<FStreamableHandle> CompletedHandle = MoveTemp(RegistryUIPreloadHandle);
+    FScopedSimulatorLoadCheckpoint Checkpoint(TEXT("Create loaded gameplay UI"));
+    UV3DSimulatorAssetRegistry* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(SubSystem)) SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     if (!IsValid(Registry))
     {
         UE_LOG(LogTemp, Warning, TEXT("AssetRegistry unavailable; using native gameplay HUD defaults."));
@@ -231,7 +292,6 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
     };
 
     // Native defaults keep every HUD available when a stale or missing Blueprint is configured.
-    if (IsValid(Registry)) Registry->EnsureMenuDefaults();
     const auto ResolveWidgetClass = [](UClass* Candidate, UClass* NativeClass)
     {
         return IsUsablePlayerWidgetClass(Candidate, NativeClass) ? Candidate : NativeClass;
@@ -239,7 +299,7 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
 
     if (!IsValid(CreatorHUDWidget))
     {
-        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->CreatorHUDWidgetClass.LoadSynchronous() : nullptr, UCreatorHUDWidget::StaticClass());
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->CreatorHUDWidgetClass.Get() : nullptr, UCreatorHUDWidget::StaticClass());
         UCreatorHUDWidget* Widget = CreateWidget<UCreatorHUDWidget>(this, WidgetClass);
         SetCreatorHUDWidget(Widget);
         AddTopLevelWidget(Widget, 0);
@@ -256,7 +316,7 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
     if (!IsValid(DebugWidget) || !DebugWidget->IsA<UDebugHUDWidget>())
     {
         if (IsValid(DebugWidget)) DebugWidget->RemoveFromParent();
-        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->DebugWidgetClass.LoadSynchronous() : nullptr, UDebugHUDWidget::StaticClass());
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->DebugWidgetClass.Get() : nullptr, UDebugHUDWidget::StaticClass());
         UDebugHUDWidget* Widget = CreateWidget<UDebugHUDWidget>(this, WidgetClass);
         SetDebugWidget(Widget);
         AddTopLevelWidget(Widget, 40);
@@ -264,17 +324,15 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
 
     if (!IsValid(PauseMenuWidget))
     {
-        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->PauseMenuWidgetClass.LoadSynchronous() : nullptr, UPauseMenuWidget::StaticClass());
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->PauseMenuWidgetClass.Get() : nullptr, UPauseMenuWidget::StaticClass());
         UPauseMenuWidget* Widget = CreateWidget<UPauseMenuWidget>(this, WidgetClass);
         SetPauseMenuWidget(Widget);
         AddTopLevelWidget(Widget, 50);
     }
 
-    EnsurePauseSettingsWidget();
-
     if (IsValid(SubSystem) && !SubSystem->HasLoadingWidget())
     {
-        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->LoadingWidgetClass.LoadSynchronous() : nullptr, ULoadingHUDWidget::StaticClass());
+        UClass* WidgetClass = ResolveWidgetClass(IsValid(Registry) ? Registry->LoadingWidgetClass.Get() : nullptr, ULoadingHUDWidget::StaticClass());
         ULoadingHUDWidget* Widget = CreateWidget<ULoadingHUDWidget>(this, WidgetClass);
         if (IsValid(Widget))
         {
@@ -288,6 +346,8 @@ void APlayerCharacterController::InitializeRegistryDrivenUI()
 void APlayerCharacterController::BeginPlay()
 {
     Super::BeginPlay();
+    CancelRegistryDrivenUIInitialization();
+    bRegistryUIInitializationStarted = false;
     bMenuWorldTravelPending = false;
     bGameplayInputSuppressed = false;
     GetWorldTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
@@ -557,6 +617,7 @@ void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
 
 void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    CancelRegistryDrivenUIInitialization();
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);

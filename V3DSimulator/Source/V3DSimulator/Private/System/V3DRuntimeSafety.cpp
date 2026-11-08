@@ -153,6 +153,11 @@ namespace V3DRuntimeSafetyPrivate
         TArray<FPendingAssetRelease> PendingAssetReleases;
         uint64 NextTicket = 1;
         bool bPumpingQueue = false;
+        bool bProcessingAssetReleases = false;
+        bool bPumpBudgetActive = false;
+        int32 PumpActionsRemaining = 0;
+        double PumpDeadlineSeconds = 0.0;
+        FTSTicker::FDelegateHandle DeferredPumpHandle;
         FTSTicker::FDelegateHandle WatchdogHandle;
         TMap<uint64, FTSTicker::FDelegateHandle> DeferredCompletions;
     };
@@ -196,6 +201,59 @@ namespace V3DRuntimeSafetyPrivate
     bool IsShuttingDown()
     {
         return GetState().ShuttingDownFlag.GetValue() != 0;
+    }
+
+    constexpr int32 MaximumCoordinatorActionsPerPump = 16;
+    constexpr double CoordinatorPumpBudgetSeconds = 0.002;
+
+    /** Nested completion/release callbacks share the current game-thread drain budget. */
+    class FScopedPumpBudget
+    {
+    public:
+        FScopedPumpBudget()
+        {
+            FState& State = GetState();
+            bOwnsBudget = !State.bPumpBudgetActive;
+            if (bOwnsBudget)
+            {
+                State.bPumpBudgetActive = true;
+                State.PumpActionsRemaining = MaximumCoordinatorActionsPerPump;
+                State.PumpDeadlineSeconds = FPlatformTime::Seconds() + CoordinatorPumpBudgetSeconds;
+            }
+        }
+        ~FScopedPumpBudget()
+        {
+            if (bOwnsBudget) GetState().bPumpBudgetActive = false;
+        }
+    private:
+        bool bOwnsBudget = false;
+    };
+
+    bool HasPumpBudget()
+    {
+        const FState& State = GetState();
+        // Module shutdown must finish without requiring another engine/ticker frame.
+        return IsShuttingDown() || !State.bPumpBudgetActive
+            || (State.PumpActionsRemaining > 0 && FPlatformTime::Seconds() < State.PumpDeadlineSeconds);
+    }
+
+    void ChargePumpAction()
+    {
+        if (!IsShuttingDown()) --GetState().PumpActionsRemaining;
+    }
+
+    void ScheduleDeferredPump_GameThread(void (*Pump)())
+    {
+        check(IsInGameThread());
+        FState& State = GetState();
+        if (IsShuttingDown() || State.DeferredPumpHandle.IsValid()) return;
+        State.DeferredPumpHandle = FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateLambda([Pump](float)
+            {
+                GetState().DeferredPumpHandle.Reset();
+                if (!IsShuttingDown()) Pump();
+                return false;
+            }), 0.0f);
     }
 
     void QueueCompletion_GameThread(const uint64 Ticket)
@@ -693,6 +751,7 @@ void FV3DRuntimeSafety::CompleteOperation(const uint64 Ticket)
     {
         return;
     }
+    V3DRuntimeSafetyPrivate::FScopedPumpBudget PumpBudget;
 
     FTSTicker::FDelegateHandle DeferredHandle;
     if (State.DeferredCompletions.RemoveAndCopyValue(Ticket, DeferredHandle))
@@ -746,6 +805,7 @@ void FV3DRuntimeSafety::CancelQueuedOperations(UObject* Owner)
     }
 
     V3DRuntimeSafetyPrivate::FState& State = V3DRuntimeSafetyPrivate::GetState();
+    V3DRuntimeSafetyPrivate::FScopedPumpBudget PumpBudget;
     TArray<V3DRuntimeSafetyPrivate::FQueuedOperation> Removed =
         V3DRuntimeSafetyPrivate::RemoveQueuedOperationsForOwner(State, Owner);
     for (V3DRuntimeSafetyPrivate::FQueuedOperation& Operation : Removed)
@@ -772,6 +832,7 @@ void FV3DRuntimeSafety::RequestAssetRelease(UglTFRuntimeAsset* Asset)
     }
 
     V3DRuntimeSafetyPrivate::FState& State = V3DRuntimeSafetyPrivate::GetState();
+    V3DRuntimeSafetyPrivate::FScopedPumpBudget PumpBudget;
     if (V3DRuntimeSafetyPrivate::IsAssetPendingRelease(State, Asset))
     {
         return;
@@ -798,12 +859,22 @@ void FV3DRuntimeSafety::ProcessPendingAssetReleases_GameThread()
 {
     check(IsInGameThread());
     V3DRuntimeSafetyPrivate::FState& State = V3DRuntimeSafetyPrivate::GetState();
+    if (State.bProcessingAssetReleases) return;
+    V3DRuntimeSafetyPrivate::FScopedPumpBudget PumpBudget;
+    State.bProcessingAssetReleases = true;
+    ON_SCOPE_EXIT { State.bProcessingAssetReleases = false; };
 
     for (int32 Index = State.PendingAssetReleases.Num() - 1; Index >= 0; --Index)
     {
+        if (!V3DRuntimeSafetyPrivate::HasPumpBudget())
+        {
+            V3DRuntimeSafetyPrivate::ScheduleDeferredPump_GameThread(&FV3DRuntimeSafety::NotifyGateAvailable_GameThread);
+            return;
+        }
         UglTFRuntimeAsset* Asset = State.PendingAssetReleases[Index].Asset.Get();
         if (!IsValid(Asset))
         {
+            V3DRuntimeSafetyPrivate::ChargePumpAction();
             State.PendingAssetReleases.RemoveAtSwap(Index, 1, EAllowShrinking::No);
             continue;
         }
@@ -821,6 +892,7 @@ void FV3DRuntimeSafety::ProcessPendingAssetReleases_GameThread()
 
         // ClearCache touches the parser's mutable cache and shares the process-wide native gate
         // with every parser constructor and mesh operation.
+        V3DRuntimeSafetyPrivate::ChargePumpAction();
         Asset->ClearCache();
         if (Asset->IsRooted())
         {
@@ -836,6 +908,7 @@ void FV3DRuntimeSafety::ProcessPendingAssetReleases_GameThread()
 void FV3DRuntimeSafety::NotifyGateAvailable_GameThread()
 {
     check(IsInGameThread());
+    V3DRuntimeSafetyPrivate::FScopedPumpBudget PumpBudget;
     ProcessPendingAssetReleases_GameThread();
     PumpQueue_GameThread();
 }
@@ -965,6 +1038,11 @@ void FV3DRuntimeSafety::BeginShutdown()
 
     V3DRuntimeSafetyPrivate::DrainDeferredCompletions_GameThread();
     ProcessPendingAssetReleases_GameThread();
+    if (State.DeferredPumpHandle.IsValid())
+    {
+        FTSTicker::GetCoreTicker().RemoveTicker(State.DeferredPumpHandle);
+        State.DeferredPumpHandle.Reset();
+    }
     if (State.WatchdogHandle.IsValid())
     {
         FTSTicker::GetCoreTicker().RemoveTicker(State.WatchdogHandle);
@@ -1082,6 +1160,7 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
     }
 
     State.bPumpingQueue = true;
+    V3DRuntimeSafetyPrivate::FScopedPumpBudget PumpBudget;
     ON_SCOPE_EXIT
     {
         State.bPumpingQueue = false;
@@ -1092,6 +1171,12 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
     while (State.ActiveOperations.Num() < MaximumConcurrentNativeOperations &&
         V3DRuntimeSafetyPrivate::IsNativeGateIdle())
     {
+        if (!V3DRuntimeSafetyPrivate::HasPumpBudget())
+        {
+            if (!State.Queue.IsEmpty() || !State.PendingAssetReleases.IsEmpty())
+                V3DRuntimeSafetyPrivate::ScheduleDeferredPump_GameThread(&FV3DRuntimeSafety::NotifyGateAvailable_GameThread);
+            return;
+        }
         // ClearCache is exclusive against all finalizers. Continuously refilling free slots can
         // otherwise retain completed builders and their parser/mesh caches for an entire long
         // streaming session, after their memory permits have already been released. Periodically
@@ -1110,6 +1195,11 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
         // native operation. The per-builder test remains as a defensive invariant.
         for (int32 Index = 0; Index < State.Queue.Num(); ++Index)
         {
+            if (!V3DRuntimeSafetyPrivate::HasPumpBudget())
+            {
+                V3DRuntimeSafetyPrivate::ScheduleDeferredPump_GameThread(&FV3DRuntimeSafety::NotifyGateAvailable_GameThread);
+                break;
+            }
             V3DRuntimeSafetyPrivate::FQueuedOperation& Candidate = State.Queue[Index];
             UObject* Owner = Candidate.Owner.Get();
             UglTFRuntimeAsset* Asset = Candidate.Asset.Get();
@@ -1117,6 +1207,7 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
             if (!IsValid(Owner) || !IsValid(Asset) || !Candidate.Start ||
                 V3DRuntimeSafetyPrivate::IsAssetPendingRelease(State, Asset))
             {
+                V3DRuntimeSafetyPrivate::ChargePumpAction();
                 RejectedBeforeStart.Add(MoveTemp(Candidate));
                 State.Queue.RemoveAt(Index, 1, EAllowShrinking::No);
                 --Index;
@@ -1175,6 +1266,7 @@ void FV3DRuntimeSafety::PumpQueue_GameThread()
                 FPlatformTime::Seconds(),
                 Operation.bExclusive);
             State.ActiveOperations.Add(Active.Ticket, MoveTemp(Active));
+            V3DRuntimeSafetyPrivate::ChargePumpAction();
             bHasSelectedOperation = true;
         }
 
@@ -1292,6 +1384,104 @@ bool FV3DNativeReleaseFairnessTest::RunTest(const FString&)
         V3DRuntimeSafetyPrivate::GetState().PendingAssetReleases.Num(), 0);
     FV3DRuntimeSafety::CompleteOperation(D);
     TestEqual(TEXT("The native coordinator finishes empty"), FV3DRuntimeSafety::GetPendingOperationCount(), 0);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DNativePumpBurstTest,
+    "V3DSimulator.Streaming.NativeQueue.BoundedSynchronousBurst",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DNativePumpBurstTest::RunTest(const FString&)
+{
+    using namespace V3DRuntimeSafetyPrivate;
+    FState& State = GetState();
+    if (FV3DRuntimeSafety::GetPendingOperationCount() != 0 || FV3DRuntimeSafety::IsCircuitOpen()
+        || IsShuttingDown() || State.bPumpingQueue)
+    {
+        AddError(TEXT("Run this test in an idle editor before shutdown."));
+        return false;
+    }
+    TStrongObjectPtr<UObject> Owner(NewObject<UObject>());
+    TStrongObjectPtr<UglTFRuntimeAsset> Asset(NewObject<UglTFRuntimeAsset>());
+    ON_SCOPE_EXIT
+    {
+        State.bPumpingQueue = false;
+        State.Queue.Reset(); // Every request in this idle-editor fixture belongs to this test.
+        if (State.DeferredPumpHandle.IsValid())
+        {
+            FTSTicker::GetCoreTicker().RemoveTicker(State.DeferredPumpHandle);
+            State.DeferredPumpHandle.Reset();
+        }
+    };
+    constexpr int32 Count = MaximumCoordinatorActionsPerPump * 8;
+    int32 Started = 0, Rejected = 0;
+    const auto Pulse = []()
+    {
+        // Exercise the public gate-notification path without requiring an engine frame.
+        FV3DRuntimeSafety::ExecuteSynchronousOperation(TEXT("native pump burst test"), []() {});
+    };
+    const auto Drain = [&]()
+    {
+        for (int32 I = 0; I < Count && !State.Queue.IsEmpty(); ++I) Pulse();
+        TestTrue(TEXT("Subsequent pumps finish every queued request"), State.Queue.IsEmpty());
+    };
+    State.bPumpingQueue = true;
+    for (int32 I = 0; I < Count; ++I)
+        FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Asset.Get(), TEXT("synchronous completion burst"),
+            [&Started](const uint64 Ticket)
+            {
+                ++Started;
+                FV3DRuntimeSafety::CompleteOperation(Ticket);
+            });
+    State.bPumpingQueue = false;
+    Pulse();
+    TestTrue(TEXT("Synchronous completion cannot drain the full burst in one pump"),
+        Started <= MaximumCoordinatorActionsPerPump && !State.Queue.IsEmpty());
+    TestTrue(TEXT("An unfinished burst owns a next-frame retry"), State.DeferredPumpHandle.IsValid());
+    Drain();
+    TestEqual(TEXT("Every synchronous request starts exactly once"), Started, Count);
+
+    State.bPumpingQueue = true;
+    for (int32 I = 0; I < Count; ++I)
+        FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Asset.Get(), TEXT("expired owner burst"),
+            [&Started](const uint64 Ticket) { ++Started; FV3DRuntimeSafety::CompleteOperation(Ticket); },
+            [&Rejected](const FString&) { ++Rejected; });
+    // Reproduce expired queued owners without collecting unrelated editor objects.
+    for (FQueuedOperation& Operation : State.Queue) Operation.Owner.Reset();
+    State.bPumpingQueue = false;
+    Pulse();
+    TestTrue(TEXT("Stale-owner rejection also yields before draining the burst"),
+        Rejected <= MaximumCoordinatorActionsPerPump && !State.Queue.IsEmpty());
+    Drain();
+    TestEqual(TEXT("Every stale request rejects exactly once"), Rejected, Count);
+    TestEqual(TEXT("Expired owners never start native work"), Started, Count);
+
+    State.bPumpingQueue = true;
+    for (int32 I = 0; I < 4; ++I)
+        FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Asset.Get(), TEXT("cancel deferred burst"),
+            [&Started](const uint64 Ticket) { ++Started; FV3DRuntimeSafety::CompleteOperation(Ticket); },
+            [&Rejected](const FString&) { ++Rejected; });
+    State.bPumpingQueue = false;
+    FV3DRuntimeSafety::CancelQueuedOperations(Owner.Get());
+    Pulse();
+    TestEqual(TEXT("Cancellation rejects each deferred request exactly once"), Rejected, Count + 4);
+    TestEqual(TEXT("Cancelled requests cannot start on a deferred retry"), Started, Count);
+    TestEqual(TEXT("The coordinator drains without another engine frame"), FV3DRuntimeSafety::GetPendingOperationCount(), 0);
+
+    const uint64 Held = FV3DRuntimeSafety::EnqueueOperation(Owner.Get(), Asset.Get(),
+        TEXT("hold cache-release barrier"), [](uint64) {});
+    if (TestTrue(TEXT("Cache-release fixture acquires a native ticket"), Held != 0))
+    {
+        for (int32 I = 0; I < Count; ++I)
+            FV3DRuntimeSafety::RequestAssetRelease(NewObject<UglTFRuntimeAsset>());
+        TestEqual(TEXT("Active native work retains all requested releases"), State.PendingAssetReleases.Num(), Count);
+        FV3DRuntimeSafety::CompleteOperation(Held);
+        TestTrue(TEXT("Cache clearing yields after one bounded wave"),
+            State.PendingAssetReleases.Num() >= Count - MaximumCoordinatorActionsPerPump
+                && !State.PendingAssetReleases.IsEmpty());
+        for (int32 I = 0; I < Count && FV3DRuntimeSafety::GetPendingOperationCount() > 0; ++I) Pulse();
+        TestEqual(TEXT("Later pumps release every retained asset without another frame"),
+            FV3DRuntimeSafety::GetPendingOperationCount(), 0);
+    }
     return true;
 }
 

@@ -1148,6 +1148,19 @@ bool FSafeFileIO::DispatchTrackedGameThread(FTrackedTask Task, const bool bCompl
     return true;
 }
 
+bool FSafeFileIO::DispatchTrackedGameThreadDeferred(FTrackedTask Task, const bool bCompleteDuringShutdown)
+{
+    if (!Task || (!bCompleteDuringShutdown && SafeFileIOPrivate::IsShuttingDown())) return false;
+    const TSharedRef<SafeFileIOPrivate::FTrackedOperation, ESPMode::ThreadSafe> TrackedOperation =
+        MakeShared<SafeFileIOPrivate::FTrackedOperation, ESPMode::ThreadSafe>();
+    SafeFileIOPrivate::QueueGameThreadContinuation(
+        [Task = MoveTemp(Task), TrackedOperation, bCompleteDuringShutdown]() mutable
+        {
+            if (bCompleteDuringShutdown || !SafeFileIOPrivate::IsShuttingDown()) Task();
+        });
+    return true;
+}
+
 bool FSafeFileIO::IsShuttingDown()
 {
     return SafeFileIOPrivate::IsShuttingDown();
@@ -1992,6 +2005,11 @@ bool FV3DFileShutdownCleanupTest::RunTest(const FString&)
     }
     auto Cleanup = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
     auto Ordinary = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
+    TestTrue(TEXT("Deferred ordinary work is accepted before shutdown"),
+        FSafeFileIO::DispatchTrackedGameThreadDeferred([Ordinary]() { Ordinary->Increment(); }));
+    TestTrue(TEXT("Deferred terminal cleanup is accepted before shutdown"),
+        FSafeFileIO::DispatchTrackedGameThreadDeferred([Cleanup]() { Cleanup->Increment(); }, true));
+    TestEqual(TEXT("Game-thread deferred cleanup does not execute inline"), Cleanup->GetValue(), 0);
     TestTrue(TEXT("Worker owns a guaranteed terminal continuation"), FSafeFileIO::RunTrackedWorker(
         [Cleanup, Ordinary]()
         {
@@ -2003,9 +2021,59 @@ bool FV3DFileShutdownCleanupTest::RunTest(const FString&)
     ON_SCOPE_EXIT { SafeFileIOPrivate::GetState().ShutdownFlag.Reset(); };
     TestTrue(TEXT("Accepted worker and terminal cleanup drain during shutdown"),
         FSafeFileIO::FlushPendingOperations(5.0));
-    TestEqual(TEXT("Terminal ownership cleanup runs exactly once"), Cleanup->GetValue(), 1);
+    TestEqual(TEXT("Both terminal ownership cleanups run exactly once"), Cleanup->GetValue(), 2);
     TestEqual(TEXT("Ordinary work is suppressed"), Ordinary->GetValue(), 0);
     TestEqual(TEXT("All lifetimes released before module unload"), FSafeFileIO::GetPendingOperationCount(), 0);
+    return true;
+}
+
+namespace SafeFileIOPrivate
+{
+    struct FDeferredContinuationProbe : TSharedFromThis<FDeferredContinuationProbe, ESPMode::ThreadSafe>
+    {
+        int32 Completed = 0;
+        int32 Depth = 0;
+        int32 MaximumDepth = 0;
+        static constexpr int32 Total = 1024;
+
+        void Run()
+        {
+            ++Depth;
+            MaximumDepth = FMath::Max(MaximumDepth, Depth);
+            ++Completed;
+            if (Completed < Total)
+            {
+                const auto Self = AsShared();
+                FSafeFileIO::DispatchTrackedGameThreadDeferred([Self]() { Self->Run(); });
+            }
+            --Depth;
+        }
+    };
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFileDeferredContinuationTest,
+    "V3DSimulator.System.FileIO.DeferredContinuation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DFileDeferredContinuationTest::RunTest(const FString&)
+{
+    if (FSafeFileIO::IsShuttingDown() || FSafeFileIO::GetPendingOperationCount() != 0)
+    {
+        AddError(TEXT("Run this test with no active file work."));
+        return false;
+    }
+    const auto Probe = MakeShared<SafeFileIOPrivate::FDeferredContinuationProbe, ESPMode::ThreadSafe>();
+    TestTrue(TEXT("Deferred callback is accepted from the game thread"),
+        FSafeFileIO::DispatchTrackedGameThreadDeferred([Probe]() { Probe->Run(); }));
+    TestEqual(TEXT("Game-thread dispatch returns before invoking the callback"), Probe->Completed, 0);
+    FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
+    TestTrue(TEXT("One pump slice leaves a long chain queued"),
+        SafeFileIOPrivate::TickGameThreadContinuations(0.0f));
+    TestTrue(TEXT("The pump callback cap bounds one slice"), Probe->Completed > 0 && Probe->Completed <= 256);
+    TestTrue(TEXT("The remaining chain drains without another engine frame"),
+        FSafeFileIO::FlushPendingOperations(5.0));
+    TestEqual(TEXT("Every deferred callback executes once"), Probe->Completed, Probe->Total);
+    TestEqual(TEXT("Requeue never recurses inline"), Probe->MaximumDepth, 1);
+    TestEqual(TEXT("No deferred operation lifetime leaks"), FSafeFileIO::GetPendingOperationCount(), 0);
     return true;
 }
 
