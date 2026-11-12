@@ -60,7 +60,7 @@ void UCreatorHUDWidget::BuildNativeLayout()
     NativeToolbarPanel->SetContent(NativeToolbar);
 
     NativeItemsPanel = AddPanel(PanelSize, FVector2D::ZeroVector);
-    if (UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(NativeItemsPanel->Slot)) Slot->SetZOrder(10);
+    if (UCanvasPanelSlot* ItemsPanelSlot = Cast<UCanvasPanelSlot>(NativeItemsPanel->Slot)) ItemsPanelSlot->SetZOrder(10);
     UVerticalBox* ItemsBox = WidgetTree->ConstructWidget<UVerticalBox>();
     NativeItemsPanel->SetContent(ItemsBox);
     AddText(ItemsBox, NSLOCTEXT("CreatorHUD", "Browser", "Available items"), true);
@@ -81,10 +81,10 @@ void UCreatorHUDWidget::BuildNativeLayout()
     NativePreviousPage = AddButton(Paging, NSLOCTEXT("CreatorHUD", "Previous", "Previous"));
     NativePreviousPage->OnClicked.AddUniqueDynamic(this, &UCreatorHUDWidget::PreviousItemPage);
     NativePageText = AddText(Paging, FText::GetEmpty());
-    if (UHorizontalBoxSlot* Slot = Cast<UHorizontalBoxSlot>(NativePageText->Slot))
+    if (UHorizontalBoxSlot* PageTextSlot = Cast<UHorizontalBoxSlot>(NativePageText->Slot))
     {
-        Slot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-        Slot->SetVerticalAlignment(VAlign_Center);
+        PageTextSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        PageTextSlot->SetVerticalAlignment(VAlign_Center);
     }
     NativePageText->SetJustification(ETextJustify::Center);
     NativeNextPage = AddButton(Paging, NSLOCTEXT("CreatorHUD", "Next", "Next"));
@@ -112,10 +112,10 @@ void UCreatorHUDWidget::ApplyNativeStyle()
     const auto UpdatePanel = [](UBorder* Panel, const FVector2D& Size, const FVector2D& Position)
     {
         if (Panel && FMath::IsFinite(Size.X) && FMath::IsFinite(Size.Y))
-            if (UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(Panel->Slot))
+            if (UCanvasPanelSlot* PanelCanvasSlot = Cast<UCanvasPanelSlot>(Panel->Slot))
             {
-                Slot->SetSize(FVector2D(FMath::Clamp(Size.X, 100., 16384.), FMath::Clamp(Size.Y, 100., 16384.)));
-                if (FMath::IsFinite(Position.X) && FMath::IsFinite(Position.Y)) Slot->SetPosition(Position);
+                PanelCanvasSlot->SetSize(FVector2D(FMath::Clamp(Size.X, 100., 16384.), FMath::Clamp(Size.Y, 100., 16384.)));
+                if (FMath::IsFinite(Position.X) && FMath::IsFinite(Position.Y)) PanelCanvasSlot->SetPosition(Position);
             }
     };
     UpdatePanel(NativeStatusPanel, StatusPanelSize, StatusPanelOffset);
@@ -125,10 +125,10 @@ void UCreatorHUDWidget::ApplyNativeStyle()
         // Exact bounds prevent the shared panel's 100px minimum and stale Blueprint defaults
         // from stretching the square slots into the previous full-width toolbar.
         NativeToolbarPanel->SetPadding(FMargin(6));
-        if (UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(NativeToolbarPanel->Slot))
+        if (UCanvasPanelSlot* ToolbarPanelSlot = Cast<UCanvasPanelSlot>(NativeToolbarPanel->Slot))
         {
-            Slot->SetSize(FVector2D(7.f * (SlotExtent + 6.f) + 12.f, SlotExtent + 18.f));
-            Slot->SetPosition(FVector2D(FMath::IsFinite(ToolbarOffset.X) ? ToolbarOffset.X : 0.,
+            ToolbarPanelSlot->SetSize(FVector2D(7.f * (SlotExtent + 6.f) + 12.f, SlotExtent + 18.f));
+            ToolbarPanelSlot->SetPosition(FVector2D(FMath::IsFinite(ToolbarOffset.X) ? ToolbarOffset.X : 0.,
                 FMath::IsFinite(ToolbarOffset.Y) ? ToolbarOffset.Y : -16.));
         }
     }

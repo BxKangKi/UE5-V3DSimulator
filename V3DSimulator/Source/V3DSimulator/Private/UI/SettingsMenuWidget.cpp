@@ -1851,20 +1851,20 @@ void USettingsMenuWidget::BuildNativeLayout()
     UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
     Content->AddChildToVerticalBox(Header);
     NativeTitle = AddText(Header, NSLOCTEXT("V3DUI", "Settings", "Settings"), true);
-    if (UOverlaySlot* Slot = Cast<UOverlaySlot>(NativeTitle->Slot))
+    if (UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(NativeTitle->Slot))
     {
-        Slot->SetHorizontalAlignment(HAlign_Center);
-        Slot->SetVerticalAlignment(VAlign_Center);
-        Slot->SetPadding(FMargin(0.f, 8.f));
+        TitleSlot->SetHorizontalAlignment(HAlign_Center);
+        TitleSlot->SetVerticalAlignment(VAlign_Center);
+        TitleSlot->SetPadding(FMargin(0.f, 8.f));
     }
     NativeBack = AddButton(Header, NSLOCTEXT("V3DUI", "Back", "Back"));
-    if (UButtonSlot* Slot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) Slot->SetPadding(FMargin(12.f));
+    if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
     if (USizeBox* Size = Cast<USizeBox>(NativeBack->GetParent())) Size->SetMinDesiredWidth(128.f);
-    if (UOverlaySlot* Slot = Cast<UOverlaySlot>(NativeBack->GetParent()->Slot))
+    if (UOverlaySlot* BackOverlaySlot = Cast<UOverlaySlot>(NativeBack->GetParent()->Slot))
     {
-        Slot->SetHorizontalAlignment(HAlign_Left);
-        Slot->SetVerticalAlignment(VAlign_Center);
-        Slot->SetPadding(FMargin(32.f, 0.f));
+        BackOverlaySlot->SetHorizontalAlignment(HAlign_Left);
+        BackOverlaySlot->SetVerticalAlignment(VAlign_Center);
+        BackOverlaySlot->SetPadding(FMargin(32.f, 0.f));
     }
 
     UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>();
@@ -1984,7 +1984,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
     }
     if (NativeBack)
     {
-        if (UButtonSlot* Slot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) Slot->SetPadding(FMargin(12.f));
+        if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
         if (UTextBlock* Label = Cast<UTextBlock>(NativeBack->GetContent()))
         {
             FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();

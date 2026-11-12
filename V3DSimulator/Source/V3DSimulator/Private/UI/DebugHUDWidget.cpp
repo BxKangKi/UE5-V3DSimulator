@@ -53,10 +53,10 @@ void UDebugHUDWidget::BuildNativeLayout()
     NativeDiagnostics = AddText(Body, FText::GetEmpty());
     NativeDiagnostics->SetAutoWrapText(true);
     NativeDiagnostics->SetJustification(ETextJustify::Right);
-    if (UOverlaySlot* Slot = Cast<UOverlaySlot>(NativeDiagnostics->Slot))
+    if (UOverlaySlot* DiagnosticsSlot = Cast<UOverlaySlot>(NativeDiagnostics->Slot))
     {
-        Slot->SetHorizontalAlignment(HAlign_Fill);
-        Slot->SetVerticalAlignment(VAlign_Center);
+        DiagnosticsSlot->SetHorizontalAlignment(HAlign_Fill);
+        DiagnosticsSlot->SetVerticalAlignment(VAlign_Center);
     }
 }
 

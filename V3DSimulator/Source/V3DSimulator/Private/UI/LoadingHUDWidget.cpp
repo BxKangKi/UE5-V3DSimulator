@@ -56,11 +56,11 @@ void ULoadingHUDWidget::BuildNativeLayout()
     NativeBack->GetParent()->SetVisibility(ESlateVisibility::Collapsed);
     NativeStatus = AddText(Body, LoadingTitle);
     NativeStatus->SetJustification(ETextJustify::Right);
-    if (UOverlaySlot* Slot = Cast<UOverlaySlot>(NativeStatus->Slot))
+    if (UOverlaySlot* StatusSlot = Cast<UOverlaySlot>(NativeStatus->Slot))
     {
-        Slot->SetHorizontalAlignment(HAlign_Right);
-        Slot->SetVerticalAlignment(VAlign_Bottom);
-        Slot->SetPadding(FMargin(0.f, 0.f, 60.f, 60.f));
+        StatusSlot->SetHorizontalAlignment(HAlign_Right);
+        StatusSlot->SetVerticalAlignment(VAlign_Bottom);
+        StatusSlot->SetPadding(FMargin(0.f, 0.f, 60.f, 60.f));
     }
 }
 

@@ -95,10 +95,10 @@ void UResponsiveHUDWidget::EnsureNativeLayout()
     NativeReferenceSize = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
     NativeReferenceSize->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
     NativeScaleRoot->SetContent(NativeReferenceSize);
-    if (UScaleBoxSlot* Slot = Cast<UScaleBoxSlot>(NativeReferenceSize->Slot))
+    if (UScaleBoxSlot* ReferenceSizeSlot = Cast<UScaleBoxSlot>(NativeReferenceSize->Slot))
     {
-        Slot->SetHorizontalAlignment(HAlign_Center);
-        Slot->SetVerticalAlignment(VAlign_Center);
+        ReferenceSizeSlot->SetHorizontalAlignment(HAlign_Center);
+        ReferenceSizeSlot->SetVerticalAlignment(VAlign_Center);
     }
 
     NativeLayout = WidgetTree->ConstructWidget<UCanvasPanel>(UCanvasPanel::StaticClass());
@@ -162,11 +162,11 @@ UBorder* UResponsiveHUDWidget::AddPanel(FVector2D Size, FVector2D Position, FVec
     UBorder* Panel = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass());
     Panel->SetBrushColor(PanelColor);
     Panel->SetPadding(FMargin(FMath::Clamp(PanelPadding, 0.f, 200.f)));
-    UCanvasPanelSlot* Slot = NativeLayout->AddChildToCanvas(Panel);
-    Slot->SetAnchors(FAnchors(Anchors.X, Anchors.Y));
-    Slot->SetAlignment(Alignment);
-    Slot->SetPosition(Position);
-    Slot->SetSize(FVector2D(SafeDimension(Size.X, 960), SafeDimension(Size.Y, 720)));
+    UCanvasPanelSlot* PanelCanvasSlot = NativeLayout->AddChildToCanvas(Panel);
+    PanelCanvasSlot->SetAnchors(FAnchors(Anchors.X, Anchors.Y));
+    PanelCanvasSlot->SetAlignment(Alignment);
+    PanelCanvasSlot->SetPosition(Position);
+    PanelCanvasSlot->SetSize(FVector2D(SafeDimension(Size.X, 960), SafeDimension(Size.Y, 720)));
     StyledPanels.Add(Panel);
     if (Size.Equals(PanelSize)) PositionedPanels.Add(Panel);
     return Panel;
@@ -185,7 +185,7 @@ UTextBlock* UResponsiveHUDWidget::AddText(UPanelWidget* Parent, const FText& Tex
     Label->SetFont(Font);
     Parent->AddChild(Label);
     if (bTitle) StyledTitles.Add(Label); else StyledTexts.Add(Label);
-    if (UVerticalBoxSlot* Slot = Cast<UVerticalBoxSlot>(Label->Slot)) Slot->SetPadding(FMargin(0, 4));
+    if (UVerticalBoxSlot* TextSlot = Cast<UVerticalBoxSlot>(Label->Slot)) TextSlot->SetPadding(FMargin(0, 4));
     return Label;
 }
 
@@ -195,13 +195,13 @@ UButton* UResponsiveHUDWidget::AddButton(UPanelWidget* Parent, const FText& Text
     USizeBox* Size = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass());
     Size->SetMinDesiredHeight(FMath::Clamp(ButtonHeight, 20.f, 200.f));
     Parent->AddChild(Size);
-    if (UVerticalBoxSlot* Slot = Cast<UVerticalBoxSlot>(Size->Slot)) Slot->SetPadding(FMargin(0, 4));
+    if (UVerticalBoxSlot* ButtonContainerSlot = Cast<UVerticalBoxSlot>(Size->Slot)) ButtonContainerSlot->SetPadding(FMargin(0, 4));
     UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
     V3DHUDLegacyStyle::ApplyButton(*Button, ButtonColor, HoveredButtonTint);
     Size->SetContent(Button);
     UTextBlock* Label = AddText(Button, Text);
     Label->SetJustification(ETextJustify::Center);
-    if (USizeBoxSlot* Slot = Cast<USizeBoxSlot>(Button->Slot)) Slot->SetVerticalAlignment(VAlign_Fill);
+    if (USizeBoxSlot* ButtonSizeSlot = Cast<USizeBoxSlot>(Button->Slot)) ButtonSizeSlot->SetVerticalAlignment(VAlign_Fill);
     StyledButtonSizes.Add(Size);
     StyledButtons.Add(Button);
     return Button;
@@ -216,19 +216,19 @@ void UResponsiveHUDWidget::ApplyNativeStyle()
         NativeReferenceSize->SetHeightOverride(Resolution.Y);
     }
     if (NativeBackground) NativeBackground->SetBrushColor(BackgroundColor);
-    const float Padding = FMath::Clamp(FMath::IsFinite(PanelPadding) ? PanelPadding : 24.f, 0.f, 200.f);
+    const float SafePanelPadding = FMath::Clamp(FMath::IsFinite(PanelPadding) ? PanelPadding : 24.f, 0.f, 200.f);
     for (UBorder* Panel : StyledPanels)
     {
         if (!Panel) continue;
         Panel->SetBrushColor(PanelColor);
-        Panel->SetPadding(FMargin(Padding));
+        Panel->SetPadding(FMargin(SafePanelPadding));
     }
     for (UBorder* Panel : PositionedPanels)
     {
         if (Panel)
         {
-            if (UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(Panel->Slot))
-                Slot->SetSize(FVector2D(SafeDimension(PanelSize.X, 960), SafeDimension(PanelSize.Y, 720)));
+            if (UCanvasPanelSlot* PanelCanvasSlot = Cast<UCanvasPanelSlot>(Panel->Slot))
+                PanelCanvasSlot->SetSize(FVector2D(SafeDimension(PanelSize.X, 960), SafeDimension(PanelSize.Y, 720)));
         }
     }
     auto StyleText = [this](const TArray<TObjectPtr<UTextBlock>>& Labels, int32 FontSize)
