@@ -8,6 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+class FJsonObject;
 #include "Gravity/GravityFieldTypes.h"
 #include "Simulator/AssetDefinitionTypes.h"
 #include "Simulator/ModelDefinitionTypes.h"
@@ -66,6 +67,10 @@ namespace ModelDefinitionJson
      * invalid UUIDs, mismatched subtypes and a character without a Bones object are rejected.
      * OutCanonicalJson receives the normalized snapshot of the exact DOM that passed validation.
      */
+    V3DSIMULATOR_API bool ValidateDefinition(const TSharedPtr<FJsonObject>& Root,
+        const FString& JsonPath, const FString& ExpectedSourcePath, FModelDefinition& OutDefinition,
+        FString& OutError, FString* OutCanonicalJson = nullptr);
+
     V3DSIMULATOR_API bool LoadDefinition(
         const FString& JsonPath,
         const FString& ExpectedSourcePath,

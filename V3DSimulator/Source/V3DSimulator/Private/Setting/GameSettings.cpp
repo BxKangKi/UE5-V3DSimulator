@@ -330,6 +330,10 @@ void UGameSettings::LoadSettingsData()
     TSharedPtr<FJsonObject> Json = FSimulatorFileServices::LoadJson(Path);
     if (!Deserialization(Json))
     {
+#if PLATFORM_ANDROID || PLATFORM_IOS
+        ApplyQualityProfile(EQualitySettings::Low);
+        BloomIntensity = 0; AmbientOcclusionIntensity = 0;
+#endif
         UE_LOG(LogTemp, Log, TEXT("Setting file doesn't exist. Generate new one."));
         SaveSettingsData();
     }

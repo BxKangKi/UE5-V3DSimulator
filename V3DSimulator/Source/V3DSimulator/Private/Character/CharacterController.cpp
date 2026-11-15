@@ -34,6 +34,8 @@
 #include "World/WaterQuerySubsystem.h"
 #include "World/BuoyancyComponent.h"
 #include "World/WorldData.h"
+#include "World/WorldEnvironmentSubsystem.h"
+#include "Components/AudioComponent.h"
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
 #include "Animation/Skeleton.h"
@@ -900,6 +902,9 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     const FVector HitImpactPoint(Hit.ImpactPoint.X, Hit.ImpactPoint.Y, Hit.ImpactPoint.Z);
     const FVector HitNormal(Hit.Normal.X, Hit.Normal.Y, Hit.Normal.Z);
 
+    if (NormalImpulse.ContainsNaN() || ActorLocation.ContainsNaN()
+        || HitImpactPoint.ContainsNaN() || HitNormal.ContainsNaN()) return;
+
     FVector PushDirection = (ActorLocation - OtherComp->GetComponentLocation()).GetSafeNormal();
     if (PushDirection.IsNearlyZero() && !HitImpactPoint.IsNearlyZero())
     {
@@ -924,6 +929,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     const FVector ImpactPoint = HitImpactPoint.IsNearlyZero() ? OtherComp->GetComponentLocation() : HitImpactPoint;
     const FVector OtherVelocity = OtherComp->GetPhysicsLinearVelocityAtPoint(ImpactPoint);
     const FVector CharacterVelocity = GetVelocity();
+    if (OtherVelocity.ContainsNaN() || CharacterVelocity.ContainsNaN()) return;
 
     // Only treat this as an incoming-object impact when the simulated body itself is moving into
     // the character. Previously a stationary car also knocked the player backwards simply because
@@ -1750,6 +1756,28 @@ void ACharacterController::SetFirstPersonEnabled(bool bEnabled)
         SavedThirdPersonSocketOffset = SpringArm->SocketOffset;
     }
 
+    if (USkeletalMeshComponent* MeshComp = GetMesh())
+    {
+        if (bEnabled && !bFirstPersonMode)
+        {
+            MeshComp->HandleExistingParallelEvaluationTask(true, true);
+            SavedFirstPersonTickOption = MeshComp->VisibilityBasedAnimTickOption;
+            bSavedFirstPersonUpdateRate = MeshComp->bEnableUpdateRateOptimizations;
+        }
+        if (bEnabled)
+        {
+            // OwnerNoSee must not stop physics-to-bone blending or animation notifies.
+            MeshComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+            MeshComp->bEnableUpdateRateOptimizations = false;
+        }
+        else if (bFirstPersonMode)
+        {
+            MeshComp->VisibilityBasedAnimTickOption = SavedFirstPersonTickOption;
+            MeshComp->bEnableUpdateRateOptimizations = bSavedFirstPersonUpdateRate;
+        }
+    }
+    bFirstPersonPhysicsView = false;
+    bHasValidFirstPersonView = false;
     bFirstPersonMode = bEnabled;
     if (bFirstPersonMode)
     {
@@ -1822,6 +1850,7 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
         if (Surfaces->PlayFootstep(HitResult)) return;
 
 
+    auto* Environment = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>();
     // 2. Resolve the physical material weak pointer from the hit result.
     if (HitResult.PhysMaterial.IsValid())
     {
@@ -1832,6 +1861,7 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
                 UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
             if (!IsValid(Registry))
             {
+                if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
                 return;
             }
 
@@ -1844,15 +1874,18 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
                 });
             if (!Binding)
             {
+                if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
                 return;
             }
 
-            if (USoundBase* Sound = Binding->Sound.IsNull() ? nullptr : Binding->Sound.LoadSynchronous())
+            if (USoundBase* Sound = Binding->Sound.Get())
             {
-                UGameplayStatics::PlaySoundAtLocation(this, Sound, HitResult.ImpactPoint);
+                UGameplayStatics::SpawnSoundAtLocation(this, Sound, HitResult.ImpactPoint,
+                    FRotator::ZeroRotator, 1.f, 1.f, 0.f, Environment ? Environment->GetSpatialAttenuation() : nullptr);
             }
+            else if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
 
-            if (UNiagaraSystem* Effect = Binding->Effect.IsNull() ? nullptr : Binding->Effect.LoadSynchronous())
+            if (UNiagaraSystem* Effect = Binding->Effect.Get())
             {
                 UNiagaraFunctionLibrary::SpawnSystemAtLocation(
                     this, Effect, HitResult.ImpactPoint, HitResult.ImpactNormal.Rotation());
@@ -1861,7 +1894,63 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
     }
     else
     {
+        if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
         // Fallback for surfaces that have collision but no physical material, such as default footsteps.
         UE_LOG(LogTemp, Verbose, TEXT("Footstep trace hit a collider, but no PhysMaterial is assigned."));
+    }
+}
+
+void ACharacterController::CalcCamera(float DeltaTime, FMinimalViewInfo& OutResult)
+{
+    Super::CalcCamera(DeltaTime, OutResult);
+    if (!bFirstPersonMode || !GetMesh()) { bFirstPersonPhysicsView = false; return; }
+    const bool bPhysicsPose = IsValid(Component) && Component->IsRagdollTransitionInProgress();
+    const FName Socket = GetMesh()->DoesSocketExist(FirstPersonHeadSocket)
+        ? FirstPersonHeadSocket : FName(BONE_HIPS);
+    if (!GetMesh()->DoesSocketExist(Socket)) return;
+    const FMinimalViewInfo FallbackView = OutResult;
+    const FTransform Head = GetMesh()->GetSocketTransform(Socket, RTS_World);
+    // A bad physics pose must not propagate through the camera into view-dependent
+    // streaming, traces or the audio listener. Keep the last finite first-person view.
+    if (Head.ContainsNaN() || !Head.IsRotationNormalized() || FirstPersonEyeOffset.ContainsNaN()
+        || GetControlRotation().ContainsNaN())
+    {
+        if (bHasValidFirstPersonView)
+        {
+            OutResult.Location = LastValidFirstPersonLocation;
+            OutResult.Rotation = LastValidFirstPersonRotation;
+        }
+        bFirstPersonPhysicsView = false;
+        return;
+    }
+    OutResult.Location = Head.TransformPosition(FirstPersonEyeOffset);
+    if (bPhysicsPose)
+    {
+        if (!bFirstPersonPhysicsView)
+        {
+            FirstPersonEntryControl = GetControlRotation().Quaternion();
+            FirstPersonHeadToView = Head.GetRotation().Inverse() * FirstPersonEntryControl;
+        }
+        // Preserve rig axis calibration and free look, including the body's physical roll.
+        const FQuat LookDelta = FirstPersonEntryControl.Inverse() * GetControlRotation().Quaternion();
+        OutResult.Rotation = (Head.GetRotation() * FirstPersonHeadToView * LookDelta).GetNormalized().Rotator();
+    }
+    else OutResult.Rotation = GetControlRotation();
+    bFirstPersonPhysicsView = bPhysicsPose;
+    if (!OutResult.Location.ContainsNaN() && !OutResult.Rotation.ContainsNaN())
+    {
+        LastValidFirstPersonLocation = OutResult.Location;
+        LastValidFirstPersonRotation = OutResult.Rotation;
+        bHasValidFirstPersonView = true;
+    }
+    else
+    {
+        OutResult = FallbackView;
+        if (bHasValidFirstPersonView)
+        {
+            OutResult.Location = LastValidFirstPersonLocation;
+            OutResult.Rotation = LastValidFirstPersonRotation;
+        }
+        bFirstPersonPhysicsView = false;
     }
 }

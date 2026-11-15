@@ -70,6 +70,7 @@ public:
         TFunction<void(bool, bool, FWorldRuntimeState, FString)> Callback);
 
     /** Coalesced player/time state save; completion is always delivered on the game thread. Returns false when the write could not be queued. */
+    bool SaveRuntimeStateBlocking(const FWorldRuntimeState& State, FString& Error);
     bool SaveRuntimeStateAsync(
         const FWorldRuntimeState& State,
         FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());

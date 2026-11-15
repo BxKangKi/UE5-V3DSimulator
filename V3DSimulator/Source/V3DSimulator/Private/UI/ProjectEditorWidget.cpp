@@ -1,0 +1,470 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+#include "UI/ProjectEditorWidget.h"
+#include "UI/BuildStatusWidget.h"
+#include "SV3DModelPreview.h"
+#include "Widgets/Layout/SBox.h"
+#include "System/ProjectSourceModelBuilder.h"
+#include "Simulator/ModelDefinitionJson.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Animation/Skeleton.h"
+#include "Materials/MaterialInterface.h"
+#include "System/V3DSimulatorAssetRegistry.h"
+#include "System/V3DSimulatorGameInstance.h"
+#include "System/GameManagerSubSystem.h"
+#include "System/SafeFileIO.h"
+#include "System/ProjectWorkspace.h"
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Layout/SSplitter.h"
+#include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/Layout/SExpandableArea.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Input/SEditableTextBox.h"
+#include "Widgets/Input/SMultiLineEditableTextBox.h"
+#include "Widgets/Input/SCheckBox.h"
+#include "Widgets/Input/SComboBox.h"
+#include "Widgets/Views/SListView.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+
+namespace V3DEditorUI
+{
+    FText Text(const FString& S) { return FText::FromString(S); }
+    FString ValueText(const TSharedPtr<FJsonValue>& V)
+    {
+        if (V->Type == EJson::String) return V->AsString();
+        auto Wrapper = MakeShared<FJsonObject>(); Wrapper->SetField(TEXT("v"), V);
+        FString S; FJsonSerializer::Serialize(Wrapper, TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&S));
+        const int32 Colon = S.Find(TEXT(":"));
+        return S.Mid(Colon + 1, S.Len() - Colon - 2);
+    }
+    TSharedRef<SWidget> Button(const TCHAR* Label, TFunction<void()> Action)
+    {
+        return SNew(SButton).Text(FText::FromString(Label)).ContentPadding(FMargin(10,8))
+            .OnClicked_Lambda([Action]() { Action(); return FReply::Handled(); });
+    }
+}
+
+TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
+{
+    using namespace V3DEditorUI;
+    SetIsFocusable(true);
+    auto Toolbar = SNew(SHorizontalBox);
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Save all"), [this] { SaveAll(false); })];
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Save + Build"), [this] { SaveAll(true); })];
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Undo"), [this]
+    {
+        if (!Current || Current->Undo.IsEmpty()) return;
+        const auto Parsed = FSafeFileIO::ParseJsonText(Current->Undo.Pop(), TEXT("Undo"));
+        if (Parsed.IsSuccess()) { Current->Json = Parsed.JsonObject; Changed(); }
+    })];
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Apply JSON"), [this] { ApplyRaw(); })];
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Reload file (discard)"), [this]
+    {
+        if (bBusy || !Current) return;
+        Remember(); bBusy = true; const auto Doc = Current;
+        const uint64 Token = RequestGeneration; const FString Path = Doc->Path;
+        TWeakObjectPtr<UProjectEditorWidget> Weak(this);
+        const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, Doc, Path]
+        {
+            FSafeJsonLimits Limits; Limits.MaxFileBytes = 16ll * 1024 * 1024;
+            const auto Loaded = FSafeFileIO::LoadJsonBlocking(Path, Limits);
+            FString TextOnDisk;
+            const bool Read = IFileManager::Get().FileSize(*Path) <= Limits.MaxFileBytes
+                && FFileHelper::LoadFileToString(TextOnDisk, *Path);
+            FSafeFileIO::DispatchTrackedGameThread([Weak, Token, Doc, Loaded, Read, TextOnDisk]
+            {
+                auto* Self = Weak.Get(); if (!Self || Self->RequestGeneration != Token) return;
+                Self->bBusy = false;
+                if (Read)
+                {
+                    Doc->DiskText = TextOnDisk; Doc->Json = Loaded.JsonObject; Doc->bDirty = false;
+                    Self->bRawDirty = false; Self->RefreshForm();
+                    Self->Message = TEXT("Reloaded from disk. Undo can restore the previous in-memory version.");
+                }
+                else Self->Message = TEXT("Reload failed. Unsaved changes were retained.");
+            });
+        });
+        if (!Queued) { bBusy = false; Message = TEXT("Reload queue unavailable."); }
+    })];
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Save + Back"), [this] { SaveAll(false, true); })];
+    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Discard + Back"), [this] { Close(); })];
+    Toolbar->AddSlot().FillWidth(1)[SNew(STextBlock).Text_Lambda([this] { return Text(TEXT("  Editor / ") + Project); })];
+    auto Left = SNew(SVerticalBox);
+    Left->AddSlot().AutoHeight()[SNew(SEditableTextBox).HintText(Text(TEXT("Filter resources / scripts")))
+        .OnTextChanged_Lambda([this](const FText& T) { Filter = T.ToString(); RefreshFiles(); })];
+    Left->AddSlot().FillHeight(1)[SAssignNew(List, SListView<TSharedPtr<FV3DEditorDocument>>)
+        .ListItemsSource(&VisibleDocuments).SelectionMode(ESelectionMode::Single)
+        .OnGenerateRow_Lambda([](TSharedPtr<FV3DEditorDocument> Doc, const TSharedRef<STableViewBase>& Owner)
+        {
+            return SNew(STableRow<TSharedPtr<FV3DEditorDocument>>, Owner)
+                [SNew(STextBlock).Text_Lambda([Doc] { return Text((Doc->bDirty ? TEXT("* ") : TEXT("")) + Doc->Label); }).Margin(FMargin(4,6))];
+        })
+        .OnSelectionChanged_Lambda([this](TSharedPtr<FV3DEditorDocument> Doc, ESelectInfo::Type Info)
+        {
+            if (!Doc || Doc == Current || Info == ESelectInfo::Direct) return;
+            if (!ApplyRaw()) { List->SetSelection(Current, ESelectInfo::Direct); return; }
+            Current = Doc; bRawDirty = false; RefreshForm();
+        })];
+    auto Right = SNew(SVerticalBox);
+    Right->AddSlot().AutoHeight()[Button(TEXT("Preview model (read only)"), [this] { StartPreview(); })];
+    Right->AddSlot().AutoHeight()[SNew(SBox).HeightOverride(240)[SAssignNew(Preview, SV3DModelPreview)]];
+    Right->AddSlot().AutoHeight()[SNew(STextBlock).Text(Text(TEXT("JSON preview / advanced edit · Apply JSON to update fields")))];
+    Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).AutoWrapText(false)
+        .OnTextChanged_Lambda([this](const FText&) { if (!bSettingRaw) bRawDirty = true; })];
+    auto Body = SNew(SSplitter)
+        + SSplitter::Slot().Value(.2f)[Left]
+        + SSplitter::Slot().Value(.45f)[SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(Form, SVerticalBox)]]
+        + SSplitter::Slot().Value(.35f)[Right];
+    return SNew(SBorder).Padding(12).BorderBackgroundColor(FLinearColor(.025f,.035f,.055f,1))
+        [SNew(SVerticalBox)
+            + SVerticalBox::Slot().AutoHeight()[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy; })[Toolbar]]
+            + SVerticalBox::Slot().AutoHeight().Padding(4,10)[SNew(STextBlock).AutoWrapText(true).Text_Lambda([this] { return Text(Message); })]
+            + SVerticalBox::Slot().FillHeight(1)[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy; })[Body]]];
+}
+
+void UProjectEditorWidget::OpenProject(const FString& ProjectName)
+{
+    Project = ProjectName; bBusy = true; Message = TEXT("Reading resources and generating missing JSON definitions...");
+    const uint64 Token = ++RequestGeneration;
+    const TWeakObjectPtr<UProjectEditorWidget> Weak(this);
+    const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, ProjectName]
+    {
+        TArray<TSharedPtr<FV3DEditorDocument>> Found; FString Error;
+        const bool Success = V3DProjectEditor::Discover(ProjectName, Found, Error);
+        FSafeFileIO::DispatchTrackedGameThread([Weak, Token, Found = MoveTemp(Found), Error, Success]() mutable
+        {
+            auto* Self = Weak.Get(); if (!Self || Self->RequestGeneration != Token) return;
+            Self->bBusy = false; Self->Documents = MoveTemp(Found);
+            Self->Message = Success ? TEXT("Choose a file. Optional keys have Add buttons. Changes are saved only with Save. Build is explicit.") : Error;
+            Self->RefreshFiles();
+            if (!Self->Documents.IsEmpty())
+            {
+                Self->Current = Self->Documents[0]; Self->RefreshForm();
+                if (Self->List) Self->List->SetSelection(Self->Current, ESelectInfo::Direct);
+            }
+        });
+    });
+    if (!Queued) { bBusy = false; Message = TEXT("Editor file queue is unavailable."); }
+}
+
+void UProjectEditorWidget::RefreshFiles()
+{
+    VisibleDocuments.Reset();
+    for (const auto& Doc : Documents) if (Filter.IsEmpty() || Doc->Label.Contains(Filter)) VisibleDocuments.Add(Doc);
+    if (List) List->RequestListRefresh();
+}
+void UProjectEditorWidget::Remember()
+{
+    if (!Current || !Current->Json) return;
+    FString Snapshot = V3DProjectEditor::Serialize(Current->Json);
+    if (Snapshot.Len() * sizeof(TCHAR) > 4 * 1024 * 1024) return;
+    Current->Undo.Add(MoveTemp(Snapshot));
+    int64 Bytes = 0; int32 Count = 0;
+    for (const auto& Doc : Documents) for (const auto& Entry : Doc->Undo) { Bytes += Entry.Len() * sizeof(TCHAR); ++Count; }
+    for (const auto& Doc : Documents)
+        while (!Doc->Undo.IsEmpty() && (Bytes > 4 * 1024 * 1024 || Count > 32))
+        { Bytes -= Doc->Undo[0].Len() * sizeof(TCHAR); --Count; Doc->Undo.RemoveAt(0); }
+
+}
+void UProjectEditorWidget::Changed()
+{
+    if (Current) Current->bDirty = true;
+    bRawDirty = false; RefreshForm();
+}
+
+bool UProjectEditorWidget::ApplyRaw()
+{
+    if (!Current || !Raw || !bRawDirty) return true;
+    FSafeJsonLimits Limits; Limits.MaxFileBytes = 16ll * 1024 * 1024; Limits.MaxDepth = 32;
+    const auto Parsed = FSafeFileIO::ParseJsonText(Raw->GetText().ToString(), Current->Path, Limits);
+    if (!Parsed.IsSuccess()) { Message = Parsed.Error; return false; }
+    Remember(); Current->Json = Parsed.JsonObject; Changed(); return true;
+}
+
+void UProjectEditorWidget::RefreshForm()
+{
+    using namespace V3DEditorUI;
+    if (!Form || !Raw || !Current) return;
+    TGuardValue<bool> RebuildGuard(bRebuildingForm, true);
+    Form->ClearChildren(); FormRowsRemaining = 1500;
+    bSettingRaw = true;
+    Raw->SetText(Text(Current->Json ? V3DProjectEditor::Serialize(Current->Json) : Current->DiskText));
+    bSettingRaw = false;
+    Form->AddSlot().AutoHeight().Padding(4)[SNew(STextBlock).AutoWrapText(true).Text(Text(Current->Label +
+        (Current->SourcePath.IsEmpty() ? TEXT("") : TEXT("\nSource: ") + FPaths::GetCleanFilename(Current->SourcePath))))];
+    if (!Current->Json) { Message = TEXT("Invalid source JSON: repair it in the advanced editor, then Apply JSON."); return; }
+    // A new asset can choose AssetType even if its metadata was incomplete.
+    if (!Current->SourcePath.IsEmpty() && !Current->Json->HasField(TEXT("AssetType")))
+        Form->AddSlot().AutoHeight()[Button(TEXT("Add AssetType"), [this]
+        { Remember(); Current->Json->SetStringField(TEXT("AssetType"), FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase) ? TEXT("Sound") : TEXT("Model")); Changed(); })];
+    AddObject(Current->Json, V3DProjectEditor::Suggestions(*Current), Form.ToSharedRef());
+}
+
+void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
+    const TSharedRef<SVerticalBox>& Box, int32 Depth, const FString& Context)
+{
+    using namespace V3DEditorUI;
+    if (!Object || Depth > 16) return;
+    TArray<FString> Keys;
+    for (const auto& Pair : Object->Values) Keys.Add(FString(Pair.Key));
+    if (Suggested) for (const auto& Pair : Suggested->Values) Keys.AddUnique(FString(Pair.Key));
+    Keys.Sort();
+    for (const auto& Key : Keys)
+    {
+        if (--FormRowsRemaining < 0)
+        {
+            Box->AddSlot().AutoHeight()[SNew(STextBlock).Text(Text(TEXT("Form limit reached; remaining keys are available in JSON.")))];
+            break;
+        }
+        const auto* Existing = Object->Values.Find(*Key);
+        const auto* Hint = Suggested ? Suggested->Values.Find(*Key) : nullptr;
+        if (!Existing)
+        {
+            const auto DefaultValue = *Hint;
+            Box->AddSlot().AutoHeight().Padding(4,2)[SNew(SHorizontalBox)
+                + SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).Text(Text(Key + TEXT(" (optional)")))]
+                + SHorizontalBox::Slot().AutoWidth()[Button(TEXT("Add"), [this, Object, Key, DefaultValue]
+                { if (bRawDirty) { Message = TEXT("Apply JSON first."); return; } Remember(); Object->SetField(Key, DefaultValue); Changed(); })]];
+            continue;
+        }
+        const auto Value = *Existing;
+        auto Row = SNew(SHorizontalBox);
+        Row->AddSlot().FillWidth(1)[SNew(STextBlock).Text(Text(Key))];
+        Row->AddSlot().AutoWidth()[Button(TEXT("Remove"), [this, Object, Key]
+        { if (bRawDirty) { Message = TEXT("Apply JSON first."); return; } Remember(); Object->RemoveField(Key); Changed(); })];
+        Box->AddSlot().AutoHeight().Padding(4,5)[Row];
+        if (Value->Type == EJson::Object)
+        {
+            auto Nested = SNew(SVerticalBox);
+            const auto HintObject = Hint && (*Hint)->Type == EJson::Object ? (*Hint)->AsObject() : V3DProjectEditor::EntryTemplate(Context);
+            AddObject(Value->AsObject(), HintObject, Nested, Depth + 1, Key);
+            Box->AddSlot().AutoHeight().Padding(12,0)[SNew(SExpandableArea).InitiallyCollapsed(true)
+                .HeaderContent()[SNew(STextBlock).Text(Text(Key + TEXT(" fields")))] .BodyContent()[Nested]];
+        }
+        else if (Value->Type == EJson::Array)
+        {
+            auto Nested = SNew(SVerticalBox);
+            const auto& Array = Value->AsArray();
+            for (int32 I = 0; I < FMath::Min(Array.Num(), 128); ++I)
+            {
+                if (--FormRowsRemaining < 0) break;
+                auto Entry = Array[I];
+                Nested->AddSlot().AutoHeight()[Button(*FString::Printf(TEXT("Remove [%d]"), I), [this, Object, Key, I]
+                {
+                    if (bRawDirty) return; Remember(); auto Values = Object->GetArrayField(Key);
+                    if (Values.IsValidIndex(I)) Values.RemoveAt(I); Object->SetArrayField(Key, Values); Changed();
+                })];
+                if (Entry->Type == EJson::Object) AddObject(Entry->AsObject(), V3DProjectEditor::EntryTemplate(Key), Nested, Depth + 1, Key);
+                else Nested->AddSlot().AutoHeight()[SNew(SEditableTextBox).Text(Text(ValueText(Entry)))
+                    .OnTextCommitted_Lambda([this, Object, Key, I, Entry](const FText& T, ETextCommit::Type)
+                    {
+                        if (bBusy || bRawDirty || bRebuildingForm) return;
+                        TSharedPtr<FJsonValue> Updated;
+                        if (Entry->Type == EJson::String) Updated = MakeShared<FJsonValueString>(T.ToString());
+                        else
+                        {
+                            const auto P = FSafeFileIO::ParseJsonText(TEXT("{\"v\":") + T.ToString() + TEXT("}"), TEXT("Array item"));
+                            if (!P.IsSuccess()) { Message = P.Error; return; }
+                            Updated = P.JsonObject->Values.FindChecked(TEXT("v"));
+                        }
+                        Remember(); auto Values = Object->GetArrayField(Key);
+                        if (Values.IsValidIndex(I)) Values[I] = Updated;
+                        Object->SetArrayField(Key, Values); Changed();
+                    })];
+            }
+            Nested->AddSlot().AutoHeight()[Button(TEXT("Append item"), [this, Object, Key]
+            {
+                if (bRawDirty) return; Remember(); auto Values = Object->GetArrayField(Key);
+                if (Key == TEXT("Sounds") || Key == TEXT("WheelMeshNames")) Values.Add(MakeShared<FJsonValueString>(TEXT("")));
+                else if (Key == TEXT("WheelHeightOffsets")) Values.Add(MakeShared<FJsonValueNumber>(0));
+                else Values.Add(MakeShared<FJsonValueObject>(V3DProjectEditor::EntryTemplate(Key)));
+                Object->SetArrayField(Key, Values); Changed();
+            })];
+            Box->AddSlot().AutoHeight().Padding(12,0)[SNew(SExpandableArea).InitiallyCollapsed(true)
+                .HeaderContent()[SNew(STextBlock).Text(Text(FString::Printf(TEXT("%s [%d items]"), *Key, Array.Num())))]
+                .BodyContent()[Nested]];
+        }
+        else if (Value->Type == EJson::Boolean)
+        {
+            Box->AddSlot().AutoHeight().Padding(4)[SNew(SCheckBox)
+                .IsChecked(Value->AsBool() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked)
+                .OnCheckStateChanged_Lambda([this, Object, Key](ECheckBoxState State)
+                { if (bBusy || bRawDirty || bRebuildingForm) return; Remember(); Object->SetBoolField(Key, State == ECheckBoxState::Checked); Changed(); })];
+        }
+        else if (Key == TEXT("AssetType") || Key == TEXT("ModelType") || Key == TEXT("EntityType") || Key == TEXT("ItemType") || Key == TEXT("ProjectType"))
+        {
+            auto Options = MakeShared<TArray<TSharedPtr<FString>>>();
+            TArray<FString> Names;
+            if (Key == TEXT("AssetType")) Names = {TEXT("Model"),TEXT("Sound")};
+            if (Key == TEXT("ModelType")) Names = {TEXT("Static"),TEXT("Dynamic"),TEXT("Character")};
+            if (Key == TEXT("EntityType")) Names = {TEXT("Prop"),TEXT("Vehicle"),TEXT("Animal")};
+            if (Key == TEXT("ItemType")) Names = {TEXT("Misc"),TEXT("Weapon"),TEXT("Tool")};
+            if (Key == TEXT("ProjectType")) Names = {TEXT("World"),TEXT("Prefab"),TEXT("Dynamic"),TEXT("Character")};
+            for (const auto& Name : Names) Options->Add(MakeShared<FString>(Name));
+            Box->AddSlot().AutoHeight().Padding(4)[SNew(SComboBox<TSharedPtr<FString>>).OptionsSource(&Options.Get())
+                .OnGenerateWidget_Lambda([Options](TSharedPtr<FString> Item) { return SNew(STextBlock).Text(Text(*Item)); })
+                .OnSelectionChanged_Lambda([this, Object, Key, Options](TSharedPtr<FString> Item, ESelectInfo::Type Info)
+                {
+                    if (!Item || bBusy || bRawDirty || bRebuildingForm || Info == ESelectInfo::Direct) return;
+                    Remember(); Object->SetStringField(Key, *Item);
+                    // Only remove mutually exclusive discriminators, preserving all unrelated authored data.
+                    if (Key == TEXT("AssetType") && *Item == TEXT("Sound")) Object->RemoveField(TEXT("ModelType"));
+                    if (Key == TEXT("ModelType") && *Item != TEXT("Dynamic"))
+                    { Object->RemoveField(TEXT("EntityType")); Object->RemoveField(TEXT("ItemType")); }
+                    if (Key == TEXT("EntityType")) Object->RemoveField(TEXT("ItemType"));
+                    if (Key == TEXT("ItemType")) Object->RemoveField(TEXT("EntityType"));
+                    if (Key == TEXT("ModelType") && *Item == TEXT("Character")) Object->RemoveField(TEXT("GravityField"));
+                    Changed();
+                })[SNew(STextBlock).Text(Text(ValueText(Value)))]];
+        }
+        else
+        {
+            const EJson ExpectedType = Value->Type;
+            const bool IsString = ExpectedType == EJson::String;
+            Box->AddSlot().AutoHeight().Padding(4)[SNew(SEditableTextBox).Text(Text(ValueText(Value)))
+                .OnTextCommitted_Lambda([this, Object, Key, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
+                {
+                    if (bBusy || bRawDirty || bRebuildingForm) { Message = TEXT("Apply pending JSON before editing fields."); return; }
+                    if (IsString)
+                    {
+                        if (Object->GetStringField(Key) == TextValue.ToString()) return;
+                        Remember(); Object->SetStringField(Key, TextValue.ToString()); Changed(); return;
+                    }
+                    const auto Parsed = FSafeFileIO::ParseJsonText(TEXT("{\"v\":") + TextValue.ToString() + TEXT("}"), TEXT("Field"));
+                    if (!Parsed.IsSuccess() || Parsed.JsonObject->Values.FindChecked(TEXT("v"))->Type != ExpectedType)
+                    { Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
+                    Remember(); Object->SetField(Key, Parsed.JsonObject->Values.FindChecked(TEXT("v"))); Changed();
+                })];
+        }
+    }
+    auto NewType = MakeShared<FString>(TEXT("String"));
+    auto Types = MakeShared<TArray<TSharedPtr<FString>>>();
+    for (const TCHAR* T : {TEXT("String"), TEXT("Number"), TEXT("Boolean"), TEXT("Object"), TEXT("Array")}) Types->Add(MakeShared<FString>(T));
+    auto TypePicker = SNew(SComboBox<TSharedPtr<FString>>).OptionsSource(&Types.Get())
+        .OnGenerateWidget_Lambda([Types](TSharedPtr<FString> T) { return SNew(STextBlock).Text(Text(*T)); })
+        .OnSelectionChanged_Lambda([NewType, Types](TSharedPtr<FString> T, ESelectInfo::Type) { if (T) *NewType = *T; })
+        [SNew(STextBlock).Text_Lambda([NewType] { return Text(*NewType); })];
+    auto NewKey = SNew(SEditableTextBox).HintText(Text(TEXT("New key (including custom keys)")));
+    Box->AddSlot().AutoHeight().Padding(4)[SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(1)[NewKey]
+        + SHorizontalBox::Slot().AutoWidth()[TypePicker]
+        + SHorizontalBox::Slot().AutoWidth()[Button(TEXT("Add key"), [this, Object, NewKey, NewType, Context]
+        {
+            const FString Key = NewKey->GetText().ToString().TrimStartAndEnd();
+            if (Key.IsEmpty() || Object->HasField(Key) || bRawDirty) { Message = TEXT("Use a new non-empty key; Apply JSON first."); return; }
+            Remember();
+            const auto EntryDefaults = V3DProjectEditor::EntryTemplate(Context);
+            if (!EntryDefaults->Values.IsEmpty()) Object->SetObjectField(Key, EntryDefaults);
+            else if (*NewType == TEXT("Number")) Object->SetNumberField(Key, 0);
+            else if (*NewType == TEXT("Boolean")) Object->SetBoolField(Key, false);
+            else if (*NewType == TEXT("Object")) Object->SetObjectField(Key, MakeShared<FJsonObject>());
+            else if (*NewType == TEXT("Array")) Object->SetArrayField(Key, TArray<TSharedPtr<FJsonValue>>());
+            else Object->SetStringField(Key, TEXT(""));
+            Changed();
+        })]];
+}
+
+void UProjectEditorWidget::SaveAll(bool bBuild, bool bClose)
+{
+    if (bBusy || !ApplyRaw()) return;
+    if (PreviewBuilder) { Message = TEXT("Wait for the preview to finish before Save/Build."); return; }
+    bBusy = true; Message = TEXT("Validating and saving JSON...");
+    // Detached snapshots only. UI is disabled for the whole transaction.
+    TArray<FV3DEditorDocument> Copies;
+    for (const auto& Doc : Documents) if (Doc->bDirty) Copies.Add(*Doc);
+    const FString Name = Project; const uint64 Token = RequestGeneration;
+    TWeakObjectPtr<UProjectEditorWidget> Weak(this);
+    const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, Name, Copies = MoveTemp(Copies), bBuild, bClose]() mutable
+    {
+        FString Error; bool Success = true;
+        // Reject schema errors before writing any file.
+        for (auto& Doc : Copies) if (!V3DProjectEditor::Validate(Doc, Name, Error, &Copies)) { Success = false; break; }
+        if (Success) for (auto& Doc : Copies) if (!V3DProjectEditor::Save(Doc, Name, Error, &Copies)) { Success = false; break; }
+        FSafeFileIO::DispatchTrackedGameThread([Weak, Token, Copies = MoveTemp(Copies), Error, Success, bBuild, bClose]() mutable
+        {
+            auto* Self = Weak.Get(); if (!Self || Self->RequestGeneration != Token) return;
+            Self->bBusy = false;
+            for (const auto& Saved : Copies) if (!Saved.bDirty)
+                for (auto& Doc : Self->Documents) if (Doc->Path == Saved.Path) { Doc->DiskText = Saved.DiskText; Doc->bDirty = false; }
+            Self->Message = Success ? TEXT("Saved. Existing built worlds are replaced only when Build succeeds.") : Error;
+            if (Success && bBuild) Self->StartBuild();
+            else if (Success && bClose) Self->Close();
+        });
+    });
+    if (!Queued) { bBusy = false; Message = TEXT("Save queue is unavailable. Changes remain in Editor."); }
+}
+
+void UProjectEditorWidget::StartBuild()
+{
+    auto* Manager = UGameManagerSubSystem::GetSubSystem(this);
+    if (!Manager || Manager->IsProjectBuildInProgress()) { Message = TEXT("A build is already running."); return; }
+    BuildStatus = CreateWidget<UBuildStatusWidget>(GetOwningPlayer());
+    if (!BuildStatus) { Message = TEXT("Cannot create Build status."); return; }
+    BuildStatus->OnConfirmed.AddDynamic(this, &UProjectEditorWidget::BuildConfirmed);
+    BuildStatus->AddToPlayerScreen(60);
+    BuildStatus->BeginObservingBuild(Project);
+    SetVisibility(ESlateVisibility::Collapsed);
+    if (!Manager->BuildProjectByName(Project)) BuildStatus->ReportBuildRejected(Manager->GetLastMessage());
+}
+void UProjectEditorWidget::BuildConfirmed()
+{
+    if (BuildStatus) { BuildStatus->StopObservingBuild(); BuildStatus->RemoveFromParent(); BuildStatus = nullptr; }
+    SetVisibility(ESlateVisibility::Visible);
+}
+void UProjectEditorWidget::Close()
+{
+    if (bBusy) return;
+    RemoveFromParent(); OnClosed.ExecuteIfBound();
+}
+void UProjectEditorWidget::NativeDestruct()
+{
+    ++RequestGeneration;
+    if (PreviewBuilder) { PreviewBuilder->OnFinished.RemoveAll(this); PreviewBuilder->Cancel(); PreviewBuilder = nullptr; }
+    if (BuildStatus) { BuildStatus->StopObservingBuild(); BuildStatus->RemoveFromParent(); BuildStatus = nullptr; }
+    Super::NativeDestruct();
+}
+void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
+{
+    Super::ReleaseSlateResources(bReleaseChildren);
+    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset();
+}
+
+void UProjectEditorWidget::StartPreview()
+{
+    if (bBusy || !Current || !ApplyRaw()) return;
+    if (auto* M = UGameManagerSubSystem::GetSubSystem(this); M && M->IsProjectBuildInProgress()) return;
+    if (PreviewBuilder) { Message = TEXT("A model preview is already loading."); return; }
+    if (Current->SourcePath.IsEmpty() || FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase))
+    { Message = TEXT("Select a model resource for geometry preview."); return; }
+    if (IFileManager::Get().FileSize(*Current->SourcePath) > 32ll * 1024 * 1024)
+    { Message = TEXT("Preview source limit is 32 MiB. JSON editing and full builds remain available."); return; }
+    FModelDefinition Definition; FString Error;
+    if (!ModelDefinitionJson::ValidateDefinition(Current->Json, Current->Path, Current->SourcePath, Definition, Error))
+    { Message = Error; return; }
+    PreviewBuilder = NewObject<UProjectSourceModelBuilder>(this);
+    if (auto* R = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this); R && Definition.ModelType == EModelDefinitionType::Character)
+    {
+        PreviewBuilder->SetCharacterMaterialOverride(R->DefaultCharacterMaterial.LoadSynchronous());
+        PreviewBuilder->SetCharacterSkeletonOverride(R->DefaultCharacterSkeleton.LoadSynchronous());
+    }
+    PreviewDocument = Current->Path;
+    PreviewBuilder->OnFinished.AddUObject(this, &UProjectEditorWidget::PreviewFinished);
+    Message = TEXT("Loading read-only wireframe preview...");
+    if (!PreviewBuilder->Start(Definition, V3DProjectEditor::Serialize(Current->Json)) && PreviewBuilder)
+    { Message = PreviewBuilder->GetError(); PreviewBuilder = nullptr; }
+}
+void UProjectEditorWidget::PreviewFinished(UProjectSourceModelBuilder* Builder, bool bSuccess)
+{
+    if (Builder != PreviewBuilder) return;
+    if (bSuccess && Preview && Current && Current->Path == PreviewDocument)
+    {
+        const auto Model = Builder->TakeBuildModel();
+        Preview->SetModel(Model);
+        Message = TEXT("Read-only wireframe (up to 3000 edges). Drag to orbit; scroll to zoom. No positions are changed.");
+    }
+    else if (!bSuccess) Message = Builder->GetError();
+    PreviewBuilder = nullptr;
+}

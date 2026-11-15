@@ -232,7 +232,7 @@ public:
     static constexpr int32 MaxSounds = 100000;
     static constexpr int64 MaxSoundBytes = 512ll * 1024ll * 1024ll;
 
-    /** Returns Worlds/WorldName.v3d for a normalized virtual WorldName root path. */
+    /** Returns V3Ds/WorldName.v3d for a normalized virtual WorldName root path. */
     static FString MakeArchivePath(const FString& WorldRoot);
 
     /** Runtime keys never contain an authoring path and are safe to replicate between peers. */

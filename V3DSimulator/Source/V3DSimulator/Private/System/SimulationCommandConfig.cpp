@@ -94,7 +94,7 @@ namespace V3DCommandConfigPrivate
     bool Condition(const TSharedPtr<FJsonObject>& Json, FV3DCommandCondition& Out, FString& Error)
     {
         FString Type, Operator;
-        if (!Json.IsValid() || !Fields(*Json, {TEXT("Type"), TEXT("Target"), TEXT("Operator"), TEXT("Value"), TEXT("Tolerance"), TEXT("Point")}, Error)
+        if (!Json.IsValid() || !Fields(*Json, {TEXT("Type"), TEXT("Target"), TEXT("Operator"), TEXT("Value"), TEXT("Tolerance"), TEXT("Point"), TEXT("Biome")}, Error)
             || !Json->TryGetStringField(TEXT("Type"), Type) || !Json->TryGetStringField(TEXT("Operator"), Operator)
             || !Target(*Json, Out.Target) || !Number(*Json, TEXT("Value"), Out.Value, -1.e12, 1.e12, true)
             || !Number(*Json, TEXT("Tolerance"), Out.Tolerance, 0, 1.e6)) return false;
@@ -102,6 +102,13 @@ namespace V3DCommandConfigPrivate
         else if (Type == TEXT("speed")) Out.Metric = EV3DCommandMetric::Speed;
         else if (Type == TEXT("distance")) Out.Metric = EV3DCommandMetric::Distance;
         else if (Type == TEXT("position_z")) Out.Metric = EV3DCommandMetric::PositionZ;
+        else if (Type == TEXT("biome"))
+        {
+            Out.Metric = EV3DCommandMetric::Biome;
+            FString Name;
+            if (!Json->TryGetStringField(TEXT("Biome"), Name) || Name.IsEmpty()) return false;
+            Out.Biome = FName(Name);
+        }
         else return false;
         if (Out.Metric == EV3DCommandMetric::Distance)
         {

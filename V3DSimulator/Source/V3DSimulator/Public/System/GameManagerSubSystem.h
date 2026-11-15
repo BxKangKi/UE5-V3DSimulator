@@ -930,6 +930,7 @@ private:
     void LoadWorldData();
     void LoadPlayerData();
     bool SaveWorldData();
+    void CommitPlayerStateBeforeSuspend();
     bool SavePlayerData();
     /** Refreshes the authoritative in-memory player record from the live primary Pawn immediately before persistence. */
     bool CaptureCurrentPlayerTransformForPersistence();

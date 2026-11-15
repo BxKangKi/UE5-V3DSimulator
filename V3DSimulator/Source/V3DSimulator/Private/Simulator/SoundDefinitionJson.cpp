@@ -110,7 +110,16 @@ bool SoundDefinitionJson::LoadDefinition(
         return false;
     }
 
-    const TSharedPtr<FJsonObject>& Root = Loaded.JsonObject;
+    return ValidateDefinition(Loaded.JsonObject, JsonPath, ExpectedWavPath, OutDefinition, OutError, OutCanonicalJson);
+}
+
+bool SoundDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root,
+    const FString& JsonPath, const FString& ExpectedWavPath, FSoundDefinition& OutDefinition,
+    FString& OutError, FString* OutCanonicalJson)
+{
+    OutDefinition = FSoundDefinition(); OutError.Reset();
+    if (!Root.IsValid()) { OutError = TEXT("Expected a JSON object."); return false; }
+
     FString AssetType;
     EAssetDefinitionType ParsedAssetType = EAssetDefinitionType::Model;
     if (!Root->TryGetStringField(V3DSimulatorJsonMetadata::AssetType, AssetType)

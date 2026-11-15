@@ -53,6 +53,7 @@ public:
 private:
     TArray<FLightOptimizationData> ManagedLights;
     int32 GameUpdateHandle = INDEX_NONE;
+    float CullingAccumulator = .2f;
 
     void RegisterGameUpdate();
     void UnregisterGameUpdate();

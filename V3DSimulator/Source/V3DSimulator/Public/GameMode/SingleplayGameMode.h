@@ -4,7 +4,7 @@
 #include "GameMode/GameplayGameModeBase.h"
 #include "SingleplayGameMode.generated.h"
 
-/** Standalone gameplay GameMode. Runtime world data is read only from Worlds/<name>.v3d. */
+/** Standalone gameplay GameMode. Runtime world data is read only from V3Ds/<name>.v3d. */
 UCLASS(Blueprintable, BlueprintType)
 class V3DSIMULATOR_API ASingleplayGameMode : public AV3DSimulatorGameplayGameModeBase
 {

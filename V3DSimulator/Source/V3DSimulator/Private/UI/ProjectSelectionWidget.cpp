@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/ProjectSelectionWidget.h"
+#include "UI/ProjectEditorWidget.h"
 #include "UI/WidgetStyleSafety.h"
 #include "UI/HUDLegacyStyle.h"
 
@@ -9,6 +10,10 @@
 #include "Components/Border.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/ComboBoxString.h"
+#include "Components/CheckBox.h"
+#include "System/ProjectRepository.h"
+#include "System/ProjectWorkspace.h"
+#include "System/SafeFileIO.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Overlay.h"
@@ -67,6 +72,7 @@ void UProjectSelectionWidget::NativeConstruct()
 
 void UProjectSelectionWidget::NativeDestruct()
 {
+    if (EditorWidget) { EditorWidget->OnClosed.Unbind(); EditorWidget->RemoveFromParent(); EditorWidget = nullptr; }
     UnbindNavigationButtons();
     if (NativeProjectType) NativeProjectType->OnSelectionChanged.RemoveDynamic(this, &UProjectSelectionWidget::HandleNativeProjectTypeChanged);
     if (IsValid(BuildStatusWidget))
@@ -438,12 +444,26 @@ bool UProjectSelectionWidget::CreateNewProject(const FString& ProjectName)
         return false;
     }
 
-    // Completing creation keeps ProjectSelection open. Only leave inline creation mode, clear and
-    // collapse the TextBox, restore the Create Project label, then refresh so the new project appears
-    // immediately in the same screen.
+    if (NewProjectType == EV3DSimulatorProjectType::World)
+    {
+        FV3DSimulatorProjectConfig Config;
+        TSharedPtr<FJsonObject> Json;
+        FString Error;
+        if (V3DSimulatorProjectRepository::LoadProject(ProjectName, Config, &Json, Error))
+        {
+            Json->SetBoolField(TEXT("bAllowProjectAssets"), NewProjectExternalAssets && NewProjectExternalAssets->IsChecked());
+            auto Audio = MakeShared<FJsonObject>();
+            Audio->SetBoolField(TEXT("bGlobalAcoustics"), NewProjectAcoustics && NewProjectAcoustics->IsChecked());
+            Audio->SetBoolField(TEXT("bEnvironmentMusic"), !NewProjectMusic || NewProjectMusic->IsChecked());
+            Json->SetObjectField(TEXT("Audio"), Audio);
+            const auto Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), V3DSimulatorProjectWorkspace::ConfigPath(ProjectName));
+            if (!Saved.IsSuccess()) UE_LOG(LogTemp, Error, TEXT("New project options: %s"), *Saved.Error);
+        }
+    }
+    // Continue directly to the JSON editor so the remaining settings can be authored before Build.
     SetCreateProjectMode(false, true);
     RefreshProjects();
-    SetVisibility(ESlateVisibility::Visible);
+    OpenEditor(ProjectName);
     return true;
 }
 
@@ -560,26 +580,8 @@ void UProjectSelectionWidget::OnSelectionEntryActivated(const FString& Selection
         return;
     }
 
-    // Selecting an existing project also leaves inline creation mode before the build/status UI
-    // takes over, so the text box never remains visible behind another screen.
     SetCreateProjectMode(false, true);
-    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
-    if (Manager && Manager->IsProjectBuildInProgress())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("A project build is already running; ignoring another project click."));
-        return;
-    }
-    UBuildStatusWidget* Status = EnsureBuildStatusWidget();
-    if (!IsValid(Status)) return;
-
-    // Subscribe before starting: validation/queue failures can report completion synchronously.
-    // Hide before the request, since a completion callback can immediately confirm and restore us.
-    ShowBuildStatus(SelectionKey);
-    if (!BuildProjectByName(SelectionKey))
-    {
-        Status->ReportBuildRejected(IsValid(Manager) ? Manager->GetLastMessage()
-            : TEXT("The project build service is unavailable."));
-    }
+    OpenEditor(SelectionKey);
 }
 
 
@@ -592,7 +594,7 @@ void UProjectSelectionWidget::BuildNativeLayout()
 
     UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
     Box->AddChildToVerticalBox(Header);
-    UTextBlock* Title = AddText(Header, NSLOCTEXT("V3DMenu", "ProjectsTitle", "Projects"), true);
+    UTextBlock* Title = AddText(Header, NSLOCTEXT("V3DMenu", "EditorTitle", "Editor"), true);
     Title->SetAutoWrapText(false);
     Title->SetJustification(ETextJustify::Center);
     UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(Title->Slot);
@@ -642,6 +644,21 @@ void UProjectSelectionWidget::BuildNativeLayout()
     UHorizontalBoxSlot* NameSlot = CreateControls->AddChildToHorizontalBox(NativeProjectName);
     NameSlot->SetPadding(FMargin(24.0f, 0.0f, 0.0f, 0.0f));
     NameSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+
+    UHorizontalBox* Options = WidgetTree->ConstructWidget<UHorizontalBox>();
+    Box->AddChildToVerticalBox(Options)->SetPadding(FMargin(32.0f, 8.0f));
+    auto AddOption = [this, Options](const TCHAR* Label, bool bChecked)
+    {
+        UCheckBox* Check = WidgetTree->ConstructWidget<UCheckBox>();
+        Check->SetIsChecked(bChecked);
+        Options->AddChildToHorizontalBox(Check)->SetPadding(FMargin(12, 0));
+        UTextBlock* Text = WidgetTree->ConstructWidget<UTextBlock>();
+        Text->SetText(FText::FromString(Label)); Check->SetContent(Text);
+        return Check;
+    };
+    NewProjectAcoustics = AddOption(TEXT("World: geometry acoustics"), false);
+    NewProjectMusic = AddOption(TEXT("Environment music"), true);
+    NewProjectExternalAssets = AddOption(TEXT("Use external project assets"), false);
 
     UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("NativeProjectList"));
     NativeProjectList = Scroll;
@@ -725,4 +742,21 @@ void UProjectSelectionWidget::SetNewProjectType(EV3DSimulatorProjectType Project
         const FString Option = V3DSimulatorProjectTypes::ToString(ProjectType);
         if (NativeProjectType->GetSelectedOption() != Option) NativeProjectType->SetSelectedOption(Option);
     }
+}
+
+void UProjectSelectionWidget::OpenEditor(const FString& ProjectName)
+{
+    if (auto* Manager = UGameManagerSubSystem::GetSubSystem(this); Manager && Manager->IsProjectBuildInProgress()) return;
+    EditorWidget = CreateWidget<UProjectEditorWidget>(GetOwningPlayer());
+    if (!EditorWidget) return;
+    EditorWidget->OnClosed.BindUObject(this, &UProjectSelectionWidget::HandleEditorClosed);
+    EditorWidget->AddToPlayerScreen(50);
+    SetVisibility(ESlateVisibility::Collapsed);
+    EditorWidget->OpenProject(ProjectName);
+}
+void UProjectSelectionWidget::HandleEditorClosed()
+{
+    EditorWidget = nullptr;
+    SetVisibility(ESlateVisibility::Visible);
+    RefreshProjects();
 }

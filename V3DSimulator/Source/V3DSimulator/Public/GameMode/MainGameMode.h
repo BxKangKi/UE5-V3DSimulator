@@ -87,7 +87,7 @@ public:
     UFUNCTION(BlueprintPure, Category="Main World|Data")
     TMap<FString, FString> GetFolderNameMap() const { return FolderNameMap; }
 
-    /** Validates and resolves an exact world-folder key from the current index of .v3d files under Worlds. */
+    /** Validates and resolves an exact world-folder key from the current index of .v3d files under V3Ds. */
     UFUNCTION(BlueprintCallable, Category="Main World|Data")
     bool TryResolveWorldFolderKey(const FString& WorldFolderKey, FString& OutFolderName) const;
 

@@ -164,7 +164,7 @@ void UWorldSelectionWidget::BuildNativeLayout()
 
     UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("NativeWorldList"));
     NativeWorldList = Scroll;
-    NativeWorldEmpty = AddText(Scroll, NSLOCTEXT("V3DMenu", "NoWorlds", "No built worlds found. Build a world project in Projects, then refresh this list."));
+    NativeWorldEmpty = AddText(Scroll, NSLOCTEXT("V3DMenu", "NoWorlds", "No built worlds found. Build a world project in Editor, then refresh this list."));
     NativeWorldEmpty->SetVisibility(IsDesignTime() ? ESlateVisibility::Collapsed : ESlateVisibility::HitTestInvisible);
     UVerticalBoxSlot* ListSlot = Box->AddChildToVerticalBox(Scroll);
     ListSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));

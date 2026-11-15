@@ -178,8 +178,17 @@ void UDynamicLightSubsystem::CompactManagedLights()
     }
 }
 
-void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float /*DeltaTime*/)
+void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
 {
+    // Visibility decisions do not need the physics/input update rate.
+    CullingAccumulator += FMath::Max(0.f, DeltaTime);
+#if PLATFORM_ANDROID || PLATFORM_IOS
+    constexpr float Interval = .2f;
+#else
+    constexpr float Interval = .1f;
+#endif
+    if (CullingAccumulator < Interval) return;
+    CullingAccumulator = FMath::Fmod(CullingAccumulator, Interval);
     CompactManagedLights();
     if (ManagedLights.Num() == 0)
     {

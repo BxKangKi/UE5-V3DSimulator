@@ -15,7 +15,7 @@ void UV3DSimulatorGameInstance::Init()
     if (!V3DSimulatorProjectWorkspace::EnsureWorkspaceRoots())
     {
         UE_LOG(LogTemp, Error,
-            TEXT("V3DSimulator failed to create the Projects, Resources, or Worlds user-data directory."));
+            TEXT("V3DSimulator failed to create the Projects, Resources, or V3Ds user-data directory."));
     }
     const bool bRegistryReady = EnsureAssetRegistry();
     FSimulatorFileServices::WriteStartupLog(bRegistryReady ? TEXT("AssetRegistry ready") : TEXT("ERROR: AssetRegistry initialization failed"));

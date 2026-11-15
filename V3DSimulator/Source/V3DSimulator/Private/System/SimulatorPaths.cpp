@@ -12,7 +12,12 @@ namespace
 
 FString V3DSimulatorPaths::UserRoot()
 {
+#if PLATFORM_ANDROID || PLATFORM_IOS
+    // Sandboxed mobile applications cannot write to a desktop Documents/UserDir path.
+    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(FPaths::ProjectSavedDir(), ProductDirectory));
+#else
     return FSafeFileIO::NormalizeFilePath(FPaths::Combine(FPlatformProcess::UserDir(), ProductDirectory));
+#endif
 }
 
 FString V3DSimulatorPaths::ProjectsRoot()
@@ -27,7 +32,7 @@ FString V3DSimulatorPaths::ResourcesRoot()
 
 FString V3DSimulatorPaths::WorldsRoot()
 {
-    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("Worlds")));
+    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("V3Ds")));
 }
 
 FString V3DSimulatorPaths::DataRoot()

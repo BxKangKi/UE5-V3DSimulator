@@ -4,7 +4,7 @@
 #include "Dom/JsonObject.h"
 
 enum class EV3DCommandAction : uint8 { Transform, Velocity, Speed, TimeScale };
-enum class EV3DCommandMetric : uint8 { Elapsed, Speed, Distance, PositionZ };
+enum class EV3DCommandMetric : uint8 { Elapsed, Speed, Distance, PositionZ, Biome };
 enum class EV3DCommandComparison : uint8 { Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual };
 
 struct FV3DCommandAction
@@ -26,6 +26,7 @@ struct FV3DCommandCondition
     EV3DCommandMetric Metric = EV3DCommandMetric::Elapsed;
     EV3DCommandComparison Comparison = EV3DCommandComparison::GreaterEqual;
     FString Target = TEXT("self");
+    FName Biome;
     FVector Point = FVector::ZeroVector;
     double Value = 0;
     double Tolerance = 0.001;

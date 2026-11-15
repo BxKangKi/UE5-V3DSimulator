@@ -11,6 +11,7 @@
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
+#include "World/WorldEnvironmentConfig.h"
 #include "WorldData.generated.h"
 
 #define LATITUDE TEXT("Latitude")
@@ -195,5 +196,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay")
     FLevelGameplaySettings Gameplay;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Audio") FV3DWorldAudioSettings Audio;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Biomes") TArray<FV3DBiomeDefinition> Biomes;
     static bool DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json);
 };

@@ -11,6 +11,7 @@
 #include "Sound/SoundAttenuation.h"
 #include "Sound/SoundWaveProcedural.h"
 #include "System/WorldArchive.h"
+#include "World/WorldEnvironmentSubsystem.h"
 #include "TimerManager.h"
 
 UWorldSurfaceSubsystem* UWorldSurfaceSubsystem::Get(const UObject* Context)
@@ -220,7 +221,11 @@ bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit)
     LastSoundIndex.Add(Surface, Index);
     const FV3DPcmPtr Pcm = PcmCache.FindChecked(Definition->Sounds[Index]);
     ActiveSounds.RemoveAll([](const TObjectPtr<UAudioComponent>& Component) { return !IsValid(Component.Get()) || !Component->IsPlaying(); });
+#if PLATFORM_ANDROID || PLATFORM_IOS
+    if (ActiveSounds.Num() >= 8) return true;
+#else
     if (ActiveSounds.Num() >= 16) return true;
+#endif
     USoundWaveProcedural* Sound = NewObject<USoundWaveProcedural>(this, NAME_None, RF_Transient);
     Sound->NumChannels = Pcm->NumChannels;
     Sound->SetSampleRate(Pcm->SampleRate);
@@ -234,6 +239,7 @@ bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit)
     if (IsValid(Audio))
     {
         ActiveSounds.Add(Audio);
+        if (auto* Environment = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>()) Environment->ApplySpatialAudio(Audio);
         // Procedural sources can keep asking for silence after their queue ends. Explicitly
         // stop at the end; use one independent queue per voice so rapid steps cannot consume it.
         FTimerHandle StopTimer;

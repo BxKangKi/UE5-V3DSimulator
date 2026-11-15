@@ -247,6 +247,12 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character|Footsteps")
     TArray<FV3DSimulatorFootstepBinding> FootstepBindings;
 
+    /** Cooked fallback sounds; Audio in each v3d config can override these. Assign looping assets for ambience/music. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultFootstepSound;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultWaterSound;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultUnderwaterSound;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultEnvironmentMusic;
+
     // Enhanced Input is centralized for the same reason: controller Blueprints no longer hard-reference assets.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Input")
     TSoftObjectPtr<UInputMappingContext> PrimaryInputMappingContext;

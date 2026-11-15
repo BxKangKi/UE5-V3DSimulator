@@ -1495,3 +1495,14 @@ bool FV3DTransientChunkLifetimeTest::RunTest(const FString&)
     return true;
 }
 #endif
+
+bool UWorldObjectStreamingSubsystem::SaveRuntimeStateBlocking(const FWorldRuntimeState& State, FString& Error)
+{
+    check(IsInGameThread());
+    if (!bRunning || !Archive.IsValid() || !HasPersistenceAuthority())
+    { Error = TEXT("Runtime persistence is unavailable."); return false; }
+    // Reserve a newer order so an older autosave cannot overwrite this final snapshot.
+    const FSafeFileWriteResult Result = Archive->SaveRuntimeState(State, Archive->ReserveRuntimeStateWrite());
+    Error = Result.Error;
+    return Result.IsSuccess();
+}

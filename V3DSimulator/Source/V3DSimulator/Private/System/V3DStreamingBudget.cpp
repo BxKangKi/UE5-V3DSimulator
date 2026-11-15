@@ -13,11 +13,18 @@
 namespace V3DStreamingBudgetPrivate
 {
     constexpr int64 MiB = 1024ll * 1024ll;
-    TAutoConsoleVariable<int32> MaxRequests(TEXT("gltfsim.Streaming.MaxResidentBuilds"), 0,
+#if PLATFORM_ANDROID || PLATFORM_IOS
+    constexpr int32 DefaultRequests = 2, DefaultBudget = 64;
+    constexpr float DefaultSceneMs = 1.f;
+#else
+    constexpr int32 DefaultRequests = 0, DefaultBudget = 256;
+    constexpr float DefaultSceneMs = 3.f;
+#endif
+    TAutoConsoleVariable<int32> MaxRequests(TEXT("gltfsim.Streaming.MaxResidentBuilds"), DefaultRequests,
         TEXT("End-to-end baked/entity load concurrency: 0 = cores - 1 (2..16), explicit 1..16. Memory budget still applies."), ECVF_Default);
-    TAutoConsoleVariable<int32> BudgetMiB(TEXT("gltfsim.Streaming.BuildBudgetMiB"), 256,
+    TAutoConsoleVariable<int32> BudgetMiB(TEXT("gltfsim.Streaming.BuildBudgetMiB"), DefaultBudget,
         TEXT("Estimated transient CPU admission budget. A single oversized request runs alone."), ECVF_Default);
-    TAutoConsoleVariable<float> SceneMs(TEXT("gltfsim.Streaming.SceneFrameBudgetMs"), 3.0f,
+    TAutoConsoleVariable<float> SceneMs(TEXT("gltfsim.Streaming.SceneFrameBudgetMs"), DefaultSceneMs,
         TEXT("Aggregate scene instance work per frame, across all actors (0.25..8 ms)."), ECVF_Default);
 
     struct FPending

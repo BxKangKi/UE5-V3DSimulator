@@ -1,5 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/SimulationScriptSubsystem.h"
+#include "World/WorldEnvironmentSubsystem.h"
 #include "System/SimulationCommandObject.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/WorldObjectStreamingSubsystem.h"
@@ -279,6 +280,9 @@ bool USimulationScriptSubsystem::Evaluate(const FV3DCommandCondition& Condition,
         case EV3DCommandMetric::Speed: Value = LinearVelocity(Actor).Size(); break;
         case EV3DCommandMetric::Distance: Value = FVector::Distance(Actor->GetActorLocation(), Condition.Point); break;
         case EV3DCommandMetric::PositionZ: Value = Actor->GetActorLocation().Z; break;
+        case EV3DCommandMetric::Biome:
+            Value = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>()->IsPointInBiome(Condition.Biome, Actor->GetActorLocation()) ? 1 : 0;
+            break;
         default: break;
         }
     }

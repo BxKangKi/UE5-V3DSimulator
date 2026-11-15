@@ -15,6 +15,8 @@ class UMenuButtonWidget;
 class UMainWorldWidget;
 class UBuildStatusWidget;
 class UComboBoxString;
+class UCheckBox;
+class UProjectEditorWidget;
 
 /**
  * Project browser shown directly over the current start menu.
@@ -107,6 +109,9 @@ private:
     UFUNCTION()
     UWidget* GenerateNativeProjectType(FString Item);
 
+    void OpenEditor(const FString& ProjectName);
+    void HandleEditorClosed();
+    UPROPERTY(Transient) TObjectPtr<UProjectEditorWidget> EditorWidget;
     void BindNavigationButtons();
     void UnbindNavigationButtons();
     UEditableTextBox* EnsureNewProjectNameTextBox();
@@ -138,4 +143,7 @@ private:
     UPROPERTY(Transient) TObjectPtr<UButton> NativeProjectRefresh;
     UPROPERTY(Transient) TObjectPtr<UEditableTextBox> NativeProjectName;
     UPROPERTY(Transient) TObjectPtr<UComboBoxString> NativeProjectType;
+    UPROPERTY(Transient) TObjectPtr<UCheckBox> NewProjectAcoustics;
+    UPROPERTY(Transient) TObjectPtr<UCheckBox> NewProjectMusic;
+    UPROPERTY(Transient) TObjectPtr<UCheckBox> NewProjectExternalAssets;
 };

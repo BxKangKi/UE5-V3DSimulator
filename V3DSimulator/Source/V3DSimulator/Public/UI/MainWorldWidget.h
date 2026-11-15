@@ -87,22 +87,22 @@ public:
     void ExecuteQuitGame();
 
     /** Shows the project-selection widget created/registered from the central registry. */
-    UFUNCTION(BlueprintCallable, Category="Main World|Projects")
+    UFUNCTION(BlueprintCallable, Category="Main World|Editor")
     void ExecuteShowProjectSelectionWidget();
 
     /** Hides the registered project-selection widget and restores this start widget. */
-    UFUNCTION(BlueprintCallable, Category="Main World|Projects")
+    UFUNCTION(BlueprintCallable, Category="Main World|Editor")
     void CloseProjectSelectionWidget();
 
     /** Toggle helper for custom Blueprint flows. */
-    UFUNCTION(BlueprintCallable, Category="Main World|Projects")
+    UFUNCTION(BlueprintCallable, Category="Main World|Editor")
     void ToggleProjectSelectionWidget();
 
     /** Register or replace the project-selection widget instance. MainGameMode fills this automatically from the registry when missing. */
-    UFUNCTION(BlueprintCallable, Category="Main World|Projects")
+    UFUNCTION(BlueprintCallable, Category="Main World|Editor")
     void SetProjectSelectionWidget(UProjectSelectionWidget* InWidget);
 
-    UFUNCTION(BlueprintPure, Category="Main World|Projects")
+    UFUNCTION(BlueprintPure, Category="Main World|Editor")
     UProjectSelectionWidget* GetProjectSelectionWidget() const { return ProjectSelectionWidget.Get(); }
 
     /** Creates and attaches the project browser on demand; never hides the menu on failure. */
@@ -141,9 +141,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Main World|Widgets")
     void SetSettingsButton(UButton* InButton);
 
-    /** Assign this from a derived WBP Construct event to enable the main Projects button. */
+    /** Assign this from a derived WBP Construct event to enable the main Editor button. */
     UFUNCTION(BlueprintCallable, Category="Main World|Widgets")
-    void SetProjectsButton(UButton* InButton);
+    void SetEditorButton(UButton* InButton);
+    UFUNCTION(BlueprintCallable, Category="Main World|Editor", meta=(DeprecatedFunction, DeprecationMessage="Use SetEditorButton"))
+    void SetProjectsButton(UButton* InButton) { SetEditorButton(InButton); }
 
     UFUNCTION(BlueprintCallable, Category="Main World|Widgets")
     void SetHostButton(UButton* InButton);
@@ -162,7 +164,7 @@ public:
     UFUNCTION(BlueprintPure, Category="Main World|World Selection")
     FString GetSelectedWorldFolderName() const { return SelectedWorldFolderName; }
 
-    /** Validates an exact folder key against the current index of .v3d files under Worlds. */
+    /** Validates an exact folder key against the current index of .v3d files under V3Ds. */
     UFUNCTION(BlueprintCallable, Category="Main World|World Selection")
     bool ResolveWorldFolderName(const FString& FolderOrDisplayName, FString& OutWorldFolderName) const;
 
@@ -170,7 +172,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Main World|World Selection")
     bool OpenSelectedWorld();
 
-    /** Resolves the selected immutable world key under Worlds; does not create directories or initiate travel. */
+    /** Resolves the selected immutable world key under V3Ds; does not create directories or initiate travel. */
     UFUNCTION(BlueprintPure, Category="World")
     FString GetSelectedWorldRootPath() const;
 
@@ -267,7 +269,7 @@ private:
     TWeakObjectPtr<UButton> RefreshButton;
     TWeakObjectPtr<UButton> MultiplayerButton;
     TWeakObjectPtr<UButton> SettingsButton;
-    TWeakObjectPtr<UButton> ProjectsButton;
+    TWeakObjectPtr<UButton> EditorButton;
     TWeakObjectPtr<UButton> HostButton;
     TWeakObjectPtr<UButton> ClientButton;
     TWeakObjectPtr<UButton> JoinButton;
@@ -275,7 +277,7 @@ private:
     UPROPERTY(Transient) TObjectPtr<UBorder> NativeMenuPanel;
     UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeMenuTitle;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeStart;
-    UPROPERTY(Transient) TObjectPtr<UButton> NativeProjects;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeEditor;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeMultiplayer;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeSettings;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeQuit;

@@ -30,7 +30,10 @@
 #include "Model/MaterialDefaultAsset.h"
 #include "World/WorldEnvManager.h"
 #include "World/WaterActor.h"
+#include "World/WorldEnvironmentSubsystem.h"
 #include "World/PlayerData.h"
+#include "Misc/CoreDelegates.h"
+#include "Math/RotationMatrix.h"
 #include "ProceduralMeshComponent.h"
 #include "System/MacroLibrary.h"
 #include "System/MultiplayerWorldSubSystem.h"
@@ -219,6 +222,8 @@ void UGameManagerSubSystem::Initialize(FSubsystemCollectionBase &Collection)
 {
     Super::Initialize(Collection);
     GameSettings = UGameSettings::CreateSettingsData(this);
+    FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddUObject(this, &UGameManagerSubSystem::CommitPlayerStateBeforeSuspend);
+    FCoreDelegates::GetApplicationWillTerminateDelegate().AddUObject(this, &UGameManagerSubSystem::CommitPlayerStateBeforeSuspend);
 
     if (!PostLoadMapCleanupHandle.IsValid())
     {
@@ -232,6 +237,9 @@ void UGameManagerSubSystem::Initialize(FSubsystemCollectionBase &Collection)
 
 void UGameManagerSubSystem::Deinitialize()
 {
+    CommitPlayerStateBeforeSuspend();
+    FCoreDelegates::ApplicationWillEnterBackgroundDelegate.RemoveAll(this);
+    FCoreDelegates::GetApplicationWillTerminateDelegate().RemoveAll(this);
     // Runs when the game instance shuts down; clean up runtime actors owned by the subsystem.
     StopGameplaySession(EEndPlayReason::Destroyed);
 
@@ -544,13 +552,16 @@ void UGameManagerSubSystem::SetPlayerLocation(
         return;
     }
 
+    if (!bInitialPlayerTransformResolved) return; // Do not overwrite a save during the spawn handshake.
     PlayerLocation = Location;
     if (IsValid(ActiveWorldData)) ActiveWorldData->PlayerLocation = Location;
     if (IsValid(ActivePlayerData))
     {
         FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
         PlayerRecord.Location = Location;
-        const FRotator Rotation = SourceActor->GetActorRotation();
+        const APawn* Pawn = Cast<APawn>(SourceActor);
+        const FRotator Rotation = Pawn && Pawn->GetController()
+            ? Pawn->GetController()->GetControlRotation() : SourceActor->GetActorRotation();
         if (IsFiniteRotation(Rotation)) PlayerRecord.Rotation = Rotation.GetNormalized();
     }
 }
@@ -1287,7 +1298,7 @@ void UGameManagerSubSystem::ContinueGameplaySessionAfterAssetPreload(
                 if (!ReadyDatabase || !ReadyDatabase->IsBuiltWorld())
                 {
                     StrongThis->FailWorldStartup(
-                        TEXT("World startup failed: runtime uses Worlds/*.v3d only. Build the project first from the Projects UI in MainWorld."));
+                        TEXT("World startup failed: runtime uses V3Ds/*.v3d only. Build the project first from the Editor UI in MainWorld."));
                     return;
                 }
                 StrongThis->ContinueWorldStartupAfterDatabase();
@@ -1417,7 +1428,7 @@ void UGameManagerSubSystem::StopGameplaySession(
     {
         // Fallback for editor shutdown or travel paths that did not run the pre-travel commit.
         SaveScene();
-        SavePlayerData();
+        CommitPlayerStateBeforeSuspend();
         bMenuTravelSaveCompleted = true;
     }
 
@@ -1447,7 +1458,7 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
     // so every live object is snapshotted before its owning chunk is released.
     WorldNameBeforeMenuTravel = CurrentWorldName;
     const bool bEntitySaveCompleted = SaveScene();
-    SavePlayerData();
+    CommitPlayerStateBeforeSuspend();
 
     bMenuTravelStatePrepared = true;
     // A failed/blocked save intentionally leaves the last committed .dat generation untouched. Do not retry
@@ -1483,6 +1494,7 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
     CancelGameplayAssetPreload();
     bRuntimeAssetsPreloaded = false;
     bUsingBootstrapLoadingWidget = false;
+    if (GetWorld()) if (auto* Environment = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>()) Environment->Reset();
     if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this)) Surfaces->Reset();
     if (GetWorld()) if (auto* Scripts = GetWorld()->GetSubsystem<USimulationScriptSubsystem>()) Scripts->Reset();
     // GameInstance subsystems survive level travel, so every UPROPERTY reference held here can keep
@@ -1848,6 +1860,7 @@ void UGameManagerSubSystem::StopWorldSystems()
     }
 
     bSpawnedWorldEnvManager = false;
+    if (GetWorld()) if (auto* Environment = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>()) Environment->Reset();
     ActivePlayerData = nullptr;
     bCurrentLevelCheatsEnabled = false;
     ActiveWorldData = nullptr;
@@ -2156,6 +2169,12 @@ void UGameManagerSubSystem::LoadWorldData()
                     Manager->SetWorldData(Manager->ActiveWorldData);
                     if (auto* Scripts = Manager->GetWorld()->GetSubsystem<USimulationScriptSubsystem>())
                         Scripts->Configure(MoveTemp(CommandConfig));
+                    FString EnvironmentError;
+                    if (!Manager->GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>()->Configure(Config.JsonObject, EnvironmentError))
+                    {
+                        Manager->FailWorldStartup(EnvironmentError);
+                        return;
+                    }
                     Manager->LoadPlayerData();
                     Manager->ApplyLevelSettings();
                     Manager->SpawnWorldEnvManager();
@@ -2208,8 +2227,22 @@ void UGameManagerSubSystem::LoadPlayerData()
         bInitialPlayerDataLoadCompleted = true;
         return;
     }
-    ActivePlayerId = IsValid(ActiveWorldData) && !ActiveWorldData->Player.IsEmpty()
-        ? FPaths::GetCleanFilename(ActiveWorldData->Player) : TEXT("Player");
+    ActivePlayerId = TEXT("Player");
+    if (IsValid(ActiveWorldData))
+    {
+        const FString LegacyId = FPaths::GetCleanFilename(ActiveWorldData->Player);
+        const FWorldPlayerRecord* Stable = ActivePlayerData->FindPlayer(ActivePlayerId);
+        const FWorldPlayerRecord* Legacy = ActivePlayerData->FindPlayer(LegacyId);
+        if (Legacy && LegacyId != ActivePlayerId && IsFiniteWorldLocation(Legacy->Location)
+            && (!Stable || (Stable->Location.IsNearlyZero() && !Legacy->Location.IsNearlyZero())))
+        {
+            FWorldPlayerRecord Migrated = *Legacy; Migrated.PlayerId = ActivePlayerId;
+            ActivePlayerData->Players.RemoveAll([&LegacyId, this](const auto& Record)
+            { return Record.PlayerId == LegacyId || Record.PlayerId == ActivePlayerId; });
+            ActivePlayerData->Players.Add(MoveTemp(Migrated));
+            bPendingInitialPlayerDataSave = true;
+        }
+    }
     const FWorldPlayerRecord* Existing = ActivePlayerData->FindPlayer(ActivePlayerId);
     if (Existing && IsFiniteWorldLocation(Existing->Location))
     {
@@ -2463,7 +2496,8 @@ void UGameManagerSubSystem::TryResolveInitialPlayerTransform()
         return;
     }
     FVector GroundedLocation = ResolvedLocation;
-    if (FindNearestGroundSpawnLocation(RegisteredPlayer, ResolvedLocation, GroundedLocation))
+    if (InitialPlayerLocationSource != EInitialPlayerLocationSource::EntityArchive
+        && FindNearestGroundSpawnLocation(RegisteredPlayer, ResolvedLocation, GroundedLocation))
     {
         if (!PrepareInitialPlayerSpawnArea(GroundedLocation))
         {
@@ -2475,9 +2509,18 @@ void UGameManagerSubSystem::TryResolveInitialPlayerTransform()
 
     // Apply the resolved transform for both saved spawns and fresh PlayerStart spawns. The latter
     // normally changes only Z, ensuring the capsule begins immediately above the nearest floor.
+    FRotator PawnRotation = ResolvedRotation;
+    if (bShouldRestoreSavedControlRotation && Cast<ACharacterController>(RegisteredPlayer))
+    {
+        // View pitch/roll belong to the controller, never to the upright collision capsule.
+        const FVector Up = RegisteredPlayer->GetActorUpVector();
+        const FVector Forward = FVector::VectorPlaneProject(ResolvedRotation.Vector(), Up).GetSafeNormal();
+        PawnRotation = Forward.IsNearlyZero() ? RegisteredPlayer->GetActorRotation()
+            : FRotationMatrix::MakeFromXZ(Forward, Up).Rotator();
+    }
     const bool bApplied = RegisteredPlayer->SetActorLocationAndRotation(
         ResolvedLocation,
-        ResolvedRotation,
+        PawnRotation,
         false,
         nullptr,
         ETeleportType::TeleportPhysics);
@@ -2578,7 +2621,9 @@ bool UGameManagerSubSystem::CaptureCurrentPlayerTransformForPersistence()
     }
     if (!IsValid(LivePlayer)) return false;
     const FVector LiveLocation = LivePlayer->GetActorLocation();
-    const FRotator LiveRotation = LivePlayer->GetActorRotation();
+    const APawn* LivePawn = Cast<APawn>(LivePlayer);
+    const FRotator LiveRotation = LivePawn && LivePawn->GetController()
+        ? LivePawn->GetController()->GetControlRotation() : LivePlayer->GetActorRotation();
     if (!IsFiniteWorldLocation(LiveLocation)) return false;
     PlayerLocation = LiveLocation;
     if (IsValid(ActiveWorldData)) ActiveWorldData->PlayerLocation = LiveLocation;
@@ -2595,6 +2640,7 @@ bool UGameManagerSubSystem::SaveWorldData()
 {
     check(IsInGameThread());
     if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return false;
+    if (!bInitialPlayerTransformResolved || !bInitialPlayerDataLoadCompleted) return false;
     if (!IsValid(ActiveWorldData) || !IsValid(ActivePlayerData) || !FMath::IsFinite(ActiveWorldData->WorldTime)) return false;
     FWorldRuntimeState Snapshot;
     Snapshot.WorldTime = ActiveWorldData->WorldTime;
@@ -2617,7 +2663,7 @@ bool UGameManagerSubSystem::SavePlayerData()
 {
     check(IsInGameThread());
     if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return false;
-    if (!IsValid(ActivePlayerData)) return false;
+    if (!IsValid(ActivePlayerData) || !bInitialPlayerTransformResolved || !bInitialPlayerDataLoadCompleted) return false;
 
     // Refresh from the live Pawn before validating the cached location. The old ordering could both
     // fail compilation (bare return in a bool function) and reject a valid live transform merely
@@ -2649,7 +2695,7 @@ void UGameManagerSubSystem::SetSelectedPlayerForRuntime(const FString& PlayerId)
     }
 
     ActiveWorldData->Player = SafeName;
-    ActivePlayerId = SafeName.IsEmpty() ? FString(TEXT("Player")) : SafeName;
+    ActivePlayerId = TEXT("Player"); // Avatar choice is not the save identity.
     if (IsValid(ActivePlayerData))
     {
         ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
@@ -2885,6 +2931,7 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 
     // Player transforms live only in WorldName.dat. Keep the in-memory mirrors current so the
     // next periodic binary save has an immutable validated snapshot.
+    if (!bInitialPlayerTransformResolved) return;
     const FVector CurrentLocation = GetPlayerLocation();
     ActiveWorldData->PlayerLocation = CurrentLocation;
     if (IsValid(ActivePlayerData))
@@ -2893,7 +2940,9 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
         PlayerRecord.Location = CurrentLocation;
         if (const AActor* Player = PlayerActor.Get())
         {
-            PlayerRecord.Rotation = Player->GetActorRotation();
+            const APawn* Pawn = Cast<APawn>(Player);
+            PlayerRecord.Rotation = Pawn && Pawn->GetController()
+                ? Pawn->GetController()->GetControlRotation() : Player->GetActorRotation();
         }
     }
 }
@@ -4674,9 +4723,12 @@ bool UGameManagerSubSystem::SaveScene()
         if (Object.IsValid()) Chunks->MarkObjectChanged(Object.Get());
     for (const TWeakObjectPtr<AVehiclePawn>& Object : SpawnedVehicles)
         if (Object.IsValid()) Chunks->MarkObjectChanged(Object.Get());
-    LastSaveMessage = TEXT("The modified object was queued for the next .dat chunk checkpoint.");
+    const bool bPlayerQueued = SavePlayerData();
+    LastSaveMessage = bPlayerQueued
+        ? TEXT("Player state and modified objects queued for .dat persistence.")
+        : TEXT("Player save unavailable while the initial spawn is unresolved.");
     NotifyStateChanged();
-    return true;
+    return bPlayerQueued;
 }
 
 FString UGameManagerSubSystem::GetProjectsRootPath()
@@ -4822,6 +4874,7 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
         FV3DProjectScripts Scripts;
         FV3DWorldSurfaceConfig SurfaceConfig;
         FV3DSimulationCommandConfig CommandConfig;
+        FV3DEnvironmentConfig EnvironmentConfig;
         FString ValidationError;
         FV3DSimulatorProjectConfig ProjectConfig;
         TSharedPtr<FJsonObject> Canonical;
@@ -4829,7 +4882,8 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
                 ConfigPath, SafeName, ProjectConfig, &Canonical, ValidationError)
             && Canonical.IsValid()
             && FV3DProjectScripts::Load(ProjectRoot, Canonical, Scripts, ValidationError)
-            && Scripts.Parse(SurfaceConfig, CommandConfig, ValidationError))
+            && Scripts.Parse(SurfaceConfig, CommandConfig, ValidationError)
+            && FV3DEnvironmentConfig::Parse(Canonical, EnvironmentConfig, ValidationError))
         {
             FV3DProjectScripts::RemoveLegacyFields(*Canonical);
             const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
@@ -5599,4 +5653,25 @@ FString UGameManagerSubSystem::BuildStatusText() const
 FString UGameManagerSubSystem::BuildHUDText() const
 {
     return BuildStatusText();
+}
+
+void UGameManagerSubSystem::CommitPlayerStateBeforeSuspend()
+{
+    UWorld* World = GetWorld();
+    if (!World || World->GetNetMode() == NM_Client || !bInitialPlayerTransformResolved
+        || !bInitialPlayerDataLoadCompleted || !IsValid(ActiveWorldData) || !IsValid(ActivePlayerData)) return;
+    CaptureCurrentPlayerTransformForPersistence();
+    FWorldRuntimeState State;
+    State.WorldTime = ActiveWorldData->WorldTime;
+    State.SelectedPlayer = ActiveWorldData->Player;
+    State.Players = ActivePlayerData->Players;
+    FString Error;
+    if (auto* Chunks = World->GetSubsystem<UWorldObjectStreamingSubsystem>())
+    {
+        if (!Chunks->SaveRuntimeStateBlocking(State, Error))
+        {
+            LastSaveMessage = TEXT("Player save failed: ") + Error;
+            UE_LOG(LogTemp, Error, TEXT("%s"), *LastSaveMessage);
+        }
+    }
 }

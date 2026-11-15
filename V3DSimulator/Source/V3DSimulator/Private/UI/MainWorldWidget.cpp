@@ -86,7 +86,7 @@ void UMainWorldWidget::NativeDestruct()
     RefreshButton.Reset();
     MultiplayerButton.Reset();
     SettingsButton.Reset();
-    ProjectsButton.Reset();
+    EditorButton.Reset();
     HostButton.Reset();
     ClientButton.Reset();
     JoinButton.Reset();
@@ -210,7 +210,7 @@ void UMainWorldWidget::ExecuteShowProjectSelectionWidget()
     if (!EnsureProjectSelectionWidget())
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("Projects button requires ProjectSelectionWidgetClass in the central AssetRegistry or an explicit SetProjectSelectionWidget() override."));
+            TEXT("Editor button requires ProjectSelectionWidgetClass in the central AssetRegistry or an explicit SetProjectSelectionWidget() override."));
         return;
     }
 
@@ -357,7 +357,7 @@ void UMainWorldWidget::BindDefaultButtons()
         Button->OnClicked.AddDynamic(this, &UMainWorldWidget::ExecuteShowSettingsMenu);
     }
 
-    if (UButton* Button = ProjectsButton.Get())
+    if (UButton* Button = EditorButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &UMainWorldWidget::ExecuteShowProjectSelectionWidget);
         Button->OnClicked.AddDynamic(this, &UMainWorldWidget::ExecuteShowProjectSelectionWidget);
@@ -414,7 +414,7 @@ void UMainWorldWidget::UnbindDefaultButtons()
         Button->OnClicked.RemoveDynamic(this, &UMainWorldWidget::ExecuteShowSettingsMenu);
     }
 
-    if (UButton* Button = ProjectsButton.Get())
+    if (UButton* Button = EditorButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &UMainWorldWidget::ExecuteShowProjectSelectionWidget);
     }
@@ -536,14 +536,14 @@ void UMainWorldWidget::SetSettingsButton(UButton* InButton)
     }
 }
 
-void UMainWorldWidget::SetProjectsButton(UButton* InButton)
+void UMainWorldWidget::SetEditorButton(UButton* InButton)
 {
     if (!AcceptWidgetAssignment(InButton)) return;
-    if (UButton* Button = ProjectsButton.Get())
+    if (UButton* Button = EditorButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &UMainWorldWidget::ExecuteShowProjectSelectionWidget);
     }
-    ProjectsButton = InButton;
+    EditorButton = InButton;
     if (IsValid(InButton))
     {
         InButton->OnClicked.RemoveDynamic(this, &UMainWorldWidget::ExecuteShowProjectSelectionWidget);
@@ -780,7 +780,7 @@ UMultiplayerMenuWidget::UMultiplayerMenuWidget(const FObjectInitializer& ObjectI
 void UMainWorldWidget::BuildNativeLayout()
 {
     NativeStart = nullptr;
-    NativeProjects = nullptr;
+    NativeEditor = nullptr;
     NativeMultiplayer = nullptr;
     NativeSettings = nullptr;
     NativeQuit = nullptr;
@@ -898,7 +898,7 @@ void UMainWorldWidget::BuildNativeLayout()
         NativeStart = AddMenuButton(Gameplay, NSLOCTEXT("V3DMenu", "Singleplay", "Singleplay"), 0, 768.0f, ETextJustify::Right);
         NativeMultiplayer = AddMenuButton(Gameplay, NSLOCTEXT("V3DMenu", "Multiplay", "Multiplay"), 1, 768.0f, ETextJustify::Right);
         UUniformGridPanel* Control = MakeGroup(HAlign_Right, VAlign_Bottom);
-        NativeProjects = AddMenuButton(Control, NSLOCTEXT("V3DMenu", "Projects", "Projects"), 0, 512.0f, ETextJustify::Center);
+        NativeEditor = AddMenuButton(Control, NSLOCTEXT("V3DMenu", "Editor", "Editor"), 0, 512.0f, ETextJustify::Center);
         NativeSettings = AddMenuButton(Control, NSLOCTEXT("V3DMenu", "Settings", "Settings"), 1, 512.0f, ETextJustify::Center);
         NativeQuit = AddMenuButton(Control, NSLOCTEXT("V3DMenu", "Exit", "Exit"), 2, 512.0f, ETextJustify::Center);
     }
@@ -951,7 +951,7 @@ void UMainWorldWidget::BindNativeWidgets()
     if (!IsUsingNativeLayout()) return;
     SetStartButton(NativeStart);
     SetWorldSelectionButton(nullptr);
-    SetProjectsButton(NativeProjects);
+    SetEditorButton(NativeEditor);
     SetMultiplayerButton(NativeMultiplayer);
     SetSettingsButton(NativeSettings);
     SetBackButton(NativeBack);

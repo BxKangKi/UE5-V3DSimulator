@@ -520,62 +520,6 @@ static FORCEINLINE bool ShouldPreserveCachedPreRagdollVelocity(const FVector& Ca
     return NewVelocity.SizeSquared() < CachedVelocity.SizeSquared() * PreserveRatio * PreserveRatio;
 }
 
-static bool ShouldApplyInitialRagdollVelocityToBone(const FName BoneName)
-{
-    const FString BoneString = GetCharacterNormalizedBoneName(BoneName);
-    if (IsRagdollCosmeticOrHelperBoneName(BoneString))
-    {
-        return false;
-    }
-
-    // Give the initial gameplay velocity only to the bodies that make up the
-    // character's physical mass. Fingers, toes, and accessory/helper chains are
-    // left to constraints so they do not amplify the activation energy.
-    return IsRagdollPrimaryReleaseBone(BoneName)
-        || BoneString.Contains(TEXT("spine"))
-        || BoneString.Contains(TEXT("chest"))
-        || BoneString.Contains(TEXT("torso"))
-        || BoneString.Contains(TEXT("abdomen"))
-        || BoneString.Contains(TEXT("neck"))
-        || BoneString.Contains(TEXT("head"))
-        || BoneString.Contains(TEXT("clavicle"))
-        || BoneString.Contains(TEXT("shoulder"))
-        || BoneString.Contains(TEXT("upperarm"))
-        || BoneString.Contains(TEXT("upper_arm"))
-        || BoneString.Contains(TEXT("lowerarm"))
-        || BoneString.Contains(TEXT("lower_arm"))
-        || BoneString.Contains(TEXT("forearm"))
-        || BoneString.Contains(TEXT("thigh"))
-        || BoneString.Contains(TEXT("upperleg"))
-        || BoneString.Contains(TEXT("upper_leg"))
-        || BoneString.Contains(TEXT("lowerleg"))
-        || BoneString.Contains(TEXT("lower_leg"))
-        || BoneString.Contains(TEXT("calf"))
-        || BoneString.Contains(TEXT("shin"));
-}
-
-static FORCEINLINE float GetSafeRagdollBodyMass(const FBodyInstance* BodyInstance)
-{
-    if (!BodyInstance)
-    {
-        return 1.0f;
-    }
-
-    const float BodyMass = BodyInstance->GetBodyMass();
-    return FMath::IsFinite(BodyMass) && BodyMass > UE_SMALL_NUMBER ? BodyMass : 1.0f;
-}
-
-static FORCEINLINE FVector GetSafeRagdollBodyVelocity(const FBodyInstance* BodyInstance)
-{
-    if (!BodyInstance)
-    {
-        return FVector::ZeroVector;
-    }
-
-    const FVector Velocity = BodyInstance->GetUnrealWorldVelocity();
-    return Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity;
-}
-
 static bool IsRagdollBodySimulatingForRelease(USkeletalMeshComponent* SkeletalMesh, const FName BoneName)
 {
     if (!IsValid(SkeletalMesh) || BoneName == NAME_None)
@@ -2679,99 +2623,12 @@ void UCharacterComponent::ApplyInitialRagdollVelocity(USkeletalMeshComponent *Sk
     }
 
     const FVector SafeInitialVelocity = ClampInitialRagdollVelocityForActivation(InitialVelocity, CharacterGravityUp(Movement.Get()));
-    if (!IsUsefulInitialRagdollVelocity(SafeInitialVelocity))
-    {
-        return;
-    }
-
-    struct FRagdollVelocityBody
-    {
-        FName BoneName = NAME_None;
-        FBodyInstance* BodyInstance = nullptr;
-        float Mass = 1.0f;
-    };
-
-    TArray<FRagdollVelocityBody, TInlineAllocator<24>> VelocityBodies;
-    float TotalMass = 0.0f;
-    FVector MassWeightedVelocity = FVector::ZeroVector;
-
-    const int32 BoneCount = SkeletalMesh->GetNumBones();
-    for (int32 BoneIndex = 0; BoneIndex < BoneCount; ++BoneIndex)
-    {
-        const FName BoneName = SkeletalMesh->GetBoneName(BoneIndex);
-        FBodyInstance* BodyInstance = SkeletalMesh->GetBodyInstance(BoneName);
-        if (!BodyInstance || !BodyInstance->IsInstanceSimulatingPhysics())
-        {
-            continue;
-        }
-
-        if (UCharacterFunctionLibrary::IsSecondaryPhysicsBone(*SkeletalMesh, BoneName)
-            || !ShouldApplyInitialRagdollVelocityToBone(BoneName))
-        {
-            continue;
-        }
-
-        // Some skeletons can resolve several bones to the same physical body.
-        // Each BodyInstance participates once in the mass-weighted velocity solve.
-        const bool bAlreadyAdded = VelocityBodies.ContainsByPredicate(
-            [BodyInstance](const FRagdollVelocityBody& ExistingBody)
-            {
-                return ExistingBody.BodyInstance == BodyInstance;
-            });
-
-        if (bAlreadyAdded)
-        {
-            continue;
-        }
-
-        const float BodyMass = GetSafeRagdollBodyMass(BodyInstance);
-        FRagdollVelocityBody VelocityBody;
-        VelocityBody.BoneName = BoneName;
-        VelocityBody.BodyInstance = BodyInstance;
-        VelocityBody.Mass = BodyMass;
-        VelocityBodies.Add(VelocityBody);
-        TotalMass += BodyMass;
-        MassWeightedVelocity += GetSafeRagdollBodyVelocity(BodyInstance) * BodyMass;
-    }
-
-    if (VelocityBodies.Num() == 0 || TotalMass <= UE_SMALL_NUMBER)
-    {
-        // Fallback for unusual physics assets that expose only the component body.
-        SkeletalMesh->WakeAllRigidBodies();
-        SkeletalMesh->SetPhysicsLinearVelocity(SafeInitialVelocity, false, NAME_None);
-        if (FBodyInstance* RootBodyInstance = SkeletalMesh->GetBodyInstance(NAME_None))
-        {
-            RootBodyInstance->SetLinearVelocity(SafeInitialVelocity, false, true);
-        }
-        SkeletalMesh->WakeAllRigidBodies();
-        return;
-    }
-
-    // Apply one common delta velocity so the mass-weighted center-of-mass velocity
-    // of the driven ragdoll bodies becomes exactly the character velocity captured
-    // immediately before activation. This preserves momentum without dividing the
-    // velocity by body count and without injecting an impulse or angular velocity.
-    const FVector CurrentCenterOfMassVelocity = MassWeightedVelocity / TotalMass;
-    const FVector CommonVelocityDelta = SafeInitialVelocity - CurrentCenterOfMassVelocity;
-    if (!IsUsefulInitialRagdollVelocity(CommonVelocityDelta))
-    {
-        return;
-    }
-
-    SkeletalMesh->WakeAllRigidBodies();
-
-    for (const FRagdollVelocityBody& VelocityBody : VelocityBodies)
-    {
-        FBodyInstance* BodyInstance = VelocityBody.BodyInstance;
-        if (!BodyInstance)
-        {
-            continue;
-        }
-
-        const FVector BodyVelocity = GetSafeRagdollBodyVelocity(BodyInstance);
-        BodyInstance->SetLinearVelocity(BodyVelocity + CommonVelocityDelta, false, true);
-    }
-
+    // Animation-driven bodies can retain very large relative velocities when a hidden
+    // mesh refreshes. A common delta only fixes the mean and preserves that energy.
+    // Start EVERY body with the captured gameplay velocity, including a stationary
+    // activation. Subsequent contacts/constraints generate the physical tumble.
+    SkeletalMesh->SetAllPhysicsLinearVelocity(SafeInitialVelocity, false);
+    SkeletalMesh->SetAllPhysicsAngularVelocityInRadians(FVector::ZeroVector, false);
     SkeletalMesh->WakeAllRigidBodies();
 }
 
@@ -2946,7 +2803,6 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     SkeletalMesh->SetCollisionProfileName(RAGDOLL);
     SkeletalMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
     SkeletalMesh->SetGenerateOverlapEvents(true);
-    SkeletalMesh->SetAllBodiesSimulatePhysics(true);
     UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, CharacterRagdollTuning::MaxBlendWeight);
     UCharacterFunctionLibrary::PrepareHairForRagdoll(*SkeletalMesh, InitialRagdollVelocity);
     ApplyInitialRagdollVelocity(SkeletalMesh, InitialRagdollVelocity);
@@ -3221,6 +3077,24 @@ void UCharacterComponent::SetRagdollActive(bool bActive)
 
     if (bActive)
     {
+        // Do not reinitialize a live ragdoll or reset its physical momentum.
+        if (bIsRagdoll) return;
+        // In first person OwnerNoSee does not stop animation evaluation. Finish its
+        // outstanding work before changing body ownership, collision or blend state.
+        MeshComp->HandleExistingParallelEvaluationTask(true, true);
+        FString InvalidReason;
+        if (!UCharacterFunctionLibrary::ValidateRagdollActivation(*MeshComp, InvalidReason))
+        {
+            const double Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+            if (LastRagdollSafetyWarningTime < 0.0 || Now - LastRagdollSafetyWarningTime >= 1.0)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("RagdollSafety: activation rejected. Actor=%s Mesh=%s FirstPerson=%d Reason=%s"),
+                    *GetNameSafe(OwnerCharacter), *GetNameSafe(MeshComp->GetSkeletalMeshAsset()),
+                    OwnerCharacter->IsFirstPersonMode(), *InvalidReason);
+                LastRagdollSafetyWarningTime = Now;
+            }
+            return;
+        }
         // Cache the last gameplay velocity before bIsRagdoll changes branch state.
         LastPreRagdollVelocity = CapturePreRagdollVelocity(OwnerCharacter, OwnerCharacter->GetCharacterMovement());
         LastPreRagdollVelocityAge = LastPreRagdollVelocity.IsNearlyZero() ? TNumericLimits<float>::Max() : 0.0f;

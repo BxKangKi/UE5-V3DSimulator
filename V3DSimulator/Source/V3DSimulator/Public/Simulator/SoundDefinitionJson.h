@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+class FJsonObject;
 #include "Simulator/AssetDefinitionTypes.h"
 
 /** Strict immutable view of one Sound JSON + same-basename WAV pair. */
@@ -31,6 +32,10 @@ namespace SoundDefinitionJson
         TArray<FString>* OutDiscoveredWavFiles = nullptr);
 
     /** Strictly validates AssetType=Sound and the exact same-basename WAV pairing. */
+    V3DSIMULATOR_API bool ValidateDefinition(const TSharedPtr<FJsonObject>& Root,
+        const FString& JsonPath, const FString& ExpectedWavPath, FSoundDefinition& OutDefinition,
+        FString& OutError, FString* OutCanonicalJson = nullptr);
+
     V3DSIMULATOR_API bool LoadDefinition(
         const FString& JsonPath,
         const FString& ExpectedWavPath,

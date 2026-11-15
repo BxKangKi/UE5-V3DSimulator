@@ -42,6 +42,12 @@ class V3DSIMULATOR_API ACharacterController : public ACharacter, public IWaterIn
 
 public:
     ACharacterController(const FObjectInitializer& ObjectInitializer);
+    virtual void CalcCamera(float DeltaTime, FMinimalViewInfo& OutResult) override;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Camera|First Person")
+    FName FirstPersonHeadSocket = TEXT("head");
+    /** Head-local offset in cm; tune for the character's eye position. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Camera|First Person")
+    FVector FirstPersonEyeOffset = FVector(0, 0, 8);
     virtual void EnterWater(const float Level) override;
     virtual void ExitWater(const float Level) override;
     UFUNCTION()
@@ -202,6 +208,14 @@ private:
     float PhysicsInteractionRefreshAccumulator = 0.0f;
     double LastPhysicsObjectImpactTime = -1.0;
     bool bFirstPersonMode = false;
+    bool bFirstPersonPhysicsView = false;
+    bool bHasValidFirstPersonView = false;
+    FVector LastValidFirstPersonLocation = FVector::ZeroVector;
+    FRotator LastValidFirstPersonRotation = FRotator::ZeroRotator;
+    FQuat FirstPersonHeadToView = FQuat::Identity;
+    FQuat FirstPersonEntryControl = FQuat::Identity;
+    EVisibilityBasedAnimTickOption SavedFirstPersonTickOption = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+    bool bSavedFirstPersonUpdateRate = false;
     bool bWaterStateFromOverlap = false;
     bool bWaterStateForcedByRagdoll = false;
     bool bHasSavedAnimationState = false;

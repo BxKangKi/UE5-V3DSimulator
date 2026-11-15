@@ -273,6 +273,7 @@ private:
     FVector PrevVelocity = FVector::ZeroVector;
     FVector LastPreRagdollVelocity = FVector::ZeroVector;
     float LastPreRagdollVelocityAge = TNumericLimits<float>::Max();
+    double LastRagdollSafetyWarningTime = -1.0;
 
 
     /** Stable entry reference; surface swimming uses the evaluated head bone instead. */

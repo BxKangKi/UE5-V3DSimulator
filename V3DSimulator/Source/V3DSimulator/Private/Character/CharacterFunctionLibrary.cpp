@@ -12,6 +12,7 @@
 #include "System/MacroLibrary.h"
 #include "PhysicsEngine/SkeletalBodySetup.h"
 #include "PhysicsEngine/PhysicsAsset.h"
+#include "PhysicsEngine/RigidBodyIndexPair.h"
 #include "PhysicsEngine/BodyInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "PhysicsEngine/ShapeElem.h"
@@ -550,10 +551,61 @@ void UCharacterFunctionLibrary::BlendRagdoll(USkeletalMeshComponent &SkeletalMes
 
     // Full ragdoll owns ALL bodies, including secondary anchors. Never run the
     // ordinary secondary setup here: it pins roots back to animation.
+    // Hidden first-person meshes still evaluate animation. No animation-driven
+    // kinematic targets may be submitted while the full physics pose owns the mesh.
+    // SetBodiesBelowPhysics restores SkipSimulatingBones on recovery.
+    SkeletalMesh.KinematicBonesUpdateType = EKinematicBonesUpdateToPhysics::SkipAllBones;
     SkeletalMesh.SetEnablePhysicsBlending(true);
     SkeletalMesh.SetAllBodiesSimulatePhysics(true);
     SkeletalMesh.SetAllBodiesPhysicsBlendWeight(FMath::Clamp(Weight, 0.0f, 1.0f));
     SkeletalMesh.SetEnableGravityOnAllBodiesBelow(true, NAME_None, true);
+}
+
+bool UCharacterFunctionLibrary::ValidateRagdollActivation(USkeletalMeshComponent& Mesh, FString& OutReason)
+{
+    check(IsInGameThread());
+    OutReason.Reset();
+    const auto ValidTransform = [](const FTransform& Transform)
+    {
+        return !Transform.ContainsNaN() && Transform.IsRotationNormalized()
+            && Transform.GetScale3D().GetAbsMin() > UE_KINDA_SMALL_NUMBER;
+    };
+    if (!ValidTransform(Mesh.GetComponentTransform()))
+    {
+        OutReason = TEXT("non-finite/degenerate mesh transform");
+        return false;
+    }
+    const UPhysicsAsset* Asset = Mesh.GetPhysicsAsset();
+    if (!IsValid(Asset) || Asset->SkeletalBodySetups.IsEmpty())
+    {
+        OutReason = TEXT("missing physics bodies");
+        return false;
+    }
+    int32 ValidBodyCount = 0;
+    for (const USkeletalBodySetup* Setup : Asset->SkeletalBodySetups)
+    {
+        if (!IsValid(Setup) || Mesh.GetBoneIndex(Setup->BoneName) == INDEX_NONE) continue;
+        const FTransform BonePose = Mesh.GetSocketTransform(Setup->BoneName, RTS_World);
+        if (!ValidTransform(BonePose))
+        {
+            OutReason = FString::Printf(TEXT("non-finite/degenerate pose: bone=%s"), *Setup->BoneName.ToString());
+            return false;
+        }
+        const FBodyInstance* Body = Mesh.GetBodyInstance(Setup->BoneName, false);
+        if (!Body || !Body->IsValidBodyInstance()) continue;
+        const float Mass = Body->GetBodyMass();
+        const FVector Inertia = Body->GetBodyInertiaTensor();
+        if (!ValidTransform(Body->GetUnrealWorldTransform()) || !FMath::IsFinite(Mass) || Mass <= 0.0f
+            || Inertia.ContainsNaN() || Inertia.GetMin() <= 0.0)
+        {
+            OutReason = FString::Printf(TEXT("invalid physics body: bone=%s mass=%g inertia=%s"),
+                *Setup->BoneName.ToString(), Mass, *Inertia.ToString());
+            return false;
+        }
+        ++ValidBodyCount;
+    }
+    if (ValidBodyCount == 0) OutReason = TEXT("no initialized physics bodies");
+    return ValidBodyCount > 0;
 }
 
 namespace
@@ -607,6 +659,20 @@ bool UCharacterFunctionLibrary::SanitizeRuntimePhysicsAsset(UPhysicsAsset *Physi
     // The runtime asset is a private DuplicateObject of the authored default PhysicsAsset. Remove
     // only entries that cannot be used by the newly imported skeleton; preserve authored body and
     // constraint settings instead of replacing them with another layer of duplicated subobjects.
+    // Save authored collision exclusions by bone name BEFORE removing/reindexing bodies.
+    // Not every excluded pair has a joint (e.g. overlapping torso/head colliders).
+    TArray<TPair<FName, FName>> AuthoredDisabledPairs;
+    for (const auto& Pair : PhysicsAsset->CollisionDisableTable)
+    {
+        const int32 A = Pair.Key.Indices[0];
+        const int32 B = Pair.Key.Indices[1];
+        if (PhysicsAsset->SkeletalBodySetups.IsValidIndex(A) && PhysicsAsset->SkeletalBodySetups.IsValidIndex(B)
+            && IsValid(PhysicsAsset->SkeletalBodySetups[A]) && IsValid(PhysicsAsset->SkeletalBodySetups[B]))
+        {
+            AuthoredDisabledPairs.Emplace(PhysicsAsset->SkeletalBodySetups[A]->BoneName,
+                PhysicsAsset->SkeletalBodySetups[B]->BoneName);
+        }
+    }
     TSet<FName> SeenBones;
     SeenBones.Reserve(PhysicsAsset->SkeletalBodySetups.Num());
     for (int32 Index = PhysicsAsset->SkeletalBodySetups.Num() - 1; Index >= 0; --Index)
@@ -637,7 +703,7 @@ bool UCharacterFunctionLibrary::SanitizeRuntimePhysicsAsset(UPhysicsAsset *Physi
 
         const FName BoneA = Constraint->DefaultInstance.ConstraintBone1;
         const FName BoneB = Constraint->DefaultInstance.ConstraintBone2;
-        if (!PhysicsBoneExists(MeshAsset, BoneA) || !PhysicsBoneExists(MeshAsset, BoneB) ||
+        if (BoneA == BoneB || !PhysicsBoneExists(MeshAsset, BoneA) || !PhysicsBoneExists(MeshAsset, BoneB) ||
             !SeenBones.Contains(BoneA) || !SeenBones.Contains(BoneB))
         {
             PhysicsAsset->ConstraintSetup.RemoveAt(Index);
@@ -664,11 +730,16 @@ bool UCharacterFunctionLibrary::SanitizeRuntimePhysicsAsset(UPhysicsAsset *Physi
         Constraint->DefaultInstance.EnableProjection();
     }
 
-    // Body indices may have changed while invalid/duplicate bodies were removed. Rebuild all
-    // index-based collision-disable state from the surviving constraints to prevent stale indices.
+    // Remap exclusions to surviving bodies, then include adjacent constraint pairs.
     PhysicsAsset->CollisionDisableTable.Empty();
     PhysicsAsset->UpdateBodySetupIndexMap();
     PhysicsAsset->UpdateBoundsBodiesArray();
+    for (const auto& Pair : AuthoredDisabledPairs)
+    {
+        const int32 A = PhysicsAsset->FindBodyIndex(Pair.Key);
+        const int32 B = PhysicsAsset->FindBodyIndex(Pair.Value);
+        if (A != INDEX_NONE && B != INDEX_NONE && A != B) PhysicsAsset->DisableCollision(A, B);
+    }
     for (const UPhysicsConstraintTemplate* Constraint : PhysicsAsset->ConstraintSetup)
     {
         if (!IsValid(Constraint))

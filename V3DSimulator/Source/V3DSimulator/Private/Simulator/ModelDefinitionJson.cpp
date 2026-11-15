@@ -153,7 +153,16 @@ bool ModelDefinitionJson::LoadDefinition(
         return false;
     }
 
-    const TSharedPtr<FJsonObject>& Root = Loaded.JsonObject;
+    return ValidateDefinition(Loaded.JsonObject, JsonPath, ExpectedSourcePath, OutDefinition, OutError, OutCanonicalJson);
+}
+
+bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root,
+    const FString& JsonPath, const FString& ExpectedSourcePath, FModelDefinition& OutDefinition,
+    FString& OutError, FString* OutCanonicalJson)
+{
+    OutDefinition = FModelDefinition(); OutError.Reset();
+    if (!Root.IsValid()) { OutError = TEXT("Expected a JSON object."); return false; }
+
     FString UUIDText;
     FString AssetTypeText;
     FString TypeText;

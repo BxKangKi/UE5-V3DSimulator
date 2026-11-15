@@ -218,6 +218,15 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
         }
         Json->TryGetBoolField(V3DSimulatorJsonMetadata::AllowProjectAssets, Data->bAllowProjectAssets);
 
+        FV3DEnvironmentConfig Environment;
+        FString EnvironmentError;
+        if (!FV3DEnvironmentConfig::Parse(Json, Environment, EnvironmentError))
+        {
+            UE_LOG(LogTemp, Error, TEXT("%s"), *EnvironmentError);
+            return false;
+        }
+        Data->Audio = Environment.Audio;
+        Data->Biomes = MoveTemp(Environment.Biomes);
         const TSharedPtr<FJsonObject>* CloudObject = nullptr;
         if (Json->TryGetObjectField(TEXT("Cloud"), CloudObject) && CloudObject && CloudObject->IsValid())
         {
