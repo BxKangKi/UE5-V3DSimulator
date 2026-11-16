@@ -40,6 +40,8 @@
 #include "Components/PrimitiveComponent.h"
 #include "Animation/Skeleton.h"
 #include "Engine/SkeletalMesh.h"
+#include "Engine/World.h"
+#include "WorldCollision.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 
 namespace CharacterControllerTuning
@@ -602,6 +604,7 @@ void ACharacterController::OnLoadCompleted(bool Result)
 
 void ACharacterController::PrepareForMeshReload()
 {
+    ResetFootstepRequests();
     USkeletalMeshComponent* MeshComp = GetMesh();
     if (!IsValid(MeshComp))
     {
@@ -697,6 +700,7 @@ void ACharacterController::PrepareForPawnReplacement()
 
 void ACharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    ResetFootstepRequests();
     QueuedCharacterPath.Reset();
     if (IsValid(ActiveLoadAction.Get()))
     {
@@ -1297,6 +1301,7 @@ void ACharacterController::ClearDryWaterState(float Level, bool bUpdateMovementM
 
 void ACharacterController::Activate(bool bValue)
 {
+    if (!bValue) ResetFootstepRequests();
     if (IsValid(Movement)) Movement->SetActive(bValue);
     GetCapsuleComponent()->SetActive(bValue);
     AWaterActor::CheckOverlappingWater(this);
@@ -1808,44 +1813,71 @@ void ACharacterController::ToggleFirstPersonMode()
 
 
 
+bool ACharacterController::CanPlayFootstep() const
+{
+    const UWorld* World = GetWorld();
+    const USkeletalMeshComponent* FootstepMesh = GetMesh();
+    const UCharacterMovementComponent* Move = GetCharacterMovement();
+    return IsValid(World) && World->IsGameWorld() && World->GetNetMode() != NM_DedicatedServer
+        && HasActorBegunPlay() && !IsActorBeingDestroyed()
+        && IsValid(FootstepMesh) && IsValid(FootstepMesh->GetSkeletalMeshAsset()) && !FootstepMesh->bPauseAnims
+        && IsValid(Move) && Move->IsActive() && Move->IsMovingOnGround()
+        && (!IsValid(Component.Get()) || !Component->IsRagdollTransitionInProgress());
+}
+
+void ACharacterController::ResetFootstepRequests()
+{
+    ++FootstepGeneration;
+    for (int32 Index = 0; Index < 2; ++Index)
+    {
+        bFootstepPending[Index] = false;
+        LastFootstepFrame[Index] = MAX_uint64;
+    }
+}
+
 void ACharacterController::TriggerFootstepTrace(EControllerHand FootSide)
 {
-    UWorld* World = GetWorld();
-    if (!World) return;
+    if (!IsInGameThread() || !CanPlayFootstep()) return;
+    if (FootSide != EControllerHand::Left && FootSide != EControllerHand::Right) return;
+    const int32 Index = FootSide == EControllerHand::Left ? 0 : 1;
+    // Blend-space/montage notifies and legacy BP calls can describe the same contact.
+    if (bFootstepPending[Index] || LastFootstepFrame[Index] == GFrameCounter) return;
 
-    // 1. Pick the foot bone that should be traced.
-    FName BoneName = (FootSide == EControllerHand::Left) ? BONE_LEFT_FOOT : BONE_RIGHT_FOOT;
-    FVector Start = GetMesh()->GetBoneLocation(BoneName) + GetActorUpVector() * 10.0f;
-    FVector End = Start - GetActorUpVector() * 50.0f;
+    USkeletalMeshComponent* FootstepMesh = GetMesh();
+    const FName BoneName = Index == 0 ? FName(BONE_LEFT_FOOT) : FName(BONE_RIGHT_FOOT);
+    if (!FootstepMesh->DoesSocketExist(BoneName)) return; // Never trace from the mesh origin for a missing foot.
+    const FVector Up = -GetCharacterMovement()->GetGravityDirection();
+    const FVector Start = FootstepMesh->GetSocketLocation(BoneName) + Up * 10.0f;
+    const FVector End = Start - Up * 50.0f;
+    if (Start.ContainsNaN() || End.ContainsNaN()) return;
 
-    FCollisionQueryParams Params;
-    // Use complex tracing so the hit result can return the physical material.
-    Params.bTraceComplex = true;
-    Params.bReturnPhysicalMaterial = true; // Required: ask the trace to return the physical material.
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(V3DFootstep), true, this);
+    Params.bReturnPhysicalMaterial = true;
     Params.bReturnFaceIndex = true;
-    Params.AddIgnoredActor(this);
-
-    FTraceDelegate TraceDelegate;
-    TraceDelegate.BindUObject(this, &ACharacterController::OnFootstepTraceCompleted);
-
-    // Submit the asynchronous footstep raycast.
-    World->AsyncLineTraceByChannel(
-        EAsyncTraceType::Single,
-        Start,
-        End,
-        ECC_Visibility,
-        Params,
-        FCollisionResponseParams::DefaultResponseParam,
-        &TraceDelegate
-    );
+    const uint64 Token = FootstepGeneration;
+    const TWeakObjectPtr<USkeletalMesh> Asset(FootstepMesh->GetSkeletalMeshAsset());
+    FTraceDelegate Delegate;
+    Delegate.BindWeakLambda(this, [this, Token, Index, Asset](const FTraceHandle& Handle, FTraceDatum& Data)
+    {
+        if (Token != FootstepGeneration) return;
+        bFootstepPending[Index] = false;
+        if (!CanPlayFootstep() || !Asset.IsValid() || GetMesh()->GetSkeletalMeshAsset() != Asset.Get()) return;
+        OnFootstepTraceCompleted(Handle, Data);
+    });
+    bFootstepPending[Index] = true;
+    LastFootstepFrame[Index] = GFrameCounter;
+    FTraceHandle Handle = GetWorld()->AsyncLineTraceByChannel(EAsyncTraceType::Single,
+        Start, End, ECC_Visibility, Params, FCollisionResponseParams::DefaultResponseParam, &Delegate);
+    if (!Handle.IsValid()) bFootstepPending[Index] = false;
 }
 
 void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHandle, FTraceDatum& TraceDatum)
 {
     // Nothing was hit, so there is no surface to resolve.
-    if (TraceDatum.OutHits.Num() == 0) return;
+    if (!CanPlayFootstep() || TraceDatum.OutHits.IsEmpty()) return;
 
     const FHitResult& HitResult = TraceDatum.OutHits[0];
+    if (!HitResult.bBlockingHit || HitResult.ImpactPoint.ContainsNaN()) return;
     if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
         if (Surfaces->PlayFootstep(HitResult)) return;
 
@@ -1880,8 +1912,7 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
 
             if (USoundBase* Sound = Binding->Sound.Get())
             {
-                UGameplayStatics::SpawnSoundAtLocation(this, Sound, HitResult.ImpactPoint,
-                    FRotator::ZeroRotator, 1.f, 1.f, 0.f, Environment ? Environment->GetSpatialAttenuation() : nullptr);
+                if (Environment) Environment->PlayFootstepSound(Sound, HitResult.ImpactPoint);
             }
             else if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
 

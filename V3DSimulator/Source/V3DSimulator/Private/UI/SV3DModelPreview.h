@@ -10,6 +10,7 @@ public:
     SLATE_BEGIN_ARGS(SV3DModelPreview) {} SLATE_END_ARGS()
     void Construct(const FArguments&) { SetClipping(EWidgetClipping::ClipToBounds); }
     void SetModel(const FGWorldBuildModel& Model);
+    void ClearModel();
     virtual FVector2D ComputeDesiredSize(float) const override { return FVector2D(320,240); }
     virtual int32 OnPaint(const FPaintArgs&, const FGeometry&, const FSlateRect&, FSlateWindowElementList&, int32,
         const FWidgetStyle&, bool) const override;

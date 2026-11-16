@@ -183,7 +183,7 @@ void UCharacterAnimInstance::RefreshWeaponIKState()
 
     UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(World);
     AWeaponActor* Weapon = Manager ? Manager->GetEquippedWeaponActor() : nullptr;
-    if (!IsValid(Weapon))
+    if (!IsValid(Weapon) || Weapon->GetOwner() != GetOwningActor())
     {
         return;
     }
@@ -349,14 +349,14 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
     // 8. Diving state and ground trace.
     // Keep owner lookup inside the branch so normal animation frames do no extra work.
 
-    if (!bWaterRagdollState && bIsSwimming && Velocity.Z < -CharacterAnimTuning::MinDivingVelocity)
+    if (!bWaterRagdollState && bIsSwimming && FVector::DotProduct(Velocity, GravityUp) < -CharacterAnimTuning::MinDivingVelocity)
     {
         // Use the already-known movement location as the trace start.
         const FVector Start = Movement->GetActorLocation();
         // End is derived from current downward speed so fast dives trace farther.
         const float TraceDistance = CharacterAnimTuning::MinDivingVelocity
-            + FMath::Abs(Velocity.Z) * FMath::Min(SafeDeltaSeconds, 1.0f);
-        const FVector End = Start - FVector::UpVector * TraceDistance;
+            + FMath::Abs(FVector::DotProduct(Velocity, GravityUp)) * FMath::Min(SafeDeltaSeconds, 1.0f);
+        const FVector End = Start - GravityUp * TraceDistance;
 
         // Cache CharacterOwner once for the raycast.
         if (ACharacter *Owner = Movement->GetCharacterOwner())
@@ -381,6 +381,24 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
         bIsDiving = false; // Reset when the dive condition is not active.
     }
 }
+
+void UCharacterAnimInstance::PlayFootstep(EControllerHand FootSide)
+{
+    // Notify dispatch is on the game thread. Never access the owner from a thread-safe AnimBP graph.
+    if (!IsInGameThread()) return;
+    auto* Character = Cast<ACharacterController>(GetOwningActor());
+    USkeletalMeshComponent* Mesh = GetSkelMeshComponent();
+    if (!IsValid(Character) || !IsValid(Mesh) || Character->GetMesh() != Mesh) return;
+    Character->TriggerFootstepTrace(FootSide);
+}
+
+void UCharacterAnimInstance::TriggerFootstepTrace(EControllerHand FootSide)
+{
+    PlayFootstep(FootSide);
+}
+
+void UCharacterAnimInstance::AnimNotify_FootstepLeft() { PlayFootstep(EControllerHand::Left); }
+void UCharacterAnimInstance::AnimNotify_FootstepRight() { PlayFootstep(EControllerHand::Right); }
 
 void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {

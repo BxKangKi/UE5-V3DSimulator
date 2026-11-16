@@ -12,6 +12,7 @@
 
 #include "CoreMinimal.h"
 #include "Animation/AnimInstance.h"
+#include "InputCoreTypes.h"
 #include "CharacterAnimInstance.generated.h"
 
 class UCharacterMovementComponent;
@@ -125,6 +126,18 @@ public:
     FVector WeaponMuzzleLocationWS = FVector::ZeroVector;
 
 
+
+    /** Call from an AnimBP notify event at foot contact. Uses project surface/default sound assignments. */
+    UFUNCTION(BlueprintCallable, Category="Character|Animation|Footsteps")
+    void PlayFootstep(EControllerHand FootSide);
+
+    /** Compatibility entry point for AnimBPs already using the controller function name. */
+    UFUNCTION(BlueprintCallable, Category="Character|Animation|Footsteps")
+    void TriggerFootstepTrace(EControllerHand FootSide);
+
+    /** Named skeleton notifies: FootstepLeft and FootstepRight. */
+    UFUNCTION() void AnimNotify_FootstepLeft();
+    UFUNCTION() void AnimNotify_FootstepRight();
 
     /** Immediately mirrors native character/ragdoll state into AnimBP-readable variables. */
     void RefreshCharacterAnimationState(float DeltaSeconds = 0.0f);

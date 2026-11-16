@@ -18,6 +18,30 @@
 #include "Serialization/JsonWriter.h"
 #include "ProjectEditorSchemaData.inl"
 
+namespace
+{
+    // Cache parsing per calling thread; default TSharedPtr JSON nodes are not thread-safe.
+    const TSharedPtr<FJsonObject>& EditorTemplates()
+    {
+        static thread_local const FSafeJsonLoadResult Templates =
+            FSafeFileIO::ParseJsonText(EditorSchemaJson, TEXT("Editor schema"));
+        return Templates.JsonObject;
+    }
+
+    TSharedPtr<FJsonValue> CloneValue(const TSharedPtr<FJsonValue>& Value)
+    {
+        return Value.IsValid() ? FJsonValue::Duplicate(Value) : MakeShared<FJsonValueNull>();
+    }
+}
+
+TSharedPtr<FJsonObject> V3DProjectEditor::CloneObject(const TSharedPtr<FJsonObject>& Object)
+{
+    if (!Object) return nullptr;
+    auto Result = MakeShared<FJsonObject>();
+    for (const auto& Pair : Object->Values) Result->SetField(Pair.Key, CloneValue(Pair.Value));
+    return Result;
+}
+
 FString V3DProjectEditor::Serialize(const TSharedPtr<FJsonObject>& Json)
 {
     FString Text;
@@ -139,13 +163,13 @@ bool V3DProjectEditor::Save(FV3DEditorDocument& Doc, const FString& Project, FSt
 TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& Doc)
 {
     auto Result = MakeShared<FJsonObject>();
-    const auto Templates = FSafeFileIO::ParseJsonText(EditorSchemaJson, TEXT("Editor schema"));
-    if (!Templates.IsSuccess() || !Doc.Json.IsValid()) return Result;
+    const auto& Templates = EditorTemplates();
+    if (!Templates.IsValid() || !Doc.Json.IsValid()) return Result;
     auto Merge = [&Result, &Templates](const TCHAR* Key)
     {
         const TSharedPtr<FJsonObject>* Part = nullptr;
-        if (Templates.JsonObject->TryGetObjectField(Key, Part))
-            for (const auto& Pair : (*Part)->Values) Result->SetField(FString(Pair.Key), Pair.Value);
+        if (Templates->TryGetObjectField(Key, Part))
+            for (const auto& Pair : (*Part)->Values) Result->SetField(FString(Pair.Key), CloneValue(Pair.Value));
     };
     if (Doc.Path.EndsWith(TEXT("scripts/materials.json"))) Merge(TEXT("MaterialsScript"));
     if (Doc.Path.EndsWith(TEXT("scripts/sounds.json"))) Merge(TEXT("SoundsScript"));
@@ -202,7 +226,7 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
 
 TSharedPtr<FJsonObject> V3DProjectEditor::EntryTemplate(const FString& Container)
 {
-    const TMap<FString, FString> Keys = {
+    static const TMap<FString, FString> Keys = {
         {TEXT("MeshData"), TEXT("MeshEntry")}, {TEXT("Biomes"), TEXT("BiomeEntry")},
         {TEXT("PhysicalMaterials"), TEXT("PhysicalMaterialEntry")}, {TEXT("FootstepMappings"), TEXT("FootstepEntry")},
         {TEXT("MaterialPhysicalMappings"), TEXT("MappingEntry")}, {TEXT("Commands"), TEXT("CommandEntry")},
@@ -210,8 +234,8 @@ TSharedPtr<FJsonObject> V3DProjectEditor::EntryTemplate(const FString& Container
         {TEXT("Conditions"), TEXT("ConditionEntry")}, {TEXT("Colliders"), TEXT("ColliderEntry")}, {TEXT("Lights"), TEXT("LightEntry")}};
     const auto* Key = Keys.Find(Container);
     if (!Key) return MakeShared<FJsonObject>();
-    const auto Templates = FSafeFileIO::ParseJsonText(EditorSchemaJson, TEXT("Editor schema"));
+    const auto& Templates = EditorTemplates();
     const TSharedPtr<FJsonObject>* Entry = nullptr;
-    if (Templates.IsSuccess() && Templates.JsonObject->TryGetObjectField(*Key, Entry)) return *Entry;
+    if (Templates.IsValid() && Templates->TryGetObjectField(*Key, Entry)) return CloneObject(*Entry);
     return MakeShared<FJsonObject>();
 }

@@ -2,6 +2,7 @@
 #pragma once
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "Styling/SlateTypes.h"
 #include "System/ProjectEditorDocument.h"
 #include "ProjectEditorWidget.generated.h"
 class SVerticalBox;
@@ -18,6 +19,7 @@ class V3DSIMULATOR_API UProjectEditorWidget : public UUserWidget
 {
     GENERATED_BODY()
 public:
+    UProjectEditorWidget(const FObjectInitializer& ObjectInitializer);
     void OpenProject(const FString& ProjectName);
     FSimpleDelegate OnClosed;
     virtual void ReleaseSlateResources(bool bReleaseChildren) override;
@@ -25,7 +27,20 @@ public:
 protected:
     virtual TSharedRef<SWidget> RebuildWidget() override;
 private:
-    FString Project, Message, Filter;
+    // Slate retains pointers to these styles; own them for the entire widget lifetime.
+    UPROPERTY(Transient) TObjectPtr<UObject> FontObject;
+    UPROPERTY(Transient) FTextBlockStyle EditorTextStyle;
+    UPROPERTY(Transient) FButtonStyle EditorButtonStyle;
+    UPROPERTY(Transient) FEditableTextBoxStyle EditorInputStyle;
+    UPROPERTY(Transient) FComboBoxStyle EditorComboStyle;
+    UPROPERTY(Transient) FTableRowStyle EditorRowStyle;
+    UPROPERTY(Transient) FCheckBoxStyle EditorCheckStyle;
+    FSlateFontInfo TitleFont;
+    TSharedRef<SWidget> MakeEditorButton(const TCHAR* Label, TFunction<void()> Action);
+    void InvalidatePreview();
+    void QueueFormRefresh();
+    bool bFormRefreshPending = false;
+    FString Project, Message, Filter, RawDraft;
     TArray<TSharedPtr<FV3DEditorDocument>> Documents, VisibleDocuments;
     TSharedPtr<FV3DEditorDocument> Current;
     TSharedPtr<SListView<TSharedPtr<FV3DEditorDocument>>> List;

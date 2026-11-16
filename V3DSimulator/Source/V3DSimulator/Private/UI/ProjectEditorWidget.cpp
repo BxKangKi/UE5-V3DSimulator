@@ -1,6 +1,10 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "UI/ProjectEditorWidget.h"
 #include "UI/BuildStatusWidget.h"
+#include "UI/HUDLegacyStyle.h"
+#include "Styling/CoreStyle.h"
+#include "Brushes/SlateColorBrush.h"
+#include "Widgets/Layout/SWrapBox.h"
 #include "SV3DModelPreview.h"
 #include "Widgets/Layout/SBox.h"
 #include "System/ProjectSourceModelBuilder.h"
@@ -40,28 +44,69 @@ namespace V3DEditorUI
         const int32 Colon = S.Find(TEXT(":"));
         return S.Mid(Colon + 1, S.Len() - Colon - 2);
     }
-    TSharedRef<SWidget> Button(const TCHAR* Label, TFunction<void()> Action)
-    {
-        return SNew(SButton).Text(FText::FromString(Label)).ContentPadding(FMargin(10,8))
-            .OnClicked_Lambda([Action]() { Action(); return FReply::Handled(); });
-    }
+}
+
+UProjectEditorWidget::UProjectEditorWidget(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer)
+{
+    FontObject = V3DHUDLegacyStyle::FindFontForConstructor();
+    EditorTextStyle = FCoreStyle::Get().GetWidgetStyle<FTextBlockStyle>("NormalText");
+    V3DHUDLegacyStyle::ApplyFont(EditorTextStyle.Font, FontObject, 16, 1);
+    EditorTextStyle.ColorAndOpacity = FSlateColor(FLinearColor::White);
+    TitleFont = EditorTextStyle.Font;
+    V3DHUDLegacyStyle::ApplyFont(TitleFont, FontObject, 36, 2);
+
+    EditorButtonStyle = FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button");
+    const FLinearColor Base = V3DHUDLegacyStyle::ButtonBackground;
+    EditorButtonStyle.Normal = FSlateColorBrush(Base);
+    EditorButtonStyle.Hovered = FSlateColorBrush(Base * FLinearColor(.8f,.8f,.8f,1));
+    EditorButtonStyle.Pressed = FSlateColorBrush(Base * FLinearColor(.5f,.5f,.5f,1));
+    EditorButtonStyle.Disabled = FSlateColorBrush(FLinearColor(.4f,.4f,.4f,.5f));
+    EditorButtonStyle.NormalPadding = EditorButtonStyle.PressedPadding = FMargin(0);
+    EditorButtonStyle.NormalForeground = EditorButtonStyle.HoveredForeground =
+        EditorButtonStyle.PressedForeground = FSlateColor(FLinearColor::White);
+
+    EditorInputStyle = FCoreStyle::Get().GetWidgetStyle<FEditableTextBoxStyle>("NormalEditableTextBox");
+    EditorInputStyle.TextStyle = EditorTextStyle;
+    EditorInputStyle.BackgroundImageNormal = FSlateColorBrush(Base);
+    EditorInputStyle.BackgroundImageHovered = FSlateColorBrush(Base * FLinearColor(.9f,.9f,.9f,1));
+    EditorInputStyle.BackgroundImageFocused = FSlateColorBrush(Base * FLinearColor(.8f,.8f,.8f,1));
+    EditorInputStyle.BackgroundImageReadOnly = FSlateColorBrush(Base);
+    EditorInputStyle.ForegroundColor = EditorInputStyle.FocusedForegroundColor = FSlateColor(FLinearColor::White);
+    EditorInputStyle.Padding = FMargin(10, 7);
+    EditorComboStyle = FCoreStyle::Get().GetWidgetStyle<FComboBoxStyle>("ComboBox");
+    EditorComboStyle.ComboButtonStyle.ButtonStyle = EditorButtonStyle;
+    EditorComboStyle.ComboButtonStyle.DownArrowImage.TintColor = FSlateColor(FLinearColor::White);
+    EditorRowStyle = FCoreStyle::Get().GetWidgetStyle<FTableRowStyle>("TableView.Row");
+    EditorRowStyle.ActiveBrush = EditorRowStyle.InactiveBrush = FSlateColorBrush(Base);
+    EditorRowStyle.ActiveHoveredBrush = EditorRowStyle.InactiveHoveredBrush = EditorButtonStyle.Hovered;
+    EditorRowStyle.EvenRowBackgroundHoveredBrush = EditorRowStyle.OddRowBackgroundHoveredBrush = EditorButtonStyle.Hovered;
+    EditorRowStyle.TextColor = EditorRowStyle.SelectedTextColor = FSlateColor(FLinearColor::White);
+    EditorCheckStyle = FCoreStyle::Get().GetWidgetStyle<FCheckBoxStyle>("Checkbox");
+}
+
+TSharedRef<SWidget> UProjectEditorWidget::MakeEditorButton(const TCHAR* Label, TFunction<void()> Action)
+{
+    return SNew(SButton).ButtonStyle(&EditorButtonStyle).ContentPadding(FMargin(14, 9))
+        .OnClicked_Lambda([Action = MoveTemp(Action)]() { Action(); return FReply::Handled(); })
+        [SNew(STextBlock).TextStyle(&EditorTextStyle).Text(FText::FromString(Label))];
 }
 
 TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
 {
     using namespace V3DEditorUI;
     SetIsFocusable(true);
-    auto Toolbar = SNew(SHorizontalBox);
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Save all"), [this] { SaveAll(false); })];
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Save + Build"), [this] { SaveAll(true); })];
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Undo"), [this]
+    auto Toolbar = SNew(SWrapBox).UseAllottedSize(true).InnerSlotPadding(FVector2D(8, 8));
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Save all"), [this] { SaveAll(false); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Save + Build"), [this] { SaveAll(true); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Undo"), [this]
     {
-        if (!Current || Current->Undo.IsEmpty()) return;
+        if (!ApplyRaw() || !Current || Current->Undo.IsEmpty()) return;
         const auto Parsed = FSafeFileIO::ParseJsonText(Current->Undo.Pop(), TEXT("Undo"));
         if (Parsed.IsSuccess()) { Current->Json = Parsed.JsonObject; Changed(); }
     })];
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Apply JSON"), [this] { ApplyRaw(); })];
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Reload file (discard)"), [this]
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Apply JSON"), [this] { ApplyRaw(); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Reload file (discard)"), [this]
     {
         if (bBusy || !Current) return;
         Remember(); bBusy = true; const auto Doc = Current;
@@ -70,10 +115,12 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, Doc, Path]
         {
             FSafeJsonLimits Limits; Limits.MaxFileBytes = 16ll * 1024 * 1024;
-            const auto Loaded = FSafeFileIO::LoadJsonBlocking(Path, Limits);
+            Limits.MaxDepth = 32;
+            const auto Bytes = FSafeFileIO::LoadBinaryBlocking(Path, Limits.MaxFileBytes);
+            const bool Read = Bytes.IsSuccess();
             FString TextOnDisk;
-            const bool Read = IFileManager::Get().FileSize(*Path) <= Limits.MaxFileBytes
-                && FFileHelper::LoadFileToString(TextOnDisk, *Path);
+            if (Read && !Bytes.Data.IsEmpty()) FFileHelper::BufferToString(TextOnDisk, Bytes.Data.GetData(), Bytes.Data.Num());
+            const auto Loaded = FSafeFileIO::ParseJsonText(TextOnDisk, Path, Limits);
             FSafeFileIO::DispatchTrackedGameThread([Weak, Token, Doc, Loaded, Read, TextOnDisk]
             {
                 auto* Self = Weak.Get(); if (!Self || Self->RequestGeneration != Token) return;
@@ -81,52 +128,74 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
                 if (Read)
                 {
                     Doc->DiskText = TextOnDisk; Doc->Json = Loaded.JsonObject; Doc->bDirty = false;
-                    Self->bRawDirty = false; Self->RefreshForm();
-                    Self->Message = TEXT("Reloaded from disk. Undo can restore the previous in-memory version.");
+                    Self->InvalidatePreview(); Self->bRawDirty = false; Self->RefreshForm();
+                    Self->Message = Loaded.IsSuccess()
+                        ? TEXT("Reloaded from disk. Undo can restore the previous in-memory version.") : Loaded.Error;
                 }
                 else Self->Message = TEXT("Reload failed. Unsaved changes were retained.");
             });
         });
         if (!Queued) { bBusy = false; Message = TEXT("Reload queue unavailable."); }
     })];
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Save + Back"), [this] { SaveAll(false, true); })];
-    Toolbar->AddSlot().AutoWidth()[Button(TEXT("Discard + Back"), [this] { Close(); })];
-    Toolbar->AddSlot().FillWidth(1)[SNew(STextBlock).Text_Lambda([this] { return Text(TEXT("  Editor / ") + Project); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Save + Back"), [this] { SaveAll(false, true); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Discard + Back"), [this] { Close(); })];
+
     auto Left = SNew(SVerticalBox);
-    Left->AddSlot().AutoHeight()[SNew(SEditableTextBox).HintText(Text(TEXT("Filter resources / scripts")))
+    Left->AddSlot().AutoHeight().Padding(0,0,0,12)[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(TEXT("Resources / Scripts")))];
+    Left->AddSlot().AutoHeight().Padding(0,0,0,12)[SNew(SEditableTextBox).Style(&EditorInputStyle).HintText(Text(TEXT("Filter resources / scripts")))
         .OnTextChanged_Lambda([this](const FText& T) { Filter = T.ToString(); RefreshFiles(); })];
     Left->AddSlot().FillHeight(1)[SAssignNew(List, SListView<TSharedPtr<FV3DEditorDocument>>)
         .ListItemsSource(&VisibleDocuments).SelectionMode(ESelectionMode::Single)
-        .OnGenerateRow_Lambda([](TSharedPtr<FV3DEditorDocument> Doc, const TSharedRef<STableViewBase>& Owner)
+        .OnGenerateRow_Lambda([this](TSharedPtr<FV3DEditorDocument> Doc, const TSharedRef<STableViewBase>& Owner)
         {
-            return SNew(STableRow<TSharedPtr<FV3DEditorDocument>>, Owner)
-                [SNew(STextBlock).Text_Lambda([Doc] { return Text((Doc->bDirty ? TEXT("* ") : TEXT("")) + Doc->Label); }).Margin(FMargin(4,6))];
+            return SNew(STableRow<TSharedPtr<FV3DEditorDocument>>, Owner).Style(&EditorRowStyle)
+                [SNew(STextBlock).TextStyle(&EditorTextStyle).Text_Lambda([Doc] { return Text((Doc->bDirty ? TEXT("* ") : TEXT("")) + Doc->Label); }).Margin(FMargin(4,6))];
         })
         .OnSelectionChanged_Lambda([this](TSharedPtr<FV3DEditorDocument> Doc, ESelectInfo::Type Info)
         {
-            if (!Doc || Doc == Current || Info == ESelectInfo::Direct) return;
+            if (bBusy || !Doc || Doc == Current || Info == ESelectInfo::Direct) return;
             if (!ApplyRaw()) { List->SetSelection(Current, ESelectInfo::Direct); return; }
-            Current = Doc; bRawDirty = false; RefreshForm();
+            InvalidatePreview(); Current = Doc; bRawDirty = false; RefreshForm();
         })];
     auto Right = SNew(SVerticalBox);
-    Right->AddSlot().AutoHeight()[Button(TEXT("Preview model (read only)"), [this] { StartPreview(); })];
-    Right->AddSlot().AutoHeight()[SNew(SBox).HeightOverride(240)[SAssignNew(Preview, SV3DModelPreview)]];
-    Right->AddSlot().AutoHeight()[SNew(STextBlock).Text(Text(TEXT("JSON preview / advanced edit · Apply JSON to update fields")))];
-    Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).AutoWrapText(false)
-        .OnTextChanged_Lambda([this](const FText&) { if (!bSettingRaw) bRawDirty = true; })];
+    Right->AddSlot().AutoHeight().Padding(0,0,0,8)[MakeEditorButton(TEXT("Preview model (read only)"), [this] { StartPreview(); })];
+    Right->AddSlot().AutoHeight()[SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+        .BorderBackgroundColor(V3DHUDLegacyStyle::LoadingBackground).Padding(8)
+        [SNew(SBox).HeightOverride(240)[SAssignNew(Preview, SV3DModelPreview)]]];
+    Right->AddSlot().AutoHeight().Padding(0,8)[SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text(Text(TEXT("JSON / advanced edit · Apply JSON to update fields")))];
+    Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).Style(&EditorInputStyle).Font(EditorTextStyle.Font).AutoWrapText(false)
+        .OnTextChanged_Lambda([this](const FText& Value)
+        { if (!bSettingRaw) { bRawDirty = true; RawDraft = Value.ToString(); } })];
     auto Body = SNew(SSplitter)
         + SSplitter::Slot().Value(.2f)[Left]
         + SSplitter::Slot().Value(.45f)[SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(Form, SVerticalBox)]]
         + SSplitter::Slot().Value(.35f)[Right];
-    return SNew(SBorder).Padding(12).BorderBackgroundColor(FLinearColor(.025f,.035f,.055f,1))
+    auto Root = SNew(SBorder).Padding(32).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+        .BorderBackgroundColor(V3DHUDLegacyStyle::MenuBackground)
         [SNew(SVerticalBox)
-            + SVerticalBox::Slot().AutoHeight()[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy; })[Toolbar]]
-            + SVerticalBox::Slot().AutoHeight().Padding(4,10)[SNew(STextBlock).AutoWrapText(true).Text_Lambda([this] { return Text(Message); })]
-            + SVerticalBox::Slot().FillHeight(1)[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy; })[Body]]];
+            + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,20)
+                [SNew(STextBlock).TextStyle(&EditorTextStyle).Font(TitleFont).AutoWrapText(true)
+                    .Text_Lambda([this] { return Text(TEXT("Editor / ") + Project); })]
+            + SVerticalBox::Slot().AutoHeight()[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy && !bFormRefreshPending; })[Toolbar]]
+            + SVerticalBox::Slot().AutoHeight().Padding(0,12)
+                [SNew(SBorder).Padding(12).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+                    .BorderBackgroundColor(V3DHUDLegacyStyle::ButtonBackground)
+                    [SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text_Lambda([this] { return Text(Message); })]]
+            + SVerticalBox::Slot().FillHeight(1)[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy && !bFormRefreshPending; })[Body]]];
+    RefreshFiles();
+    RefreshForm();
+    if (List && Current) List->SetSelection(Current, ESelectInfo::Direct);
+    return Root;
 }
 
 void UProjectEditorWidget::OpenProject(const FString& ProjectName)
 {
+    if (bBusy || BuildStatus) { Message = TEXT("Wait for the current operation before opening another project."); return; }
+    InvalidatePreview();
+    Current.Reset(); Documents.Reset(); VisibleDocuments.Reset(); bRawDirty = false; RawDraft.Reset();
+    if (Form) Form->ClearChildren();
+    if (Raw) { TGuardValue<bool> Guard(bSettingRaw, true); Raw->SetText(FText::GetEmpty()); }
+    RefreshFiles();
     Project = ProjectName; bBusy = true; Message = TEXT("Reading resources and generating missing JSON definitions...");
     const uint64 Token = ++RequestGeneration;
     const TWeakObjectPtr<UProjectEditorWidget> Weak(this);
@@ -172,14 +241,38 @@ void UProjectEditorWidget::Remember()
 void UProjectEditorWidget::Changed()
 {
     if (Current) Current->bDirty = true;
-    bRawDirty = false; RefreshForm();
+    bRawDirty = false; InvalidatePreview(); QueueFormRefresh();
+}
+
+void UProjectEditorWidget::QueueFormRefresh()
+{
+    if (bFormRefreshPending || !Form) return;
+    bFormRefreshPending = true;
+    Form->RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateWeakLambda(this,
+        [this](double, float)
+        {
+            if (bFormRefreshPending) RefreshForm();
+            return EActiveTimerReturnType::Stop;
+        }));
+}
+
+void UProjectEditorWidget::InvalidatePreview()
+{
+    PreviewDocument.Reset();
+    if (PreviewBuilder)
+    {
+        PreviewBuilder->OnFinished.RemoveAll(this);
+        PreviewBuilder->Cancel();
+        PreviewBuilder = nullptr;
+    }
+    if (Preview) Preview->ClearModel();
 }
 
 bool UProjectEditorWidget::ApplyRaw()
 {
     if (!Current || !Raw || !bRawDirty) return true;
     FSafeJsonLimits Limits; Limits.MaxFileBytes = 16ll * 1024 * 1024; Limits.MaxDepth = 32;
-    const auto Parsed = FSafeFileIO::ParseJsonText(Raw->GetText().ToString(), Current->Path, Limits);
+    const auto Parsed = FSafeFileIO::ParseJsonText(RawDraft, Current->Path, Limits);
     if (!Parsed.IsSuccess()) { Message = Parsed.Error; return false; }
     Remember(); Current->Json = Parsed.JsonObject; Changed(); return true;
 }
@@ -187,18 +280,20 @@ bool UProjectEditorWidget::ApplyRaw()
 void UProjectEditorWidget::RefreshForm()
 {
     using namespace V3DEditorUI;
+    bFormRefreshPending = false;
     if (!Form || !Raw || !Current) return;
     TGuardValue<bool> RebuildGuard(bRebuildingForm, true);
     Form->ClearChildren(); FormRowsRemaining = 1500;
     bSettingRaw = true;
-    Raw->SetText(Text(Current->Json ? V3DProjectEditor::Serialize(Current->Json) : Current->DiskText));
+    if (!bRawDirty) RawDraft = Current->Json ? V3DProjectEditor::Serialize(Current->Json) : Current->DiskText;
+    Raw->SetText(Text(RawDraft));
     bSettingRaw = false;
-    Form->AddSlot().AutoHeight().Padding(4)[SNew(STextBlock).AutoWrapText(true).Text(Text(Current->Label +
+    Form->AddSlot().AutoHeight().Padding(4)[SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text(Text(Current->Label +
         (Current->SourcePath.IsEmpty() ? TEXT("") : TEXT("\nSource: ") + FPaths::GetCleanFilename(Current->SourcePath))))];
     if (!Current->Json) { Message = TEXT("Invalid source JSON: repair it in the advanced editor, then Apply JSON."); return; }
     // A new asset can choose AssetType even if its metadata was incomplete.
     if (!Current->SourcePath.IsEmpty() && !Current->Json->HasField(TEXT("AssetType")))
-        Form->AddSlot().AutoHeight()[Button(TEXT("Add AssetType"), [this]
+        Form->AddSlot().AutoHeight()[MakeEditorButton(TEXT("Add AssetType"), [this]
         { Remember(); Current->Json->SetStringField(TEXT("AssetType"), FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase) ? TEXT("Sound") : TEXT("Model")); Changed(); })];
     AddObject(Current->Json, V3DProjectEditor::Suggestions(*Current), Form.ToSharedRef());
 }
@@ -216,7 +311,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
     {
         if (--FormRowsRemaining < 0)
         {
-            Box->AddSlot().AutoHeight()[SNew(STextBlock).Text(Text(TEXT("Form limit reached; remaining keys are available in JSON.")))];
+            Box->AddSlot().AutoHeight()[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(TEXT("Form limit reached; remaining keys are available in JSON.")))];
             break;
         }
         const auto* Existing = Object->Values.Find(*Key);
@@ -225,15 +320,15 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
         {
             const auto DefaultValue = *Hint;
             Box->AddSlot().AutoHeight().Padding(4,2)[SNew(SHorizontalBox)
-                + SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).Text(Text(Key + TEXT(" (optional)")))]
-                + SHorizontalBox::Slot().AutoWidth()[Button(TEXT("Add"), [this, Object, Key, DefaultValue]
+                + SHorizontalBox::Slot().FillWidth(1)[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(Key + TEXT(" (optional)")))]
+                + SHorizontalBox::Slot().AutoWidth()[MakeEditorButton(TEXT("Add"), [this, Object, Key, DefaultValue]
                 { if (bRawDirty) { Message = TEXT("Apply JSON first."); return; } Remember(); Object->SetField(Key, DefaultValue); Changed(); })]];
             continue;
         }
         const auto Value = *Existing;
         auto Row = SNew(SHorizontalBox);
-        Row->AddSlot().FillWidth(1)[SNew(STextBlock).Text(Text(Key))];
-        Row->AddSlot().AutoWidth()[Button(TEXT("Remove"), [this, Object, Key]
+        Row->AddSlot().FillWidth(1)[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(Key))];
+        Row->AddSlot().AutoWidth()[MakeEditorButton(TEXT("Remove"), [this, Object, Key]
         { if (bRawDirty) { Message = TEXT("Apply JSON first."); return; } Remember(); Object->RemoveField(Key); Changed(); })];
         Box->AddSlot().AutoHeight().Padding(4,5)[Row];
         if (Value->Type == EJson::Object)
@@ -242,7 +337,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             const auto HintObject = Hint && (*Hint)->Type == EJson::Object ? (*Hint)->AsObject() : V3DProjectEditor::EntryTemplate(Context);
             AddObject(Value->AsObject(), HintObject, Nested, Depth + 1, Key);
             Box->AddSlot().AutoHeight().Padding(12,0)[SNew(SExpandableArea).InitiallyCollapsed(true)
-                .HeaderContent()[SNew(STextBlock).Text(Text(Key + TEXT(" fields")))] .BodyContent()[Nested]];
+                .HeaderContent()[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(Key + TEXT(" fields")))] .BodyContent()[Nested]];
         }
         else if (Value->Type == EJson::Array)
         {
@@ -252,16 +347,16 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             {
                 if (--FormRowsRemaining < 0) break;
                 auto Entry = Array[I];
-                Nested->AddSlot().AutoHeight()[Button(*FString::Printf(TEXT("Remove [%d]"), I), [this, Object, Key, I]
+                Nested->AddSlot().AutoHeight()[MakeEditorButton(*FString::Printf(TEXT("Remove [%d]"), I), [this, Object, Key, I]
                 {
                     if (bRawDirty) return; Remember(); auto Values = Object->GetArrayField(Key);
                     if (Values.IsValidIndex(I)) Values.RemoveAt(I); Object->SetArrayField(Key, Values); Changed();
                 })];
                 if (Entry->Type == EJson::Object) AddObject(Entry->AsObject(), V3DProjectEditor::EntryTemplate(Key), Nested, Depth + 1, Key);
-                else Nested->AddSlot().AutoHeight()[SNew(SEditableTextBox).Text(Text(ValueText(Entry)))
+                else Nested->AddSlot().AutoHeight()[SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Entry)))
                     .OnTextCommitted_Lambda([this, Object, Key, I, Entry](const FText& T, ETextCommit::Type)
                     {
-                        if (bBusy || bRawDirty || bRebuildingForm) return;
+                        if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) return;
                         TSharedPtr<FJsonValue> Updated;
                         if (Entry->Type == EJson::String) Updated = MakeShared<FJsonValueString>(T.ToString());
                         else
@@ -275,7 +370,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                         Object->SetArrayField(Key, Values); Changed();
                     })];
             }
-            Nested->AddSlot().AutoHeight()[Button(TEXT("Append item"), [this, Object, Key]
+            Nested->AddSlot().AutoHeight()[MakeEditorButton(TEXT("Append item"), [this, Object, Key]
             {
                 if (bRawDirty) return; Remember(); auto Values = Object->GetArrayField(Key);
                 if (Key == TEXT("Sounds") || Key == TEXT("WheelMeshNames")) Values.Add(MakeShared<FJsonValueString>(TEXT("")));
@@ -284,15 +379,15 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                 Object->SetArrayField(Key, Values); Changed();
             })];
             Box->AddSlot().AutoHeight().Padding(12,0)[SNew(SExpandableArea).InitiallyCollapsed(true)
-                .HeaderContent()[SNew(STextBlock).Text(Text(FString::Printf(TEXT("%s [%d items]"), *Key, Array.Num())))]
+                .HeaderContent()[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(FString::Printf(TEXT("%s [%d items]"), *Key, Array.Num())))]
                 .BodyContent()[Nested]];
         }
         else if (Value->Type == EJson::Boolean)
         {
-            Box->AddSlot().AutoHeight().Padding(4)[SNew(SCheckBox)
+            Box->AddSlot().AutoHeight().Padding(4)[SNew(SCheckBox).Style(&EditorCheckStyle)
                 .IsChecked(Value->AsBool() ? ECheckBoxState::Checked : ECheckBoxState::Unchecked)
                 .OnCheckStateChanged_Lambda([this, Object, Key](ECheckBoxState State)
-                { if (bBusy || bRawDirty || bRebuildingForm) return; Remember(); Object->SetBoolField(Key, State == ECheckBoxState::Checked); Changed(); })];
+                { if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) return; Remember(); Object->SetBoolField(Key, State == ECheckBoxState::Checked); Changed(); })];
         }
         else if (Key == TEXT("AssetType") || Key == TEXT("ModelType") || Key == TEXT("EntityType") || Key == TEXT("ItemType") || Key == TEXT("ProjectType"))
         {
@@ -304,11 +399,11 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             if (Key == TEXT("ItemType")) Names = {TEXT("Misc"),TEXT("Weapon"),TEXT("Tool")};
             if (Key == TEXT("ProjectType")) Names = {TEXT("World"),TEXT("Prefab"),TEXT("Dynamic"),TEXT("Character")};
             for (const auto& Name : Names) Options->Add(MakeShared<FString>(Name));
-            Box->AddSlot().AutoHeight().Padding(4)[SNew(SComboBox<TSharedPtr<FString>>).OptionsSource(&Options.Get())
-                .OnGenerateWidget_Lambda([Options](TSharedPtr<FString> Item) { return SNew(STextBlock).Text(Text(*Item)); })
+            Box->AddSlot().AutoHeight().Padding(4)[SNew(SComboBox<TSharedPtr<FString>>).ComboBoxStyle(&EditorComboStyle).OptionsSource(&Options.Get())
+                .OnGenerateWidget_Lambda([this, Options](TSharedPtr<FString> Item) { return SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(*Item)); })
                 .OnSelectionChanged_Lambda([this, Object, Key, Options](TSharedPtr<FString> Item, ESelectInfo::Type Info)
                 {
-                    if (!Item || bBusy || bRawDirty || bRebuildingForm || Info == ESelectInfo::Direct) return;
+                    if (!Item || bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending || Info == ESelectInfo::Direct) return;
                     Remember(); Object->SetStringField(Key, *Item);
                     // Only remove mutually exclusive discriminators, preserving all unrelated authored data.
                     if (Key == TEXT("AssetType") && *Item == TEXT("Sound")) Object->RemoveField(TEXT("ModelType"));
@@ -318,16 +413,16 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                     if (Key == TEXT("ItemType")) Object->RemoveField(TEXT("EntityType"));
                     if (Key == TEXT("ModelType") && *Item == TEXT("Character")) Object->RemoveField(TEXT("GravityField"));
                     Changed();
-                })[SNew(STextBlock).Text(Text(ValueText(Value)))]];
+                })[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(ValueText(Value)))]];
         }
         else
         {
             const EJson ExpectedType = Value->Type;
             const bool IsString = ExpectedType == EJson::String;
-            Box->AddSlot().AutoHeight().Padding(4)[SNew(SEditableTextBox).Text(Text(ValueText(Value)))
+            Box->AddSlot().AutoHeight().Padding(4)[SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Value)))
                 .OnTextCommitted_Lambda([this, Object, Key, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
                 {
-                    if (bBusy || bRawDirty || bRebuildingForm) { Message = TEXT("Apply pending JSON before editing fields."); return; }
+                    if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) { Message = TEXT("Apply pending JSON before editing fields."); return; }
                     if (IsString)
                     {
                         if (Object->GetStringField(Key) == TextValue.ToString()) return;
@@ -343,15 +438,15 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
     auto NewType = MakeShared<FString>(TEXT("String"));
     auto Types = MakeShared<TArray<TSharedPtr<FString>>>();
     for (const TCHAR* T : {TEXT("String"), TEXT("Number"), TEXT("Boolean"), TEXT("Object"), TEXT("Array")}) Types->Add(MakeShared<FString>(T));
-    auto TypePicker = SNew(SComboBox<TSharedPtr<FString>>).OptionsSource(&Types.Get())
-        .OnGenerateWidget_Lambda([Types](TSharedPtr<FString> T) { return SNew(STextBlock).Text(Text(*T)); })
+    auto TypePicker = SNew(SComboBox<TSharedPtr<FString>>).ComboBoxStyle(&EditorComboStyle).OptionsSource(&Types.Get())
+        .OnGenerateWidget_Lambda([this, Types](TSharedPtr<FString> T) { return SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(*T)); })
         .OnSelectionChanged_Lambda([NewType, Types](TSharedPtr<FString> T, ESelectInfo::Type) { if (T) *NewType = *T; })
-        [SNew(STextBlock).Text_Lambda([NewType] { return Text(*NewType); })];
-    auto NewKey = SNew(SEditableTextBox).HintText(Text(TEXT("New key (including custom keys)")));
+        [SNew(STextBlock).TextStyle(&EditorTextStyle).Text_Lambda([NewType] { return Text(*NewType); })];
+    auto NewKey = SNew(SEditableTextBox).Style(&EditorInputStyle).HintText(Text(TEXT("New key (including custom keys)")));
     Box->AddSlot().AutoHeight().Padding(4)[SNew(SHorizontalBox)
         + SHorizontalBox::Slot().FillWidth(1)[NewKey]
         + SHorizontalBox::Slot().AutoWidth()[TypePicker]
-        + SHorizontalBox::Slot().AutoWidth()[Button(TEXT("Add key"), [this, Object, NewKey, NewType, Context]
+        + SHorizontalBox::Slot().AutoWidth()[MakeEditorButton(TEXT("Add key"), [this, Object, NewKey, NewType, Context]
         {
             const FString Key = NewKey->GetText().ToString().TrimStartAndEnd();
             if (Key.IsEmpty() || Object->HasField(Key) || bRawDirty) { Message = TEXT("Use a new non-empty key; Apply JSON first."); return; }
@@ -374,7 +469,14 @@ void UProjectEditorWidget::SaveAll(bool bBuild, bool bClose)
     bBusy = true; Message = TEXT("Validating and saving JSON...");
     // Detached snapshots only. UI is disabled for the whole transaction.
     TArray<FV3DEditorDocument> Copies;
-    for (const auto& Doc : Documents) if (Doc->bDirty) Copies.Add(*Doc);
+    for (const auto& Doc : Documents) if (Doc->bDirty)
+    {
+        FV3DEditorDocument Copy;
+        Copy.Path = Doc->Path; Copy.SourcePath = Doc->SourcePath; Copy.Label = Doc->Label;
+        Copy.DiskText = Doc->DiskText; Copy.bDirty = true;
+        Copy.Json = V3DProjectEditor::CloneObject(Doc->Json);
+        Copies.Add(MoveTemp(Copy));
+    }
     const FString Name = Project; const uint64 Token = RequestGeneration;
     TWeakObjectPtr<UProjectEditorWidget> Weak(this);
     const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, Name, Copies = MoveTemp(Copies), bBuild, bClose]() mutable
@@ -387,8 +489,11 @@ void UProjectEditorWidget::SaveAll(bool bBuild, bool bClose)
         {
             auto* Self = Weak.Get(); if (!Self || Self->RequestGeneration != Token) return;
             Self->bBusy = false;
-            for (const auto& Saved : Copies) if (!Saved.bDirty)
-                for (auto& Doc : Self->Documents) if (Doc->Path == Saved.Path) { Doc->DiskText = Saved.DiskText; Doc->bDirty = false; }
+            TMap<FString, const FV3DEditorDocument*> SavedByPath;
+            for (const auto& Saved : Copies) if (!Saved.bDirty) SavedByPath.Add(Saved.Path, &Saved);
+            for (auto& Doc : Self->Documents)
+                if (const auto* Saved = SavedByPath.Find(Doc->Path))
+                { Doc->DiskText = (*Saved)->DiskText; Doc->bDirty = false; }
             Self->Message = Success ? TEXT("Saved. Existing built worlds are replaced only when Build succeeds.") : Error;
             if (Success && bBuild) Self->StartBuild();
             else if (Success && bClose) Self->Close();
@@ -422,13 +527,15 @@ void UProjectEditorWidget::Close()
 void UProjectEditorWidget::NativeDestruct()
 {
     ++RequestGeneration;
-    if (PreviewBuilder) { PreviewBuilder->OnFinished.RemoveAll(this); PreviewBuilder->Cancel(); PreviewBuilder = nullptr; }
+    bBusy = false; bFormRefreshPending = false;
+    InvalidatePreview();
     if (BuildStatus) { BuildStatus->StopObservingBuild(); BuildStatus->RemoveFromParent(); BuildStatus = nullptr; }
     Super::NativeDestruct();
 }
 void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
 {
     Super::ReleaseSlateResources(bReleaseChildren);
+    bFormRefreshPending = false;
     List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset();
 }
 

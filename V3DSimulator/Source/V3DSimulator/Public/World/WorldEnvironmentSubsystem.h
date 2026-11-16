@@ -27,6 +27,7 @@ public:
     UFUNCTION(BlueprintPure, Category="World|Biomes") FName GetActiveBiome() const { return ActiveBiome; }
     UPROPERTY(BlueprintAssignable, Category="World|Biomes") FV3DBiomeChanged OnBiomeChanged;
     void PlayDefaultFootstep(const FVector& Location);
+    void PlayFootstepSound(USoundBase* Sound, const FVector& Location, float Volume = 1.0f);
     void ApplySpatialAudio(UAudioComponent* Audio) const;
     USoundAttenuation* GetSpatialAttenuation() const { return SpatialAttenuation; }
 private:

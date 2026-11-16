@@ -13,6 +13,8 @@ struct V3DSIMULATOR_API FV3DEditorDocument
 };
 namespace V3DProjectEditor
 {
+    /** Deep copy for independently editable defaults and worker save snapshots. */
+    V3DSIMULATOR_API TSharedPtr<FJsonObject> CloneObject(const TSharedPtr<FJsonObject>& Object);
     V3DSIMULATOR_API bool Discover(const FString& Project, TArray<TSharedPtr<FV3DEditorDocument>>& Documents, FString& Error);
     V3DSIMULATOR_API bool Validate(const FV3DEditorDocument& Document, const FString& Project, FString& Error, const TArray<FV3DEditorDocument>* Batch = nullptr);
     V3DSIMULATOR_API TSharedPtr<FJsonObject> Suggestions(const FV3DEditorDocument& Document);

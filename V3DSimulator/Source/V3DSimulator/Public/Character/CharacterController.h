@@ -14,6 +14,7 @@
 #include "GameFramework/Character.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
+#include "InputCoreTypes.h"
 #include "Interface/WaterInteract.h"
 #include "CharacterController.generated.h"
 
@@ -228,5 +229,10 @@ private:
     TSubclassOf<UAnimInstance> SavedAnimClass;
     float SavedThirdPersonArmLength = 350.0f;
     FVector SavedThirdPersonSocketOffset = FVector::ZeroVector;
+    bool CanPlayFootstep() const;
+    void ResetFootstepRequests();
+    uint64 FootstepGeneration = 0;
+    uint64 LastFootstepFrame[2] = { MAX_uint64, MAX_uint64 };
+    bool bFootstepPending[2] = { false, false };
     void OnFootstepTraceCompleted(const FTraceHandle &TraceHandle, FTraceDatum &TraceDatum);
 };

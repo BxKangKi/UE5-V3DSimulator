@@ -24,7 +24,7 @@ void UWorldEnvironmentSubsystem::Reset()
     ++Generation;
     if (AssetLoad) AssetLoad->CancelHandle();
     AssetLoad.Reset();
-    if (GetWorld()) GetWorld()->GetTimerManager().ClearTimer(Timer);
+    if (GetWorld()) GetWorld()->GetTimerManager().ClearAllTimersForObject(this);
     for (auto* Audio : {WaterAudio.Get(), UnderwaterAudio.Get(), MusicAudio.Get()}) if (IsValid(Audio)) Audio->Stop();
     for (auto& Audio : Effects) if (IsValid(Audio)) Audio->Stop();
     for (auto& Audio : FadingMusic) if (IsValid(Audio)) Audio->Stop();
@@ -303,7 +303,8 @@ void UWorldEnvironmentSubsystem::ApplySpatialAudio(UAudioComponent* Audio) const
 }
 void UWorldEnvironmentSubsystem::PlayDefaultFootstep(const FVector& Location)
 {
-    if (GetWorld()->GetNetMode() == NM_DedicatedServer) return;
+    if (!GetWorld() || GetWorld()->GetNetMode() == NM_DedicatedServer) return;
+    // Prune and enforce the cap before creating a procedural wave/queue.
     Effects.RemoveAll([](const auto& C) { return !IsValid(C) || !C->IsPlaying(); });
 #if PLATFORM_ANDROID || PLATFORM_IOS
     constexpr int32 MaxVoices = 8;
@@ -311,16 +312,30 @@ void UWorldEnvironmentSubsystem::PlayDefaultFootstep(const FVector& Location)
     constexpr int32 MaxVoices = 16;
 #endif
     if (Effects.Num() >= MaxVoices) return;
-    if (auto* Sound = ResolveSound(Config.Audio.DefaultFootstep, TEXT("Footstep"), false))
+    PlayFootstepSound(ResolveSound(Config.Audio.DefaultFootstep, TEXT("Footstep"), false), Location, .7f);
+}
+
+void UWorldEnvironmentSubsystem::PlayFootstepSound(USoundBase* Sound, const FVector& Location, float Volume)
+{
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->GetNetMode() == NM_DedicatedServer || !IsValid(Sound)
+        || Location.ContainsNaN() || !FMath::IsFinite(Volume) || Volume <= 0.f) return;
+    Effects.RemoveAll([](const auto& C) { return !IsValid(C) || !C->IsPlaying(); });
+#if PLATFORM_ANDROID || PLATFORM_IOS
+    constexpr int32 MaxVoices = 8;
+#else
+    constexpr int32 MaxVoices = 16;
+#endif
+    if (Effects.Num() >= MaxVoices) return;
+    auto* Audio = UGameplayStatics::SpawnSoundAtLocation(this, Sound, Location,
+        FRotator::ZeroRotator, Volume, 1.f, 0, SpatialAttenuation);
+    if (!IsValid(Audio)) return;
+    Effects.Add(Audio);
+    if (Cast<USoundWaveProcedural>(Sound))
     {
-        auto* Audio = UGameplayStatics::SpawnSoundAtLocation(this, Sound, Location, FRotator::ZeroRotator, .7f, 1.f, 0, SpatialAttenuation);
-        if (!Audio) return;
-        Effects.Add(Audio);
-        if (Cast<USoundWaveProcedural>(Sound))
-        {
-            FTimerHandle Stop; TWeakObjectPtr<UAudioComponent> Weak(Audio);
-            GetWorld()->GetTimerManager().SetTimer(Stop, FTimerDelegate::CreateWeakLambda(this,
-                [Weak]() { if (auto* A = Weak.Get()) A->Stop(); }), Sound->Duration + .1f, false);
-        }
+        FTimerHandle Stop;
+        const TWeakObjectPtr<UAudioComponent> Weak(Audio);
+        World->GetTimerManager().SetTimer(Stop, FTimerDelegate::CreateWeakLambda(this,
+            [Weak]() { if (auto* A = Weak.Get()) A->Stop(); }), Sound->Duration + .1f, false);
     }
 }
