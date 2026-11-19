@@ -1,7 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "UI/SimulatorChatWidget.h"
 #include "UI/WidgetStyleSafety.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "Character/PlayerCharacterController.h"
 #include "Blueprint/WidgetTree.h"
 #include "Components/CanvasPanel.h"
@@ -48,7 +48,7 @@ void USimulatorChatWidget::ApplyNativeStyle()
     if (Input)
     {
         FEditableTextBoxStyle Style = Input->GetWidgetStyle();
-        V3DHUDLegacyStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
+        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
         Style.SetForegroundColor(FSlateColor(TextColor));
         V3DWidgetStyle::SetOwnedStyle(*Input, Style);
     }

@@ -179,7 +179,7 @@ UWorldBakedModelAsset* FRuntimeModelResolver::LoadAssetSynchronously(
 
     UWorldBakedModelAsset* Asset = NewObject<UWorldBakedModelAsset>(
         GetTransientPackage(), NAME_None, RF_Transient);
-    if (!IsValid(Asset) || !Asset->Initialize(Model, OutError))
+    if (!IsValid(Asset) || !Asset->Initialize(Model.UUID, Model.Reference, Model.ArchiveReader, OutError))
     {
         if (OutError.IsEmpty()) OutError = TEXT("could not initialize the baked model facade");
         return nullptr;

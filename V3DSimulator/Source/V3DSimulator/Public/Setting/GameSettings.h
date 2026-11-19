@@ -67,9 +67,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|World")
     bool bCloud = true;
 
-    /** 0.0 = disabled, 1.0 = enabled. Written directly to ShaderLibraryMPC.CelShadingMode. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float CelShadingMode = 1.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ShadowQuality = 2;

@@ -24,10 +24,6 @@ struct V3DSIMULATOR_API FBuoyancyPhysicsSettings
 {
     GENERATED_BODY()
 
-    /** Per-sample force safety cap. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Buoyancy|Physics", meta=(ClampMin="1.0"))
-    float BuoyancyForcePerPoint = 45000.0f;
-
     /** 1.0 means neutral lift for a fully submerged body. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Buoyancy|Physics", meta=(ClampMin="0.0", ClampMax="2.0"))
     float BuoyancyAccelerationScale = 0.990f;
@@ -42,7 +38,7 @@ struct V3DSIMULATOR_API FBuoyancyPhysicsSettings
     float AngularWaterDamping = 3.60f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Buoyancy|Physics", meta=(ClampMin="1.0"))
-    float MaxForcePerPoint = 50000.0f;
+    float MaxForcePerPoint = 45000.0f;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Buoyancy|Physics|Drag", meta=(ClampMin="0.0"))
     float WaterLinearDragCoefficient = 2.05f;

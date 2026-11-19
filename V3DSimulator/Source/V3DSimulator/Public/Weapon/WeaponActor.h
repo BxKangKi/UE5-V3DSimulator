@@ -80,7 +80,7 @@ public:
 
     AWeaponActor();
 
-    /** Equips a model addressed by its immutable gworld:// reference. */
+    /** Equips a model addressed by its immutable v3d:// reference. */
     UFUNCTION(BlueprintCallable, Category="Weapon")
     bool EquipFromModel(const FString& InModelReference, USceneComponent* AttachTarget);
 
@@ -122,7 +122,7 @@ private:
     TObjectPtr<USceneComponent> Root;
 
     UPROPERTY()
-    /** Range-reading facade for one gworld:// model; it never contains or opens a source GLB. */
+    /** Range-reading facade for one v3d:// model; it never contains or opens a source GLB. */
     TObjectPtr<UWorldBakedModelAsset> BakedAsset;
 
     UPROPERTY()

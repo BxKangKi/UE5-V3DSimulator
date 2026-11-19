@@ -8,6 +8,7 @@
  */
 
 #include "Weapon/WeaponActor.h"
+#include "System/WorldSurfaceSubsystem.h"
 #include "Gravity/GravityFieldComponent.h"
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/V3DSimulatorAssetRegistry.h"
@@ -59,7 +60,7 @@ namespace
         {
             V3DMaterialOverrideUtils::ApplyOverrides(
                 GameManager->GetMaterialDefaultReferences(),
-                MeshConfig.MaterialsConfig);
+                MeshConfig.MaterialsConfig, 1);
         }
         MeshConfig.bAllowCPUAccess = false;
         MeshConfig.bGenerateStaticMeshDescription = false;
@@ -554,6 +555,7 @@ bool AWeaponActor::LoadWeaponMesh(const FResolvedRuntimeModel& Model)
         MeshComponent->SetMobility(EComponentMobility::Movable);
         MeshComponent->SetupAttachment(Root);
         MeshComponent->SetStaticMesh(Mesh);
+        if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this)) Surfaces->ApplyToMesh(MeshComponent);
         MeshComponent->SetRelativeTransform(Node.Transform);
         MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         MeshComponent->SetGenerateOverlapEvents(false);
@@ -579,6 +581,7 @@ bool AWeaponActor::CreateDefaultBoxMesh()
     MeshComponent->SetMobility(EComponentMobility::Movable);
     MeshComponent->SetupAttachment(Root);
     MeshComponent->SetStaticMesh(DefaultWeaponMesh);
+    if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this)) Surfaces->ApplyToMesh(MeshComponent);
     MeshComponent->SetRelativeLocation(FVector(DefaultWeaponVisualLengthCm * 0.5f, 0.0f, 0.0f));
     MeshComponent->SetRelativeScale3D(FVector(
         DefaultWeaponVisualLengthCm / 100.0f,

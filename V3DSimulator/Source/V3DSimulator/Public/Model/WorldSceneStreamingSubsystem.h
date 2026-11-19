@@ -34,7 +34,7 @@ struct FWorldSceneStreamRecord
     bool bHasGravityField = false;
 };
 
-/** Immutable character selector. The runtime reference is a gworld:// UUID, never a file path. */
+/** Immutable character selector. The runtime reference is a v3d:// UUID, never a file path. */
 struct FWorldCharacterStreamRecord
 {
     FGuid UUID;
@@ -117,6 +117,8 @@ private:
     // One immutable view plan reused by startup bursts; no actor/UObject references on workers.
     FV3DStreamingEvaluation SceneEvaluation;
     TArray<int32> SceneLoadOrder;
+    TMap<FString, int32> SceneRecordIndices;
+    int32 SceneLoadCursor = 0;
     TArray<uint8> SceneUnloadRange;
     TArray<FWorldCharacterStreamRecord> CharacterRecords;
     TSet<FString> FailedCharacterReferences;

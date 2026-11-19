@@ -126,7 +126,7 @@ AMainGameMode::AMainGameMode()
     PendingServerAddress = DefaultServerAddress;
 
     // Registry widget classes are auto-created in BeginPlay. Set*Widget remains an optional
-    // compatibility/override path for projects that explicitly construct a custom instance.
+    // override path for projects that explicitly construct a custom instance.
 }
 
 void AMainGameMode::SetStartMenuWidget(UMainWorldWidget* InWidget)

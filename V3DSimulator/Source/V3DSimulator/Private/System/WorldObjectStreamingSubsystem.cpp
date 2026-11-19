@@ -487,9 +487,15 @@ void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
                     if (Field->GetSettingsRef().bEnabled) { NewDesired.Add(Pair.Key); break; }
     // Known-empty cells are installed synchronously by PumpLoads. Reserve all three containers so
     // the first 2-4 km radius does not repeatedly rehash on the game thread.
-    LoadedChunks.Reserve(LoadedChunks.Num() + NewDesired.Num());
-    LoadingChunks.Reserve(LoadingChunks.Num() + NewDesired.Num());
-    PendingLoads.Reserve(PendingLoads.Num() + NewDesired.Num());
+    int32 NewLoadCount = 0;
+    for (const FWorldChunkCoordinate& Coordinate : NewDesired)
+        if (!LoadedChunks.Contains(Coordinate) && !LoadingChunks.Contains(Coordinate)) ++NewLoadCount;
+    if (NewLoadCount > 0)
+    {
+        LoadedChunks.Reserve(LoadedChunks.Num() + LoadingChunks.Num() + NewLoadCount);
+        LoadingChunks.Reserve(LoadingChunks.Num() + NewLoadCount);
+        PendingLoads.Reserve(PendingLoads.Num() + NewLoadCount);
+    }
     for (const FWorldChunkCoordinate& Coordinate : NewDesired)
     {
         if (FRuntimeChunk* Existing = LoadedChunks.Find(Coordinate))

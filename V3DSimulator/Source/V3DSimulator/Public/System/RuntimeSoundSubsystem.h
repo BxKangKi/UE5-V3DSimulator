@@ -43,7 +43,7 @@ public:
     UFUNCTION(BlueprintPure, Category="Sound", meta=(WorldContext="WorldContextObject"))
     static URuntimeSoundSubsystem* Get(const UObject* WorldContextObject);
 
-    /** Loads an exact gworld://sound/<UUID> reference asynchronously. */
+    /** Loads an exact v3d://sound/<UUID> reference asynchronously. */
     UFUNCTION(BlueprintCallable, Category="Sound")
     void LoadSoundAsync(const FString& SoundReference, FRuntimeSoundLoadCompleted Completion);
 

@@ -54,7 +54,7 @@ void UCreatorHUDWidget::BuildNativeLayout()
 
     NativeMessage = AddText(StatusBox, FText::GetEmpty());
 
-    NativeToolbarPanel = AddPanel(ToolbarSize, ToolbarOffset, FVector2D(.5, 1), FVector2D(.5, 1));
+    NativeToolbarPanel = AddPanel(FVector2D(7.f * (GetToolbarSlotExtent() + 6.f) + 12.f, GetToolbarSlotExtent() + 18.f), ToolbarOffset, FVector2D(.5, 1), FVector2D(.5, 1));
     NativeToolbar = WidgetTree->ConstructWidget<UUniformGridPanel>(UUniformGridPanel::StaticClass(), TEXT("CreatorToolbarGrid"));
     NativeToolbar->SetSlotPadding(FMargin(3));
     NativeToolbarPanel->SetContent(NativeToolbar);

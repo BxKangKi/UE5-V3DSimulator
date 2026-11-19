@@ -2,7 +2,7 @@
 
 #include "UI/SettingControlWidget.h"
 #include "UI/NativeWidgetTreeNames.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "UI/WidgetStyleSafety.h"
 #include "UI/SettingsMenuWidget.h"
 
@@ -46,7 +46,7 @@ namespace
 USettingControlWidget::USettingControlWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
-    FontObject = V3DHUDLegacyStyle::FindFontForConstructor();
+    FontObject = V3DHUDStyle::FindFontForConstructor();
 }
 
 UBooleanSettingWidget::UBooleanSettingWidget(const FObjectInitializer& ObjectInitializer)
@@ -605,7 +605,7 @@ void USettingControlWidget::ApplyNativeRowStyle()
     {
         if (!IsValid(Text)) continue;
         FSlateFontInfo Font = Text->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, FontObject,
+        V3DHUDStyle::ApplyFont(Font, FontObject,
             FMath::Clamp(Text == NativeLabel.Get() ? FontSize : ValueFontSize, 8, 96), FontOutlineSize);
         Text->SetFont(Font);
         Text->SetColorAndOpacity(FSlateColor(TextColor));
@@ -616,13 +616,13 @@ void USettingControlWidget::ApplyNativeRowStyle()
         UTextBlock* Text = WeakText.Get();
         if (!IsValid(Text)) continue;
         FSlateFontInfo Font = Text->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
+        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
         Text->SetFont(Font);
         Text->SetColorAndOpacity(FSlateColor(TextColor));
     }
     if (UButton* Button = Cast<UButton>(NativeControl))
     {
-        V3DHUDLegacyStyle::ApplyButton(*Button, PanelColor);
+        V3DHUDStyle::ApplyButton(*Button, PanelColor);
         FButtonStyle Style = Button->GetStyle();
         Style.Hovered.TintColor = FSlateColor(AccentColor);
         V3DWidgetStyle::SetOwnedStyle(*Button, Style);
@@ -693,7 +693,7 @@ UWidget* USettingControlWidget::GenerateNativeOption(FString Option)
     UTextBlock* Text = NewObject<UTextBlock>(this);
     Text->SetText(FText::FromString(Option));
     FSlateFontInfo Font = Text->GetFont();
-    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
+    V3DHUDStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
     Text->SetFont(Font);
     Text->SetColorAndOpacity(FSlateColor(TextColor));
     NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });

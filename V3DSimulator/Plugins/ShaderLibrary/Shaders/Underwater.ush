@@ -4,6 +4,20 @@
 #pragma once
 // /Plugin/ShaderLibrary/Underwater.ush
 
+// Opaque and masked meshes (including the player) participate without a custom-depth pass.
+float UW_SceneDepth(float2 ViewportUV)
+{
+    const float2 UV = ClampSceneTextureUV(
+        ViewportUVToSceneTextureUV(saturate(ViewportUV), 1), 1);
+    return SceneTextureLookup(UV, 1, false).r;
+}
+
+float UW_OpenWaterVisibility(float Depth)
+{
+    // Invalid samples are closed; they must never leak light through the foreground.
+    return Depth > 0.0f ? smoothstep(900000.0f, 995000.0f, Depth) : 0.0f;
+}
+
 // -----------------------------------------------------------------------------
 // Underwater light shaft helper functions
 // -----------------------------------------------------------------------------
@@ -92,7 +106,10 @@ float4 UnderWaterShaft(
         return float4(0.0f, 0.0f, 0.0f, 1.0f);
     }
 
-    float3 L = normalize(SunDir);
+    float SunLengthSquared = dot(SunDir, SunDir);
+    [branch] if (SunLengthSquared < 1.0e-8f || Weight <= 0.0f || Exposure <= 0.0f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    float3 L = SunDir * rsqrt(SunLengthSquared);
 
     float3 V = normalize(ResolvedView.ViewForward);
     float Time = ResolvedView.GameTime;
@@ -135,10 +152,13 @@ float4 UnderWaterShaft(
     float2 sunOff = abs(sunScreenUV - 0.5f);
     float sunOffAmount = max(sunOff.x, sunOff.y);
     float offscreenFade = 1.0f - smoothstep(1.25f, 1.50f, sunOffAmount);
+    [branch] if (sunInFront * sunAboveWater * offscreenFade <= 0.001f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
 
     // 화면공간 radial shaft.
     float sampleCountF = clamp(floor(NumSamples + 0.5f), 1.0f, 96.0f);
     int sampleCount = (int)sampleCountF;
+    float noiseScaleSafe = max(NoiseScale, 1.0e-6f);
     float invSampleCount = rcp(sampleCountF);
 
     float2 rayDelta = (ScreenUV - sunScreenUV) * invSampleCount;
@@ -147,6 +167,10 @@ float4 UnderWaterShaft(
     float2 worldSeed = WorldPos.xy * 0.0005f;
     float jitter = UW_Hash21(ScreenUV * 173.17f + worldSeed + Time * 0.037f);
 
+    // Never start beyond the foreground silhouette because of jitter/refraction.
+    float pathVisibility = UW_OpenWaterVisibility(UW_SceneDepth(ScreenUV));
+    [branch] if (pathVisibility <= 0.001f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
     float2 currentUV = ScreenUV - rayDelta * jitter;
 
     float3 accumulatedLight = 0.0f;
@@ -191,23 +215,17 @@ float4 UnderWaterShaft(
 
         float2 refractedUV = saturate(currentUV + waveNoise * refractionAmount);
 
-        // ---------------------------------------------------------------------
-        // SceneDepth 기반 occlusion.
-        // 주의: 기존 코드의 13이 CustomDepth 쪽이었다면, 실제 가림용으로는 SceneDepth를 쓰는 편이 맞습니다.
-        // Unreal 기본 MaterialTemplate 계열에서 SceneDepth는 보통 1입니다.
-        // 프로젝트 래퍼가 다르면 여기의 1을 프로젝트의 SceneDepth id로 맞추세요.
-        // ---------------------------------------------------------------------
-        float2 depthSampleUV = ViewportUVToSceneTextureUV(refractedUV, 1);
-        float sceneDepth = SceneTextureLookup(depthSampleUV, 13, false).r;
-
-        float isInvalidDepth = 1.0f - step(1.0f, sceneDepth);
-        float isTooFar = step(FarSceneDepth, sceneDepth);
-        sceneDepth = lerp(sceneDepth, FarSceneDepth, saturate(isInvalidDepth + isTooFar));
-        // 하늘/빈 공간이면 빛이 들어오는 구멍으로 보고, 지형/오브젝트면 빛을 막습니다.
-        float openWaterVisibility = smoothstep(FarSceneDepth * 0.90f, FarSceneDepth * 0.995f, sceneDepth);
-        // SceneDepth는 현재 픽셀뿐 아니라 UV를 넣어 다른 위치의 깊이도 샘플할 수 있으므로,
-        // screen-space radial shaft에서 occlusion mask로 쓰기 좋습니다.
-        // Epic 문서도 SceneDepth가 임의 UV 샘플링을 지원한다고 설명합니다.
+        // Conservative sampling prevents refraction from stepping around a silhouette.
+        float sceneDepth = min(UW_SceneDepth(currentUV), UW_SceneDepth(refractedUV));
+        float openWaterVisibility = UW_OpenWaterVisibility(sceneDepth);
+        pathVisibility = min(pathVisibility, openWaterVisibility);
+        [branch] if (pathVisibility <= 0.001f)
+        {
+            // No samples beyond a blocker may illuminate this radial ray.
+            accumulatedLight = 0.0f;
+            break;
+        }
+        sceneDepth = min(sceneDepth, FarSceneDepth);
 
         // ---------------------------------------------------------------------
         // 현재 샘플 방향의 월드 레이 근사.
@@ -242,7 +260,6 @@ float4 UnderWaterShaft(
         float3 patternPosTS = lerp(volumePosTS, surfacePosTS, canHitSurface);
         float2 patternPosWS = (patternPosTS - preViewTranslation).xy;
 
-        float noiseScaleSafe = max(NoiseScale, 1.0e-6f);
         float2 p = patternPosWS * noiseScaleSafe;
 
         float causticShadow = UW_CausticLikePattern(p + worldSeed * 2.0f, Time);
@@ -292,6 +309,7 @@ float4 UnderWaterShaft(
 
     float3 finalShaft =
         accumulatedLight *
+        pathVisibility *
         invSampleCount *
         Weight *
         Exposure *
@@ -318,12 +336,12 @@ float4 UnderWaterHazeBlur(
 
     if (underwaterMask <= 0.001f)
     {
-        float2 sceneUV = ViewportUVToSceneTextureUV(ScreenUV, 14);
+        float2 sceneUV = ClampSceneTextureUV(ViewportUVToSceneTextureUV(ScreenUV, 14), 14);
         return SceneTextureLookup(sceneUV, 14, false);
     }
 
-    float2 sceneUV = ViewportUVToSceneTextureUV(ScreenUV, 14);
-    float sceneDepth = SceneTextureLookup(ViewportUVToSceneTextureUV(ScreenUV, 1), 13, false).r;
+    float2 sceneUV = ClampSceneTextureUV(ViewportUVToSceneTextureUV(ScreenUV, 14), 14);
+    float sceneDepth = max(UW_SceneDepth(ScreenUV), 0.0f);
 
     float depthFactor = saturate(sceneDepth / 18000.0f);
     depthFactor = pow(depthFactor, 0.65f);
@@ -332,7 +350,9 @@ float4 UnderWaterHazeBlur(
     float blurAmount = underwaterMask * BlurStrength * depthFactor * waterFog;
 
     float2 texel = ResolvedView.BufferSizeAndInvSize.zw;
-    float radius = MaxBlurRadius * blurAmount;
+    float radius = max(MaxBlurRadius * blurAmount, 0.0f);
+    [branch] if (radius <= 0.001f && underwaterMask * HazeStrength * depthFactor * waterFog <= 0.001f)
+        return SceneTextureLookup(sceneUV, 14, false);
 
     float4 col = 0.0f;
     float total = 0.0f;
@@ -354,7 +374,7 @@ float4 UnderWaterHazeBlur(
     [unroll] for (int i = 0; i < 8; i++)
     {
         float w = 0.0975f;
-        float2 uv = sceneUV + offsets[i] * texel * radius;
+        float2 uv = ClampSceneTextureUV(sceneUV + offsets[i] * texel * radius, 14);
         col += SceneTextureLookup(uv, 14, false) * w;
         total += w;
     }

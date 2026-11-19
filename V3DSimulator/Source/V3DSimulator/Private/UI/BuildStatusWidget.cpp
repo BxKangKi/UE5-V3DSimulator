@@ -1,7 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/BuildStatusWidget.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 #include "Components/SizeBox.h"
@@ -24,8 +24,8 @@ UBuildStatusWidget::UBuildStatusWidget(const FObjectInitializer& ObjectInitializ
     : Super(ObjectInitializer)
 {
     PanelSize = FVector2D(1920.f, 1080.f);
-    BackgroundColor = V3DHUDLegacyStyle::LoadingBackground;
-    AccentColor = V3DHUDLegacyStyle::ProgressFill;
+    BackgroundColor = V3DHUDStyle::LoadingBackground;
+    AccentColor = V3DHUDStyle::ProgressFill;
     BodyFontSize = 16;
     ButtonHeight = 44.f;
     FontOutlineSize = 1;

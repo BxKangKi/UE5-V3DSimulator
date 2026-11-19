@@ -9,7 +9,7 @@
 
 #include "UI/SettingsMenuWidget.h"
 #include "UI/WidgetStyleSafety.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 #include "UI/SettingControlWidget.h"
@@ -102,7 +102,6 @@ namespace
             ESettingsField::RayTracing,
             ESettingsField::HeightFog,
             ESettingsField::Cloud,
-            ESettingsField::CelShadingMode,
             ESettingsField::ShadowQuality,
             ESettingsField::TextureQuality,
             ESettingsField::MaxTextureResolution,
@@ -232,7 +231,6 @@ namespace
         case ESettingsField::RayTracing: return TEXT("RayTracing");
         case ESettingsField::HeightFog: return TEXT("HeightFog");
         case ESettingsField::Cloud: return TEXT("Cloud");
-        case ESettingsField::CelShadingMode: return TEXT("CelShadingMode");
         case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
         case ESettingsField::MaxTextureResolution: return TEXT("MaxTextureResolution");
@@ -767,7 +765,6 @@ ESettingsControlType USettingsMenuWidget::GetSettingControlType(ESettingsField F
     case ESettingsField::RayTracing:
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
-    case ESettingsField::CelShadingMode:
         return ESettingsControlType::Toggle;
 
     case ESettingsField::MouseSensitivity:
@@ -822,7 +819,6 @@ bool USettingsMenuWidget::GetPendingBooleanSettingValue(ESettingsField Field) co
     case ESettingsField::RayTracing: return bPendingRayTracing;
     case ESettingsField::HeightFog: return bPendingHeightFog;
     case ESettingsField::Cloud: return bPendingCloud;
-    case ESettingsField::CelShadingMode: return PendingCelShadingMode >= 0.5f;
     default: return false;
     }
 }
@@ -936,7 +932,6 @@ void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
-    case ESettingsField::CelShadingMode: PendingCelShadingMode = PendingCelShadingMode >= 0.5f ? 0.0f : 1.0f; break;
     default: return;
     }
     ApplyAndSaveSettingsFromUI();
@@ -1111,10 +1106,6 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         break;
-    case ESettingsField::CelShadingMode:
-        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCelShadingModeFromUI);
-        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCelShadingModeFromUI);
-        break;
     case ESettingsField::ShadowQuality:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
@@ -1223,7 +1214,6 @@ void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Butto
     case ESettingsField::RayTracing: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI); break;
     case ESettingsField::HeightFog: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI); break;
     case ESettingsField::Cloud: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI); break;
-    case ESettingsField::CelShadingMode: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCelShadingModeFromUI); break;
     case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
     case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
     case ESettingsField::MaxTextureResolution: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI); break;
@@ -1327,7 +1317,6 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     bPendingRayTracing = Settings->bRayTracing;
     bPendingHeightFog = Settings->bHeightFog;
     bPendingCloud = Settings->bCloud;
-    PendingCelShadingMode = Settings->CelShadingMode >= 0.5f ? 1.0f : 0.0f;
     PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
     PendingMaxTextureResolution = FMath::Clamp(Settings->MaxTextureResolution, TextureResolutionMin, TextureResolutionMax);
@@ -1359,7 +1348,6 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->bRayTracing = bPendingRayTracing;
     Settings->bHeightFog = bPendingHeightFog;
     Settings->bCloud = bPendingCloud;
-    Settings->CelShadingMode = PendingCelShadingMode >= 0.5f ? 1.0f : 0.0f;
     Settings->ShadowQuality = PendingShadowQuality;
     Settings->TextureQuality = PendingTextureQuality;
     Settings->MaxTextureResolution = PendingMaxTextureResolution;
@@ -1476,7 +1464,6 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::RayTracing: return FText::FromString(TEXT("Ray Tracing"));
     case ESettingsField::HeightFog: return FText::FromString(TEXT("Height Fog"));
     case ESettingsField::Cloud: return FText::FromString(TEXT("Cloud"));
-    case ESettingsField::CelShadingMode: return FText::FromString(TEXT("Cel Shading"));
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
     case ESettingsField::MaxTextureResolution: return FText::FromString(TEXT("Max Texture Resolution"));
@@ -1550,7 +1537,6 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
     case ESettingsField::RayTracing:
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
-    case ESettingsField::CelShadingMode:
         Options.Add(GetBoolText(false));
         Options.Add(GetBoolText(true));
         break;
@@ -1642,7 +1628,6 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
-    case ESettingsField::CelShadingMode: PendingCelShadingMode = PendingCelShadingMode >= 0.5f ? 0.0f : 1.0f; break;
     case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::MaxTextureResolution: CycleTextureResolution(PendingMaxTextureResolution, Direction); break;
@@ -1711,7 +1696,6 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
     case ESettingsField::RayTracing: return GetBoolText(bPendingRayTracing);
     case ESettingsField::HeightFog: return GetBoolText(bPendingHeightFog);
     case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
-    case ESettingsField::CelShadingMode: return GetBoolText(PendingCelShadingMode >= 0.5f);
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
     case ESettingsField::MaxTextureResolution: return FText::FromString(FString::Printf(TEXT("%d px"), PendingMaxTextureResolution));
@@ -1791,7 +1775,6 @@ void USettingsMenuWidget::CycleExposureFromUI() { CycleSettingValueFromUI(ESetti
 void USettingsMenuWidget::CycleRayTracingFromUI() { CycleSettingValueFromUI(ESettingsField::RayTracing); }
 void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESettingsField::HeightFog); }
 void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
-void USettingsMenuWidget::CycleCelShadingModeFromUI() { CycleSettingValueFromUI(ESettingsField::CelShadingMode); }
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
 void USettingsMenuWidget::CycleMaxTextureResolutionFromUI() { CycleSettingValueFromUI(ESettingsField::MaxTextureResolution); }
@@ -1952,7 +1935,7 @@ void USettingsMenuWidget::BindNativeWidgets()
     SetConfirmButton(nullptr);
     SetCancelButton(nullptr);
 
-    // Native controls are restored after a legacy WBP Construct/PreConstruct graph.
+    // Bind current native controls after Blueprint construction.
     // Replace only adapters that were replaced by that graph; retain live adapters on refresh.
     for (int32 Index = 0; Index < NativeControls.Num(); ++Index)
     {
@@ -1979,7 +1962,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
     if (NativeTitle)
     {
         FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, nullptr, TitleFontSize, FontOutlineSize);
+        V3DHUDStyle::ApplyFont(Font, nullptr, TitleFontSize, FontOutlineSize);
         NativeTitle->SetFont(Font);
     }
     if (NativeBack)
@@ -1988,7 +1971,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
         if (UTextBlock* Label = Cast<UTextBlock>(NativeBack->GetContent()))
         {
             FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();
-            V3DHUDLegacyStyle::ApplyFont(Font, nullptr, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), FontOutlineSize);
+            V3DHUDStyle::ApplyFont(Font, nullptr, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), FontOutlineSize);
             Label->SetFont(Font);
         }
     }
@@ -1998,7 +1981,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
         if (!IsValid(Label)) continue;
         const bool bToggle = GetSettingControlType(NativeControlFields[Index]) == ESettingsControlType::Toggle;
         FSlateFontInfo Font = Label->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, FontObject,
+        V3DHUDStyle::ApplyFont(Font, FontObject,
             bToggle ? FMath::RoundToInt(BodyFontSize * 4.f / 3.f) : BodyFontSize, 1);
         Label->SetFont(Font);
         Label->SetColorAndOpacity(FSlateColor(TextColor));
@@ -2009,7 +1992,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
         UTextBlock* Label = WeakLabel.Get();
         if (!IsValid(Label)) continue;
         FSlateFontInfo Font = Label->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+        V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
         Label->SetFont(Font);
         Label->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2017,7 +2000,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
     {
         if (!IsValid(Value)) continue;
         FSlateFontInfo Font = Value->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Max(8, BodyFontSize / 2), 1);
+        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::Max(8, BodyFontSize / 2), 1);
         Value->SetFont(Font);
         Value->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2040,7 +2023,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
             if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
             {
                 FSlateFontInfo Font = Label->GetFont();
-                V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 2.f / 3.f), 1);
+                V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 2.f / 3.f), 1);
                 Label->SetFont(Font);
             }
         }
@@ -2053,7 +2036,7 @@ UWidget* USettingsMenuWidget::GenerateNativeOption(FString Option)
     UTextBlock* Text = NewObject<UTextBlock>(this);
     Text->SetText(FText::FromString(Option));
     FSlateFontInfo Font = Text->GetFont();
-    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+    V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
     Text->SetFont(Font);
     Text->SetColorAndOpacity(FSlateColor(TextColor));
     NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });

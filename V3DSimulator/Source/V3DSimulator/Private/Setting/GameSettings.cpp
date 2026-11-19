@@ -57,7 +57,6 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetBoolField(TEXT("bRayTracing"), bRayTracing);
     Json->SetBoolField(TEXT("bHeightFog"), bHeightFog);
     Json->SetBoolField(TEXT("bCloud"), bCloud);
-    Json->SetNumberField(TEXT("CelShadingMode"), CelShadingMode >= 0.5f ? 1.0f : 0.0f);
     return Json;
 }
 
@@ -93,8 +92,6 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetBoolField(TEXT("bRayTracing"), bRayTracing);
         Json->TryGetBoolField(TEXT("bHeightFog"), bHeightFog);
         Json->TryGetBoolField(TEXT("bCloud"), bCloud);
-        Json->TryGetNumberField(TEXT("CelShadingMode"), CelShadingMode);
-        CelShadingMode = CelShadingMode >= 0.5f ? 1.0f : 0.0f;
         ShadowQuality = FMath::Clamp(ShadowQuality, 0, 3);
         TextureQuality = FMath::Clamp(TextureQuality, 0, 3);
         ViewDistanceQuality = FMath::Clamp(ViewDistanceQuality, 0, 3);

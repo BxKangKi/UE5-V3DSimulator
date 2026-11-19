@@ -8,6 +8,7 @@
  */
 
 #include "System/MultiplayerWorldStateActor.h"
+#include "System/SoundEventSubsystem.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "Engine/World.h"
@@ -119,4 +120,12 @@ void AMultiplayerWorldStateActor::ApplyWorldFolderName() const
             }
         }
     }
+}
+
+void AMultiplayerWorldStateActor::MulticastSoundEvent_Implementation(FName Event, FVector Location, bool bStop)
+{
+    if (!GetWorld()) return;
+    auto* Events = GetWorld()->GetSubsystem<USoundEventSubsystem>();
+    if (bStop) Events->StopEvent(Event);
+    else Events->TriggerEvent(Event, Location);
 }

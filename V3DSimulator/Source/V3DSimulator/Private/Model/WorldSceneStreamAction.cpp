@@ -59,7 +59,7 @@ namespace
     constexpr int32 DefaultRuntimeMultiLOD = 1;
 
     TAutoConsoleVariable<int32> CVarEnableRuntimeMultiLOD(
-        TEXT("gworld.Streaming.EnableRuntimeMultiLOD"),
+        TEXT("v3d.Streaming.EnableRuntimeMultiLOD"),
         DefaultRuntimeMultiLOD,
         TEXT("Enables glTFRuntime multi-LOD mesh assembly. 0 loads one validated LOD (prefers LOD0); 1 enables LOD1-LOD3."),
         ECVF_Default);
@@ -313,62 +313,12 @@ namespace
     }
 }
 
-void UWorldGeneratedStaticMeshContext::Initialize(UWorld* InWorld)
-{
-    CancelBuild();
-    BuildCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
-    PinnedWorld = nullptr;
-    World = InWorld;
-}
-
-bool UWorldGeneratedStaticMeshContext::PinWorldForBuild()
-{
-    if (IsBuildCancelled()) return false;
-    UWorld* RuntimeWorld = World.Get();
-    if (!IsValid(RuntimeWorld) || !RuntimeWorld->IsGameWorld())
-    {
-        PinnedWorld = nullptr;
-        return false;
-    }
-
-    PinnedWorld = RuntimeWorld;
-    return true;
-}
-
-void UWorldGeneratedStaticMeshContext::ReleaseWorldPin()
-{
-    PinnedWorld = nullptr;
-}
-
-void UWorldGeneratedStaticMeshContext::CancelBuild()
-{
-    check(IsInGameThread());
-    if (BuildCancellation.IsValid() && BuildCancellation->GetValue() == 0) BuildCancellation->Increment();
-}
-
-bool UWorldGeneratedStaticMeshContext::IsBuildCancelled() const
-{
-    check(IsInGameThread());
-    return BuildCancellation.IsValid() && BuildCancellation->GetValue() != 0;
-}
-
-UWorld* UWorldGeneratedStaticMeshContext::GetWorld() const
-{
-    if (UWorld* ActiveWorld = PinnedWorld.Get())
-    {
-        return ActiveWorld;
-    }
-
-    return World.Get();
-}
-
 UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
     UObject *WorldContextObject,
     AStaticActor *Actor,
     AInstancedMeshActor *InMeshActor,
     const FVector &InPlayerLocation,
     const FglTFRuntimeStaticMeshConfig &StaticMeshConfig,
-    float InDistance,
     int32 InChunkSize,
     bool bInRenderOnly,
     bool bInWaterGroup,
@@ -377,7 +327,7 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
     TArray<FVector> Observers;
     Observers.Add(InPlayerLocation);
     return StreamAsyncForObservers(
-        WorldContextObject, Actor, InMeshActor, Observers, StaticMeshConfig, InDistance,
+        WorldContextObject, Actor, InMeshActor, Observers, StaticMeshConfig,
         InChunkSize, bInRenderOnly, bInWaterGroup, InUnloadDistanceMultiplier);
 }
 
@@ -387,7 +337,6 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
     AInstancedMeshActor* InMeshActor,
     const TArray<FVector>& InObserverLocations,
     const FglTFRuntimeStaticMeshConfig& StaticMeshConfig,
-    float InDistance,
     int32 InChunkSize,
     bool bInRenderOnly,
     bool bInWaterGroup,
@@ -413,7 +362,6 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
         || (bInWaterGroup ? IsValid(InMeshActor) : !IsValid(InMeshActor))
         || (!bInWaterGroup && InMeshActor->GetOwner() != Actor)
         || ValidObservers.IsEmpty()
-        || !FMath::IsFinite(InDistance) || InDistance < 0.0f
         || InChunkSize <= 0
         || !FMath::IsFinite(InUnloadDistanceMultiplier) || InUnloadDistanceMultiplier < 1.0f
         || Actor->GetActorTransform().ContainsNaN())
@@ -421,9 +369,7 @@ UWorldSceneStreamAction* UWorldSceneStreamAction::StreamAsyncForObservers(
         return nullptr;
     }
 
-    // Legacy distance arguments remain source/Blueprint compatible; the shared camera policy
-    // now supplies chunk radii. Nodes in a resident chunk are no longer removed by a 5% test.
-    InDistance = V3DStreamingPolicy::GetScreenSizeDistance(Actor);
+    const float InDistance = V3DStreamingPolicy::GetScreenSizeDistance(Actor);
 
     auto* Action = NewObject<UWorldSceneStreamAction>();
     Action->WorldContextObject = WorldContextObject;
@@ -493,6 +439,19 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     }
 
     bAbortRequested = true;
+    // Water actions own a partial spawn/unload result until completion. Preserve that result
+    // for a live retry; during teardown destroy it now so newly spawned water cannot be orphaned.
+    if (bWaterGroup && TotalOperationCount > 0)
+    {
+        FWorldSceneStreamResult WaterState;
+        WaterState.WaterNodeMap = MoveTemp(WaterNodeMap);
+        WaterState.LoadedWaterNodes = MoveTemp(LoadedWaterNodes);
+        WaterState.WaterActorMap = MoveTemp(WaterActorMap);
+        if (!IsValid(OwnerActor)
+            || !OwnerActor->PreserveAbortedWaterState(this, MoveTemp(WaterState)))
+            for (auto& Pair : WaterState.WaterActorMap)
+                if (IsValid(Pair.Value)) Pair.Value->Destroy();
+    }
     bPreparationInFlight = false;
     if (PreparationCancellation.IsValid()) PreparationCancellation->Increment();
     PreparationCancellation.Reset();
@@ -569,6 +528,8 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     }
     GeneratedMeshWorldContext = nullptr;
     DecalLight = nullptr;
+    WaterClass = nullptr;
+    StaticMeshConfig = FglTFRuntimeStaticMeshConfig();
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
     bIsLoading = false;
@@ -578,6 +539,7 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     {
         RemoveFromRoot();
     }
+    FV3DStreamingBudget::NotifyUnloaded();
 }
 
 void UWorldSceneStreamAction::Activate()
@@ -654,7 +616,7 @@ void UWorldSceneStreamAction::StartStreamPlanAsync()
                 {
                     if (Cancellation->GetValue() != 0) return;
                     AInstancedMeshActor::BuildNativeNodeSnapshot(*Definitions, Loaded, Observer,
-                        OwnerTransform, PlanningRadius, ObserverNodes);
+                        OwnerTransform, PlanningRadius, ObserverNodes, PlanningMaxDistanceCm);
                     Plan.NodeMap.Append(ObserverNodes);
                 }
             }
@@ -778,6 +740,10 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
     LoadedWaterNodes.Empty();
     WaterActorMap.Empty();
     DecalLight = nullptr;
+    WaterClass = nullptr;
+    StaticMeshConfig = FglTFRuntimeStaticMeshConfig();
+    Progress.Clear();
+    Completed.Clear();
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
     bIsLoading = false;
@@ -875,6 +841,10 @@ void UWorldSceneStreamAction::ProcessChunk()
         Result.GroupName = GroupName;
         Result.bWaterGroup = bWaterGroup;
         Result.bGroupFailed = bGroupFailed;
+        Result.FailureStage = FailureStage;
+        Result.FailureReason = FailureReason;
+        Result.FailedNode = FailedNode;
+        Result.FailedMesh = FailedMesh;
         Result.WaterNodeMap = MoveTemp(WaterNodeMap);
         Result.LoadedWaterNodes = MoveTemp(LoadedWaterNodes);
         Result.WaterActorMap = MoveTemp(WaterActorMap);
@@ -1038,15 +1008,10 @@ bool UWorldSceneStreamAction::IsNodeWithinCurrentRenderRange(const FName& Name) 
     const FModelMeshData* Mesh = Node ? MeshMap.Find(Node->MeshName) : nullptr;
     if (!Mesh || !IsValid(OwnerActor)) return false;
     const FTransform Transform = Node->Transform * CurrentRenderOwnerTransform;
-    FBox ChunkBounds = V3DHISMChunkPolicy::CellBounds(V3DHISMChunkPolicy::Key(Transform.GetLocation()));
-    const FVector Half = Mesh->Size.GetAbs() * 0.5;
-    ChunkBounds += FBox(-Half, Half).TransformBy(Transform);
-    const double Radius = Node->bAlwaysLoaded ? CurrentMaxRenderDistanceCm : FMath::Max(
-        FMath::Min(CurrentMaxRenderDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm),
-        V3DStreamingPolicy::LoadRadius(Mesh->Size, MeshActor->GetMaxNodeScale()
-            * CurrentRenderOwnerTransform.GetScale3D().GetAbs().GetMax(), Distance, CurrentMaxRenderDistanceCm));
-    if (!V3DHISMChunkPolicy::InRange(ChunkBounds, CurrentRenderObservers,
-        FMath::Min(CurrentMaxRenderDistanceCm, Radius * UnloadDistanceMultiplier))) return false;
+    // The worker admitted this node using the aggregate bounds/radius of its entire cell.
+    // Replacing that decision with this node's smaller radius rejects valid peers forever.
+    // Only enforce the current hard render cap here; movement/settings invalidate the pass,
+    // and the next worker evaluation updates cell residency using the complete group.
     for (const FVector& Observer : CurrentRenderObservers)
         if (V3DStreamingPolicy::BoundsInRenderRange(FVector::ZeroVector, Mesh->Size,
             Transform, Observer, CurrentMaxRenderDistanceCm)) return true;
@@ -1081,14 +1046,12 @@ void UWorldSceneStreamAction::ProcessUnloadNode(const FName &Name)
     if (!Info)
         return;
 
-    DestroyStreamComponents(Name);
-
     if (!MeshActor->RemoveNodeInstance(Name))
     {
-        NodeMap.Empty();
-        bGroupFailed = true;
+        FailGroup(TEXT("RemoveInstance"), TEXT("Instance removal was rejected; existing colliders were retained"), Name, Info->MeshName);
         return;
     }
+    DestroyStreamComponents(Name);
     if (bRenderOnly)
     {
         return;
@@ -1140,13 +1103,9 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
     }
     if (!IsValid(StaticMesh))
     {
-        const FString FailedPath = OwnerActor->GetModelReference();
-        FV3DRuntimeSafety::ReportRecoverableFailure(
-            FailedPath,
-            FString::Printf(TEXT("glTFRuntime rejected or failed static mesh '%s' for node '%s'"),
-                *CurrentLoadingMesh.ToString(), *CurrentLoadingNode.ToString()));
-        NodeMap.Empty();
-        bGroupFailed = true;
+        // The payload/finalizer reports its request-specific error. A null callback can also
+        // mean cancellation; counting it again quarantines a model after just one failed build.
+        FailGroup(TEXT("MeshLoad"), TEXT("No mesh returned; see V3DStreaming Stage/Reason for these mesh indices"));
         ResetLoadState();
         return;
     }
@@ -1184,8 +1143,7 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
     }
     else
     {
-        NodeMap.Empty();
-        bGroupFailed = true;
+        FailGroup(TEXT("AssignMesh"), TEXT("Shared mesh assignment was rejected"));
         ResetLoadState();
     }
 }
@@ -1213,8 +1171,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     UWorldBakedModelAsset* MeshSourceAsset = Asset.Get();
     if (!IsValid(MeshSourceAsset))
     {
-        NodeMap.Empty();
-        bGroupFailed = true;
+        FailGroup(TEXT("MeshSource"), TEXT("Baked mesh source is no longer valid"));
         ResetLoadState();
         return;
     }
@@ -1222,8 +1179,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     FModelMeshData* Mesh = MeshMap.Find(MeshName);
     if (!Mesh)
     {
-        bGroupFailed = true;
-        NodeMap.Empty();
+        FailGroup(TEXT("MeshMetadata"), TEXT("Requested mesh metadata is absent"));
         ResetLoadState();
         return;
     }
@@ -1297,8 +1253,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
             *MeshName.ToString(),
             *CurrentLoadingNode.ToString(),
             RuntimeMeshCount);
-        NodeMap.Empty();
-        bGroupFailed = true;
+        FailGroup(TEXT("MeshIndices"), TEXT("No valid runtime mesh index remains"));
         ResetLoadState();
         return;
     }
@@ -1337,8 +1292,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
             TEXT("Runtime mesh collision build rejected because no active game-world outer is available. Mesh=%s Node=%s"),
             *MeshName.ToString(),
             *CurrentLoadingNode.ToString());
-        NodeMap.Empty();
-        bGroupFailed = true;
+        FailGroup(TEXT("CollisionWorld"), TEXT("No active game-world outer for collision build"));
         ResetLoadState();
         return;
     }
@@ -1370,8 +1324,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     if (bRequestedCollision && (!IsValid(GeneratedMeshWorldContext)
         || !GeneratedMeshWorldContext->PinWorldForBuild()))
     {
-        NodeMap.Empty();
-        bGroupFailed = true;
+        FailGroup(TEXT("WorldPin"), TEXT("Collision world pin was rejected or cancelled"));
         ResetLoadState();
         return;
     }
@@ -1409,8 +1362,7 @@ void UWorldSceneStreamAction::AddTransform(const FName &Name)
         if (NodeInfo->Transform.ContainsNaN() || NodeInfo->MeshName.IsNone()
             || !MeshActor->AddNodeInstance(Name, NodeInfo->Transform))
         {
-            NodeMap.Empty();
-            bGroupFailed = true;
+            FailGroup(TEXT("AddInstance"), TEXT("Instance transform, mesh, or node placement was rejected"), Name, NodeInfo->MeshName);
             ResetLoadState();
             return;
         }
@@ -1538,6 +1490,22 @@ void UWorldSceneStreamAction::DestroyStreamComponents(const FName &NodeName)
     }
 }
 
+void UWorldSceneStreamAction::FailGroup(const TCHAR* Stage, const FString& Reason, const FName Node, const FName Mesh)
+{
+    check(IsInGameThread());
+    if (!bGroupFailed)
+    {
+        FailureStage = Stage;
+        FailureReason = Reason.Left(2048);
+        FailedNode = Node.IsNone() ? CurrentLoadingNode : Node;
+        FailedMesh = Mesh.IsNone() ? CurrentLoadingMesh : Mesh;
+    }
+    bGroupFailed = true;
+    NodeMap.Empty();
+    // An unload failure may happen while a mesh load is outstanding. Its native callback still
+    // owns the action/world pins; FailGroup must not reset bStaticMeshLoadInFlight here.
+}
+
 void UWorldSceneStreamAction::ResetLoadState()
 {
     if (!EnsureStreamActionGameThread(TEXT("UWorldSceneStreamAction::ResetLoadState")))
@@ -1621,6 +1589,110 @@ bool FV3DSceneActionLifetimeTest::RunTest(const FString&)
     TestTrue(TEXT("A cancelled action cannot be revived"), InFlight->bAbortRequested);
     InFlight->SetStaticMesh(nullptr);
     TestFalse(TEXT("Terminal callback releases the cancelled action"), InFlight->IsRooted());
+
+    const auto Values = UWorld::InitializationValues().AllowAudioPlayback(false)
+        .CreatePhysicsScene(false).CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Water lifetime world"), World)) return false;
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    AStaticActor* Scene = World->SpawnActor<AStaticActor>();
+    AWaterActor* Water = World->SpawnActor<AWaterActor>();
+    if (!TestNotNull(TEXT("Scene"), Scene) || !TestNotNull(TEXT("Water"), Water)) return false;
+    TStrongObjectPtr<UWorldSceneStreamAction> WaterAction(NewObject<UWorldSceneStreamAction>());
+    WaterAction->OwnerActor = Scene;
+    WaterAction->bWaterGroup = true;
+    WaterAction->TotalOperationCount = 1;
+    WaterAction->WaterNodeMap.Add(TEXT("Water"), FWaterStreamNodeData());
+    WaterAction->LoadedWaterNodes.Add(TEXT("Water"));
+    WaterAction->WaterActorMap.Add(TEXT("Water"), Water);
+    Scene->ActiveStreamActions.Add(NAME_None, WaterAction.Get());
+    WaterAction->CancelAndRelease();
+    TestTrue(TEXT("Retry preserves partial water residency"),
+        Scene->GetLoadedWaterNodesRef().Contains(TEXT("Water"))
+        && Scene->GetWaterActorMapRef().FindRef(TEXT("Water")).Get() == Water);
+    Scene->ReleaseRuntimeResourcesForWorldExit();
+    TestTrue(TEXT("World exit destroys water retained by a cancelled pass"), Water->IsActorBeingDestroyed());
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DSceneCellAdmissionTest,
+    "V3DSimulator.Streaming.Regression.CellAdmission",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DSceneCellAdmissionTest::RunTest(const FString&)
+{
+    FWorldSceneStreamPlan Plan;
+    FModelMeshData Mesh;
+    Mesh.LOD0 = 0;
+    Mesh.Size = FVector(100.0);
+    Mesh.Extent = Mesh.Size * 0.5;
+    Plan.MeshMap.Add(TEXT("Mesh"), Mesh);
+    FModelNodeData Anchor;
+    Anchor.MeshName = TEXT("Mesh");
+    Anchor.Transform.SetLocation(FVector(100, 100, 100));
+    Anchor.bAlwaysLoaded = true;
+    Plan.NodeMap.Add(TEXT("Anchor"), Anchor);
+    FModelNodeData Peer = Anchor;
+    Peer.bAlwaysLoaded = false;
+    Peer.Transform.SetLocation(FVector(1000, 100, 100));
+    Plan.NodeMap.Add(TEXT("Peer"), Peer);
+    TArray<FVector> Observers;
+    Observers.Add(FVector(300000, 100, 100));
+    BuildNativeStreamPlan(Plan, TSet<FName>(), FTransform::Identity, Observers,
+        19.0f, 819200.0, 1.1f, true, nullptr);
+    TestTrue(TEXT("Worker admits the ordinary peer of a selected cell"),
+        Plan.PendingLoadNodes.Contains(TEXT("Peer")));
+    const FBox PeerCell = V3DHISMChunkPolicy::CellBounds(V3DHISMChunkPolicy::Key(Peer.Transform.GetLocation()));
+    TestFalse(TEXT("Fixture would fail the old per-node callback radius check"),
+        V3DHISMChunkPolicy::InRange(PeerCell, Observers, V3DHISMChunkPolicy::ChunkSizeCm * 1.1));
+
+    const auto Values = UWorld::InitializationValues().AllowAudioPlayback(false)
+        .CreatePhysicsScene(false).CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Cell admission world"), World)) return false;
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    AStaticActor* Scene = World->SpawnActor<AStaticActor>();
+    if (!TestNotNull(TEXT("Cell admission owner"), Scene)) return false;
+    TStrongObjectPtr<UWorldSceneStreamAction> Action(NewObject<UWorldSceneStreamAction>());
+    Action->OwnerActor = Scene;
+    Action->NodeMap = Plan.NodeMap;
+    Action->MeshMap = Plan.MeshMap;
+    Action->CurrentRenderObservers = Observers;
+    Action->CurrentRenderOwnerTransform = FTransform::Identity;
+    Action->CurrentMaxRenderDistanceCm = 819200.0;
+    TestTrue(TEXT("Callback preserves the worker's whole-cell admission"),
+        Action->IsNodeWithinCurrentRenderRange(TEXT("Peer")));
+    Action->CurrentMaxRenderDistanceCm = 10000.0;
+    TestFalse(TEXT("Reduced hard cap still rejects a stale asynchronous result"),
+        Action->IsNodeWithinCurrentRenderRange(TEXT("Peer")));
+    Action->CurrentRenderObservers.Add(Peer.Transform.GetLocation());
+    TestTrue(TEXT("Any current observer can keep the node visible"),
+        Action->IsNodeWithinCurrentRenderRange(TEXT("Peer")));
+    Action->CurrentRenderObservers = Observers;
+    Action->CurrentRenderOwnerTransform.SetLocation(Observers[0]);
+    TestTrue(TEXT("Callback applies the current scene transform"),
+        Action->IsNodeWithinCurrentRenderRange(TEXT("Peer")));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DSceneFailureDiagnosticTest,
+    "V3DSimulator.Streaming.Regression.FailureDiagnosticLifetime",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DSceneFailureDiagnosticTest::RunTest(const FString&)
+{
+    TStrongObjectPtr<UWorldSceneStreamAction> Action(NewObject<UWorldSceneStreamAction>());
+    Action->CurrentLoadingNode = TEXT("Tree_01");
+    Action->CurrentLoadingMesh = TEXT("Tree");
+    Action->NodeMap.Add(Action->CurrentLoadingNode, FModelNodeData());
+    Action->bStaticMeshLoadInFlight = true;
+    Action->FailGroup(TEXT("RemoveInstance"), TEXT("injected removal failure"), TEXT("Tree_02"), TEXT("Tree"));
+    TestTrue(TEXT("Failure does not release an outstanding native callback"), Action->bStaticMeshLoadInFlight);
+    TestTrue(TEXT("Failed plan releases temporary placements"), Action->NodeMap.IsEmpty());
+    Action->FailGroup(TEXT("MeshLoad"), TEXT("later error"));
+    TestEqual(TEXT("The first failure is retained"), Action->FailureStage, FString(TEXT("RemoveInstance")));
+    TestEqual(TEXT("The failing node survives per-node reset"), Action->FailedNode, FName(TEXT("Tree_02")));
+    Action->ResetLoadState();
+    TestTrue(TEXT("Load state is released"), Action->CurrentLoadingNode.IsNone());
+    TestEqual(TEXT("Error details survive until completion"), Action->FailureReason, FString(TEXT("injected removal failure")));
     return true;
 }
 #endif

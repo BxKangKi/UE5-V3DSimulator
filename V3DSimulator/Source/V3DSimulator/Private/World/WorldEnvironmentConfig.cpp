@@ -21,13 +21,25 @@ bool FV3DEnvironmentConfig::Parse(const TSharedPtr<FJsonObject>& Root, FV3DEnvir
         if (!J->HasField(Key)) return true;
         if (!J->TryGetStringField(Key, V)) return false;
         FGuid Id;
-        return V.IsEmpty() || V == TEXT("none") || FGWorldArchive::ParseSoundReference(V, Id);
+        return V.IsEmpty() || V == TEXT("none") || (V.StartsWith(TEXT("event://")) && V.Len() > 8 && V.Len() <= 136) || FGWorldArchive::ParseSoundReference(V, Id);
     };
     const TSharedPtr<FJsonObject>* A = nullptr;
     if (Root->HasField(TEXT("Audio")))
     {
         if (!Root->TryGetObjectField(TEXT("Audio"), A)) return Fail(TEXT("Audio"));
         auto& S = Out.Audio;
+        for (const auto& Field : {TPair<const TCHAR*, TOptional<bool>*>(TEXT("DefaultFootstepLoop"), &S.DefaultFootstepLoop),
+             TPair<const TCHAR*, TOptional<bool>*>(TEXT("WaterLoop"), &S.WaterLoop),
+             TPair<const TCHAR*, TOptional<bool>*>(TEXT("UnderwaterLoop"), &S.UnderwaterLoop),
+             TPair<const TCHAR*, TOptional<bool>*>(TEXT("EnvironmentMusicLoop"), &S.EnvironmentMusicLoop)})
+        {
+            bool Value = false;
+            if ((*A)->HasField(Field.Key))
+            {
+                if (!(*A)->TryGetBoolField(Field.Key, Value)) return Fail(TEXT("Audio Loop must be a boolean"));
+                *Field.Value = Value;
+            }
+        }
         for (auto Pair : {TPair<const TCHAR*, bool*>(TEXT("bGlobalAcoustics"), &S.bGlobalAcoustics),
                          TPair<const TCHAR*, bool*>(TEXT("bEnvironmentMusic"), &S.bEnvironmentMusic)})
             if ((*A)->HasField(Pair.Key) && !(*A)->TryGetBoolField(Pair.Key, *Pair.Value)) return Fail(Pair.Key);
@@ -70,6 +82,12 @@ bool FV3DEnvironmentConfig::Parse(const TSharedPtr<FJsonObject>& Root, FV3DEnvir
         else if (Shape != TEXT("Box") || !Vector(J, TEXT("Min"), B.Min) || !Vector(J, TEXT("Max"), B.Max)
             || B.Min.X >= B.Max.X || B.Min.Y >= B.Max.Y || B.Min.Z >= B.Max.Z) return Fail(TEXT("Biome box"));
         double Priority = 0;
+        if (J->HasField(TEXT("MusicLoop")))
+        {
+            bool bMusicLoop = false;
+            if (!J->TryGetBoolField(TEXT("MusicLoop"), bMusicLoop)) return Fail(TEXT("Biome MusicLoop must be a boolean"));
+            B.MusicLoop = bMusicLoop;
+        }
         if (!Number(J, TEXT("Priority"), Priority, -100000, 100000) || !Reference(J, TEXT("Music"), B.Music)) return Fail(TEXT("Biome priority/music"));
         B.Priority = int32(Priority);
         if ((J->HasField(TEXT("EnterCommand")) && !J->TryGetStringField(TEXT("EnterCommand"), Enter))

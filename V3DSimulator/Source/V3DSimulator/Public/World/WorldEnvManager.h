@@ -139,7 +139,7 @@ private:
 
     /** Strong refs for asynchronously resolved global shader assets. */
     UPROPERTY(Transient)
-    TObjectPtr<UMaterialInterface> GlobalPostProcessMaterial;
+    TObjectPtr<UMaterialInstanceDynamic> OceanPostProcessMaterial;
 
     UPROPERTY(Transient)
     TObjectPtr<UMaterialParameterCollection> ShaderLibraryMPC;

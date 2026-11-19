@@ -52,6 +52,10 @@ FString USimulationCommandObject::ToJson() const
             break;
         case EV3DCommandAction::Speed:
             Object->SetStringField(TEXT("Type"), TEXT("speed")); Object->SetNumberField(TEXT("Value"), Action.Value); break;
+        case EV3DCommandAction::SoundEvent:
+            Object->SetStringField(TEXT("Type"), TEXT("sound_event")); Object->SetStringField(TEXT("Event"), Action.Event.ToString());
+            if (Action.bStop) Object->SetBoolField(TEXT("Stop"), true);
+            break;
         case EV3DCommandAction::TimeScale:
             Object->SetStringField(TEXT("Type"), TEXT("time_scale")); Object->SetNumberField(TEXT("Value"), Action.Value); break;
         }

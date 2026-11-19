@@ -282,6 +282,10 @@ void UWorldSceneStreamingSubsystem::StartWorldStreaming(
         return A.RuntimeReference < B.RuntimeReference;
     });
 
+    SceneRecordIndices.Reserve(SceneRecords.Num());
+    for (int32 Index = 0; Index < SceneRecords.Num(); ++Index)
+        SceneRecordIndices.Add(SceneRecords[Index].RuntimeReference, Index);
+
     // The first pass uses only compact directory summaries. EnsureSceneActor causes exact metadata
     // and decoded .dat member reads solely for a scene whose bounds intersects the player's radius.
     UpdateStreaming();
@@ -343,6 +347,8 @@ void UWorldSceneStreamingSubsystem::StopWorldStreaming()
     SceneRecords.Empty();
     SceneEvaluation.Reset();
     SceneLoadOrder.Empty();
+    SceneRecordIndices.Empty();
+    SceneLoadCursor = 0;
     SceneUnloadRange.Empty();
     CharacterRecords.Empty();
     FailedCharacterReferences.Empty();
@@ -703,24 +709,26 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     if (SceneEvaluation.NeedsEvaluation(View))
     {
         BuildSceneSelectionPlan(SceneRecords, View, SceneLoadOrder, SceneUnloadRange);
+        SceneLoadCursor = 0;
         SceneEvaluation.Capture(MoveTemp(View));
     }
 
     TArray<FString> PendingUnloads;
-    for (int32 Index = 0; Index < SceneRecords.Num(); ++Index)
+    for (auto It = ActiveSceneActors.CreateIterator(); It; ++It)
     {
-        const FWorldSceneStreamRecord& Record = SceneRecords[Index];
-        const TObjectPtr<AStaticActor>* Existing = ActiveSceneActors.Find(Record.RuntimeReference);
-        if (!Existing) continue;
-        if (!IsValid(Existing->Get()))
+        if (!IsValid(It.Value()))
         {
-            ActiveSceneActors.Remove(Record.RuntimeReference);
+            It.RemoveCurrent();
+            SceneLoadCursor = 0; // An externally destroyed scene must be recreated even at rest.
             continue;
         }
-        const UGravityFieldComponent* Field = Existing->Get()->GravityField.Get();
+        const int32* Index = SceneRecordIndices.Find(It.Key());
+        if (!Index) { PendingUnloads.Add(It.Key()); continue; }
+        const FWorldSceneStreamRecord& Record = SceneRecords[*Index];
+        const UGravityFieldComponent* Field = It.Value()->GravityField.Get();
         const bool bActiveField = IsValid(Field) && Field->GetSettingsRef().bEnabled;
-        if (!Record.bHasGravityField && !bActiveField && !SceneUnloadRange[Index])
-            PendingUnloads.Add(Record.RuntimeReference);
+        if (!Record.bHasGravityField && !bActiveField && !SceneUnloadRange[*Index])
+            PendingUnloads.Add(It.Key());
     }
     for (const FString& RuntimeReference : PendingUnloads)
     {
@@ -735,9 +743,9 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     int32 Spawned = 0;
     const double SliceStart = FPlatformTime::Seconds();
     const double SliceBudget = FV3DStreamingBudget::RemainingSceneSeconds();
-    for (int32 PlanIndex = 0; PlanIndex < SceneLoadOrder.Num(); ++PlanIndex)
+    for (; SceneLoadCursor < SceneLoadOrder.Num(); ++SceneLoadCursor)
     {
-        const FWorldSceneStreamRecord& Candidate = SceneRecords[SceneLoadOrder[PlanIndex]];
+        const FWorldSceneStreamRecord& Candidate = SceneRecords[SceneLoadOrder[SceneLoadCursor]];
         const TObjectPtr<AStaticActor>* Existing = ActiveSceneActors.Find(Candidate.RuntimeReference);
         if (Existing && IsValid(Existing->Get())) continue;
         // Ensure at least one request progresses even when other scenes used this frame's slice.
@@ -747,9 +755,10 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
             break;
         }
         const FWorldSceneStreamRecord Record = Candidate;
-        if (!EnsureSceneActor(Record)) bAllScenesStarted = false;
+        const bool bSpawned = EnsureSceneActor(Record) != nullptr;
         ++Spawned;
         if (!bActive || StreamingGeneration != Session) return;
+        if (!bSpawned) { bAllScenesStarted = false; break; }
     }
     FV3DStreamingBudget::ChargeSceneSeconds(FPlatformTime::Seconds() - SliceStart);
     bInitialScenePassComplete = bAllScenesStarted;

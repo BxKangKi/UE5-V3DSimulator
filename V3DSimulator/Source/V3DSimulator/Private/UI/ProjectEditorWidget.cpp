@@ -1,7 +1,9 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "UI/ProjectEditorWidget.h"
+#include "Widgets/SOverlay.h"
+#include "InputCoreTypes.h"
 #include "UI/BuildStatusWidget.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "Styling/CoreStyle.h"
 #include "Brushes/SlateColorBrush.h"
 #include "Widgets/Layout/SWrapBox.h"
@@ -49,15 +51,15 @@ namespace V3DEditorUI
 UProjectEditorWidget::UProjectEditorWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
-    FontObject = V3DHUDLegacyStyle::FindFontForConstructor();
+    FontObject = V3DHUDStyle::FindFontForConstructor();
     EditorTextStyle = FCoreStyle::Get().GetWidgetStyle<FTextBlockStyle>("NormalText");
-    V3DHUDLegacyStyle::ApplyFont(EditorTextStyle.Font, FontObject, 16, 1);
+    V3DHUDStyle::ApplyFont(EditorTextStyle.Font, FontObject, 16, 1);
     EditorTextStyle.ColorAndOpacity = FSlateColor(FLinearColor::White);
     TitleFont = EditorTextStyle.Font;
-    V3DHUDLegacyStyle::ApplyFont(TitleFont, FontObject, 36, 2);
+    V3DHUDStyle::ApplyFont(TitleFont, FontObject, 36, 2);
 
     EditorButtonStyle = FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button");
-    const FLinearColor Base = V3DHUDLegacyStyle::ButtonBackground;
+    const FLinearColor Base = V3DHUDStyle::ButtonBackground;
     EditorButtonStyle.Normal = FSlateColorBrush(Base);
     EditorButtonStyle.Hovered = FSlateColorBrush(Base * FLinearColor(.8f,.8f,.8f,1));
     EditorButtonStyle.Pressed = FSlateColorBrush(Base * FLinearColor(.5f,.5f,.5f,1));
@@ -97,7 +99,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
     using namespace V3DEditorUI;
     SetIsFocusable(true);
     auto Toolbar = SNew(SWrapBox).UseAllottedSize(true).InnerSlotPadding(FVector2D(8, 8));
-    Toolbar->AddSlot()[MakeEditorButton(TEXT("Save all"), [this] { SaveAll(false); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Save"), [this] { SaveAll(false); })];
     Toolbar->AddSlot()[MakeEditorButton(TEXT("Save + Build"), [this] { SaveAll(true); })];
     Toolbar->AddSlot()[MakeEditorButton(TEXT("Undo"), [this]
     {
@@ -127,7 +129,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
                 Self->bBusy = false;
                 if (Read)
                 {
-                    Doc->DiskText = TextOnDisk; Doc->Json = Loaded.JsonObject; Doc->bDirty = false;
+                    Doc->DiskText = TextOnDisk; Doc->Json = Loaded.JsonObject; Doc->bDirty = Doc->bNewFile = false;
                     Self->InvalidatePreview(); Self->bRawDirty = false; Self->RefreshForm();
                     Self->Message = Loaded.IsSuccess()
                         ? TEXT("Reloaded from disk. Undo can restore the previous in-memory version.") : Loaded.Error;
@@ -137,8 +139,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         });
         if (!Queued) { bBusy = false; Message = TEXT("Reload queue unavailable."); }
     })];
-    Toolbar->AddSlot()[MakeEditorButton(TEXT("Save + Back"), [this] { SaveAll(false, true); })];
-    Toolbar->AddSlot()[MakeEditorButton(TEXT("Discard + Back"), [this] { Close(); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Back"), [this] { RequestBack(); })];
 
     auto Left = SNew(SVerticalBox);
     Left->AddSlot().AutoHeight().Padding(0,0,0,12)[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(TEXT("Resources / Scripts")))];
@@ -160,7 +161,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
     auto Right = SNew(SVerticalBox);
     Right->AddSlot().AutoHeight().Padding(0,0,0,8)[MakeEditorButton(TEXT("Preview model (read only)"), [this] { StartPreview(); })];
     Right->AddSlot().AutoHeight()[SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
-        .BorderBackgroundColor(V3DHUDLegacyStyle::LoadingBackground).Padding(8)
+        .BorderBackgroundColor(V3DHUDStyle::LoadingBackground).Padding(8)
         [SNew(SBox).HeightOverride(240)[SAssignNew(Preview, SV3DModelPreview)]]];
     Right->AddSlot().AutoHeight().Padding(0,8)[SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text(Text(TEXT("JSON / advanced edit · Apply JSON to update fields")))];
     Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).Style(&EditorInputStyle).Font(EditorTextStyle.Font).AutoWrapText(false)
@@ -171,7 +172,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         + SSplitter::Slot().Value(.45f)[SNew(SScrollBox) + SScrollBox::Slot()[SAssignNew(Form, SVerticalBox)]]
         + SSplitter::Slot().Value(.35f)[Right];
     auto Root = SNew(SBorder).Padding(32).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
-        .BorderBackgroundColor(V3DHUDLegacyStyle::MenuBackground)
+        .BorderBackgroundColor(V3DHUDStyle::MenuBackground)
         [SNew(SVerticalBox)
             + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,20)
                 [SNew(STextBlock).TextStyle(&EditorTextStyle).Font(TitleFont).AutoWrapText(true)
@@ -179,13 +180,28 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
             + SVerticalBox::Slot().AutoHeight()[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy && !bFormRefreshPending; })[Toolbar]]
             + SVerticalBox::Slot().AutoHeight().Padding(0,12)
                 [SNew(SBorder).Padding(12).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
-                    .BorderBackgroundColor(V3DHUDLegacyStyle::ButtonBackground)
+                    .BorderBackgroundColor(V3DHUDStyle::ButtonBackground)
                     [SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text_Lambda([this] { return Text(Message); })]]
             + SVerticalBox::Slot().FillHeight(1)[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy && !bFormRefreshPending; })[Body]]];
     RefreshFiles();
     RefreshForm();
     if (List && Current) List->SetSelection(Current, ESelectInfo::Direct);
-    return Root;
+    auto Choices = SNew(SHorizontalBox);
+    Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Save"), [this] { bConfirmBack = false; SaveAll(false, true); })];
+    Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Discard"), [this] { bConfirmBack = false; Close(); })];
+    Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Cancel"), [this] { bConfirmBack = false; })];
+    return SNew(SOverlay)
+        + SOverlay::Slot()[SNew(SBox).IsEnabled_Lambda([this] { return !bConfirmBack; })[Root]]
+        + SOverlay::Slot()[SNew(SBorder)
+            .Visibility_Lambda([this] { return bConfirmBack ? EVisibility::Visible : EVisibility::Collapsed; })
+            .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+            .BorderBackgroundColor(FLinearColor(0,0,0,.85f)).HAlign(HAlign_Center).VAlign(VAlign_Center)
+            [SNew(SBorder).Padding(28).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+                .BorderBackgroundColor(V3DHUDStyle::MenuBackground)
+                [SNew(SVerticalBox)
+                    + SVerticalBox::Slot().AutoHeight().Padding(0,0,0,16)
+                        [SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(TEXT("Unsaved changes. Save before leaving?")))]
+                    + SVerticalBox::Slot().AutoHeight()[Choices]]]];
 }
 
 void UProjectEditorWidget::OpenProject(const FString& ProjectName)
@@ -389,11 +405,17 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                 .OnCheckStateChanged_Lambda([this, Object, Key](ECheckBoxState State)
                 { if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) return; Remember(); Object->SetBoolField(Key, State == ECheckBoxState::Checked); Changed(); })];
         }
-        else if (Key == TEXT("AssetType") || Key == TEXT("ModelType") || Key == TEXT("EntityType") || Key == TEXT("ItemType") || Key == TEXT("ProjectType"))
+        else if (Key == TEXT("Shader") || Key == TEXT("MaterialMode") || Key == TEXT("AssetType") || Key == TEXT("ModelType") || Key == TEXT("EntityType") || Key == TEXT("ItemType") || Key == TEXT("ProjectType"))
         {
             auto Options = MakeShared<TArray<TSharedPtr<FString>>>();
+            FString DisplayValue=ValueText(Value);
+            if (Key==TEXT("MaterialMode"))
+            {
+            }
             TArray<FString> Names;
-            if (Key == TEXT("AssetType")) Names = {TEXT("Model"),TEXT("Sound")};
+            if (Key == TEXT("Shader")) Names = {TEXT("Default"), TEXT("Toon")};
+            else if (Key == TEXT("MaterialMode")) Names = {TEXT("Auto"), TEXT("Opaque"), TEXT("Masked"), TEXT("Translucent")};
+            else if (Key == TEXT("AssetType")) Names = {TEXT("Model"),TEXT("Sound")};
             if (Key == TEXT("ModelType")) Names = {TEXT("Static"),TEXT("Dynamic"),TEXT("Character")};
             if (Key == TEXT("EntityType")) Names = {TEXT("Prop"),TEXT("Vehicle"),TEXT("Animal")};
             if (Key == TEXT("ItemType")) Names = {TEXT("Misc"),TEXT("Weapon"),TEXT("Tool")};
@@ -413,7 +435,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                     if (Key == TEXT("ItemType")) Object->RemoveField(TEXT("EntityType"));
                     if (Key == TEXT("ModelType") && *Item == TEXT("Character")) Object->RemoveField(TEXT("GravityField"));
                     Changed();
-                })[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(ValueText(Value)))]];
+                })[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(DisplayValue))]];
         }
         else
         {
@@ -473,7 +495,7 @@ void UProjectEditorWidget::SaveAll(bool bBuild, bool bClose)
     {
         FV3DEditorDocument Copy;
         Copy.Path = Doc->Path; Copy.SourcePath = Doc->SourcePath; Copy.Label = Doc->Label;
-        Copy.DiskText = Doc->DiskText; Copy.bDirty = true;
+        Copy.DiskText = Doc->DiskText; Copy.bDirty = true; Copy.bNewFile = Doc->bNewFile;
         Copy.Json = V3DProjectEditor::CloneObject(Doc->Json);
         Copies.Add(MoveTemp(Copy));
     }
@@ -493,7 +515,7 @@ void UProjectEditorWidget::SaveAll(bool bBuild, bool bClose)
             for (const auto& Saved : Copies) if (!Saved.bDirty) SavedByPath.Add(Saved.Path, &Saved);
             for (auto& Doc : Self->Documents)
                 if (const auto* Saved = SavedByPath.Find(Doc->Path))
-                { Doc->DiskText = (*Saved)->DiskText; Doc->bDirty = false; }
+                { Doc->DiskText = (*Saved)->DiskText; Doc->bDirty = Doc->bNewFile = false; }
             Self->Message = Success ? TEXT("Saved. Existing built worlds are replaced only when Build succeeds.") : Error;
             if (Success && bBuild) Self->StartBuild();
             else if (Success && bClose) Self->Close();
@@ -518,6 +540,27 @@ void UProjectEditorWidget::BuildConfirmed()
 {
     if (BuildStatus) { BuildStatus->StopObservingBuild(); BuildStatus->RemoveFromParent(); BuildStatus = nullptr; }
     SetVisibility(ESlateVisibility::Visible);
+}
+bool UProjectEditorWidget::HasUnsavedChanges() const
+{
+    if (bRawDirty) return true;
+    for (const auto& Document : Documents) if (Document && Document->bDirty) return true;
+    return false;
+}
+void UProjectEditorWidget::RequestBack()
+{
+    if (bBusy || BuildStatus) return;
+    if (HasUnsavedChanges()) bConfirmBack = true;
+    else Close();
+}
+FReply UProjectEditorWidget::NativeOnKeyDown(const FGeometry& Geometry, const FKeyEvent& Event)
+{
+    if (Event.GetKey() == EKeys::Escape)
+    {
+        if (bConfirmBack) bConfirmBack = false; else RequestBack();
+        return FReply::Handled();
+    }
+    return Super::NativeOnKeyDown(Geometry, Event);
 }
 void UProjectEditorWidget::Close()
 {
@@ -554,7 +597,6 @@ void UProjectEditorWidget::StartPreview()
     PreviewBuilder = NewObject<UProjectSourceModelBuilder>(this);
     if (auto* R = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this); R && Definition.ModelType == EModelDefinitionType::Character)
     {
-        PreviewBuilder->SetCharacterMaterialOverride(R->DefaultCharacterMaterial.LoadSynchronous());
         PreviewBuilder->SetCharacterSkeletonOverride(R->DefaultCharacterSkeleton.LoadSynchronous());
     }
     PreviewDocument = Current->Path;

@@ -9,6 +9,11 @@
  */
 
 #include "Character/CharacterLoadAsyncAction.h"
+#include "Model/V3DModelAnimation.h"
+#include "Animation/AnimSequence.h"
+#include "Model/V3DMaterialOverrideUtils.h"
+#include "System/GameManagerSubSystem.h"
+#include "Model/MaterialDefaultAsset.h"
 
 #include "Animation/Skeleton.h"
 #include "Character/CharacterController.h"
@@ -117,6 +122,10 @@ void UCharacterLoadAsyncAction::Activate()
     bMeshLoadInFlight = false;
     DetectedMeshIndex = INDEX_NONE;
     DetectedSkinIndex = INDEX_NONE;
+    PendingModelAnimations.Reset();
+    ModelAnimationIds.Reset();
+    PendingModelAnimation = {};
+    NextModelAnimation = 0;
     ClearGameThreadStageTimer();
     CurrentLoadedAsset = nullptr;
     CurrentRuntimeSkeleton = nullptr;
@@ -160,7 +169,7 @@ void UCharacterLoadAsyncAction::ResolveAndLoadModel()
     // UBlueprintAsyncActionBase registration keeps the action alive but does not make the
     // action itself a reliable runtime-world context. WorldSceneStreaming starts character
     // loading only after the verified model database is open, so the owner pawn is the
-    // authoritative UWorld/UGameInstance source for the gworld:// lookup.
+    // authoritative UWorld/UGameInstance source for the v3d:// lookup.
     const ACharacterController* ResolveContext = OwnerCharacter.Get();
     if (!FRuntimeModelResolver::ResolveDirectory(ResolveContext, FilePath, Model, ResolveError))
     {
@@ -386,10 +395,9 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     }
 
     USkeleton* DefaultSkeleton = Owner->DefaultSkeleton.Get();
-    UMaterialInterface* Material = Owner->DefaultMaterial.Get();
-    if (!IsValid(DefaultSkeleton) || !IsValid(Material))
+    if (!IsValid(DefaultSkeleton))
     {
-        FailLoad(TEXT("Character default skeleton or material is not assigned"));
+        FailLoad(TEXT("Character default skeleton is not assigned"));
         return;
     }
     FString SkeletonError;
@@ -405,7 +413,8 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     // may be destroyed during travel, so keep the source skeleton/material GC-safe on this action
     // until the native terminal callback has acknowledged completion or cancellation.
     SourceSkeletonReferenceGuard = DefaultSkeleton;
-    SourceMaterialReferenceGuard = Material;
+    if (auto* Manager = UGameManagerSubSystem::GetSubSystem(Owner))
+        SourceMaterialReferenceGuard = Manager->AcquireMaterialDefaultReferenceGuard();
 
     // Creating/duplicating UObjects must remain on the game thread. Archive range I/O, decode and
     // RuntimeLOD conversion run on workers; glTFRuntime also builds the native mesh asynchronously.
@@ -443,15 +452,8 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     Config.SkeletonConfig.bAddRootNodeIfMissing = false;
     Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
 
-    TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialMap;
-    MaterialMap.Add(EglTFRuntimeMaterialType::Opaque, Material);
-    MaterialMap.Add(EglTFRuntimeMaterialType::Translucent, Material);
-    MaterialMap.Add(EglTFRuntimeMaterialType::TwoSided, Material);
-    MaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Material);
-    MaterialMap.Add(EglTFRuntimeMaterialType::Masked, Material);
-    MaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, Material);
-    Config.MaterialsConfig.UberMaterialsOverrideMap = MaterialMap;
-    Config.MaterialsConfig.UnlitOverrideMap = MaterialMap;
+    if (SourceMaterialReferenceGuard)
+        V3DMaterialOverrideUtils::ApplyOverrides(SourceMaterialReferenceGuard->References, Config.MaterialsConfig, 1);
     Config.MaterialsConfig.bGeneratesMipMaps = false;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
 
@@ -721,7 +723,69 @@ void UCharacterLoadAsyncAction::FinalizeRuntimePhysics_GameThread()
     }
 
     OnProgress.Broadcast(0.96f);
-    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::CommitRuntimeMesh_GameThread);
+    CurrentLoadedAsset->GetAnimationIds(ModelAnimationIds);
+    NextModelAnimation=0;
+    PendingModelAnimations.Reset();
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::LoadModelAnimations_GameThread);
+}
+
+void UCharacterLoadAsyncAction::LoadModelAnimations_GameThread()
+{
+    check(IsInGameThread());
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished) { FinishAndRelease();return; }
+    if (!IsValid(CurrentLoadedAsset) || !IsValid(PendingSkeletalMesh) || !OwnerCharacter.IsValid())
+    { FailLoad(TEXT("Character was released before animation creation"));return; }
+    if (NextModelAnimation>=ModelAnimationIds.Num())
+    { ScheduleGameThreadStage(&UCharacterLoadAsyncAction::CommitRuntimeMesh_GameThread);return; }
+    FString Error;
+    const int32 Id=ModelAnimationIds[NextModelAnimation];
+    if (PendingModelAnimation.animation_id!=Id)
+    {
+        TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader;
+        FGWorldArchiveRange Range;
+        if (!CurrentLoadedAsset->PrepareAnimationRead(Id,Reader,Range))
+        { FailLoad(TEXT("Animation range was released"));return; }
+        const auto Cancellation=MakeShared<TAtomic<bool>, ESPMode::ThreadSafe>(false);
+        TableReadCancellation=Cancellation;bTableReadInFlight=true;
+        TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+        const bool Queued=FSafeFileIO::RunTrackedWorker([WeakThis,Reader,Range,Id,Cancellation]() mutable
+        {
+            v3d::animation Clip;FString ReadError;
+            const bool Success=!Cancellation->Load() && !FSafeFileIO::IsShuttingDown()
+                && Reader->ReadAnimationRange(Range,Clip,ReadError) && Clip.animation_id==Id;
+            if (!Success && ReadError.IsEmpty()) ReadError=TEXT("Animation read cancelled or identity mismatch");
+            FSafeFileIO::DispatchTrackedGameThread([WeakThis,Cancellation,Success,
+                Clip=MoveTemp(Clip),ReadError=MoveTemp(ReadError)]() mutable
+            {
+                auto* Self=WeakThis.Get();
+                if (!Self || Self->TableReadCancellation.Get()!=&Cancellation.Get()) return;
+                Self->bTableReadInFlight=false;Self->TableReadCancellation.Reset();
+                if (Self->bCancelled || Self->bFinished || Cancellation->Load()) { Self->FinishAndRelease();return; }
+                if (!Success) { Self->FailLoad(ReadError);return; }
+                Self->PendingModelAnimation=MoveTemp(Clip);
+                Self->ScheduleGameThreadStage(&UCharacterLoadAsyncAction::LoadModelAnimations_GameThread);
+            });
+        });
+        if (!Queued)
+        { bTableReadInFlight=false;TableReadCancellation.Reset();FailLoad(TEXT("Animation read could not be queued")); }
+        return;
+    }
+    if (PendingModelAnimation.skin_index==DetectedSkinIndex)
+    {
+        UAnimSequence* Sequence=nullptr;
+        if (!FV3DRuntimeSafety::ExecuteSynchronousOperation(TEXT("Create baked model animation"),[&]
+            { Sequence=V3DModelAnimation::Create(PendingModelAnimation,PendingSkeletalMesh,Error); }))
+        { ScheduleGameThreadStage(&UCharacterLoadAsyncAction::LoadModelAnimations_GameThread);return; }
+        if (!Sequence) { FailLoad(*Error);return; }
+        const FName Name(UTF8_TO_TCHAR(PendingModelAnimation.name.c_str()));
+        if (PendingModelAnimations.Contains(Name))
+        { FailLoad(*FString::Printf(TEXT("Duplicate model animation name: %s"),*Name.ToString()));return; }
+        PendingModelAnimations.Add(Name,Sequence);
+    }
+    PendingModelAnimation={};
+    ++NextModelAnimation;
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::LoadModelAnimations_GameThread);
 }
 
 void UCharacterLoadAsyncAction::CommitRuntimeMesh_GameThread()
@@ -748,7 +812,7 @@ void UCharacterLoadAsyncAction::CommitRuntimeMesh_GameThread()
         Owner->CommitRuntimeCharacterResources(
             MeshToCommit,
             PhysicsToCommit,
-            SkeletonToCommit);
+            SkeletonToCommit, PendingModelAnimations);
 
     if (bSuccess)
     {
@@ -834,6 +898,10 @@ bool UCharacterLoadAsyncAction::ResolveCharacterSkin(UWorldBakedModelAsset* Asse
 
     DetectedMeshIndex = INDEX_NONE;
     DetectedSkinIndex = INDEX_NONE;
+    PendingModelAnimations.Reset();
+    ModelAnimationIds.Reset();
+    PendingModelAnimation = {};
+    NextModelAnimation = 0;
     if (!IsValid(Asset))
     {
         return false;
@@ -889,6 +957,7 @@ void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
     }
 
     CurrentLoadedAsset = nullptr;
+    PendingModelAnimations.Reset();ModelAnimationIds.Reset();PendingModelAnimation={};NextModelAnimation=0;
 
     ReleaseTransientRuntimeObject(PendingRuntimePhysicsAsset);
     ReleaseTransientRuntimeObject(PendingSkeletalMesh);

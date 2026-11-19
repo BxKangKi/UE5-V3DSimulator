@@ -102,7 +102,7 @@ namespace
         {
             V3DMaterialOverrideUtils::ApplyOverrides(
                 GameManager->GetMaterialDefaultReferences(),
-                MeshConfig.MaterialsConfig);
+                MeshConfig.MaterialsConfig, 1);
         }
         MeshConfig.bAllowCPUAccess = false;
         MeshConfig.bGenerateStaticMeshDescription = false;

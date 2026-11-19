@@ -11,8 +11,9 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "HAL/ThreadSafeCounter.h"
+#include "System/WorldGeneratedStaticMeshContext.h"
 #include "Model/ModelData.h"
+#include "Model/WorldSceneStreamTypes.h"
 #include "glTFRuntimeAsset.h"
 #include "WorldSceneStreamAction.generated.h"
 
@@ -33,39 +34,6 @@ struct FWorldSceneUnavailableRegion
 {
     FName NodeName = NAME_None;
     FBox WorldBounds = FBox(ForceInit);
-};
-
-/**
- * Stable async-build outer for runtime static meshes.
- *
- * glTFRuntime queries StaticMesh->GetWorld() while finalizing complex collision. A weak world
- * reference is retained for completed meshes, while PinWorldForBuild() temporarily holds a strong
- * reference for the exact lifetime of one native collision build. This prevents map teardown or GC
- * from nulling the world halfway through Chaos cooking without making completed meshes retain it.
- */
-UCLASS(Transient)
-class V3DSIMULATOR_API UWorldGeneratedStaticMeshContext : public UObject
-{
-    GENERATED_BODY()
-
-public:
-    void Initialize(UWorld* InWorld);
-    bool PinWorldForBuild();
-    void ReleaseWorldPin();
-    /** Cancels queued/read work; an already-active native collision build keeps its world pin. */
-    void CancelBuild();
-    bool IsBuildCancelled() const;
-    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> GetBuildCancellationToken() const { return BuildCancellation; }
-    virtual UWorld* GetWorld() const override;
-
-private:
-    UPROPERTY(Transient)
-    TObjectPtr<UWorld> PinnedWorld;
-
-    UPROPERTY(Transient)
-    TWeakObjectPtr<UWorld> World;
-
-    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> BuildCancellation;
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
@@ -96,7 +64,6 @@ public:
         AInstancedMeshActor *InMeshActor,
         const FVector &InPlayerLocation,
         const FglTFRuntimeStaticMeshConfig &StaticMeshConfig,
-        float InDistance = 19.0f,
         int32 InChunkSize = 256,
         bool bInRenderOnly = false,
         bool bInWaterGroup = false,
@@ -109,7 +76,6 @@ public:
         AInstancedMeshActor* InMeshActor,
         const TArray<FVector>& InObserverLocations,
         const FglTFRuntimeStaticMeshConfig& StaticMeshConfig,
-        float InDistance = 19.0f,
         int32 InChunkSize = 256,
         bool bInRenderOnly = false,
         bool bInWaterGroup = false,
@@ -119,9 +85,12 @@ public:
     void Activate();
 
     void CancelAndRelease();
+    bool IsFinished() const { return bAbortRequested; }
 
 private:
     friend class FV3DSceneActionLifetimeTest;
+    friend class FV3DSceneCellAdmissionTest;
+    friend class FV3DSceneFailureDiagnosticTest;
 
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
@@ -177,6 +146,10 @@ private:
     FName GroupName = NAME_None;
     bool bWaterGroup = false;
     bool bGroupFailed = false;
+    FString FailureStage;
+    FString FailureReason;
+    FName FailedNode;
+    FName FailedMesh;
     FName CurrentLoadingNode;
     FName CurrentLoadingMesh;
 
@@ -216,6 +189,7 @@ private:
     void ApplyPreparedPlan(FWorldSceneStreamPlan&& Plan, uint32 Serial);
     void AbortAndRelease(UStaticMesh* OrphanedMesh = nullptr);
     void ResetLoadState();
+    void FailGroup(const TCHAR* Stage, const FString& Reason, FName Node = NAME_None, FName Mesh = NAME_None);
     void LoadStaticMeshAsync(const FName &Name);
     void AddTransform(const FName &Name);
     void ProcessUnloadNode(const FName &Name);

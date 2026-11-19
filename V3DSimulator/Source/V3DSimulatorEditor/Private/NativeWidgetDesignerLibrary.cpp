@@ -51,28 +51,6 @@ namespace V3DNativeDesigner
             || Class->IsChildOf(USettingControlWidget::StaticClass()));
     }
 
-    void UpgradeShippedGenericHUD(UWidgetBlueprint* Blueprint)
-    {
-        if (Blueprint->ParentClass != UUserWidget::StaticClass()) return;
-        const FString Path = Blueprint->GetPathName();
-        UClass* NativeParent = nullptr;
-        if (Path == TEXT("/Game/Blueprints/UI/WBP_Debug.WBP_Debug"))
-            NativeParent = UDebugHUDWidget::StaticClass();
-        else if (Path == TEXT("/Game/Blueprints/UI/WBP_Loading.WBP_Loading"))
-            NativeParent = ULoadingHUDWidget::StaticClass();
-        if (!NativeParent) return;
-        // Only the two shipped generic assets need migration. Custom parents and all other
-        // generic UserWidgets retain their own behavior. Both targets inherit the same original
-        // UUserWidget contract, so refresh their graphs and regenerate the class after changing
-        // the parent. Saving remains an explicit normal asset-save operation.
-        TGuardValue<bool> MigrationGuard(bRefreshing, true);
-        Blueprint->Modify();
-        Blueprint->ParentClass = NativeParent;
-        FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
-        FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
-        FKismetEditorUtilities::CompileBlueprint(Blueprint);
-    }
-
     FString DefaultsFingerprint(const UWidgetBlueprint* Blueprint, const UClass* Class)
     {
         const UObject* Defaults = Class->GetDefaultObject();
@@ -138,74 +116,6 @@ namespace V3DNativeDesigner
             EArchiveReplaceObjectFlags::IgnoreOuterRef | EArchiveReplaceObjectFlags::IgnoreArchetypeRef);
     }
 
-    void PreserveReferencedVariables(UWidgetBlueprint* Blueprint, const UWidgetTree* PreviousTree,
-        UWidgetTree* NativeTree)
-    {
-        if (!IsValid(PreviousTree)) return;
-        TArray<UWidget*> PreviousWidgets;
-        PreviousTree->GetAllWidgets(PreviousWidgets);
-        UCanvasPanel* CompatibilityHost = nullptr;
-        for (const UWidget* Previous : PreviousWidgets)
-        {
-            const FName Name = Previous->GetFName();
-            const bool bHasEvents = FKismetEditorUtilities::PropertyHasBoundEvents(Blueprint, Name);
-            if (!bHasEvents && (!Previous->bIsVariable
-                || !FBlueprintEditorUtils::IsVariableUsed(Blueprint, Name, nullptr))) continue;
-            if (UWidget* NativeWidget = NativeTree->FindWidget(Name))
-            {
-                if (NativeWidget->IsA(Previous->GetClass())) NativeWidget->bIsVariable = true;
-                else UE_LOG(LogV3DNativeDesigner, Warning,
-                    TEXT("%s: legacy variable %s conflicts with a native widget type."),
-                    *Blueprint->GetPathName(), *Name.ToString());
-                continue;
-            }
-            UClass* LegacyClass = Previous->GetClass();
-            if (LegacyClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
-                continue;
-            if (!CompatibilityHost)
-            {
-                // HUD roots overlay a viewport background and scaled canvas; reusable widgets
-                // have panel/button content under a ScaleBox.
-                // A collapsed sibling on an existing panel preserves referenced property types
-                // without restoring an obsolete layout or copying its callbacks/child trees.
-                TArray<UWidget*> NativeWidgets;
-                NativeTree->GetAllWidgets(NativeWidgets);
-                UPanelWidget* HostPanel = nullptr;
-                for (UWidget* Widget : NativeWidgets)
-                {
-                    UPanelWidget* Panel = Cast<UPanelWidget>(Widget);
-                    if (Panel && Panel->CanHaveMultipleChildren()) { HostPanel = Panel; break; }
-                }
-                if (!HostPanel)
-                {
-                    // Reusable button trees have only single-child panels. Wrap the ScaleBox's
-                    // original content in an Overlay so its layout remains unchanged.
-                    UScaleBox* Scale = Cast<UScaleBox>(NativeTree->RootWidget);
-                    if (!Scale) continue;
-                    UWidget* Content = Scale->GetContent();
-                    Scale->ClearChildren();
-                    UOverlay* Wrapper = NativeTree->ConstructWidget<UOverlay>(
-                        UOverlay::StaticClass(), TEXT("NativeCompatibilityLayout"));
-                    Scale->SetContent(Wrapper);
-                    Wrapper->AddChildToOverlay(Content);
-                    HostPanel = Wrapper;
-                }
-                CompatibilityHost = NativeTree->ConstructWidget<UCanvasPanel>(
-                    UCanvasPanel::StaticClass(), TEXT("LegacyBindings_Only"));
-                CompatibilityHost->SetVisibility(ESlateVisibility::Collapsed);
-                CompatibilityHost->bIsVariable = false;
-                HostPanel->AddChild(CompatibilityHost);
-            }
-            // Only the referenced class/name contract is needed. Copying an old panel wholesale
-            // would retain all descendants and stale instance event targets unnecessarily.
-            // Unlike ConstructWidget, NewObject does not Initialize a nested UserWidget and
-            // duplicate its old component tree. Only the serialized variable type is retained.
-            UWidget* Placeholder = NewObject<UWidget>(NativeTree, LegacyClass, Name, RF_Transactional);
-            Placeholder->bIsVariable = true;
-            Placeholder->SetVisibility(ESlateVisibility::Collapsed);
-            CompatibilityHost->AddChild(Placeholder);
-        }
-    }
 }
 
 bool UNativeWidgetDesignerLibrary::UsesNativeWidgetLayout(const UWidgetBlueprint* Blueprint)
@@ -220,7 +130,6 @@ bool UNativeWidgetDesignerLibrary::RefreshNativeWidgetHierarchy(UWidgetBlueprint
 {
     using namespace V3DNativeDesigner;
     if (!IsInGameThread() || bRefreshing || !IsValid(Blueprint)) return false;
-    UpgradeShippedGenericHUD(Blueprint);
     if (!UsesNativeWidgetLayout(Blueprint)) return false;
     for (UClass* Parent = Blueprint->ParentClass; Parent; Parent = Parent->GetSuperClass())
     {
@@ -269,9 +178,8 @@ bool UNativeWidgetDesignerLibrary::RefreshNativeWidgetHierarchy(UWidgetBlueprint
     MakeSerializable(NewTree, Preview.Get());
 
     Blueprint->Modify();
-    PreserveReferencedVariables(Blueprint, Blueprint->WidgetTree, NewTree);
     Blueprint->WidgetTree = NewTree;
-    // Bindings to widgets removed with the unused legacy layout have no target to compile.
+    // Bindings to removed controls have no target to compile.
     Blueprint->Bindings.RemoveAll([NewTree](const FDelegateEditorBinding& Binding)
     {
         return NewTree->FindWidget(FName(*Binding.ObjectName)) == nullptr;

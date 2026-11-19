@@ -12,6 +12,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Model/ModelData.h"
+#include "Model/WorldSceneStreamTypes.h"
 #include "InstancedMeshActor.generated.h"
 
 class UInstancedStaticMeshComponent;
@@ -40,7 +41,10 @@ public:
     FName GetGroupName() const { return GroupName; }
     double GetMaxNodeScale() const { return MaxNodeScale; }
     const FBox& GetNodeBounds() const { return NodeBounds; }
-    bool HasAlwaysLoadedNodes() const { return !AlwaysLoadedNodeNames.IsEmpty(); }
+    bool HasAlwaysLoadedNodes() const
+    {
+        return GroupDefinitions.IsValid() && !GroupDefinitions->AlwaysLoadedNodeNames.IsEmpty();
+    }
     const TMap<FName, FModelNodeData>& GetNodeMapRef() const;
     const TArray<FName>& GetReferencedMeshNames() const { return ReferencedMeshNames; }
     /** Copies complete nearby 1024 m chunks and resident nodes for one stream pass. */
@@ -54,7 +58,8 @@ public:
     TSharedPtr<const TSet<FName>, ESPMode::ThreadSafe> CaptureLoadedNodes() const { return LoadedNodes; }
     static void BuildNativeNodeSnapshot(const FInstancedMeshGroupInitData& Definitions,
         const TSet<FName>& Loaded, const FVector& Observer, const FTransform& OwnerTransform,
-        float Radius, TMap<FName, FModelNodeData>& OutNodes);
+        float Radius, TMap<FName, FModelNodeData>& OutNodes,
+        double MaxDistanceCm = 819200.0);
     bool HasLoadedNodes() const { return !LoadedNodes->IsEmpty(); }
     bool IsNodeLoaded(FName NodeName) const { return LoadedNodes->Contains(NodeName); }
     /** Game-thread snapshot used by pure worker-side stream planning. */
@@ -108,7 +113,6 @@ private:
     int32 NextPageId = 0;
     UHierarchicalInstancedStaticMeshComponent* CreateChunkComponent(const FIntVector& Chunk, FName& OutPage);
     void DestroyChunkComponent(FName Page);
-    TArray<FName> AlwaysLoadedNodeNames;
     TArray<FName> ReferencedMeshNames;
     bool bRuntimeResourcesReleased = false;
 };

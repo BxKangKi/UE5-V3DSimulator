@@ -325,7 +325,7 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
     {
         bMaterialDefaultAssetResolved = true;
         UE_LOG(LogTemp, Warning,
-            TEXT("No central AssetRegistry is available; glTFRuntime plugin material defaults will be used."));
+            TEXT("No central AssetRegistry is available; assign MI_Opaque, MI_Masked, MI_Translucent and MI_Toon before loading models."));
         return true;
     }
 
@@ -336,11 +336,12 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
         !bRuntimeAssetsPreloaded);
     NewCache->References.Terrain = bRuntimeAssetsPreloaded
         ? Registry->TerrainMaterial.Get() : Registry->ResolveTerrainMaterial();
-    if (!Registry->TerrainMaterial.IsNull() && !IsValid(NewCache->References.Terrain))
+    if (!Registry->TerrainMaterial.IsNull() && (!IsValid(NewCache->References.Terrain) || NewCache->References.Terrain->IsTwoSided()))
     {
         Failures.Add(FString::Printf(
-            TEXT("TerrainMaterial -> %s"),
+            TEXT("TerrainMaterial -> %s (unavailable or Two Sided enabled)"),
             *Registry->TerrainMaterial.ToSoftObjectPath().ToString()));
+        NewCache->References.Terrain = nullptr;
     }
     bMaterialDefaultAssetResolved = true;
 
@@ -350,9 +351,8 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
     }
 
     UE_LOG(LogTemp, Display,
-        TEXT("Central glTF materials resolved. Configured=%d Named=%d Failures=%d"),
+        TEXT("Central V3D material slots resolved. Configured=%d/4 Failures=%d"),
         Registry->V3DMaterials.NumConfiguredReferences(),
-        NewCache->References.ByMaterialName.Num(),
         Failures.Num());
     return bResolveCallSucceeded;
 }
@@ -538,6 +538,17 @@ void UGameManagerSubSystem::SetPlayerActor(AActor* Actor)
     }
 
     TryResolveInitialPlayerTransform();
+}
+
+FVector UGameManagerSubSystem::GetPlayerLocation() const
+{
+    // Before spawn restoration completes, the persisted destination remains authoritative.
+    if (bInitialPlayerTransformResolved)
+        if (const AActor* Actor = PlayerActor.Get(); IsValid(Actor)
+            && !Actor->IsActorBeingDestroyed() && Actor->GetWorld() == GetWorld())
+            if (const FVector Location = Actor->GetActorLocation(); IsFiniteWorldLocation(Location))
+                return Location;
+    return PlayerLocation;
 }
 
 void UGameManagerSubSystem::SetPlayerLocation(
@@ -991,18 +1002,9 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         AddPath(Registry->LoadingWidgetClass.ToSoftObjectPath());
         AddPath(Registry->TerrainMaterial.ToSoftObjectPath());
         const FV3DMaterialSoftAssetReferences& Materials = Registry->V3DMaterials;
-        AddPath(Materials.Opaque.ToSoftObjectPath());
-        AddPath(Materials.Masked.ToSoftObjectPath());
-        AddPath(Materials.TwoSided.ToSoftObjectPath());
-        AddPath(Materials.TwoSidedMasked.ToSoftObjectPath());
-        AddPath(Materials.Translucent.ToSoftObjectPath());
-        AddPath(Materials.TwoSidedTranslucent.ToSoftObjectPath());
-        int32 NamedCount = 0;
-        for (const auto& Pair : Materials.ByMaterialName)
-        {
-            if (NamedCount++ >= 4096) break; // Same bound as material resolution.
-            if (!Pair.Key.TrimStartAndEnd().IsEmpty()) AddPath(Pair.Value.ToSoftObjectPath());
-        }
+        TArray<FSoftObjectPath> MaterialPaths; Materials.GetPreloadPaths(MaterialPaths);
+        for (const auto& Path : MaterialPaths) AddPath(Path);
+
     }
 
     TArray<FString> PathNames;
@@ -1211,12 +1213,6 @@ void UGameManagerSubSystem::ContinueGameplaySessionAfterAssetPreload(
             TryWorldCandidate(UrlWorldCandidate, TEXT("URL option"));
         }
 
-        // CurrentWorldName is a compatibility fallback only when there is no explicit map launch
-        // descriptor. Never let state from another destination outrank the active GameMode/map.
-        if (!IsValid(Multiplayer) || Multiplayer->GetRequestedWorldAsset().IsNull())
-        {
-            TryWorldCandidate(CurrentWorldName, TEXT("pending selection"));
-        }
     }
     TryWorldCandidate(InConfigGameMode->WorldFolderName, TEXT("game mode default"));
 
@@ -2071,9 +2067,8 @@ void UGameManagerSubSystem::LoadWorldData()
         FString ScriptError;
         if (Config.IsSuccess())
         {
-            if (!ArchiveReader->HasProjectScripts()) FV3DProjectScripts::FromLegacyConfig(Config.JsonObject, Scripts);
-            else if (!ArchiveReader->ReadProjectScripts(Scripts, ScriptError)) Config.Status = ESafeFileIOStatus::ReadFailed;
-            if (ScriptError.IsEmpty() && !Scripts.Parse(SurfaceConfig, CommandConfig, ScriptError)) Config.Status = ESafeFileIOStatus::ValidationFailed;
+            if (!ArchiveReader->ReadProjectScripts(Scripts, ScriptError)) Config.Status = ESafeFileIOStatus::ReadFailed;
+            else if (!Scripts.Parse(SurfaceConfig, CommandConfig, ScriptError)) Config.Status = ESafeFileIOStatus::ValidationFailed;
             if (!ScriptError.IsEmpty()) Config.Error = TEXT("Project scripts: ") + ScriptError;
         }
         FSafeFileIO::DispatchTrackedGameThread(
@@ -2228,21 +2223,6 @@ void UGameManagerSubSystem::LoadPlayerData()
         return;
     }
     ActivePlayerId = TEXT("Player");
-    if (IsValid(ActiveWorldData))
-    {
-        const FString LegacyId = FPaths::GetCleanFilename(ActiveWorldData->Player);
-        const FWorldPlayerRecord* Stable = ActivePlayerData->FindPlayer(ActivePlayerId);
-        const FWorldPlayerRecord* Legacy = ActivePlayerData->FindPlayer(LegacyId);
-        if (Legacy && LegacyId != ActivePlayerId && IsFiniteWorldLocation(Legacy->Location)
-            && (!Stable || (Stable->Location.IsNearlyZero() && !Legacy->Location.IsNearlyZero())))
-        {
-            FWorldPlayerRecord Migrated = *Legacy; Migrated.PlayerId = ActivePlayerId;
-            ActivePlayerData->Players.RemoveAll([&LegacyId, this](const auto& Record)
-            { return Record.PlayerId == LegacyId || Record.PlayerId == ActivePlayerId; });
-            ActivePlayerData->Players.Add(MoveTemp(Migrated));
-            bPendingInitialPlayerDataSave = true;
-        }
-    }
     const FWorldPlayerRecord* Existing = ActivePlayerData->FindPlayer(ActivePlayerId);
     if (Existing && IsFiniteWorldLocation(Existing->Location))
     {
@@ -4881,11 +4861,10 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
         if (V3DSimulatorProjectConfig::Load(
                 ConfigPath, SafeName, ProjectConfig, &Canonical, ValidationError)
             && Canonical.IsValid()
-            && FV3DProjectScripts::Load(ProjectRoot, Canonical, Scripts, ValidationError)
+            && FV3DProjectScripts::Load(ProjectRoot, Scripts, ValidationError)
             && Scripts.Parse(SurfaceConfig, CommandConfig, ValidationError)
             && FV3DEnvironmentConfig::Parse(Canonical, EnvironmentConfig, ValidationError))
         {
-            FV3DProjectScripts::RemoveLegacyFields(*Canonical);
             const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
                 TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ConfigJson);
             if (!FJsonSerializer::Serialize(Canonical.ToSharedRef(), Writer) || ConfigJson.IsEmpty())
@@ -5184,15 +5163,11 @@ void UGameManagerSubSystem::StartNextProjectBuildModel()
 
         if (Definition.ModelType == EModelDefinitionType::Character)
         {
-            UMaterialInterface* CharacterMaterial = nullptr;
             USkeleton* CharacterSkeleton = nullptr;
             USkeletalMesh* CharacterSkeletalMesh = nullptr;
             if (UV3DSimulatorAssetRegistry* Registry =
                     UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this))
             {
-                CharacterMaterial = Registry->DefaultCharacterMaterial.IsNull()
-                    ? nullptr
-                    : Registry->DefaultCharacterMaterial.LoadSynchronous();
                 CharacterSkeleton = Registry->DefaultCharacterSkeleton.IsNull()
                     ? nullptr
                     : Registry->DefaultCharacterSkeleton.LoadSynchronous();
@@ -5205,12 +5180,12 @@ void UGameManagerSubSystem::StartNextProjectBuildModel()
             {
                 CharacterSkeleton = CharacterSkeletalMesh->GetSkeleton();
             }
-            if (!IsValid(CharacterMaterial) || !IsValid(CharacterSkeleton))
+            if (!IsValid(CharacterSkeleton))
             {
                 ++ProjectBuild.CompletedModels;
                 ++ProjectBuild.FailedModels;
                 LastSaveMessage = FString::Printf(
-                    TEXT("Character build requires DefaultCharacterMaterial and DefaultCharacterSkeleton in AssetRegistry: %s"),
+                    TEXT("Character build requires DefaultCharacterSkeleton in AssetRegistry: %s"),
                     *FPaths::GetCleanFilename(ModelPath));
                 UE_LOG(LogTemp, Error, TEXT("%s"), *LastSaveMessage);
                 ActiveProjectBuildTask = nullptr;
@@ -5219,7 +5194,6 @@ void UGameManagerSubSystem::StartNextProjectBuildModel()
                 continue;
             }
 
-            BuildTask->SetCharacterMaterialOverride(CharacterMaterial);
             BuildTask->SetCharacterSkeletonOverride(CharacterSkeleton);
         }
 

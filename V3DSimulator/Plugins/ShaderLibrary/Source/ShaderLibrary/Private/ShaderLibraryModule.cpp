@@ -62,7 +62,9 @@ void FShaderLibraryModule::EnsureShaderLibraryParameters()
         return;
     }
     const FName ParameterName(TEXT("MaxRenderDistance"));
-    if (Collection->GetParameterId(ParameterName).IsValid()) return;
+    const bool bAddDistance = !Collection->GetParameterId(ParameterName).IsValid();
+    const FName RemovedParameter(TEXT("CelShadingMode"));
+    if (!bAddDistance && !Collection->GetParameterId(RemovedParameter).IsValid()) return;
 
     FProperty* Property = FindFProperty<FProperty>(UMaterialParameterCollection::StaticClass(),
         GET_MEMBER_NAME_CHECKED(UMaterialParameterCollection, ScalarParameters));
@@ -72,8 +74,10 @@ void FShaderLibraryModule::EnsureShaderLibraryParameters()
     Parameter.ParameterName = ParameterName;
     Parameter.Id = FGuid::NewGuid();
     Parameter.DefaultValue = 819200.0f; // Unreal centimetres; runtime settings replace this value.
-    Collection->ScalarParameters.Add(Parameter);
-    FPropertyChangedEvent Event(Property, EPropertyChangeType::ArrayAdd);
+    Collection->ScalarParameters.RemoveAll([RemovedParameter](const FCollectionScalarParameter& Item)
+        { return Item.ParameterName == RemovedParameter; });
+    if (bAddDistance) Collection->ScalarParameters.Add(Parameter);
+    FPropertyChangedEvent Event(Property, EPropertyChangeType::ValueSet);
     Collection->PostEditChangeProperty(Event);
     Collection->MarkPackageDirty();
 

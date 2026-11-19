@@ -9,6 +9,7 @@ struct V3DSIMULATOR_API FV3DEditorDocument
     FString Path, SourcePath, Label, DiskText;
     TSharedPtr<FJsonObject> Json;
     bool bDirty = false;
+    bool bNewFile = false;
     TArray<FString> Undo;
 };
 namespace V3DProjectEditor

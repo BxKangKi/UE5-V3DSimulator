@@ -8,7 +8,7 @@
  */
 
 #include "UI/PauseMenuWidget.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "Character/PlayerCharacterController.h"
 #include "Components/Button.h"
 #include "Blueprint/WidgetTree.h"
@@ -31,7 +31,7 @@ UPauseMenuWidget::UPauseMenuWidget(const FObjectInitializer& ObjectInitializer)
     ButtonHeight = 100.0f;
     BodyFontSize = 64;
     TitleFontSize = 100;
-    BackgroundColor = V3DHUDLegacyStyle::PauseBackground;
+    BackgroundColor = V3DHUDStyle::PauseBackground;
     PanelColor = FLinearColor::Transparent;
 }
 

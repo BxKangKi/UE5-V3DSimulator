@@ -64,6 +64,10 @@ private:
     bool ApplyRaw();
     void SaveAll(bool bBuild, bool bClose = false);
     void Close();
+    void RequestBack();
+    bool HasUnsavedChanges() const;
+    bool bConfirmBack = false;
+    virtual FReply NativeOnKeyDown(const FGeometry& Geometry, const FKeyEvent& Event) override;
     void StartBuild();
     UFUNCTION() void BuildConfirmed();
 };

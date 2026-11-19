@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/V3DStreamingPolicy.h"
-#include "../../System/WorldArchiveCodec.h"
+#include "System/WorldArchiveCodec.h"
 #include "Misc/AutomationTest.h"
 #include "PixelFormat.h"
 

@@ -136,7 +136,7 @@ void UWorldSelectionWidget::BuildNativeLayout()
 
     UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
     Box->AddChildToVerticalBox(Header);
-    UTextBlock* Title = AddText(Header, NSLOCTEXT("V3DMenu", "WorldTitle", "World"), true);
+    UTextBlock* Title = AddText(Header, NSLOCTEXT("V3DMenu", "V3DWorldsTitle", "V3D Worlds"), true);
     Title->SetAutoWrapText(false);
     Title->SetJustification(ETextJustify::Center);
     UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(Title->Slot);

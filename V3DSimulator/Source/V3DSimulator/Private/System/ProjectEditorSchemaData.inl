@@ -1,7 +1,9 @@
 // Generated from runtime readers; native values, not editor placements.
 static const TCHAR* EditorSchemaJson = TEXT(R"V3DSCHEMA({
   "Model": {
-    "MeshData": {}
+    "MeshData": {},
+    "Shader": "Default",
+    "MaterialMode": "Auto"
   },
   "Dynamic": {
     "EnableCollision": true,
@@ -171,7 +173,11 @@ static const TCHAR* EditorSchemaJson = TEXT(R"V3DSCHEMA({
       "EnvironmentMusic": "",
       "MusicVolume": 0.4,
       "Absorption": 0.25,
-      "ProbeDistanceCm": 3000
+      "ProbeDistanceCm": 3000,
+      "DefaultFootstepLoop": false,
+      "WaterLoop": true,
+      "UnderwaterLoop": true,
+      "EnvironmentMusicLoop": true
     },
     "Biomes": []
   },
@@ -204,14 +210,17 @@ static const TCHAR* EditorSchemaJson = TEXT(R"V3DSCHEMA({
       0,
       0
     ],
-    "Radius": 1000
+    "Radius": 1000,
+    "MusicLoop": true
   },
-  "MaterialsScript": {
-    "PhysicalMaterials": {},
-    "MaterialPhysicalMappings": []
-  },
+  "MaterialsScript": {},
   "SoundsScript": {
-    "FootstepMappings": {}
+    "SoundLists": {},
+    "Events": {},
+    "FootstepMappings": {},
+    "PhysicalMaterials": {},
+    "DefaultPhysicalMaterial": "",
+    "MaterialPhysicalMappings": []
   },
   "CommandsScript": {
     "Version": 1,
@@ -227,10 +236,13 @@ static const TCHAR* EditorSchemaJson = TEXT(R"V3DSCHEMA({
     "RestitutionCombineMode": "Average"
   },
   "FootstepEntry": {
-    "Sounds": [],
+    "Sounds": [
+      ""
+    ],
     "Volume": 0.7,
     "PitchMin": 0.94,
-    "PitchMax": 1.06
+    "PitchMax": 1.06,
+    "Loop": false
   },
   "MappingEntry": {
     "Material": "MaterialName",
@@ -296,5 +308,19 @@ static const TCHAR* EditorSchemaJson = TEXT(R"V3DSCHEMA({
     "SoftSourceRadius": 0,
     "AttenuationRadius": 1000,
     "Length": 0
+  },
+  "SoundListEntry": {
+    "Sounds": [
+      ""
+    ],
+    "Loop": false
+  },
+  "SoundEventEntry": {
+    "SoundList": "",
+    "Volume": 1,
+    "PitchMin": 1,
+    "PitchMax": 1,
+    "Spatial": true,
+    "Loop": false
   }
 })V3DSCHEMA");

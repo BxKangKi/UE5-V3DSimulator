@@ -1,7 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/LoadingHUDWidget.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 
@@ -22,8 +22,8 @@ ULoadingHUDWidget::ULoadingHUDWidget(const FObjectInitializer& ObjectInitializer
     : Super(ObjectInitializer)
 {
     PanelSize = FVector2D(1920.f, 1080.f);
-    BackgroundColor = V3DHUDLegacyStyle::LoadingBackground;
-    AccentColor = V3DHUDLegacyStyle::ProgressFill;
+    BackgroundColor = V3DHUDStyle::LoadingBackground;
+    AccentColor = V3DHUDStyle::ProgressFill;
     BodyFontSize = 32;
     FontOutlineSize = 1;
     SetIsFocusable(true);

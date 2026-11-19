@@ -98,7 +98,7 @@ private:
     TObjectPtr<UBoxComponent> Root;
 
     UPROPERTY()
-    /** Range-reading facade for one gworld:// model; it never contains or opens a source GLB. */
+    /** Range-reading facade for one v3d:// model; it never contains or opens a source GLB. */
     TObjectPtr<UWorldBakedModelAsset> BakedAsset;
 
 

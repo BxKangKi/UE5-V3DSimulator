@@ -189,15 +189,13 @@ static float ComputeForceLimitPerSample(
     const float TotalMass,
     const float GravityMagnitude,
     const float BuoyancyScale,
-    const float LegacyPointLimit,
     const float MaxPointLimit,
     const int32 SampleCount)
 {
     const int32 SafeSampleCount = FMath::Max(1, SampleCount);
     const float NeutralForcePerSample = (FMath::Max(1.0f, TotalMass) * GravityMagnitude * FMath::Max(0.0f, BuoyancyScale)) / static_cast<float>(SafeSampleCount);
-    const float SafeLegacyLimit = FMath::Max(1.0f, LegacyPointLimit);
     const float SafeMaxLimit = FMath::Max(1.0f, MaxPointLimit);
-    return FMath::Max(1.0f, FMath::Min(NeutralForcePerSample, FMath::Min(SafeLegacyLimit, SafeMaxLimit)));
+    return FMath::Max(1.0f, FMath::Min(NeutralForcePerSample, SafeMaxLimit));
 }
 
 static FVector ComputeWaterDragForce(
@@ -866,7 +864,6 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
                 TotalMass,
                 GravityMagnitude,
                 PhysicsSettings.BuoyancyAccelerationScale,
-                PhysicsSettings.BuoyancyForcePerPoint,
                 PhysicsSettings.MaxForcePerPoint,
                 PrimarySampleCount);
             const float DragLimitPerSample = FMath::Max(1.0f, PhysicsSettings.MaxDragForcePerPoint);
@@ -966,7 +963,6 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
                     TotalMass,
                     GravityMagnitude,
                     PhysicsSettings.BuoyancyAccelerationScale,
-                    PhysicsSettings.BuoyancyForcePerPoint,
                     PhysicsSettings.MaxForcePerPoint,
                     ExcludedSampleCount);
                 const float DragLimitPerSample = FMath::Max(1.0f, PhysicsSettings.MaxDragForcePerPoint);
@@ -1121,7 +1117,6 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
         TotalMass,
         GravityMagnitude,
         PhysicsSettings.BuoyancyAccelerationScale,
-        PhysicsSettings.BuoyancyForcePerPoint,
         PhysicsSettings.MaxForcePerPoint,
         LocalSamplePoints.Num());
     const float DragLimitPerSample = FMath::Max(1.0f, PhysicsSettings.MaxDragForcePerPoint);

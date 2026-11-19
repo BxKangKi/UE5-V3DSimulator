@@ -45,7 +45,7 @@ public:
         FModelDatabaseReady Completion = FModelDatabaseReady());
     void Stop();
 
-    /** Resolves a built UUID to its canonical gworld:// reference. Source mode always returns false. */
+    /** Resolves a built UUID to its canonical v3d:// reference. Source mode always returns false. */
     bool Resolve(
         const FGuid& UUID,
         FModelDefinition& OutDefinition,
@@ -55,7 +55,7 @@ public:
         FModelDefinition& OutDefinition,
         FString& OutRuntimeReference) const;
 
-    /** Accepts only a canonical gworld://model/<UUID> reference belonging to a mounted archive. */
+    /** Accepts only a canonical v3d://model/<UUID> reference belonging to a mounted archive. */
     bool FindUUIDForReference(const FString& ModelReference, FGuid& OutUUID) const;
     void GetDefinitions(TArray<FModelDefinition>& OutDefinitions) const;
     void GetSoundDefinitions(TArray<FSoundDefinition>& OutDefinitions) const;

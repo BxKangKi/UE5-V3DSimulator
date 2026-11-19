@@ -96,12 +96,12 @@ protected:
 
     /** Construct child controls here. Called once per new widget tree, before Slate construction. */
     virtual void BuildNativeLayout() {}
-    /** Restore native assignments after legacy Blueprint PreConstruct/Construct setter calls. */
+    /** Bind controls in the current native widget tree. */
     virtual void BindNativeWidgets() {}
     /** Cosmetic only: may execute in the Blueprint designer without a world or player. */
     virtual void ApplyNativeStyle();
 
-    /** Reject references to obsolete WBP controls after replacing a legacy designer tree. */
+    /** Accept only controls owned by the active widget tree. */
     bool AcceptWidgetAssignment(const UWidget* Widget) const;
 
     UBorder* AddPanel(FVector2D Size, FVector2D Position,

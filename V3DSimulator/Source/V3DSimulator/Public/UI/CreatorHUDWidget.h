@@ -45,9 +45,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
     FVector2D ActionsPanelSize = FVector2D(264, 280);
 
-    /** Legacy serialized size. The native toolbar now sizes itself to its seven square slots. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
-    FVector2D ToolbarSize = FVector2D(432, 72);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Creator HUD|Layout")
     FVector2D StatusPanelOffset = FVector2D(24, 24);

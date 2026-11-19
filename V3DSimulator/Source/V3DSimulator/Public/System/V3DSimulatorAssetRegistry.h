@@ -43,14 +43,39 @@ struct V3DSIMULATOR_API FV3DSimulatorFootstepBinding
 {
     GENERATED_BODY()
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character|Footsteps")
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio")
     TSoftObjectPtr<UPhysicalMaterial> PhysicalMaterial;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character|Footsteps")
-    TSoftObjectPtr<USoundBase> Sound;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio")
+    TArray<TSoftObjectPtr<USoundBase>> Sounds;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character|Footsteps")
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") bool bLoop = false;
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio")
     TSoftObjectPtr<UNiagaraSystem> Effect;
+};
+
+/** One random candidate per playback. Loop never changes the shared source asset. */
+USTRUCT(BlueprintType)
+struct V3DSIMULATOR_API FV3DDefaultSoundSettings
+{
+    GENERATED_BODY()
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") TArray<TSoftObjectPtr<USoundBase>> Sounds;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") bool bLoop = false;
+};
+
+USTRUCT(BlueprintType)
+struct V3DSIMULATOR_API FV3DSimulatorAudioDefaults
+{
+    GENERATED_BODY()
+    FV3DSimulatorAudioDefaults() { Water.bLoop = Underwater.bLoop = EnvironmentMusic.bLoop = true; }
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") FV3DDefaultSoundSettings Footstep;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") FV3DDefaultSoundSettings Water;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") FV3DDefaultSoundSettings Underwater;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") FV3DDefaultSoundSettings EnvironmentMusic;
+    /** Fallback for cooked physical-material assets. Project mappings live in scripts/sounds.json. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio") TArray<FV3DSimulatorFootstepBinding> Footsteps;
 };
 
 USTRUCT(BlueprintType)
@@ -105,6 +130,13 @@ public:
     /** Synchronously resolves TerrainMaterial on the game thread. */
     UMaterialInterface* ResolveTerrainMaterial() const;
 
+    /** Loaded once by the world surface subsystem; the registry retains only the soft path. */
+    UPhysicalMaterial* ResolveDefaultPhysicalMaterial() const;
+
+    /** Fallback for runtime meshes without a project mapping or authored physical material. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Physics")
+    TSoftObjectPtr<UPhysicalMaterial> DefaultPhysicalMaterial;
+
     // Native actor classes can be replaced by Blueprint subclasses without forcing them to load at startup.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Actors")
     TSoftClassPtr<AStaticActor> StaticActorClass;
@@ -157,11 +189,11 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UCreatorHUDWidget> CreatorHUDWidgetClass;
 
-    /** Use a Blueprint child of UDebugHUDWidget; legacy plain UserWidgets fall back to the native HUD. */
+    /** Use a Blueprint child of UDebugHUDWidget; assign the current native HUD parent. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UUserWidget> DebugWidgetClass;
 
-    /** Use a Blueprint child of ULoadingHUDWidget; legacy plain UserWidgets fall back to the native HUD. */
+    /** Use a Blueprint child of ULoadingHUDWidget; assign the current native HUD parent. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="UI")
     TSoftClassPtr<UUserWidget> LoadingWidgetClass;
 
@@ -189,7 +221,7 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> PlacementGridMaterial;
 
-    /** Default glTF material soft references live directly in this one central data object. */
+    /** MI_Opaque / MI_Masked / MI_Translucent / MI_Toon. Dynamic models share these parents and set MID FadeDistance=50. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     FV3DMaterialSoftAssetReferences V3DMaterials;
 
@@ -200,9 +232,9 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> StaticDecalLightMaterial;
 
-    /** One unbound post-process material containing cel shading and global ocean underwater effects. */
+    /** Underwater-only post-process material for the global ocean. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
-    TSoftObjectPtr<UMaterialInterface> GlobalPostProcessMaterial;
+    TSoftObjectPtr<UMaterialInterface> OceanPostProcessMaterial;
 
     /** Shared shader parameter collection used by global post-process/environment shaders. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
@@ -236,22 +268,14 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character")
     TSoftObjectPtr<USkeleton> DefaultCharacterSkeleton;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character")
-    TSoftObjectPtr<UMaterialInterface> DefaultCharacterMaterial;
 
     /** Animation Blueprint class applied to the character mesh. The class is loaded only when a character begins play. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character")
     TSoftClassPtr<UAnimInstance> DefaultCharacterAnimInstanceClass;
 
-    /** Loaded on demand: sound/effect assets are resolved only when their surface is actually stepped on. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Character|Footsteps")
-    TArray<FV3DSimulatorFootstepBinding> FootstepBindings;
-
-    /** Cooked fallback sounds; Audio in each v3d config can override these. Assign looping assets for ambience/music. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultFootstepSound;
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultWaterSound;
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultUnderwaterSound;
-    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio|Defaults") TSoftObjectPtr<USoundBase> DefaultEnvironmentMusic;
+    /** All cooked sound defaults. Project-specific surfaces/events are configured in sounds.json. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Audio", meta=(DisplayName="Sound Defaults"))
+    FV3DSimulatorAudioDefaults AudioDefaults;
 
     // Enhanced Input is centralized for the same reason: controller Blueprints no longer hard-reference assets.
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Input")

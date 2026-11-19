@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "UI/ResponsiveHUDWidget.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "UI/NativeWidgetTreeNames.h"
 
 #include "Blueprint/WidgetTree.h"
@@ -29,7 +29,7 @@ namespace
 UResponsiveHUDWidget::UResponsiveHUDWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
-    FontObject = V3DHUDLegacyStyle::FindFontForConstructor();
+    FontObject = V3DHUDStyle::FindFontForConstructor();
 }
 
 FVector2D UResponsiveHUDWidget::GetSafeDesignResolution() const
@@ -57,7 +57,7 @@ bool UResponsiveHUDWidget::AcceptWidgetAssignment(const UWidget* Widget) const
 void UResponsiveHUDWidget::EnsureNativeLayout()
 {
     if (!bUseNativeLayout || IsUsingNativeLayout()) return;
-    // A fresh tree excludes hidden legacy Blueprint controls and makes generated names
+    // A fresh tree owns exactly the native controls and makes generated names
     // independent of old designer nodes retained by undo/reinstancing.
     WidgetTree = NewObject<UWidgetTree>(this, NAME_None, RF_Transient);
 
@@ -181,7 +181,7 @@ UTextBlock* UResponsiveHUDWidget::AddText(UPanelWidget* Parent, const FText& Tex
     Label->SetColorAndOpacity(FSlateColor(TextColor));
     Label->SetVisibility(ESlateVisibility::HitTestInvisible);
     FSlateFontInfo Font = Label->GetFont();
-    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, bTitle ? TitleFontSize : BodyFontSize, FontOutlineSize);
+    V3DHUDStyle::ApplyFont(Font, FontObject, bTitle ? TitleFontSize : BodyFontSize, FontOutlineSize);
     Label->SetFont(Font);
     Parent->AddChild(Label);
     if (bTitle) StyledTitles.Add(Label); else StyledTexts.Add(Label);
@@ -197,7 +197,7 @@ UButton* UResponsiveHUDWidget::AddButton(UPanelWidget* Parent, const FText& Text
     Parent->AddChild(Size);
     if (UVerticalBoxSlot* ButtonContainerSlot = Cast<UVerticalBoxSlot>(Size->Slot)) ButtonContainerSlot->SetPadding(FMargin(0, 4));
     UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass());
-    V3DHUDLegacyStyle::ApplyButton(*Button, ButtonColor, HoveredButtonTint);
+    V3DHUDStyle::ApplyButton(*Button, ButtonColor, HoveredButtonTint);
     Size->SetContent(Button);
     UTextBlock* Label = AddText(Button, Text);
     Label->SetJustification(ETextJustify::Center);
@@ -237,14 +237,14 @@ void UResponsiveHUDWidget::ApplyNativeStyle()
         {
             if (!Label) continue;
             FSlateFontInfo Font = Label->GetFont();
-            V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FontSize, FontOutlineSize);
+            V3DHUDStyle::ApplyFont(Font, FontObject, FontSize, FontOutlineSize);
             Label->SetFont(Font);
             Label->SetColorAndOpacity(FSlateColor(TextColor));
         }
     };
     StyleText(StyledTexts, BodyFontSize);
     StyleText(StyledTitles, TitleFontSize);
-    for (UButton* Button : StyledButtons) if (Button) V3DHUDLegacyStyle::ApplyButton(*Button, ButtonColor, HoveredButtonTint);
+    for (UButton* Button : StyledButtons) if (Button) V3DHUDStyle::ApplyButton(*Button, ButtonColor, HoveredButtonTint);
     for (USizeBox* Size : StyledButtonSizes) if (Size)
         Size->SetMinDesiredHeight(FMath::Clamp(FMath::IsFinite(ButtonHeight) ? ButtonHeight : 44.f, 20.f, 200.f));
 }

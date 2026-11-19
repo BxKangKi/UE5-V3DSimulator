@@ -10,7 +10,7 @@
 
 #include "UI/MainWorldWidget.h"
 #include "UI/WidgetStyleSafety.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 
 #include "Components/Button.h"
 #include "Blueprint/WidgetTree.h"
@@ -925,7 +925,7 @@ void UMainWorldWidget::ApplyNativeStyle()
     if (NativeServerAddress)
     {
         FEditableTextBoxStyle Style = NativeServerAddress->GetWidgetStyle();
-        V3DHUDLegacyStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
+        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
         Style.BackgroundImageNormal.TintColor = FSlateColor(ButtonColor);
         Style.BackgroundImageHovered.TintColor = FSlateColor(ButtonColor * .8f);
         Style.BackgroundImageFocused.TintColor = FSlateColor(ButtonColor);
@@ -1000,7 +1000,7 @@ UWidget* UMainWorldWidget::GenerateNativeWorldChoice(FString Item)
     UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>();
     Label->SetText(FText::FromString(Item));
     FSlateFontInfo Font = Label->GetFont();
-    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
+    V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
     Label->SetFont(Font);
     Label->SetColorAndOpacity(FSlateColor(TextColor));
     return Label;

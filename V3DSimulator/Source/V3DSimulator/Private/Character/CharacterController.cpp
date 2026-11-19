@@ -9,6 +9,8 @@
  */
 
 #include "Character/CharacterController.h"
+#include "Character/CharacterAnimInstance.h"
+#include "Animation/AnimSequence.h"
 #include "System/WorldSurfaceSubsystem.h"
 #include "Character/CharacterControllerMovementComponent.h"
 #include "Character/CharacterComponent.h"
@@ -222,7 +224,6 @@ void ACharacterController::BeginPlay()
         };
         DefaultPhysicsAsset = LoadDefault(Registry->DefaultCharacterPhysicsAsset);
         DefaultSkeleton = LoadDefault(Registry->DefaultCharacterSkeleton);
-        DefaultMaterial = LoadDefault(Registry->DefaultCharacterMaterial);
         DefaultSkeletalMesh = LoadDefault(Registry->DefaultCharacterSkeletalMesh);
 
         UClass* ResolvedAnimClass = LoadDefault(Registry->DefaultCharacterAnimInstanceClass);
@@ -239,14 +240,15 @@ void ACharacterController::BeginPlay()
         if (IsValid(DefaultSkeletalMesh) && MeshComp->GetSkinnedAsset() != DefaultSkeletalMesh.Get())
         {
             MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+            if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this))
+            {
+                Surfaces->ApplyToMesh(MeshComp);
+                Surfaces->ApplyToPrimitive(GetCapsuleComponent());
+            }
         }
         if (IsValid(DefaultPhysicsAsset) && MeshComp->GetPhysicsAsset() != DefaultPhysicsAsset.Get())
         {
             MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
-        }
-        if (IsValid(DefaultMaterial))
-        {
-            MeshComp->SetMaterial(0, DefaultMaterial);
         }
         if (DefaultAnimInstanceClass)
         {
@@ -421,7 +423,7 @@ void ACharacterController::HandleCharacterLoadActionReleased(
 bool ACharacterController::CommitRuntimeCharacterResources(
     USkeletalMesh* SkeletalMesh,
     UPhysicsAsset* PhysicsAsset,
-    USkeleton* InRuntimeSkeleton)
+    USkeleton* InRuntimeSkeleton, const TMap<FName, TObjectPtr<UAnimSequence>>& Animations)
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("CommitRuntimeCharacterResources must run on the game thread")))
     {
@@ -440,12 +442,17 @@ bool ACharacterController::CommitRuntimeCharacterResources(
     MeshComp->SetSimulatePhysics(false);
     MeshComp->PutAllRigidBodiesToSleep();
 
-    // BeginPlay installs DefaultCharacterMaterial as a component override for the placeholder mesh.
+    // Clear placeholder component overrides before assigning imported material slots.
     // Component overrides survive SetSkinnedAssetAndUpdate(), so leaving it in place masks the
     // texture-bearing MIDs reconstructed for the runtime glTF mesh and makes the whole character
     // render with the plain/default material. The generated mesh already owns its correct MIDs.
     MeshComp->EmptyOverrideMaterials();
     MeshComp->SetSkinnedAssetAndUpdate(SkeletalMesh, true);
+    if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this))
+    {
+        Surfaces->ApplyToMesh(MeshComp);
+        Surfaces->ApplyToPrimitive(GetCapsuleComponent());
+    }
 
     UPhysicsAsset* PhysicsToUse = IsValid(PhysicsAsset) ? PhysicsAsset : DefaultPhysicsAsset.Get();
     if (IsValid(PhysicsToUse))
@@ -456,6 +463,7 @@ bool ACharacterController::CommitRuntimeCharacterResources(
     MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
     MeshComp->SetGenerateOverlapEvents(false);
 
+    RuntimeModelAnimations = Animations;
     RuntimeSkeletalMesh = SkeletalMesh;
     RuntimePhysicsAsset = IsValid(PhysicsAsset) ? PhysicsAsset : nullptr;
     RuntimeSkeleton = IsValid(SkeletalMesh->GetSkeleton())
@@ -469,6 +477,7 @@ bool ACharacterController::CommitRuntimeCharacterResources(
 
 void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefaultMesh)
 {
+    RuntimeModelAnimations.Reset();
     if (!ensureMsgf(IsInGameThread(), TEXT("ReleaseRuntimeCharacterResources must run on the game thread")))
     {
         return;
@@ -515,9 +524,10 @@ void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefault
     {
         MeshComp->EmptyOverrideMaterials();
         MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
-        if (IsValid(DefaultMaterial))
+        if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this))
         {
-            MeshComp->SetMaterial(0, DefaultMaterial);
+            Surfaces->ApplyToMesh(MeshComp);
+            Surfaces->ApplyToPrimitive(GetCapsuleComponent());
         }
     }
     if (IsValid(DefaultPhysicsAsset))
@@ -570,10 +580,11 @@ void ACharacterController::OnLoadCompleted(bool Result)
             {
                 MeshComp->EmptyOverrideMaterials();
                 MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
-            }
-            if (IsValid(DefaultMaterial))
-            {
-                MeshComp->SetMaterial(0, DefaultMaterial);
+                if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this))
+                {
+                    Surfaces->ApplyToMesh(MeshComp);
+                    Surfaces->ApplyToPrimitive(GetCapsuleComponent());
+                }
             }
             if (IsValid(DefaultPhysicsAsset))
             {
@@ -584,6 +595,9 @@ void ACharacterController::OnLoadCompleted(bool Result)
     }
 
     RestoreAfterMeshReload();
+    if (USkeletalMeshComponent* Mesh = GetMesh())
+        if (auto* Animation = Cast<UCharacterAnimInstance>(Mesh->GetAnimInstance()))
+            Animation->InstallModelAnimations(RuntimeModelAnimations);
 
     if (Result)
     {
@@ -1879,7 +1893,7 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
     const FHitResult& HitResult = TraceDatum.OutHits[0];
     if (!HitResult.bBlockingHit || HitResult.ImpactPoint.ContainsNaN()) return;
     if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
-        if (Surfaces->PlayFootstep(HitResult)) return;
+        if (Surfaces->PlayFootstep(HitResult, this)) return;
 
 
     auto* Environment = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>();
@@ -1893,12 +1907,12 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
                 UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this);
             if (!IsValid(Registry))
             {
-                if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
+                if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint, this);
                 return;
             }
 
             const FSoftObjectPath HitMaterialPath(HitPhysMat);
-            const FV3DSimulatorFootstepBinding* Binding = Registry->FootstepBindings.FindByPredicate(
+            const FV3DSimulatorFootstepBinding* Binding = Registry->AudioDefaults.Footsteps.FindByPredicate(
                 [&HitMaterialPath](const FV3DSimulatorFootstepBinding& Candidate)
                 {
                     return !Candidate.PhysicalMaterial.IsNull()
@@ -1906,15 +1920,17 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
                 });
             if (!Binding)
             {
-                if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
+                if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint, this);
                 return;
             }
 
-            if (USoundBase* Sound = Binding->Sound.Get())
+            TArray<USoundBase*, TInlineAllocator<16>> ReadySounds;
+            for (const auto& Candidate : Binding->Sounds) if (IsValid(Candidate.Get())) ReadySounds.AddUnique(Candidate.Get());
+            if (USoundBase* Sound = ReadySounds.IsEmpty() ? nullptr : ReadySounds[FMath::RandHelper(ReadySounds.Num())])
             {
-                if (Environment) Environment->PlayFootstepSound(Sound, HitResult.ImpactPoint);
+                if (Environment) Environment->PlayFootstepSound(Sound, HitResult.ImpactPoint, 1.f, Binding->bLoop, this, HitPhysMat);
             }
-            else if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
+            else if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint, this);
 
             if (UNiagaraSystem* Effect = Binding->Effect.Get())
             {
@@ -1925,7 +1941,7 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
     }
     else
     {
-        if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint);
+        if (Environment) Environment->PlayDefaultFootstep(HitResult.ImpactPoint, this);
         // Fallback for surfaces that have collision but no physical material, such as default footsteps.
         UE_LOG(LogTemp, Verbose, TEXT("Footstep trace hit a collider, but no PhysMaterial is assigned."));
     }
@@ -1984,4 +2000,10 @@ void ACharacterController::CalcCamera(float DeltaTime, FMinimalViewInfo& OutResu
         }
         bFirstPersonPhysicsView = false;
     }
+}
+
+UAnimSequence* ACharacterController::GetModelAnimation(FName ClipName) const
+{
+    const auto* Found=RuntimeModelAnimations.Find(ClipName);
+    return Found?Found->Get():nullptr;
 }

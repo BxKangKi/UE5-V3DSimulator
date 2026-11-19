@@ -23,6 +23,10 @@
 #include "Animation/AnimNodeBase.h"
 #include "Animation/PoseSnapshot.h"
 #include "Engine/SkeletalMesh.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/BlendSpace.h"
+#include "Serialization/ArchiveReplaceObjectRef.h"
+#include "Format/animation_names.hpp"
 
 namespace
 {
@@ -392,10 +396,6 @@ void UCharacterAnimInstance::PlayFootstep(EControllerHand FootSide)
     Character->TriggerFootstepTrace(FootSide);
 }
 
-void UCharacterAnimInstance::TriggerFootstepTrace(EControllerHand FootSide)
-{
-    PlayFootstep(FootSide);
-}
 
 void UCharacterAnimInstance::AnimNotify_FootstepLeft() { PlayFootstep(EControllerHand::Left); }
 void UCharacterAnimInstance::AnimNotify_FootstepRight() { PlayFootstep(EControllerHand::Right); }
@@ -412,4 +412,74 @@ void UCharacterAnimInstance::NativeInitializeAnimation()
     ResetRuntimeAnimationState();
     RefreshCachedReferences();
     RefreshCharacterAnimationState(0.0f);
+    if (auto* Character=Cast<ACharacterController>(GetOwningActor()))
+        InstallModelAnimations(Character->GetModelAnimations());
+}
+
+UAnimSequence* UCharacterAnimInstance::ResolveModelAnimation(UAnimSequence* DefaultSequence) const
+{
+    const auto* Replacement=ModelSequenceOverrides.Find(DefaultSequence);
+    return Replacement?Replacement->Get():DefaultSequence;
+}
+UBlendSpace* UCharacterAnimInstance::ResolveModelBlendSpace(UBlendSpace* DefaultBlendSpace) const
+{
+    const auto* Replacement=ModelBlendSpaceOverrides.Find(DefaultBlendSpace);
+    return Replacement?Replacement->Get():DefaultBlendSpace;
+}
+void UCharacterAnimInstance::InstallModelAnimations(const TMap<FName, TObjectPtr<UAnimSequence>>& Clips)
+{
+    check(IsInGameThread());
+    if (auto* Mesh=GetSkelMeshComponent()) Mesh->HandleExistingParallelEvaluationTask(true,true);
+    ModelSequenceOverrides.Reset();ModelBlendSpaceOverrides.Reset();
+    if (Clips.IsEmpty()) return;
+    TArray<FName> Names;Clips.GetKeys(Names);Names.Sort(FNameLexicalLess());
+    TMap<FString,UAnimSequence*> Named;
+    for (const FName Name:Names)
+    {
+        const auto Key=v3d::animation_key(TCHAR_TO_UTF8(*Name.ToString()));
+        if (Key.empty()) continue;
+        const FString Canonical=UTF8_TO_TCHAR(Key.c_str());
+        if (Named.Contains(Canonical))
+        {
+            // Explicit canonical spelling wins over an alias, independently of map iteration order.
+            if (!Name.ToString().Equals(Canonical,ESearchCase::IgnoreCase)) continue;
+        }
+        if (IsValid(Clips.FindChecked(Name))) Named.Add(Canonical,Clips.FindChecked(Name));
+    }
+    const auto FindReplacement=[&](UAnimSequence* Default)->UAnimSequence*
+    {
+        if (!Default) return nullptr;
+        for (const auto& Key:v3d::animation_candidates(TCHAR_TO_UTF8(*Default->GetName())))
+            if (UAnimSequence** Clip=Named.Find(UTF8_TO_TCHAR(Key.c_str()))) return *Clip;
+        return nullptr;
+    };
+    for (UAnimSequence* Default:DefaultModelSequences)
+        if (UAnimSequence* Replacement=FindReplacement(Default)) ModelSequenceOverrides.Add(Default,Replacement);
+    for (UBlendSpace* Default:DefaultModelBlendSpaces)
+    {
+        if (!Default) continue;
+        TMap<UObject*,UObject*> Replacements;
+        for (const FBlendSample& Sample:Default->GetBlendSamples())
+            if (UAnimSequence* Replacement=FindReplacement(Sample.Animation)) Replacements.Add(Sample.Animation,Replacement);
+        if (Replacements.IsEmpty()) continue;
+        UBlendSpace* Instance=DuplicateObject<UBlendSpace>(Default,this);
+        if (!Instance) continue;
+        Instance->SetFlags(RF_Transient);
+        Instance->ClearFlags(RF_Public|RF_Standalone);
+        // Runtime serialization visits sample UPROPERTY references; no editor-only sample mutation API.
+        // Preserve sample coordinates, triangulation and the original BlendSpace asset.
+        FArchiveReplaceObjectRef<UObject> Replace(Instance,Replacements,
+            EArchiveReplaceObjectFlags::IgnoreOuterRef|EArchiveReplaceObjectFlags::IgnoreArchetypeRef);
+        // glTF clips carry no UE sync markers. Clear the copied marker list before disabling
+        // marker sync so neither sample blending nor an AnimBP sync group uses stale markers.
+        // Use the UAnimationAsset virtual interface: UBlendSpace's internal marker validator
+        // is not exported from Engine in modular installed builds (including Mac arm64).
+        UAnimationAsset* RuntimeAnimation = Instance;
+        if (TArray<FName>* MarkerNames = RuntimeAnimation->GetUniqueMarkerNames())
+        {
+            MarkerNames->Reset();
+        }
+        Instance->bAllowMarkerBasedSync = false;
+        ModelBlendSpaceOverrides.Add(Default,Instance);
+    }
 }

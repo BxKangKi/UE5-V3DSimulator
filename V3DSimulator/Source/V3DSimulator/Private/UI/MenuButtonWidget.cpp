@@ -2,7 +2,7 @@
 
 #include "UI/MenuButtonWidget.h"
 #include "UI/NativeWidgetTreeNames.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "UI/WidgetStyleSafety.h"
 
 #include "Components/Button.h"
@@ -16,7 +16,7 @@
 UMenuButtonWidget::UMenuButtonWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
-    FontObject = V3DHUDLegacyStyle::FindFontForConstructor();
+    FontObject = V3DHUDStyle::FindFontForConstructor();
 }
 
 TSharedRef<SWidget> UMenuButtonWidget::RebuildWidget()
@@ -174,7 +174,7 @@ void UMenuButtonWidget::ApplyNativeStyle()
     NativeRoot->SetMinDesiredHeight(FMath::Clamp(FMath::IsFinite(ButtonMinSize.Y) ? ButtonMinSize.Y : 64.0, 1.0, 16384.0));
     if (IsValid(NativeButton))
     {
-        V3DHUDLegacyStyle::ApplyButton(*NativeButton, BackgroundColor);
+        V3DHUDStyle::ApplyButton(*NativeButton, BackgroundColor);
         FButtonStyle Style = NativeButton->GetStyle();
         Style.Hovered.TintColor = FSlateColor(AccentColor);
         V3DWidgetStyle::SetOwnedStyle(*NativeButton, Style);
@@ -188,7 +188,7 @@ void UMenuButtonWidget::ApplyNativeStyle()
     if (IsValid(NativeLabel))
     {
         FSlateFontInfo Font = NativeLabel->GetFont();
-        V3DHUDLegacyStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
+        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::Clamp(FontSize, 8, 96), FontOutlineSize);
         NativeLabel->SetFont(Font);
         NativeLabel->SetColorAndOpacity(FSlateColor(TextColor));
         NativeLabel->SetText(DisplayLabel.IsEmpty() ? PreviewLabel : FText::FromString(DisplayLabel));

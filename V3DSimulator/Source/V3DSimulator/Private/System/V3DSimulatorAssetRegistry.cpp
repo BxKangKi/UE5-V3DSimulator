@@ -3,6 +3,7 @@
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/V3DTerrain.h"
 #include "Materials/MaterialInterface.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
 #include "UI/BuildStatusWidget.h"
 #include "UI/CreatorHUDWidget.h"
 #include "UI/DebugHUDWidget.h"
@@ -19,6 +20,8 @@ UV3DSimulatorAssetRegistry::UV3DSimulatorAssetRegistry(const FObjectInitializer&
         FSoftObjectPath(TEXT("/Game/Blueprints/UI/WBP_ProjectSelection.WBP_ProjectSelection_C")));
     BuildStatusWidgetClass = TSoftClassPtr<UBuildStatusWidget>(
         FSoftObjectPath(TEXT("/Game/Blueprints/UI/WBP_BuildStatus.WBP_BuildStatus_C")));
+    OceanPostProcessMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(
+        TEXT("/ShaderLibrary/Water/PostProcessing/MPP_UnderWater.MPP_UnderWater")));
     EnsureMenuDefaults();
 }
 
@@ -71,4 +74,11 @@ UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveTerrainMaterial() const
     }
 
     return TerrainMaterial.LoadSynchronous();
+}
+
+UPhysicalMaterial* UV3DSimulatorAssetRegistry::ResolveDefaultPhysicalMaterial() const
+{
+    if (!IsInGameThread() || IsGarbageCollecting() || DefaultPhysicalMaterial.IsNull()) return nullptr;
+    if (UPhysicalMaterial* Existing = DefaultPhysicalMaterial.Get()) return Existing;
+    return DefaultPhysicalMaterial.LoadSynchronous();
 }

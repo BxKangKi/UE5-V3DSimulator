@@ -19,7 +19,6 @@ enum class ESettingsField : uint8
     RayTracing UMETA(DisplayName="Ray Tracing"),
     HeightFog UMETA(DisplayName="Height Fog"),
     Cloud UMETA(DisplayName="Cloud"),
-    CelShadingMode UMETA(DisplayName="Cel Shading"),
     ShadowQuality UMETA(DisplayName="Shadow Quality"),
     TextureQuality UMETA(DisplayName="Texture Quality"),
     MaxTextureResolution UMETA(DisplayName="Max Texture Resolution"),

@@ -4,6 +4,7 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "World/WorldEnvironmentConfig.h"
 #include "System/RuntimeSoundSubsystem.h"
+#include "System/V3DSoundPlayback.h"
 #include "TimerManager.h"
 #include "WorldEnvironmentSubsystem.generated.h"
 class USoundBase;
@@ -11,6 +12,13 @@ class UAudioComponent;
 class UReverbEffect;
 class USoundAttenuation;
 struct FStreamableHandle;
+USTRUCT()
+struct FV3DLoadedSoundList
+{
+    GENERATED_BODY()
+    UPROPERTY(Transient) TArray<TObjectPtr<USoundBase>> Sounds;
+    bool bLoop = false;
+};
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FV3DBiomeChanged, FName, Biome, bool, bInside);
 
 /** Bounded geometry acoustics, default audio and named spatial variables. No per-frame scans. */
@@ -26,8 +34,9 @@ public:
     UFUNCTION(BlueprintPure, Category="World|Biomes") bool IsPointInBiome(FName Name, FVector Point) const;
     UFUNCTION(BlueprintPure, Category="World|Biomes") FName GetActiveBiome() const { return ActiveBiome; }
     UPROPERTY(BlueprintAssignable, Category="World|Biomes") FV3DBiomeChanged OnBiomeChanged;
-    void PlayDefaultFootstep(const FVector& Location);
-    void PlayFootstepSound(USoundBase* Sound, const FVector& Location, float Volume = 1.0f);
+    void PlayDefaultFootstep(const FVector& Location, UObject* Emitter = nullptr);
+    void PlayFootstepSound(USoundBase* Sound, const FVector& Location, float Volume = 1.0f,
+        bool bLoop = false, UObject* Emitter = nullptr, UObject* LoopIdentity = nullptr, float Pitch = 1.f);
     void ApplySpatialAudio(UAudioComponent* Audio) const;
     USoundAttenuation* GetSpatialAttenuation() const { return SpatialAttenuation; }
 private:
@@ -38,7 +47,7 @@ private:
     uint64 Generation = 0;
     TSharedPtr<FStreamableHandle> AssetLoad;
     UPROPERTY(Transient) TArray<TObjectPtr<UObject>> LoadedAssets;
-    UPROPERTY(Transient) TMap<FString, TObjectPtr<USoundBase>> Defaults;
+    UPROPERTY(Transient) TMap<FString, FV3DLoadedSoundList> Defaults;
     UPROPERTY(Transient) TArray<TObjectPtr<UAudioComponent>> Effects;
     UPROPERTY(Transient) TObjectPtr<UAudioComponent> WaterAudio;
     UPROPERTY(Transient) TObjectPtr<UAudioComponent> UnderwaterAudio;
@@ -50,7 +59,10 @@ private:
     TSet<FString> Loading, Failed;
     TArray<FString> CacheOrder;
     int64 CachedBytes = 0;
-    FString MusicKey;
+    FString MusicKey, MusicContext;
+    TSet<FString> StartedChannels;
+    FV3DFootstepLoops FootstepLoops;
+    TMap<FString, FString> EventChoices;
     bool bAssetsReady = false;
     int32 LastReverbBucket = -1;
     float LastWet = -1;
@@ -58,6 +70,7 @@ private:
     void ProbeRoom(const FVector& Listener, AActor* Pawn);
     void RequestPcm(const FString& Reference);
     USoundBase* ResolveSound(const FString& Reference, const FString& DefaultKey, bool bLoop);
+    bool ResolveLoop(const FString& Reference, const FString& DefaultKey, TOptional<bool> Override = {}) const;
     void UpdateLoop(TObjectPtr<UAudioComponent>& Component, const FString& Reference,
-        const FString& DefaultKey, float Volume);
+        const FString& DefaultKey, float Volume, TOptional<bool> LoopOverride = {});
 };

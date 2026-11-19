@@ -37,7 +37,7 @@ DECLARE_MULTICAST_DELEGATE_TwoParams(
  * This object is the gameplay owner of the authoring model decoder. It asks
  * glTFRuntime to decode the document once, copies the resulting render data into the stable
  * FGWorldBaked* structures, and releases the parser before publishing its result. It never
- * spawns an actor and it cannot be used by the runtime gworld:// resolver.
+ * spawns an actor and it cannot be used by the runtime v3d:// resolver.
  *
  * The project build coordinator owns this UObject through a UPROPERTY while work is active. Parser creation
  * happens on a worker thread; every UObject and glTFRuntime decode/finalization call happens on
@@ -51,12 +51,6 @@ class V3DSIMULATOR_API UProjectSourceModelBuilder final : public UObject
 public:
     /** Starts a new one-shot build. DefinitionJson must be the already validated JSON snapshot. */
     bool Start(const FModelDefinition& InDefinition, const FString& InDefinitionJson);
-
-    /** Supplies the authoritative registry material used while baking Character models. */
-    void SetCharacterMaterialOverride(UMaterialInterface* InMaterial)
-    {
-        CharacterMaterialOverride = InMaterial;
-    }
 
     /** Supplies the authoritative registry skeleton used for Character ref-pose conversion. */
     void SetCharacterSkeletonOverride(USkeleton* InSkeleton)
@@ -79,12 +73,11 @@ public:
     virtual void BeginDestroy() override;
 
 private:
+    friend class FV3DSourceStreamingMetadataTest;
     UPROPERTY(Transient)
     TObjectPtr<UglTFRuntimeAsset> SourceAsset;
 
     /** Strong reflected references supplied by GameManagerSubSystem before Character build starts. */
-    UPROPERTY(Transient)
-    TObjectPtr<UMaterialInterface> CharacterMaterialOverride;
 
     UPROPERTY(Transient)
     TObjectPtr<USkeleton> CharacterSkeletonOverride;

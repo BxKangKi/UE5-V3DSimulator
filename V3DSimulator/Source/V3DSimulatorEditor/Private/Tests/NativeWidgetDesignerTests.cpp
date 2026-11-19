@@ -39,7 +39,7 @@ bool FV3DNativeWidgetDesignerTest::RunTest(const FString&)
             TEXT("WBP_Debug"), BPTYPE_Normal, UWidgetBlueprint::StaticClass(),
             UWidgetBlueprintGeneratedClass::StaticClass(), TEXT("NativeHierarchyTest"))));
     if (!TestNotNull(TEXT("Unrelated generic widget created"), Unrelated.Get())) return false;
-    TestFalse(TEXT("Same asset name at another path does not trigger shipped HUD migration"),
+    TestFalse(TEXT("Generic widgets are not reparented"),
         UNativeWidgetDesignerLibrary::RefreshNativeWidgetHierarchy(Unrelated.Get(), true));
     TestTrue(TEXT("Unrelated generic widget keeps its parent"), Unrelated->ParentClass == UUserWidget::StaticClass());
     TStrongObjectPtr<UWidgetBlueprint> Blueprint(Cast<UWidgetBlueprint>(
@@ -48,44 +48,12 @@ bool FV3DNativeWidgetDesignerTest::RunTest(const FString&)
             UWidgetBlueprintGeneratedClass::StaticClass(), TEXT("NativeHierarchyTest"))));
     if (!TestNotNull(TEXT("Widget Blueprint created"), Blueprint.Get())) return false;
 
-    // A referenced legacy panel must retain its variable/type, without restoring its full old
-    // layout. An unused sibling and the referenced panel's unreferenced children should vanish.
-    Blueprint->WidgetTree = NewObject<UWidgetTree>(Blueprint.Get(), NAME_None, RF_Transactional);
-    UCanvasPanel* LegacyRoot = Blueprint->WidgetTree->ConstructWidget<UCanvasPanel>();
-    Blueprint->WidgetTree->RootWidget = LegacyRoot;
-    UVerticalBox* LegacyPanel = Blueprint->WidgetTree->ConstructWidget<UVerticalBox>(
-        UVerticalBox::StaticClass(), TEXT("LegacyContainer"));
-    LegacyPanel->bIsVariable = true;
-    LegacyRoot->AddChild(LegacyPanel);
-    LegacyPanel->AddChild(Blueprint->WidgetTree->ConstructWidget<UTextBlock>(
-        UTextBlock::StaticClass(), TEXT("LegacyUnreferencedChild")));
-    LegacyRoot->AddChild(Blueprint->WidgetTree->ConstructWidget<UTextBlock>(
-        UTextBlock::StaticClass(), TEXT("LegacyUnused")));
-    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint.Get());
-    FKismetEditorUtilities::CompileBlueprint(Blueprint.Get());
-    if (!TestTrue(TEXT("Legacy source compiles"), Blueprint->Status != BS_Error)) return false;
-    UEdGraph* EventGraph = FBlueprintEditorUtils::FindEventGraph(Blueprint.Get());
-    if (!TestNotNull(TEXT("Event graph exists"), EventGraph)) return false;
-    UK2Node_VariableGet* Reference = NewObject<UK2Node_VariableGet>(EventGraph);
-    Reference->VariableReference.SetSelfMember(TEXT("LegacyContainer"));
-    EventGraph->AddNode(Reference, false, false);
-    Reference->AllocateDefaultPins();
-
     TestTrue(TEXT("Native templates are materialized"),
         UNativeWidgetDesignerLibrary::RefreshNativeWidgetHierarchy(Blueprint.Get(), true));
     UWidgetTree* Tree = Blueprint->WidgetTree;
     if (!TestNotNull(TEXT("Asset tree exists"), Tree)) return false;
     TestTrue(TEXT("Serialized tree is owned by the Blueprint asset"), Tree->GetOuter() == Blueprint.Get());
     TestTrue(TEXT("Designer hierarchy begins with ScaleBox"), Tree->RootWidget->IsA<UScaleBox>());
-    UWidget* Compatibility = Tree->FindWidget(TEXT("LegacyBindings_Only"));
-    if (TestNotNull(TEXT("Only referenced legacy bindings are retained"), Compatibility))
-        TestEqual(TEXT("Compatibility controls never occupy layout space"), Compatibility->GetVisibility(), ESlateVisibility::Collapsed);
-    UVerticalBox* Placeholder = Cast<UVerticalBox>(Tree->FindWidget(TEXT("LegacyContainer")));
-    if (TestNotNull(TEXT("Referenced variable keeps its original type/name"), Placeholder))
-        TestEqual(TEXT("Legacy panel descendants are not copied"), Placeholder->GetChildrenCount(), 0);
-    TestNull(TEXT("Unused legacy widget removed"), Tree->FindWidget(TEXT("LegacyUnused")));
-    TestNull(TEXT("Unreferenced legacy descendant removed"), Tree->FindWidget(TEXT("LegacyUnreferencedChild")));
-
     TArray<UObject*> Templates;
     GetObjectsWithOuter(Tree, Templates);
     Templates.Add(Tree);
@@ -109,7 +77,7 @@ bool FV3DNativeWidgetDesignerTest::RunTest(const FString&)
 
     FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint.Get());
     FKismetEditorUtilities::CompileBlueprint(Blueprint.Get());
-    TestTrue(TEXT("Preserved graph variables compile against the native template tree"), Blueprint->Status != BS_Error);
+    TestTrue(TEXT("Native template tree compiles"), Blueprint->Status != BS_Error);
     TStrongObjectPtr<UMenuButtonWidget> Preview(NewObject<UMenuButtonWidget>(GetTransientPackage(), Blueprint->GeneratedClass));
     Preview->SetDesignerFlags(EWidgetDesignFlags::Designing);
     TestTrue(TEXT("Materialized Blueprint initializes without a world"), Preview->Initialize());
@@ -118,8 +86,6 @@ bool FV3DNativeWidgetDesignerTest::RunTest(const FString&)
         Preview->GetRootWidget()->GetFName(), Tree->RootWidget->GetFName());
     for (UWidget* Widget : Widgets)
     {
-        if (Widget == Compatibility || Widget == Placeholder
-            || Widget->GetFName() == TEXT("NativeCompatibilityLayout")) continue;
         UWidget* PreviewWidget = Preview->WidgetTree->FindWidget(Widget->GetFName());
         TestNotNull(*FString::Printf(TEXT("Native hierarchy selection resolves %s"), *Widget->GetName()), PreviewWidget);
     }

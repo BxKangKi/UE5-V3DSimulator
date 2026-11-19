@@ -215,7 +215,7 @@ public:
     template <typename T> T* GetCameraComponent() const { return Cast<T>(CurrentCamera.Get()); }
     UFUNCTION(BlueprintPure, Category="SettingData")
     UGameSettings* GetGameSettings() const { return GameSettings.Get(); }
-    FVector GetPlayerLocation() const { return PlayerLocation; }
+    FVector GetPlayerLocation() const;
     FVector GetCameraLocation() const { return IsValid(CurrentCamera.Get()) ? CurrentCamera->GetComponentLocation() : FVector::ZeroVector; }
     bool GetGamePaused() const { return bIsGamePaused; }
     UWorldData* GetWorldData() const { return CurrentWorldData.Get(); }
@@ -773,7 +773,7 @@ private:
     UPROPERTY(Transient)
     TArray<TWeakObjectPtr<AVehiclePawn>> SpawnedVehicles;
 
-    /** Opaque gworld:// keys copied from the verified archive directory; never source filenames. */
+    /** Opaque v3d:// keys copied from the verified archive directory; never source filenames. */
     TArray<FString> StaticReferences;
     TArray<FString> VehicleReferences;
     TArray<FString> WeaponReferences;

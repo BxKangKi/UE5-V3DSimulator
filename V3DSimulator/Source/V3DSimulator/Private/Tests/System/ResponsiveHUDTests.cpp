@@ -24,7 +24,7 @@
 #include "UI/SurvivalHUDWidget.h"
 #include "UI/MainWorldWidget.h"
 #include "UI/WorldSelectionWidget.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 #include "UI/WidgetStyleSafety.h"
 #include "Widgets/SWidget.h"
 #include "Layout/ArrangedChildren.h"
@@ -264,7 +264,6 @@ bool FV3DCompactCreatorHUDTest::RunTest(const FString&)
     TestTrue(TEXT("Status remains available for optional diagnostics"), bFoundStatus);
 
     HUD->ToolbarSlotHeight = 80.f;
-    HUD->ToolbarSize = FVector2D(4000, 1000); // Old Blueprint rectangle must not stretch slots.
     HUD->SynchronizeProperties();
     HUD->ForceLayoutPrepass();
     CheckSquareSlots(80.f);
@@ -333,11 +332,11 @@ bool FV3DOriginalHUDStyleTest::RunTest(const FString&)
     const UMainWorldWidget* Start = GetDefault<UMainWorldWidget>();
     const UPauseMenuWidget* Pause = GetDefault<UPauseMenuWidget>();
     const ULoadingHUDWidget* Loading = GetDefault<ULoadingHUDWidget>();
-    TestTrue(TEXT("Start uses the original serialized background"), Start->BackgroundColor.Equals(V3DHUDLegacyStyle::MenuBackground));
-    TestTrue(TEXT("Original blue-gray buttons restored"), Start->ButtonColor.Equals(V3DHUDLegacyStyle::ButtonBackground));
-    TestTrue(TEXT("Original translucent pause background restored"), Pause->BackgroundColor.Equals(V3DHUDLegacyStyle::PauseBackground));
-    TestTrue(TEXT("Original loading background restored"), Loading->BackgroundColor.Equals(V3DHUDLegacyStyle::LoadingBackground));
-    TestTrue(TEXT("Original green progress restored"), Loading->AccentColor.Equals(V3DHUDLegacyStyle::ProgressFill));
+    TestTrue(TEXT("Start uses the original serialized background"), Start->BackgroundColor.Equals(V3DHUDStyle::MenuBackground));
+    TestTrue(TEXT("Original blue-gray buttons restored"), Start->ButtonColor.Equals(V3DHUDStyle::ButtonBackground));
+    TestTrue(TEXT("Original translucent pause background restored"), Pause->BackgroundColor.Equals(V3DHUDStyle::PauseBackground));
+    TestTrue(TEXT("Original loading background restored"), Loading->BackgroundColor.Equals(V3DHUDStyle::LoadingBackground));
+    TestTrue(TEXT("Original green progress restored"), Loading->AccentColor.Equals(V3DHUDStyle::ProgressFill));
     TestEqual(TEXT("Original start font size"), Start->BodyFontSize, 48);
     TestEqual(TEXT("Original pause font size"), Pause->BodyFontSize, 64);
     TestEqual(TEXT("Original pause title size"), Pause->TitleFontSize, 100);

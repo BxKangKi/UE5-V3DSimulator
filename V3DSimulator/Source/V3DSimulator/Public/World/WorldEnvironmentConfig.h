@@ -8,9 +8,10 @@ USTRUCT(BlueprintType)
 struct V3DSIMULATOR_API FV3DWorldAudioSettings
 {
     GENERATED_BODY()
+    TOptional<bool> DefaultFootstepLoop, WaterLoop, UnderwaterLoop, EnvironmentMusicLoop;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") bool bGlobalAcoustics = false;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") bool bEnvironmentMusic = true;
-    /** Empty uses AssetRegistry. "none" explicitly mutes. Otherwise gworld://sound/UUID. */
+    /** Empty uses AssetRegistry. "none" explicitly mutes. Otherwise v3d://sound/UUID. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") FString DefaultFootstep;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") FString Water;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") FString Underwater;
@@ -32,6 +33,7 @@ struct V3DSIMULATOR_API FV3DBiomeDefinition
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Biome") float Radius = 1000;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Biome") int32 Priority = 0;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Biome") FString Music;
+    TOptional<bool> MusicLoop;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Biome") FName EnterCommand;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Biome") FName ExitCommand;
     bool Contains(const FVector& Point) const;

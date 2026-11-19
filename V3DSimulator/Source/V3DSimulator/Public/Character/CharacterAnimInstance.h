@@ -15,6 +15,9 @@
 #include "InputCoreTypes.h"
 #include "CharacterAnimInstance.generated.h"
 
+class UAnimSequence;
+class UBlendSpace;
+
 class UCharacterMovementComponent;
 class UCharacterComponent;
 class AWeaponActor;
@@ -25,6 +28,19 @@ class V3DSIMULATOR_API UCharacterAnimInstance : public UAnimInstance
     GENERATED_BODY()
 
 public:
+    /** Filled from ABP_Humanoid's player nodes by the editor binding setup. Cooked hard references. */
+    UPROPERTY(EditDefaultsOnly, Category="Character|Model Animations")
+    TArray<TObjectPtr<UAnimSequence>> DefaultModelSequences;
+    UPROPERTY(EditDefaultsOnly, Category="Character|Model Animations")
+    TArray<TObjectPtr<UBlendSpace>> DefaultModelBlendSpaces;
+
+    /** Read-only lookups used by exposed ABP asset pins during parallel animation updates. */
+    UFUNCTION(BlueprintPure, Category="Character|Model Animations", meta=(BlueprintThreadSafe))
+    UAnimSequence* ResolveModelAnimation(UAnimSequence* DefaultSequence) const;
+    UFUNCTION(BlueprintPure, Category="Character|Model Animations", meta=(BlueprintThreadSafe))
+    UBlendSpace* ResolveModelBlendSpace(UBlendSpace* DefaultBlendSpace) const;
+    void InstallModelAnimations(const TMap<FName, TObjectPtr<UAnimSequence>>& Clips);
+
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     FVector Velocity = FVector::ZeroVector;
 
@@ -131,9 +147,6 @@ public:
     UFUNCTION(BlueprintCallable, Category="Character|Animation|Footsteps")
     void PlayFootstep(EControllerHand FootSide);
 
-    /** Compatibility entry point for AnimBPs already using the controller function name. */
-    UFUNCTION(BlueprintCallable, Category="Character|Animation|Footsteps")
-    void TriggerFootstepTrace(EControllerHand FootSide);
 
     /** Named skeleton notifies: FootstepLeft and FootstepRight. */
     UFUNCTION() void AnimNotify_FootstepLeft();
@@ -143,6 +156,10 @@ public:
     void RefreshCharacterAnimationState(float DeltaSeconds = 0.0f);
 
 private:
+    UPROPERTY(Transient)
+    TMap<TObjectPtr<UAnimSequence>, TObjectPtr<UAnimSequence>> ModelSequenceOverrides;
+    UPROPERTY(Transient)
+    TMap<TObjectPtr<UBlendSpace>, TObjectPtr<UBlendSpace>> ModelBlendSpaceOverrides;
     virtual FAnimInstanceProxy* CreateAnimInstanceProxy() override;
     virtual void DestroyAnimInstanceProxy(FAnimInstanceProxy* InProxy) override;
     virtual void NativeUpdateAnimation(float DeltaSeconds) override;

@@ -2,6 +2,9 @@
 #ifndef SHADER_LIBRARY_USH
 #define SHADER_LIBRARY_USH
 #pragma once
+#if POST_PROCESS_MATERIAL
+#include "/Plugin/ShaderLibrary/Underwater.ush"
+#endif
 // /Plugin/ShaderLibrary/ShaderLibrary.ush
 
 float InvLerp(float a, float b, float v)
@@ -9,7 +12,7 @@ float InvLerp(float a, float b, float v)
     return (v - a) / (b - a);
 }
 
-float NormalToTangent(float3 NormalMap)
+float3 NormalToTangent(float3 NormalMap)
 {
     // Convert from [0,1] to [-1,1]
     float3 tangentNormal = normalize(NormalMap * 2.0f - 1.0f);
@@ -23,12 +26,13 @@ float2 ParticlePosToScreenUV(float3 World, float3 View, float FlipY)
     // Assuming ViewProj is your View * Projection matrix (pre-multiplied on CPU)
     // Assuming FlipY is a uniform/constant
 
-    const float4 clipPos = mul(float4(World, 1.0f), ViewProj);
+    const float3 TranslatedWorld = World + LWCToFloat(ResolvedView.PreViewTranslation);
+    const float4 clipPos = mul(float4(TranslatedWorld, 1.0f), LWCToFloat(ResolvedView.TranslatedWorldToClip));
 
     // --- Epsilon-Max Approach (Branchless W-Guard) ---
     // 1. Get the sign of W (1.0 or -1.0).
     // 2. Force W to be at least 1e-6 to avoid division by zero or extreme precision loss.
-    const float w = sign(clipPos.w) * max(abs(clipPos.w), 1e-6f);
+    const float w = (clipPos.w < 0.0f ? -1.0f : 1.0f) * max(abs(clipPos.w), 1e-6f);
 
     // Standard perspective divide to get Normalized Device Coordinates
     const float3 ndc = clipPos.xyz / w;
@@ -49,8 +53,8 @@ float2 ParticlePosToScreenUV(float3 World, float3 View, float FlipY)
 float3 WorldToTangent(float3 TangentWS, float3 NormalWS, float3 NormalMap)
 {
     // Inputs from vertex shader or interpolated per-pixel
-    const TangentWS = normalize(TangentWS); // Tangent vector in world space
-    const NormalWS = normalize(NormalWS);   // Normal vector in world space
+    TangentWS = normalize(TangentWS); // Tangent vector in world space
+    NormalWS = normalize(NormalWS);   // Normal vector in world space
     const float TangentW = 1.0;               // Handedness component
 
     // Calculate Binormal (bitangent) using cross product and handedness

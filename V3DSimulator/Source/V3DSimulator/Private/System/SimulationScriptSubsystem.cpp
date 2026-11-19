@@ -1,5 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/SimulationScriptSubsystem.h"
+#include "System/SoundEventSubsystem.h"
+#include "System/MultiplayerWorldStateActor.h"
+#include "EngineUtils.h"
 #include "World/WorldEnvironmentSubsystem.h"
 #include "System/SimulationCommandObject.h"
 #include "System/GameManagerSubSystem.h"
@@ -205,6 +208,11 @@ bool USimulationScriptSubsystem::ExecuteDefinition(APlayerController* Controller
             { Message = TEXT("Transform destination is not streamed in. Preload it first; player long-distance travel can use tp."); return false; }
             Predicted.Add(Actor, Transform);
         }
+        else if (Action.Type == EV3DCommandAction::SoundEvent)
+        {
+            if (!GetWorld()->GetSubsystem<USoundEventSubsystem>()->HasEvent(Action.Event))
+            { Message = TEXT("Unknown sound event: ") + Action.Event.ToString(); return false; }
+        }
         else if (!PhysicsRoot(Actor) && (!CharacterMovement(Actor) || Action.bAngular))
         { Message = TEXT("Velocity/speed requires a simulated physics root or CharacterMovement; Angular requires physics."); return false; }
         Transforms.Add(Transform);
@@ -229,7 +237,21 @@ bool USimulationScriptSubsystem::ExecuteDefinition(APlayerController* Controller
         {
             AActor* Actor = Actors[Index].Get();
             if (!IsValid(Actor)) { Message = FString::Printf(TEXT("Target was destroyed after %d actions."), Applied); return false; }
-            if (Action.Type == EV3DCommandAction::Transform)
+            if (Action.Type == EV3DCommandAction::SoundEvent)
+            {
+                TActorIterator<AMultiplayerWorldStateActor> WorldState(GetWorld());
+                if (WorldState)
+                {
+                    WorldState->MulticastSoundEvent(Action.Event, Actor->GetActorLocation(), Action.bStop);
+                }
+                else
+                {
+                    auto* Events = GetWorld()->GetSubsystem<USoundEventSubsystem>();
+                    if (Action.bStop) Events->StopEvent(Action.Event);
+                    else Events->TriggerEvent(Action.Event, Actor->GetActorLocation());
+                }
+            }
+            else if (Action.Type == EV3DCommandAction::Transform)
             {
                 if (!Actor->SetActorTransform(Transforms[Index], false, nullptr, ETeleportType::TeleportPhysics))
                 { Message = FString::Printf(TEXT("Transform rejected after %d actions."), Applied); return false; }

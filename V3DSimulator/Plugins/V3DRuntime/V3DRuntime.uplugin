@@ -1,0 +1,26 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "V3D Runtime",
+  "Description": "Portable V3D format, Unreal archive/mesh/texture loader and material shaders.",
+  "Category": "Rendering",
+  "CanContainContent": true,
+  "Modules": [
+    {
+      "Name": "V3DRuntime",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit"
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "glTFRuntime",
+      "Enabled": true
+    },
+    {
+      "Name": "ShaderLibrary",
+      "Enabled": true
+    }
+  ]
+}

@@ -1,71 +1,18 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #ifndef SHADERLIBRARY_POSTPROCESS_USH
 #define SHADERLIBRARY_POSTPROCESS_USH
-#pragma once
-// /Plugin/ShaderLibrary/PostProcess.ush
 
-// ------------------------------------------------------------
-// Scene texture indices (UE 5.8 ESceneTextureId)
-// ------------------------------------------------------------
-#define SL_PPI_SCENE_DEPTH 1
-#define SL_PPI_WORLD_NORMAL 8
-#define SL_PPI_CUSTOM_DEPTH 13
-#define SL_PPI_POSTPROCESS_INPUT0 14
-#define SL_PPI_CUSTOM_STENCIL 25
-
-float2 SL_SceneUV(float2 ViewportUV, int SceneTextureId)
+// Entry point used by PP_Weather. Cel shading is not part of this pass.
+float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation, float Time)
 {
-    return ClampSceneTextureUV(
-        ViewportUVToSceneTextureUV(DERIV_BASE_VALUE(saturate(ViewportUV)), SceneTextureId),
-        SceneTextureId);
+    float2 SceneUV = ClampSceneTextureUV(ViewportUVToSceneTextureUV(saturate(UV), 14), 14);
+    float3 Scene = SceneTextureLookup(SceneUV, 14, false).rgb;
+    float Coverage = saturate(Precipitation);
+    [branch] if (Coverage <= 0.001f) return Scene;
+    // Preserve HDR exposure and highlights while tinting the existing scene.
+    float Luma = dot(max(Scene, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+    float3 Wet = Scene * float3(0.86f, 0.90f, 0.96f);
+    float3 Snow = lerp(Scene, Luma * float3(0.94f, 0.97f, 1.0f), 0.35f);
+    return lerp(Scene, lerp(Wet, Snow, saturate(WeatherMode)), Coverage);
 }
-
-float4 SL_SceneSample(float2 ViewportUV, int SceneTextureId, bool Filtered)
-{
-    float2 UV = SL_SceneUV(ViewportUV, SceneTextureId);
-    return SceneTextureLookup(UV, SceneTextureId, Filtered);
-}
-
-float SL_Luminance(float3 C)
-{
-    return dot(max(C, 0.0), float3(0.2126, 0.7152, 0.0722));
-}
-
-float3 SL_QuantizeHDR(float3 Color, float Steps)
-{
-    const float MAX_LOG_LUMA = 3.0;
-    Steps = max(Steps, 1.0);
-
-    float3 C = max(Color, 0.0);
-    float L = SL_Luminance(C);
-    float LogL = log2(1.0 + L);
-    float T = saturate(LogL / MAX_LOG_LUMA);
-    float QT = round(T * Steps) / Steps;
-    float TargetLogL = QT * MAX_LOG_LUMA;
-    float TargetL = exp2(TargetLogL) - 1.0;
-    float Scale = TargetL / max(L, 1.0e-5);
-    return max(C * Scale, 0.0);
-}
-
-// ------------------------------------------------------------
-// Cel shading
-//
-// Scene color is sampled here from the current viewport UV, so the material
-// graph only needs to supply UV. This also fixes the classic editor viewport
-// scaling mismatch from using raw ViewportUV in SceneTextureLookup.
-// ------------------------------------------------------------
-float3 CelShading(float3 SceneColor, float2 UV, float CelShadingMode)
-{
-    if (CelShadingMode)
-    {
-        // Re-sample the authoritative post-process input from the correctly
-        // converted UV. SceneColor is kept as an argument for backward
-        // compatibility with the existing material function signature.
-        float3 Scene = SL_SceneSample(UV, SL_PPI_POSTPROCESS_INPUT0, false).rgb;
-        float3 Q = SL_QuantizeHDR(Scene, 4.0);
-        return Q;
-    }
-    return SceneColor;
-}
-
-#endif // SHADERLIBRARY_POSTPROCESS_USH
+#endif

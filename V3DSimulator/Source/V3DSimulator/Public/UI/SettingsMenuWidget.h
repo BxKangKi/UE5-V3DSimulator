@@ -284,8 +284,6 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleCloudFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
-    void CycleCelShadingModeFromUI();
-    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleShadowQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleTextureQualityFromUI();
@@ -401,7 +399,6 @@ private:
     bool bPendingRayTracing = true;
     bool bPendingHeightFog = true;
     bool bPendingCloud = true;
-    float PendingCelShadingMode = 1.0f;
     int32 PendingShadowQuality = 2;
     int32 PendingTextureQuality = 2;
     int32 PendingMaxTextureResolution = 768;

@@ -109,14 +109,12 @@ bool FV3DQualityProfilesTest::RunTest(const FString&)
     const TArray<FText> Options = Menu->GetSettingOptionTexts(ESettingsField::QualityProfile);
     if (!TestEqual(TEXT("Four presets and custom display"), Options.Num(), 5)) return false;
     Settings->Exposure = 2.0f;
-    Settings->CelShadingMode = 0.0f;
     for (int32 Q = 0; Q < 4; ++Q)
     {
         Settings->ApplyQualityProfile(static_cast<EQualitySettings>(Q));
         TestEqual(TEXT("Preset recognized"), Settings->GetQualityProfileIndex(), Q);
         TestEqual(TEXT("Preset render budget"), Settings->GetClampedMaxRenderDistanceMeters(), 1024 << Q);
         TestEqual(TEXT("Preset preserves exposure"), Settings->Exposure, 2.0f);
-        TestEqual(TEXT("Preset preserves art style"), Settings->CelShadingMode, 0.0f);
         TestTrue(TEXT("Preset serializes"), Restored->Deserialization(Settings->Serialization()));
         TestEqual(TEXT("Preset survives reload"), Restored->GetQualityProfileIndex(), Q);
         Menu->SetSettingFromDropdownSelection(ESettingsField::QualityProfile, Options[Q].ToString());

@@ -1,8 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/WorldSurfaceSubsystem.h"
+#include "System/SoundEventSubsystem.h"
 #include "Components/AudioComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/MeshComponent.h"
 #include "Engine/GameInstance.h"
+#include "Engine/Engine.h"
+#include "System/V3DSimulatorAssetRegistry.h"
+#include "System/V3DSimulatorGameInstance.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -23,15 +28,26 @@ UWorldSurfaceSubsystem* UWorldSurfaceSubsystem::Get(const UObject* Context)
 void UWorldSurfaceSubsystem::Reset()
 {
     check(IsInGameThread());
+    if (UWorld* World = GetWorld())
+        if (auto* Events = World->GetSubsystem<USoundEventSubsystem>()) Events->Reset();
     ++Generation;
     if (UWorld* World = GetWorld()) World->GetTimerManager().ClearAllTimersForObject(this);
     for (UAudioComponent* Sound : ActiveSounds) if (IsValid(Sound)) Sound->Stop();
     ActiveSounds.Empty();
     PendingSounds.Empty();
     PcmCache.Empty();
+    for (const auto& Pair : UniformComponents)
+        if (UPrimitiveComponent* Component = Pair.Key.Get(); IsValid(Component)
+            && Component->GetPhysicsMaterialOverride() == Pair.Value.Get())
+            Component->SetPhysMaterialOverride(nullptr);
+    UniformComponents.Empty();
+    for (const auto& Source : MaterialCache)
+        for (const auto& Entry : Source.Value)
+            if (auto* Material = Entry.Value.Get()) { Material->PhysMaterial = nullptr; Material->bOverridePhysMaterial = false; }
     MaterialCache.Empty();
     PhysicalMaterials.Empty();
-    LastSoundIndex.Empty();
+    DefaultPhysicalMaterial = nullptr;
+    LastSoundIndex.Empty(); FootstepLoops.Empty();
     Attenuation = nullptr;
     Config = FV3DWorldSurfaceConfig();
     InFlight = 0;
@@ -56,7 +72,10 @@ bool UWorldSurfaceSubsystem::Configure(const TSharedPtr<FJsonObject>& Json, FStr
 bool UWorldSurfaceSubsystem::Configure(FV3DWorldSurfaceConfig Parsed, FString& Error)
 {
     check(IsInGameThread());
-    UGameInstance* Instance = GetWorld()->GetGameInstance();
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->bIsTearingDown)
+    { Error = TEXT("Surface configuration requires an active world."); return false; }
+    UGameInstance* Instance = World->GetGameInstance();
     UModelDatabaseSubsystem* Database = Instance ? Instance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
     TArray<FSoundDefinition> Sounds;
     if (Database) Database->GetSoundDefinitions(Sounds);
@@ -65,6 +84,14 @@ bool UWorldSurfaceSubsystem::Configure(FV3DWorldSurfaceConfig Parsed, FString& E
     if (!Parsed.ValidateSounds(Available, Error)) return false;
     Reset();
     Config = MoveTemp(Parsed);
+    if (const auto* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this))
+    {
+        DefaultPhysicalMaterial = Registry->ResolveDefaultPhysicalMaterial();
+        if (!Registry->DefaultPhysicalMaterial.IsNull() && !IsValid(DefaultPhysicalMaterial))
+            UE_LOG(LogTemp, Warning, TEXT("AssetRegistry.DefaultPhysicalMaterial could not be loaded: %s"),
+                *Registry->DefaultPhysicalMaterial.ToSoftObjectPath().ToString());
+    }
+    if (auto* Events = World->GetSubsystem<USoundEventSubsystem>()) Events->Configure(Config);
     for (const auto& Pair : Config.PhysicalMaterials)
     {
         UPhysicalMaterial* Material = NewObject<UPhysicalMaterial>(this, NAME_None, RF_Transient);
@@ -95,12 +122,19 @@ bool UWorldSurfaceSubsystem::Configure(FV3DWorldSurfaceConfig Parsed, FString& E
 
 void UWorldSurfaceSubsystem::ApplyToStaticMesh(UStaticMeshComponent* Component)
 {
+    ApplyToMesh(Component);
+}
+
+void UWorldSurfaceSubsystem::ApplyToMesh(UMeshComponent* Component)
+{
     check(IsInGameThread());
-    if (!IsValid(Component) || PhysicalMaterials.IsEmpty()) return;
+    if (!IsValid(Component) || (PhysicalMaterials.IsEmpty() && !IsValid(DefaultPhysicalMaterial))) return;
     // Weak cached wrappers share unchanged shader/texture parameters without editing a shared
     // facade material (facades can be shared across worlds, including multiple PIE sessions).
     if ((++MaterialApplications % 128) == 0)
     {
+        for (auto It = UniformComponents.CreateIterator(); It; ++It)
+            if (!It.Key().IsValid() || !It.Value().IsValid()) It.RemoveCurrent();
         for (auto It = MaterialCache.CreateIterator(); It; ++It)
         {
             if (!It.Key().IsValid()) { It.RemoveCurrent(); continue; }
@@ -117,6 +151,12 @@ void UWorldSurfaceSubsystem::ApplyToStaticMesh(UStaticMeshComponent* Component)
         UMaterialInterface* Base = Component->GetMaterial(Index);
         const FName Surface = Config.ResolveMaterial(Slots.IsValidIndex(Index) ? Slots[Index].ToString() : FString());
         UPhysicalMaterial* Physical = PhysicalMaterials.FindRef(Surface);
+        UPhysicalMaterial* Authored = IsValid(Base) ? Base->GetPhysicalMaterial() : nullptr;
+        // JSON mappings/defaults win. A specifically authored material keeps its own surface;
+        // only an unassigned/engine-default slot receives the registry fallback.
+        if (!IsValid(Physical) && IsValid(DefaultPhysicalMaterial)
+            && (!IsValid(Authored) || (GEngine && Authored == GEngine->DefaultPhysMaterial)))
+            Physical = DefaultPhysicalMaterial;
         if (IsValid(Base) && IsValid(Physical))
         {
             // Applying a surface again must preserve the existing wrapper. Keying another
@@ -130,9 +170,12 @@ void UWorldSurfaceSubsystem::ApplyToStaticMesh(UStaticMeshComponent* Component)
                 {
                     UMaterialInterface* Parent = Base;
                     while (UMaterialInstanceDynamic* Dynamic = Cast<UMaterialInstanceDynamic>(Parent))
+                    {
                         Parent = Dynamic->Parent;
+                    }
                     if (!IsValid(Parent)) continue;
-                    Material = UMaterialInstanceDynamic::Create(Parent, this);
+                    Material = UMaterialInstanceDynamic::Create(Parent, this,
+                        MakeUniqueObjectName(this, UMaterialInstanceDynamic::StaticClass(), FName(TEXT("V3D_Surface"))));
                     Material->CopyMaterialUniformParameters(Base);
                     Material->PhysMaterial = Physical;
                     Material->bOverridePhysMaterial = true; // UE 5.8
@@ -141,21 +184,64 @@ void UWorldSurfaceSubsystem::ApplyToStaticMesh(UStaticMeshComponent* Component)
                 Component->SetMaterial(Index, Material);
             }
         }
-        else Physical = Base ? Base->GetPhysicalMaterial() : nullptr;
+        else if (!IsValid(Physical)) Physical = Authored;
         if (Index == 0) Uniform = Physical;
         else bUniform &= Uniform == Physical;
     }
     // A component override would erase all per-triangle materials on a mixed-material mesh.
-    if (bUniform && !FindSurface(Uniform).IsNone()) Component->SetPhysMaterialOverride(Uniform);
+    const TWeakObjectPtr<UPrimitiveComponent> ComponentKey(Component);
+    if (Component->GetNumMaterials() == 0)
+    {
+        Uniform = PhysicalMaterials.FindRef(Config.DefaultPhysicalMaterial);
+        if (!IsValid(Uniform)) Uniform = DefaultPhysicalMaterial;
+        bUniform = IsValid(Uniform);
+    }
+    // Preserve a deliberate component override (for example vehicle low-friction bodies).
+    UPhysicalMaterial* ExistingOverride = Component->GetPhysicsMaterialOverride();
+    const auto* OwnedOverride = UniformComponents.Find(ComponentKey);
+    const bool bOwnsOverride = OwnedOverride && OwnedOverride->Get() == ExistingOverride;
+    if (IsValid(ExistingOverride) && !bOwnsOverride)
+    {
+        UniformComponents.Remove(ComponentKey);
+        return;
+    }
+    if (bUniform && IsValid(Uniform)
+        && (Uniform == DefaultPhysicalMaterial || !FindSurface(Uniform).IsNone()))
+    {
+        if (ExistingOverride != Uniform) Component->SetPhysMaterialOverride(Uniform);
+        UniformComponents.Add(ComponentKey, Uniform);
+    }
+    else if (UniformComponents.Remove(ComponentKey)) Component->SetPhysMaterialOverride(nullptr);
+}
+
+void UWorldSurfaceSubsystem::ApplyToPrimitive(UPrimitiveComponent* Component)
+{
+    check(IsInGameThread());
+    if (!IsValid(Component)) return;
+    if (UMeshComponent* Mesh = Cast<UMeshComponent>(Component)) { ApplyToMesh(Mesh); return; }
+    const TWeakObjectPtr<UPrimitiveComponent> Key(Component);
+    UPhysicalMaterial* Existing = Component->GetPhysicsMaterialOverride();
+    const auto* Owned = UniformComponents.Find(Key);
+    if (IsValid(Existing) && (!Owned || Owned->Get() != Existing)) return;
+    UPhysicalMaterial* Physical = PhysicalMaterials.FindRef(Config.DefaultPhysicalMaterial);
+    if (!IsValid(Physical)) Physical = DefaultPhysicalMaterial;
+    if (!IsValid(Physical)) return;
+    if (Existing != Physical) Component->SetPhysMaterialOverride(Physical);
+    UniformComponents.Add(Key, Physical);
 }
 
 UPhysicalMaterial* UWorldSurfaceSubsystem::GetSimplePhysicalMaterial(UPrimitiveComponent* Component) const
 {
-    // A primitive collider has only one material: use slot 0, then the explicit world default.
+    // A primitive collider has one material. Use an explicit override/slot before defaults.
     if (IsValid(Component))
+    {
+        if (UPhysicalMaterial* Override = Component->GetPhysicsMaterialOverride()) return Override;
         if (UMaterialInterface* Material = Component->GetMaterial(0))
-            if (UPhysicalMaterial* Physical = Material->GetPhysicalMaterial(); !FindSurface(Physical).IsNone()) return Physical;
-    return PhysicalMaterials.FindRef(Config.DefaultPhysicalMaterial);
+            if (UPhysicalMaterial* Physical = Material->GetPhysicalMaterial(); IsValid(Physical)
+                && (!GEngine || Physical != GEngine->DefaultPhysMaterial)) return Physical;
+    }
+    if (UPhysicalMaterial* Physical = PhysicalMaterials.FindRef(Config.DefaultPhysicalMaterial)) return Physical;
+    return DefaultPhysicalMaterial;
 }
 
 FName UWorldSurfaceSubsystem::FindSurface(const UPhysicalMaterial* Material) const
@@ -196,7 +282,7 @@ void UWorldSurfaceSubsystem::PumpSoundLoads()
     }
 }
 
-bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit)
+bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit, UObject* Emitter)
 {
     check(IsInGameThread());
     if (!Hit.bBlockingHit || GetWorld()->GetNetMode() == NM_DedicatedServer) return false;
@@ -208,8 +294,15 @@ bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit)
             if (UMaterialInterface* Material = Component->GetMaterialFromCollisionFaceIndex(Hit.FaceIndex, Section))
                 Surface = FindSurface(Material->GetPhysicalMaterial());
         }
+    if (Surface.IsNone()) Surface = Config.DefaultPhysicalMaterial;
     const FV3DFootstepDefinition* Definition = Config.FootstepMappings.Find(Surface);
-    if (!Definition) return false;
+    if (!Definition)
+    {
+        V3DSoundPlayback::RefreshFootstep(FootstepLoops, this, Emitter, FString(), Hit.ImpactPoint);
+        return false;
+    }
+    const FString LoopKey = Definition->bLoop && Definition->Volume > 0 ? Surface.ToString() : FString();
+    if (V3DSoundPlayback::RefreshFootstep(FootstepLoops, this, Emitter, LoopKey, Hit.ImpactPoint)) return true;
     if (Definition->Volume <= 0) return true;
     TArray<int32, TInlineAllocator<16>> Ready;
     for (int32 Index = 0; Index < Definition->Sounds.Num(); ++Index)
@@ -226,13 +319,8 @@ bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit)
 #else
     if (ActiveSounds.Num() >= 16) return true;
 #endif
-    USoundWaveProcedural* Sound = NewObject<USoundWaveProcedural>(this, NAME_None, RF_Transient);
-    Sound->NumChannels = Pcm->NumChannels;
-    Sound->SetSampleRate(Pcm->SampleRate);
-    Sound->SetNumFrames(Pcm->NumFrames);
-    Sound->SampleByteSize = 2;
-    Sound->Duration = static_cast<float>(Pcm->NumFrames) / Pcm->SampleRate;
-    Sound->QueueAudio(Pcm->Bytes.GetData(), Pcm->Bytes.Num());
+    USoundWaveProcedural* Sound = V3DSoundPlayback::CreatePcm(this, Pcm, Definition->bLoop);
+    if (!Sound) return true;
     const float Pitch = FMath::FRandRange(Definition->PitchMin, Definition->PitchMax);
     UAudioComponent* Audio = UGameplayStatics::SpawnSoundAtLocation(this, Sound, Hit.ImpactPoint,
         FRotator::ZeroRotator, Definition->Volume, Pitch, 0.0f, Attenuation, nullptr, true);
@@ -240,12 +328,8 @@ bool UWorldSurfaceSubsystem::PlayFootstep(const FHitResult& Hit)
     {
         ActiveSounds.Add(Audio);
         if (auto* Environment = GetWorld()->GetSubsystem<UWorldEnvironmentSubsystem>()) Environment->ApplySpatialAudio(Audio);
-        // Procedural sources can keep asking for silence after their queue ends. Explicitly
-        // stop at the end; use one independent queue per voice so rapid steps cannot consume it.
-        FTimerHandle StopTimer;
-        const TWeakObjectPtr<UAudioComponent> WeakAudio(Audio);
-        GetWorld()->GetTimerManager().SetTimer(StopTimer, FTimerDelegate::CreateWeakLambda(this,
-            [WeakAudio]() { if (auto* Component = WeakAudio.Get()) Component->Stop(); }), Sound->Duration / Pitch + 0.1f, false);
+        if (Definition->bLoop) V3DSoundPlayback::TrackFootstep(FootstepLoops, this, Emitter, LoopKey, Audio, Hit.ImpactPoint);
+        else V3DSoundPlayback::StopOneShot(this, Audio, Sound->Duration, Pitch);
     }
     return true;
 }

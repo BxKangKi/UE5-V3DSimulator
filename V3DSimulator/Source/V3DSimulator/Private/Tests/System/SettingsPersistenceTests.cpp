@@ -37,10 +37,10 @@ bool FV3DJsonNoBackupTest::RunTest(const FString&)
     return true;
 }
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DDataFolderMigrationTest,
-    "V3DSimulator.Streaming.DataFolderMigration",
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DCurrentDataFolderTest,
+    "V3DSimulator.Streaming.CurrentDataFolder",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-bool FV3DDataFolderMigrationTest::RunTest(const FString&)
+bool FV3DCurrentDataFolderTest::RunTest(const FString&)
 {
     const FString Root = FSafeFileIO::NormalizeFilePath(FPaths::Combine(
         FPaths::ProjectSavedDir(), TEXT("Automation"), FGuid::NewGuid().ToString()));
@@ -60,22 +60,13 @@ bool FV3DDataFolderMigrationTest::RunTest(const FString&)
     IFileManager::Get().MakeDirectory(*FPaths::GetPath(LegacyPath), true);
     if (!TestTrue(TEXT("Seed legacy layout"), FPlatformFileManager::Get().GetPlatformFile().MoveFile(*LegacyPath, *NewPath))) return false;
     Store = FEntityArchiveStore::Open(WorldRoot, false, Error);
-    if (!TestTrue(TEXT("Migrate existing data even with creation disabled"), Store.IsValid())) return false;
-    TestEqual(TEXT("Migration preserves commits"), Store->GetGeneration(), Generation);
-    bool bMissing = true;
-    FWorldRuntimeState Loaded;
-    TestTrue(TEXT("Read migrated state"), Store->LoadRuntimeState(Loaded, bMissing, Error));
-    TestFalse(TEXT("State was not replaced by an empty world"), bMissing);
-    TestEqual(TEXT("State value preserved"), Loaded.WorldTime, 123.0f);
-    TestFalse(TEXT("Legacy file moved, not duplicated"), IFileManager::Get().FileExists(*LegacyPath));
-    Store.Reset();
-    const TSharedRef<FJsonObject> Sentinel = MakeShared<FJsonObject>();
-    Sentinel->SetStringField(TEXT("Sentinel"), TEXT("do not overwrite"));
-    TestTrue(TEXT("Create conflict fixture"), FSafeFileIO::SaveJsonBlocking(Sentinel, LegacyPath).IsSuccess());
+    TestFalse(TEXT("Old directory is not read or moved"), Store.IsValid());
+    TestTrue(TEXT("Unrelated file is preserved"), IFileManager::Get().FileExists(*LegacyPath));
+    TestFalse(TEXT("Read-only open does not create a current archive"), IFileManager::Get().FileExists(*NewPath));
+    TestTrue(TEXT("Place fixture at its current location"), FPlatformFileManager::Get().GetPlatformFile().MoveFile(*NewPath, *LegacyPath));
     Store = FEntityArchiveStore::Open(WorldRoot, false, Error);
-    if (TestTrue(TEXT("New path wins when both exist"), Store.IsValid()))
-        TestEqual(TEXT("New data remains intact"), Store->GetGeneration(), Generation);
-    TestTrue(TEXT("Conflicting legacy file is preserved"), IFileManager::Get().FileExists(*LegacyPath));
+    if (TestTrue(TEXT("Current location reads"), Store.IsValid()))
+        TestEqual(TEXT("Committed state is preserved"), Store->GetGeneration(), Generation);
     Store.Reset();
     return true;
 }

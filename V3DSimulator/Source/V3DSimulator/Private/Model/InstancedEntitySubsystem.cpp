@@ -8,6 +8,7 @@
  */
 
 #include "Model/InstancedEntitySubsystem.h"
+#include "System/WorldSurfaceSubsystem.h"
 #include "Gravity/GravityFieldComponent.h"
 
 #include "Async/ParallelFor.h"
@@ -330,6 +331,9 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
         Binding.RenderWorldTransform = WorldTransform;
     }
     RenderActor->FlushDirtyTransforms();
+
+    if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(this))
+        Surfaces->ApplyToPrimitive(PhysicsRoot);
 
     if (Options.bStoreAsEntityTemplate)
     {

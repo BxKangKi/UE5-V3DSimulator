@@ -122,6 +122,9 @@ bool V3DSimulatorProjectConfig::Parse(
     OutConfig = FV3DSimulatorProjectConfig();
     OutError.Reset();
     if (!Json.IsValid()) { OutError = TEXT("Project config.json is invalid."); return false; }
+    for (const TCHAR* Key : {TEXT("PhysicalMaterials"), TEXT("DefaultPhysicalMaterial"), TEXT("MaterialPhysicalMappings"), TEXT("FootstepMappings"), TEXT("SoundLists"), TEXT("Events")})
+        if (Json->HasField(Key))
+        { OutError = FString::Printf(TEXT("%s belongs in scripts/sounds.json, not config.json."), Key); return false; }
 
     FString TypeText;
     FString UUIDText;

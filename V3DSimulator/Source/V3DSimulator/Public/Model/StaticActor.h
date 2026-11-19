@@ -14,7 +14,9 @@
 #include "TimerManager.h"
 #include "GameFramework/Actor.h"
 #include "Model/ModelData.h"
+#include "Model/WorldSceneStreamTypes.h"
 #include "System/V3DStreamingEvaluation.h"
+#include "System/V3DStreamingRetrySchedule.h"
 #include "glTFRuntimeParser.h"
 #include "StaticActor.generated.h"
 
@@ -32,7 +34,7 @@ struct FGWorldModelManifest;
 /**
  * Runtime representation of one Static model stored in the active .v3d.
  *
- * This actor has no filename-loading or source-build mode. Init accepts only a gworld:// UUID,
+ * This actor has no filename-loading or source-build mode. Init accepts only a v3d:// UUID,
  * range-reads baked metadata, and schedules independently stored mesh/material/texture .dat
  * members as the player moves. Source GLBs are owned exclusively by UProjectSourceModelBuilder.
  */
@@ -47,7 +49,7 @@ public:
 
     AStaticActor();
 
-    /** Assigns the immutable gworld:// model reference before FinishSpawning for WorldStream use. */
+    /** Assigns the immutable v3d:// model reference before FinishSpawning for WorldStream use. */
     void Init(const FString& ModelReference);
 
     /** Loads a placeable Static model. Uses the same immutable .v3d payload as WorldStream. */
@@ -110,6 +112,10 @@ protected:
 
 private:
     friend class FV3DStaticStreamingSchedulingTest;
+    friend class FV3DStaticStreamingRecoveryTest;
+    friend class FV3DSceneActionLifetimeTest;
+    friend class UWorldSceneStreamAction;
+    bool PreserveAbortedWaterState(const UWorldSceneStreamAction* Action, FWorldSceneStreamResult&& State);
 
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USceneComponent> Root;
@@ -167,6 +173,8 @@ private:
     bool bIsLoaded = false;
     bool bAsyncLoading = false;
     double NextStreamingUpdateSeconds = 0.0;
+    FV3DStreamingRetrySchedule StreamingRetry;
+    bool bReloadMetadataOnRetry = false;
     FV3DStreamingEvaluation StreamingEvaluation;
     bool bRenderOnlyStreaming = false;
     bool bHasModelMetadata = false;
@@ -174,6 +182,8 @@ private:
     bool bRuntimeResourcesReleased = false;
 
     void StartBuiltLoad();
+    void RecordStreamingFailure();
+    void RetryMetadataLoad();
     void LoadBuiltMetadataAsync(const FGuid& UUID);
     void OnBuiltMetadataLoaded(
         uint64 RequestSerial,
@@ -204,10 +214,8 @@ private:
         int32 InvalidNodeCount);
     void BuildInstancedMeshActorsStep();
     void FinishBuildInstancedMeshActors();
-    void RemoveInstancedMeshGroup(FName GroupName);
     void PruneUnreferencedMeshMetadata();
     void ReleaseInstancedMeshActors();
-    bool IsPlayerInsideModelRange() const;
     void WriteLogAsync(const FString& Message) const;
     FglTFRuntimeStaticMeshConfig BuildStreamingMeshConfig();
 };

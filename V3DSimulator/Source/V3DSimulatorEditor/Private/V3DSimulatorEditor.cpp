@@ -1,9 +1,10 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "NativeWidgetDesignerLibrary.h"
-#include "V3DTerrainMaterialPreparation.h"
+#include "HumanoidAnimationBindings.h"
 
 #include "Containers/Ticker.h"
 #include "Editor.h"
+#include "Engine/Engine.h"
 #include "Engine/Blueprint.h"
 #include "Framework/Commands/UIAction.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -26,9 +27,9 @@ class FV3DSimulatorEditorModule final : public IModuleInterface
 public:
     virtual void StartupModule() override
     {
-        // This module loads PostEngineInit. Cook commandlets need the same material usage
-        // preparation as the interactive editor, without registering any editor UI hooks.
-        V3DTerrainMaterialPreparation::PrepareShippedMaterial();
+        // Runs before interactive use and before commandlet cooking, once per schema change.
+        if (GEngine) HumanoidAnimationBindings::Upgrade();
+        else AnimationBindingHandle = FCoreDelegates::GetOnPostEngineInit().AddStatic(&HumanoidAnimationBindings::Upgrade);
         if (IsRunningCommandlet()) return;
         bRegistered = true;
         // Layouts are only generated for assets the user creates, opens, or changes in Class
@@ -51,6 +52,7 @@ public:
 
     virtual void ShutdownModule() override
     {
+        FCoreDelegates::GetOnPostEngineInit().Remove(AnimationBindingHandle);
         if (!bRegistered) return;
         FKismetEditorUtilities::UnregisterAutoBlueprintNodeCreation(this);
         FCoreDelegates::GetOnPostEngineInit().Remove(PostEngineInitHandle);
@@ -133,6 +135,7 @@ private:
     }
 
     TWeakObjectPtr<UAssetEditorSubsystem> AssetEditors;
+    FDelegateHandle AnimationBindingHandle;
     FDelegateHandle OpeningHandle;
     FDelegateHandle PostEngineInitHandle;
     FDelegateHandle PropertyChangedHandle;

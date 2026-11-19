@@ -14,7 +14,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DFootstepNotifyContractTest,
 bool FV3DFootstepNotifyContractTest::RunTest(const FString&)
 {
     UClass* Class = UCharacterAnimInstance::StaticClass();
-    for (const FName Name : {FName(TEXT("PlayFootstep")), FName(TEXT("TriggerFootstepTrace"))})
+    for (const FName Name : {FName(TEXT("PlayFootstep"))})
     {
         const UFunction* Function = Class->FindFunctionByName(Name);
         if (!TestNotNull(TEXT("Footstep entry point is reflected on AnimInstance"), Function)) continue;
@@ -29,7 +29,7 @@ bool FV3DFootstepNotifyContractTest::RunTest(const FString&)
     TStrongObjectPtr<USkeletalMeshComponent> Mesh(NewObject<USkeletalMeshComponent>());
     TStrongObjectPtr<UCharacterAnimInstance> Instance(NewObject<UCharacterAnimInstance>(Mesh.Get()));
     Instance->PlayFootstep(EControllerHand::Left);
-    Instance->TriggerFootstepTrace(EControllerHand::Right);
+    Instance->PlayFootstep(EControllerHand::Right);
     Instance->PlayFootstep(EControllerHand::AnyHand);
     Instance->AnimNotify_FootstepLeft();
     Instance->AnimNotify_FootstepRight();

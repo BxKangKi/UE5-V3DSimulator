@@ -91,7 +91,14 @@ bool V3DProjectEditor::Discover(const FString& Project, TArray<TSharedPtr<FV3DEd
         if (const auto* Source = Sources.Find(Doc->Path.ToLower())) Doc->SourcePath = *Source;
         FSafeJsonLimits Limits; Limits.MaxFileBytes = 16ll * 1024 * 1024;
         const auto Loaded = FSafeFileIO::LoadJsonBlocking(Doc->Path, Limits);
-        if (!FFileHelper::LoadFileToString(Doc->DiskText, *Doc->Path)) continue;
+        if (!FFileHelper::LoadFileToString(Doc->DiskText, *Doc->Path))
+        {
+            int32 ScriptIndex = INDEX_NONE;
+            for (int32 I = 0; I < 3; ++I) if (Doc->Path.EndsWith(FV3DProjectScripts::MemberName(I))) ScriptIndex = I;
+            if (Loaded.Status != ESafeFileIOStatus::Missing || ScriptIndex == INDEX_NONE) continue;
+            Doc->Json = FSafeFileIO::ParseJsonText(FV3DProjectScripts().Text(ScriptIndex), Doc->Path).JsonObject;
+            Doc->bNewFile = Doc->bDirty = true; Documents.Add(Doc); continue;
+        }
         Doc->Json = Loaded.JsonObject; // Invalid JSON is still exposed in the raw editor for repair.
         Documents.Add(Doc);
     }
@@ -150,12 +157,15 @@ bool V3DProjectEditor::Save(FV3DEditorDocument& Doc, const FString& Project, FSt
     if (!Doc.Path.StartsWith(Root + TEXT("/")) || !Doc.Path.EndsWith(TEXT(".json")))
     { Error = TEXT("Save path is outside the selected project."); return false; }
     FString Current;
-    if (!FFileHelper::LoadFileToString(Current, *Doc.Path) || Current != Doc.DiskText)
+    const bool bExists = IFileManager::Get().FileExists(*Doc.Path);
+    if ((Doc.bNewFile && bExists) || (!Doc.bNewFile && (!FFileHelper::LoadFileToString(Current, *Doc.Path) || Current != Doc.DiskText)))
     { Error = TEXT("File changed outside Editor. Reload before saving: ") + Doc.Label; return false; }
+    if (Doc.bNewFile && !IFileManager::Get().MakeDirectory(*FPaths::GetPath(Doc.Path), true))
+    { Error = TEXT("Could not create scripts directory."); return false; }
     const auto Written = FSafeFileIO::SaveJsonBlocking(Doc.Json.ToSharedRef(), Doc.Path);
     if (!Written.IsSuccess()) { Error = Written.Error; return false; }
     FFileHelper::LoadFileToString(Doc.DiskText, *Doc.Path);
-    Doc.bDirty = false;
+    Doc.bDirty = Doc.bNewFile = false;
     // Keep the last successful build playable. Only explicit Build replaces the archive.
     return true;
 }
@@ -227,6 +237,7 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
 TSharedPtr<FJsonObject> V3DProjectEditor::EntryTemplate(const FString& Container)
 {
     static const TMap<FString, FString> Keys = {
+        {TEXT("SoundLists"), TEXT("SoundListEntry")}, {TEXT("Events"), TEXT("SoundEventEntry")},
         {TEXT("MeshData"), TEXT("MeshEntry")}, {TEXT("Biomes"), TEXT("BiomeEntry")},
         {TEXT("PhysicalMaterials"), TEXT("PhysicalMaterialEntry")}, {TEXT("FootstepMappings"), TEXT("FootstepEntry")},
         {TEXT("MaterialPhysicalMappings"), TEXT("MappingEntry")}, {TEXT("Commands"), TEXT("CommandEntry")},

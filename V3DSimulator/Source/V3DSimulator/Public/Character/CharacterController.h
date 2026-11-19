@@ -18,6 +18,9 @@
 #include "Interface/WaterInteract.h"
 #include "CharacterController.generated.h"
 
+class UAnimSequence;
+class UBlendSpace;
+
 // Forward declarations for the components created earlier.
 class UCharacterComponent;
 class USpringArmComponent;
@@ -61,7 +64,12 @@ public:
     void CancelCharacterLoad(bool bRestoreDefaultMesh = true);
 
     /** Atomically installs a completed runtime character mesh. UObject/component mutation is game-thread only. */
-    bool CommitRuntimeCharacterResources(USkeletalMesh* SkeletalMesh, UPhysicsAsset* PhysicsAsset, USkeleton* RuntimeSkeleton);
+    bool CommitRuntimeCharacterResources(USkeletalMesh* SkeletalMesh, UPhysicsAsset* PhysicsAsset, USkeleton* RuntimeSkeleton,
+        const TMap<FName, TObjectPtr<UAnimSequence>>& Animations);
+    const TMap<FName, TObjectPtr<UAnimSequence>>& GetModelAnimations() const { return RuntimeModelAnimations; }
+    UFUNCTION(BlueprintPure, Category="Character|Animation")
+    UAnimSequence* GetModelAnimation(FName ClipName) const;
+
 
     /** Detaches the current runtime character mesh and releases all strong references without forcing a blocking GC. */
     void ReleaseRuntimeCharacterResources(bool bRestoreDefaultMesh = true);
@@ -116,8 +124,6 @@ public:
     TObjectPtr<UPhysicsAsset> DefaultPhysicsAsset = nullptr;
     UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
     TObjectPtr<USkeleton> DefaultSkeleton = nullptr;
-    UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
-    TObjectPtr<UMaterialInterface> DefaultMaterial = nullptr;
     UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
     TObjectPtr<USkeletalMesh> DefaultSkeletalMesh = nullptr;
     /** Resolved from AssetRegistry.DefaultCharacterAnimInstanceClass and pinned while this character lives. */
@@ -182,6 +188,8 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<USkeleton> RuntimeSkeleton = nullptr;
+    UPROPERTY(Transient)
+    TMap<FName, TObjectPtr<UAnimSequence>> RuntimeModelAnimations;
     void SetWaterState(bool bValue, float Level, bool bForceRagdollWaterState = false);
     bool FindDirectWaterLevel(float& OutLevel) const;
     void RefreshWaterStateFromQuery();

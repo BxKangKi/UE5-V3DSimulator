@@ -16,19 +16,6 @@ public class V3DSimulator : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-        // v3d.hlsl is the public shader source. Unreal shader includes use .ush;
-        // keep a byte-identical alias so editing the public file is sufficient.
-        string TerrainShaderDirectory = Path.GetFullPath(Path.Combine(ModuleDirectory, "../../Shaders"));
-        string TerrainHlsl = Path.Combine(TerrainShaderDirectory, "v3d.hlsl");
-        string TerrainUsh = Path.Combine(TerrainShaderDirectory, "v3d.ush");
-        ExternalDependencies.Add(TerrainHlsl);
-        ExternalDependencies.Add(TerrainUsh);
-        if (File.Exists(TerrainHlsl)
-            && (!File.Exists(TerrainUsh) || File.ReadAllText(TerrainHlsl) != File.ReadAllText(TerrainUsh)))
-        {
-            File.Copy(TerrainHlsl, TerrainUsh, true);
-        }
-
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
@@ -39,6 +26,8 @@ public class V3DSimulator : ModuleRules
                 "InputCore",
                 "Json",
                 "glTFRuntime",
+                "V3DRuntime",
+                "ShaderLibrary",
                 "Slate",
                 "UMG",
                 "SlateCore"

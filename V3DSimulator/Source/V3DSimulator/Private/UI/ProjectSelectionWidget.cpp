@@ -3,7 +3,7 @@
 #include "UI/ProjectSelectionWidget.h"
 #include "UI/ProjectEditorWidget.h"
 #include "UI/WidgetStyleSafety.h"
-#include "UI/HUDLegacyStyle.h"
+#include "UI/HUDStyle.h"
 
 #include "Components/Button.h"
 #include "Components/ButtonSlot.h"
@@ -678,7 +678,7 @@ void UProjectSelectionWidget::ApplyNativeStyle()
     if (NativeProjectName)
     {
         FEditableTextBoxStyle Style = NativeProjectName->GetWidgetStyle();
-        V3DHUDLegacyStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
+        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
         Style.BackgroundImageNormal.TintColor = FSlateColor(ButtonColor);
         Style.BackgroundImageHovered.TintColor = FSlateColor(ButtonColor * .8f);
         Style.BackgroundImageFocused.TintColor = FSlateColor(ButtonColor);
@@ -727,7 +727,7 @@ UWidget* UProjectSelectionWidget::GenerateNativeProjectType(FString Item)
     UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>();
     Label->SetText(FText::FromString(Item));
     FSlateFontInfo Font = Label->GetFont();
-    V3DHUDLegacyStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
+    V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
     Label->SetFont(Font);
     Label->SetColorAndOpacity(FSlateColor(TextColor));
     return Label;

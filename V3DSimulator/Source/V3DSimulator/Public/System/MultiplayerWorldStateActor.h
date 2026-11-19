@@ -34,6 +34,9 @@ public:
     UFUNCTION(BlueprintPure, Category="Multiplayer")
     const FString& GetWorldFolderName() const { return WorldFolderName; }
 
+    /** Unreliable cosmetic event; clients choose independently from the same authored list. */
+    UFUNCTION(NetMulticast, Reliable) void MulticastSoundEvent(FName Event, FVector Location, bool bStop = false);
+
 protected:
     virtual void BeginPlay() override;
     virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;

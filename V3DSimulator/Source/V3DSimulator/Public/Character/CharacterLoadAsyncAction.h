@@ -11,10 +11,14 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Format/v3d.hpp"
 #include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "TimerManager.h"
 #include "CharacterLoadAsyncAction.generated.h"
+
+class UAnimSequence;
+class UBlendSpace;
 
 USTRUCT(BlueprintType)
 struct FBoneMapWrapper
@@ -31,6 +35,7 @@ class USkeleton;
 class USkeletalMesh;
 class UPhysicsAsset;
 class UMaterialInterface;
+class UMaterialDefaultRuntimeCache;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadCallback, bool, Result);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadProgress, float, Progress);
@@ -68,7 +73,7 @@ private:
     TObjectPtr<USkeleton> SourceSkeletonReferenceGuard = nullptr;
 
     UPROPERTY(Transient)
-    TObjectPtr<UMaterialInterface> SourceMaterialReferenceGuard = nullptr;
+    TObjectPtr<UMaterialDefaultRuntimeCache> SourceMaterialReferenceGuard = nullptr;
 
     UPROPERTY(Transient)
     TObjectPtr<USkeletalMesh> PendingSkeletalMesh = nullptr;
@@ -120,6 +125,12 @@ private:
 
     /** Game-thread stage: performs the final atomic component swap. */
     void CommitRuntimeMesh_GameThread();
+    void LoadModelAnimations_GameThread();
+    TArray<int32> ModelAnimationIds;
+    int32 NextModelAnimation = 0;
+    v3d::animation PendingModelAnimation;
+    UPROPERTY(Transient)
+    TMap<FName, TObjectPtr<UAnimSequence>> PendingModelAnimations;
 
     void ScheduleGameThreadStage(void (UCharacterLoadAsyncAction::*StageFunction)());
     void ClearGameThreadStageTimer();

@@ -350,7 +350,7 @@ void AWorldEnvManager::QueueEnvironmentAssetLoad()
 
     AddSoftPath(Registry->CloudMaterial.ToSoftObjectPath());
     AddSoftPath(Registry->SkyboxMesh.ToSoftObjectPath());
-    AddSoftPath(Registry->GlobalPostProcessMaterial.ToSoftObjectPath());
+    AddSoftPath(Registry->OceanPostProcessMaterial.ToSoftObjectPath());
     AddSoftPath(Registry->ShaderLibraryMPC.ToSoftObjectPath());
 
     if (AssetsToLoad.IsEmpty())
@@ -397,16 +397,14 @@ void AWorldEnvManager::HandleEnvironmentAssetsReady()
         }
     }
 
-    if (!Registry->GlobalPostProcessMaterial.IsNull())
+    if (IsValid(Registry->OceanPostProcessMaterial.Get()))
     {
-        GlobalPostProcessMaterial = Registry->GlobalPostProcessMaterial.Get();
-        if (IsValid(PostProcess) && IsValid(GlobalPostProcessMaterial))
+        OceanPostProcessMaterial = UMaterialInstanceDynamic::Create(Registry->OceanPostProcessMaterial.Get(), this);
+        if (IsValid(PostProcess) && IsValid(OceanPostProcessMaterial))
         {
-            // The shader library is intentionally a single global blendable: cel shading and
-            // underwater rendering are branches of this one material. Remove legacy authored
-            // blendables (including the former standalone cel-shading material) before attaching it.
+            // The underwater-only material has no cel shading or stencil dependency.
             PostProcess->Settings.WeightedBlendables.Array.Reset();
-            PostProcess->AddOrUpdateBlendable(GlobalPostProcessMaterial, 1.0f);
+            PostProcess->AddOrUpdateBlendable(OceanPostProcessMaterial, 1.0f);
         }
     }
 
@@ -427,6 +425,15 @@ void AWorldEnvManager::RefreshShaderLibraryParameters()
 {
     check(IsInGameThread());
 
+    const bool bOceanEnabled = IsValid(Data) && Data->bOcean && bRenderingActive;
+    const float OceanHeight = bOceanEnabled && FMath::IsFinite(Data->OceanHeightCm)
+        ? static_cast<float>(Data->OceanHeightCm) : 0.0f;
+    if (IsValid(OceanPostProcessMaterial) && IsValid(PostProcess))
+    {
+        OceanPostProcessMaterial->SetScalarParameterValue(TEXT("WaterLevel"), OceanHeight);
+        PostProcess->AddOrUpdateBlendable(OceanPostProcessMaterial, bOceanEnabled ? 1.0f : 0.0f);
+    }
+
     if (!IsValid(ShaderLibraryMPC))
     {
         return;
@@ -445,25 +452,17 @@ void AWorldEnvManager::RefreshShaderLibraryParameters()
         return;
     }
 
-    const bool bOceanEnabled = IsValid(Data) && Data->bOcean;
-    const float OceanHeight = bOceanEnabled && FMath::IsFinite(Data->OceanHeightCm)
-        ? static_cast<float>(Data->OceanHeightCm)
-        : 0.0f;
-
-    float CelShadingMode = 1.0f;
     float MaxDistanceCm = GetDefault<UGameSettings>()->GetMaxRenderDistanceCentimeters();
     if (UGameManagerSubSystem* GameManager = SubSystem.Get())
     {
         if (const UGameSettings* Settings = GameManager->GetGameSettings())
         {
-            CelShadingMode = Settings->CelShadingMode >= 0.5f ? 1.0f : 0.0f;
             MaxDistanceCm = Settings->GetMaxRenderDistanceCentimeters();
         }
     }
 
     Parameters->SetScalarParameterValue(TEXT("OceanHeight"), OceanHeight);
     Parameters->SetScalarParameterValue(TEXT("OceanEnabled"), bOceanEnabled ? 1.0f : 0.0f);
-    Parameters->SetScalarParameterValue(TEXT("CelShadingMode"), CelShadingMode);
     Parameters->SetScalarParameterValue(TEXT("MaxRenderDistance"), MaxDistanceCm);
 }
 

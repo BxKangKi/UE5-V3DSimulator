@@ -142,7 +142,7 @@ void AWaterActor::BeginPlay()
         Decal->SetDecalMaterial(DecalMID);
     }
     // The global ocean no longer owns an underwater PP material. WorldEnvManager's single
-    // unbound GlobalPostProcessMaterial reads OceanHeight/OceanEnabled from ShaderLibraryMPC.
+    // unbound underwater MID receives WaterLevel from the current ocean data.
     UMaterialInstanceDynamic *PostProcessMID = !bGlobalOcean && IsValid(UnderWaterMaterial)
         ? UMaterialInstanceDynamic::Create(UnderWaterMaterial, this)
         : nullptr;

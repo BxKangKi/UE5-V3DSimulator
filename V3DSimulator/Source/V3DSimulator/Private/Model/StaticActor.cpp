@@ -100,6 +100,7 @@ namespace StaticActorPrivate
                 Work.OwnerTransform.TransformPosition(Node.Transform.GetLocation()));
             FInstancedMeshStreamChunk& Chunk = Group.Data.StreamChunks.FindOrAdd(ChunkKey);
             Chunk.Nodes.Add(Pair.Key);
+            Chunk.bHasAlwaysLoadedNodes |= Node.bAlwaysLoaded;
             // Include the full world-space cell, transformed back for the actor's immutable index.
             Chunk.LocalBounds += V3DHISMChunkPolicy::CellBounds(ChunkKey).TransformBy(InverseOwnerTransform);
             const FVector Half = Work.MeshSizes.FindChecked(Node.MeshName).GetAbs() * 0.5;
@@ -116,8 +117,9 @@ namespace StaticActorPrivate
             Data.AlwaysLoadedNodeNames.Sort([](const FName A, const FName B) { return A.LexicalLess(B); });
             Work.Groups.Add(Pair.Key, MoveTemp(Data));
         }
-        Work.Nodes.Reset();
-        Work.MeshToGroup.Reset();
+        Work.Nodes.Empty();
+        Work.MeshToGroup.Empty();
+        Work.MeshSizes.Empty();
     }
 
     bool EnsureGameThread(const TCHAR* FunctionName)
@@ -177,7 +179,7 @@ namespace StaticActorPrivate
         }
         if (NormalizeReference(OutCanonicalReference).IsEmpty())
         {
-            OutReason = TEXT("model database returned a non-gworld runtime reference");
+            OutReason = TEXT("model database returned a non-v3d runtime reference");
             return false;
         }
         return true;
@@ -211,6 +213,8 @@ void AStaticActor::Init(const FString& InModelReference)
         InModelReference);
     bRuntimeResourcesReleased = false;
     bIsDestroyed = false;
+    StreamingRetry.Reset();
+    bReloadMetadataOnRetry = false;
     if (bRestart)
     {
         bIsLoaded = false;
@@ -270,6 +274,7 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
 {
     check(IsInGameThread());
     if (bIsDestroyed || !bHasModelMetadata || !IsValid(BakedAsset)
+        || bReloadMetadataOnRetry || !PendingInstancedGroupNames.IsEmpty()
         || (bAsyncLoading && !StreamingEvaluation.HasSnapshot())
         || WorldLocation.ContainsNaN())
     {
@@ -301,7 +306,9 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
         for (const auto& ChunkPair : Definitions->StreamChunks)
         {
             const FBox Bounds = ChunkPair.Value.LocalBounds.TransformBy(OwnerTransform);
-            if (Bounds.ComputeSquaredDistanceToPoint(WorldLocation) > FMath::Square(double(MaxWorldRadius))) continue;
+            const double QueryRadius = ChunkPair.Value.bHasAlwaysLoadedNodes
+                ? FMath::Max(double(MaxWorldRadius), MaxDistanceCm) : double(MaxWorldRadius);
+            if (Bounds.ComputeSquaredDistanceToPoint(WorldLocation) > FMath::Square(QueryRadius)) continue;
             double ChunkRadius = FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm);
             for (const FName NodeName : ChunkPair.Value.Nodes)
             {
@@ -352,6 +359,8 @@ void AStaticActor::BeginPlay()
 
     bRuntimeResourcesReleased = false;
     bIsDestroyed = false;
+    StreamingRetry.Reset();
+    bReloadMetadataOnRetry = false;
     bIsLoaded = false;
     bAsyncLoading = false;
     bHasModelMetadata = false;
@@ -412,6 +421,18 @@ void AStaticActor::StartBuiltLoad()
     WorkCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
     StreamingEvaluation.Reset();
     NextStreamingUpdateSeconds = 0.0;
+    StreamingRetry.BeginAttempt();
+    bReloadMetadataOnRetry = false;
+    CancelActiveStreamActions();
+    ReleaseStreamingResources();
+    BakedAsset = nullptr;
+    AllNodeMap.Empty();
+    AllMeshMap.Empty();
+    WaterNodeMap.Empty();
+    PendingInstancedGroups.Empty();
+    PendingInstancedGroupNames.Empty();
+    PendingInstancedGroupIndex = 0;
+    bHasModelMetadata = false;
     bIsLoaded = false;
     ModelReference = StaticActorPrivate::NormalizeReference(ModelReference);
     FGuid UUID;
@@ -421,13 +442,11 @@ void AStaticActor::StartBuiltLoad()
         || !StaticActorPrivate::ResolveScene(
             this, ModelReference, UUID, CanonicalReference, Reason))
     {
-        bIsLoaded = true;
-        bAsyncLoading = false;
-        LoadingStatus = 1.0f;
+        RetryMetadataLoad();
         WriteLogAsync(FString::Printf(
             TEXT("Static load rejected. Reference=%s Reason=%s"),
             *ModelReference,
-            Reason.IsEmpty() ? TEXT("invalid gworld reference") : *Reason));
+            Reason.IsEmpty() ? TEXT("invalid v3d reference") : *Reason));
         return;
     }
 
@@ -472,6 +491,8 @@ void AStaticActor::ReleaseRuntimeResourcesForWorldExit()
     }
 
     StreamingEvaluation.Reset();
+    StreamingRetry.Reset();
+    bReloadMetadataOnRetry = false;
     bIsDestroyed = true;
     bAsyncLoading = false;
     bIsLoaded = false;
@@ -614,30 +635,19 @@ void AStaticActor::OnBuiltMetadataLoaded(
     }
     if (!bSuccess || !Reader.IsValid())
     {
-        bIsLoaded = true;
-        bAsyncLoading = false;
-        LoadingStatus = 1.0f;
+        RetryMetadataLoad();
         WriteLogAsync(FString::Printf(
             TEXT("Static metadata range rejected. Reference=%s Reason=%s"),
             *ModelReference, *Error));
         return;
     }
 
-    // Keep the archive table intact until the prepared facade has validated it. Only the tiny
-    // bounds row is copied here so an out-of-range actor can be rejected before any UObject setup.
+    // Complete the admitted scene's metadata even if observers moved during the read. The outer
+    // streamer owns coarse eviction; dropping these tables here leaves an empty actor in its
+    // unload hysteresis band that can never load when an observer returns.
     ModelMetadata = Metadata.SceneData.ModelData;
     bHasModelMetadata = true;
     LoadingStatus = 0.5f;
-
-    // The outer streamer checks the compact archive summary first. Repeat the exact metadata
-    // bounds check here because this deferred actor may have moved while its ranges were read.
-    if (!IsPlayerInsideModelRange())
-    {
-        bIsLoaded = true;
-        bAsyncLoading = false;
-        LoadingStatus = 1.0f;
-        return;
-    }
 
     // Publish the tables that the worker already read. This deliberately avoids Resolve() here:
     // static world streaming does not need definition JSON/bone aliases, and synchronously loading
@@ -652,9 +662,7 @@ void AStaticActor::OnBuiltMetadataLoaded(
         ResolveError);
     if (!IsValid(BakedAsset))
     {
-        bIsLoaded = true;
-        bAsyncLoading = false;
-        LoadingStatus = 1.0f;
+        RetryMetadataLoad();
         WriteLogAsync(FString::Printf(
             TEXT("Baked scene facade initialization failed: %s"),
             *ResolveError));
@@ -764,8 +772,8 @@ void AStaticActor::BeginBuildInstancedMeshActors()
         // Shutdown/drain refuses new worker tasks. Do not move an O(N) grouping/index build back to
         // GameThread; invalidate this request and let teardown release the detached native work.
         ++MetadataRequestSerial;
-        bAsyncLoading = false;
-        UE_LOG(LogTemp, Verbose, TEXT("Static grouping skipped because the worker queue is shutting down."));
+        RetryMetadataLoad();
+        UE_LOG(LogTemp, Verbose, TEXT("Static grouping deferred because the worker queue is shutting down."));
     }
 }
 
@@ -822,7 +830,7 @@ void AStaticActor::BuildInstancedMeshActorsStep()
     UWorld* World = GetWorld();
     if (!World)
     {
-        FinishBuildInstancedMeshActors();
+        RetryMetadataLoad();
         return;
     }
 
@@ -854,7 +862,6 @@ void AStaticActor::BuildInstancedMeshActorsStep()
             }
 
             FInstancedMeshGroupInitData PreparedGroup = MoveTemp(*GroupData);
-            PendingInstancedGroups.Remove(GroupName);
 
             FActorSpawnParameters Parameters;
             Parameters.Owner = this;
@@ -879,12 +886,28 @@ void AStaticActor::BuildInstancedMeshActorsStep()
                 || !InstancedActor->AttachToActor(
                     this, FAttachmentTransformRules::KeepWorldTransform))
             {
+                // InitializeGroup transfers ownership. Recover that immutable data before
+                // destroying a partially constructed actor; never silently skip its placements.
                 if (IsValid(InstancedActor))
                 {
+                    const auto Definitions = InstancedActor->CaptureDefinitions();
+                    if (Definitions.IsValid()) PreparedGroup = *Definitions;
                     InstancedActor->Destroy();
                 }
-                continue;
+                if (PreparedGroup.IsValid())
+                {
+                    PendingInstancedGroups.Add(GroupName, MoveTemp(PreparedGroup));
+                    bAsyncLoading = false;
+                    RecordStreamingFailure();
+                    RegisterGameUpdate();
+                }
+                else RetryMetadataLoad();
+                WriteLogAsync(FString::Printf(
+                    TEXT("Static group construction deferred. Static=%s Group=%s"),
+                    *ModelReference, *GroupName.ToString()));
+                return;
             }
+            PendingInstancedGroups.Remove(GroupName);
             OwnedInstancedMeshActors.Add(GroupName, InstancedActor);
         }
     }
@@ -943,22 +966,6 @@ void AStaticActor::ReleaseInstancedMeshActors()
     OwnedInstancedMeshActors.Empty();
 }
 
-void AStaticActor::RemoveInstancedMeshGroup(const FName GroupName)
-{
-    check(IsInGameThread());
-    if (TObjectPtr<AInstancedMeshActor>* Found =
-            OwnedInstancedMeshActors.Find(GroupName))
-    {
-        if (IsValid(Found->Get()))
-        {
-            Found->Get()->ReleaseRuntimeResources();
-            Found->Get()->Destroy();
-        }
-    }
-    OwnedInstancedMeshActors.Remove(GroupName);
-    PruneUnreferencedMeshMetadata();
-}
-
 void AStaticActor::PruneUnreferencedMeshMetadata()
 {
     check(IsInGameThread());
@@ -986,43 +993,13 @@ void AStaticActor::SetStreamGroupProgress(const FName GroupName, const float Pro
         : static_cast<float>(StreamGroupProgressSum / StreamGroupProgress.Num());
     LoadingStatus = FMath::Max(LoadingStatus,
         FMath::Clamp(0.5f + BatchProgress * 0.5f, 0.5f, 1.0f));
+    if (StreamingRetry.HasFailedAttempt()) LoadingStatus = FMath::Min(LoadingStatus, 0.99f);
 }
 
 void AStaticActor::OnStreamProgress(const FName GroupName, const float Progress)
 {
     check(IsInGameThread());
     SetStreamGroupProgress(GroupName, Progress);
-}
-
-bool AStaticActor::IsPlayerInsideModelRange() const
-{
-    check(IsInGameThread());
-    if (GravityField->GetSettingsRef().bEnabled || !bHasModelMetadata || ModelMetadata.Size.IsNearlyZero(0.001f))
-    {
-        return true;
-    }
-
-    TArray<FVector> ObserverLocations;
-    if (UWorldSceneStreamingSubsystem* Streamer =
-            UWorldSceneStreamingSubsystem::Get(const_cast<AStaticActor*>(this)))
-    {
-        Streamer->GetStreamingObserverLocations(ObserverLocations);
-    }
-    else if (UGameManagerSubSystem* Manager =
-            UGameManagerSubSystem::GetSubSystem(
-                const_cast<AStaticActor*>(this)))
-    {
-        ObserverLocations.Add(Manager->GetPlayerLocation());
-    }
-    if (ObserverLocations.IsEmpty()) ObserverLocations.Add(FVector::ZeroVector);
-    const float ScreenDistance = V3DStreamingPolicy::GetScreenSizeDistance(this);
-    const double MaxDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(this);
-    for (const FVector& Observer : ObserverLocations)
-    {
-        if (V3DHISMChunkPolicy::SceneInRange(ModelMetadata.Center, ModelMetadata.Size,
-            GetActorTransform(), Observer, ScreenDistance, 1.0, MaxDistanceCm)) return true;
-    }
-    return false;
 }
 
 void AStaticActor::WriteLogAsync(const FString& Message) const
@@ -1143,6 +1120,24 @@ FV3DStreamingEvaluationInputs AStaticActor::GetStreamingEvaluationInputs() const
     return Inputs;
 }
 
+void AStaticActor::RecordStreamingFailure()
+{
+    check(IsInGameThread());
+    StreamingRetry.Fail(FPlatformTime::Seconds());
+    StreamingEvaluation.Invalidate();
+    bIsLoaded = false;
+    LoadingStatus = FMath::Min(LoadingStatus, 0.99f);
+}
+
+void AStaticActor::RetryMetadataLoad()
+{
+    check(IsInGameThread());
+    bReloadMetadataOnRetry = true;
+    bAsyncLoading = false;
+    RecordStreamingFailure();
+    RegisterGameUpdate();
+}
+
 void AStaticActor::StartStreamingStep()
 {
     check(IsInGameThread());
@@ -1152,14 +1147,46 @@ void AStaticActor::StartStreamingStep()
         UnregisterGameUpdate();
         return;
     }
+    // A failed admission/planning path may terminate without Completed. Do not let its
+    // stale slot lock this scene forever. Keep definitions and retry after a short cooldown.
+    bool bAbortedAction = false;
+    for (auto It = ActiveStreamActions.CreateIterator(); It; ++It)
+        if (!IsValid(It.Value()) || It.Value()->IsFinished())
+        {
+            const auto* Group = OwnedInstancedMeshActors.Find(It.Key());
+            if (!It.Key().IsNone() && (!Group || !IsValid(Group->Get())))
+                bReloadMetadataOnRetry = true;
+            It.RemoveCurrent();
+            bAbortedAction = true;
+        }
+    if (bAbortedAction)
+    {
+        RecordStreamingFailure();
+        if (ActiveStreamActions.IsEmpty()
+            && PendingStreamGroupIndex >= PendingStreamGroupNames.Num() && !bPendingWaterStream)
+            FinishStreamingCycle();
+        else QueueStreamingBatch();
+    }
     // Metadata/group construction and active payload work own this cycle until completion.
     if (bAsyncLoading) return;
+    const double Now = FPlatformTime::Seconds();
+    if (!StreamingRetry.CanAttempt(Now)) return;
+    if (bReloadMetadataOnRetry)
+    {
+        StartBuiltLoad();
+        return;
+    }
+    if (PendingInstancedGroupIndex < PendingInstancedGroupNames.Num())
+    {
+        StreamingRetry.BeginAttempt();
+        bAsyncLoading = true;
+        BuildInstancedMeshActorsStep();
+        return;
+    }
     if (!IsValid(BakedAsset))
     {
-        bAsyncLoading = false;
-        bIsLoaded = true;
-        LoadingStatus = 1.0f;
-        UnregisterGameUpdate();
+        StreamingRetry.BeginAttempt();
+        RetryMetadataLoad();
         WriteLogAsync(FString::Printf(
             TEXT("Baked scene facade became invalid: %s"), *ModelReference));
         return;
@@ -1173,7 +1200,6 @@ void AStaticActor::StartStreamingStep()
         return;
     }
 
-    const double Now = FPlatformTime::Seconds();
     if (Now < NextStreamingUpdateSeconds) return;
     double UpdateInterval = 0.08;
     if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
@@ -1184,6 +1210,7 @@ void AStaticActor::StartStreamingStep()
     FV3DStreamingEvaluationInputs Inputs = GetStreamingEvaluationInputs();
     if (!StreamingEvaluation.NeedsEvaluation(Inputs)) return;
     StreamingEvaluation.Capture(MoveTemp(Inputs));
+    StreamingRetry.BeginAttempt();
 
     // Keep completed scenes ready while other scenes load. An unchanged view cannot gain new
     // candidates in immutable metadata, so re-queuing every mesh group would only delay startup.
@@ -1313,6 +1340,7 @@ void AStaticActor::LaunchNextStreamingBatch()
             // Unloaded groups outside a conservative bound need no action/snapshot/worker.
             // Loaded groups must still run so instances leaving the range can be released.
             if (!bWaterGroup && !InstancedActor->HasLoadedNodes()
+                && !InstancedActor->HasAlwaysLoadedNodes()
                 && InstancedActor->GetNodeBounds().IsValid)
             {
                 const FTransform OwnerTransform = GetActorTransform();
@@ -1348,7 +1376,6 @@ void AStaticActor::LaunchNextStreamingBatch()
                     InstancedActor,
                     ObserverLocations,
                     MeshConfig,
-                    EffectiveStreamDistance,
                     SafeChunkSize,
                     bRenderOnlyStreaming,
                     bWaterGroup,
@@ -1375,7 +1402,6 @@ void AStaticActor::LaunchNextStreamingBatch()
     ON_SCOPE_EXIT { FV3DStreamingBudget::ChargeSceneSeconds(FPlatformTime::Seconds() - LaunchStart); };
     const uint64 RequestSerial = MetadataRequestSerial;
     const double LaunchDeadline = LaunchStart + LaunchBudget;
-    TArray<FName> FailedGroups;
     while (LaunchedThisBatch < AvailableSlots && ExaminedThisBatch++ < 64
         && FPlatformTime::Seconds() < LaunchDeadline
         && PendingStreamGroupIndex < PendingStreamGroupNames.Num())
@@ -1383,31 +1409,30 @@ void AStaticActor::LaunchNextStreamingBatch()
         const FName GroupName = PendingStreamGroupNames[PendingStreamGroupIndex++];
         TObjectPtr<AInstancedMeshActor>* Found = OwnedInstancedMeshActors.Find(GroupName);
         AInstancedMeshActor* InstancedActor = Found ? Found->Get() : nullptr;
-        if (!IsValid(InstancedActor)
-            || InstancedActor->GetOwner() != this
-            || !StartGroup(InstancedActor, false))
+        if (!IsValid(InstancedActor) || InstancedActor->GetOwner() != this)
         {
-            FailedGroups.Add(GroupName);
+            // The immutable definitions disappeared with the actor. Recover from archive tables
+            // after the remaining actions finish, instead of deleting the group's mesh metadata.
+            bReloadMetadataOnRetry = true;
+            RecordStreamingFailure();
+            SetStreamGroupProgress(GroupName, 1.0f);
+            continue;
+        }
+        if (!StartGroup(InstancedActor, false))
+        {
+            RecordStreamingFailure();
             SetStreamGroupProgress(GroupName, 1.0f);
             continue;
         }
         if (bIsDestroyed || MetadataRequestSerial != RequestSerial) return;
         if (ActiveStreamActions.Contains(GroupName)) ++LaunchedThisBatch;
     }
-    for (const FName GroupName : FailedGroups)
-    {
-        RemoveInstancedMeshGroup(GroupName);
-        if (bIsDestroyed || MetadataRequestSerial != RequestSerial) return;
-    }
-
     if (LaunchedThisBatch < AvailableSlots && bPendingWaterStream)
     {
         bPendingWaterStream = false;
         if (!StartGroup(nullptr, true))
         {
-            WaterNodeMap.Empty();
-            LoadedWaterNodes.Empty();
-            WaterActorMap.Empty();
+            RecordStreamingFailure();
             SetStreamGroupProgress(NAME_None, 1.0f);
         }
         else
@@ -1440,12 +1465,26 @@ void AStaticActor::FinishStreamingCycle()
     bPendingWaterStream = false;
     // A settings/focus request or late callback rejection may invalidate an in-flight pass.
     // Do not publish readiness until the current observer set has actually been evaluated.
-    bIsLoaded = !StreamingEvaluation.NeedsEvaluation(GetStreamingEvaluationInputs());
+    bIsLoaded = !bReloadMetadataOnRetry && !StreamingRetry.HasFailedAttempt()
+        && !StreamingEvaluation.NeedsEvaluation(GetStreamingEvaluationInputs());
     if (!bIsLoaded) NextStreamingUpdateSeconds = 0.0;
+    else StreamingRetry.Reset();
     bAsyncLoading = false;
-    LoadingStatus = 1.0f;
+    LoadingStatus = bIsLoaded ? 1.0f : FMath::Min(LoadingStatus, 0.99f);
     StreamGroupProgress.Empty();
     StreamGroupProgressSum = 0.0;
+}
+
+bool AStaticActor::PreserveAbortedWaterState(
+    const UWorldSceneStreamAction* Action, FWorldSceneStreamResult&& State)
+{
+    check(IsInGameThread());
+    const auto* Current = ActiveStreamActions.Find(NAME_None);
+    if (bIsDestroyed || !Current || Current->Get() != Action) return false;
+    WaterNodeMap = MoveTemp(State.WaterNodeMap);
+    LoadedWaterNodes = MoveTemp(State.LoadedWaterNodes);
+    WaterActorMap = MoveTemp(State.WaterActorMap);
+    return true;
 }
 
 void AStaticActor::OnStreamCompleted(
@@ -1464,12 +1503,14 @@ void AStaticActor::OnStreamCompleted(
         LoadedWaterNodes = Result.LoadedWaterNodes;
         WaterActorMap = Result.WaterActorMap;
     }
-    else if (Result.bGroupFailed)
+    if (Result.bGroupFailed)
     {
-        RemoveInstancedMeshGroup(Result.GroupName);
+        RecordStreamingFailure();
         WriteLogAsync(FString::Printf(
-            TEXT("Failed mesh group isolated. Static=%s Mesh=%s"),
-            *ModelReference, *Result.GroupName.ToString()));
+            TEXT("Mesh group retained for retry. Static=%s Group=%s Node=%s Mesh=%s Stage=%s Reason=%s RetryIn=%.2fs"),
+            *ModelReference, *Result.GroupName.ToString(), *Result.FailedNode.ToString(),
+            *Result.FailedMesh.ToString(), *Result.FailureStage, *Result.FailureReason,
+            FMath::Max(0.0, StreamingRetry.GetRetryAfterSeconds() - FPlatformTime::Seconds())));
     }
     const bool bHasPendingGroups =
         PendingStreamGroupIndex < PendingStreamGroupNames.Num() || bPendingWaterStream;
@@ -1519,6 +1560,13 @@ bool FV3DStaticStreamingSchedulingTest::RunTest(const FString&)
     for (int32 Completion = 0; Completion < 16; ++Completion) Actor->QueueStreamingBatch();
     TestTrue(TEXT("A wave of completions queues one next-frame pump"),
         Actor->bStreamingBatchQueued && First == Actor->StreamingBatchTimerHandle);
+    // A planner that terminates without broadcasting Completed must release its slot.
+    auto* HeldAction = Actor->ActiveStreamActions.FindChecked(TEXT("HeldBuild")).Get();
+    HeldAction->CancelAndRelease();
+    Actor->StartStreamingStep();
+    TestTrue(TEXT("Aborted action does not permanently occupy a streaming slot"), Actor->ActiveStreamActions.IsEmpty());
+    TestTrue(TEXT("Aborted cycle schedules a bounded retry"), Actor->StreamingRetry.GetRetryAfterSeconds() > FPlatformTime::Seconds());
+    TestTrue(TEXT("Aborted cycle leaves readiness invalidated"), !Actor->StreamingEvaluation.HasSnapshot());
     Actor->WorkCancellation = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>();
     const auto DetachedWorkerToken = Actor->WorkCancellation;
     Actor->ReleaseRuntimeResourcesForWorldExit();
@@ -1528,6 +1576,81 @@ bool FV3DStaticStreamingSchedulingTest::RunTest(const FString&)
         DetachedWorkerToken->GetValue() != 0);
     Actor->QueueStreamingBatch();
     TestFalse(TEXT("Teardown cannot schedule a new pump"), Actor->bStreamingBatchQueued);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DStaticStreamingRecoveryTest,
+    "V3DSimulator.Streaming.Regression.FailureRecovery",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DStaticStreamingRecoveryTest::RunTest(const FString&)
+{
+    const auto Values = UWorld::InitializationValues().AllowAudioPlayback(false)
+        .CreatePhysicsScene(false).CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Recovery world"), World)) return false;
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    AStaticActor* Scene = World->SpawnActor<AStaticActor>();
+    AInstancedMeshActor* Group = World->SpawnActor<AInstancedMeshActor>();
+    if (!TestNotNull(TEXT("Scene"), Scene) || !TestNotNull(TEXT("Group"), Group)) return false;
+    FModelMeshData Mesh;
+    Mesh.LOD0 = 0;
+    Mesh.Size = FVector(100);
+    const FName GroupName = StaticActorPrivate::MakeMeshGroupName(Mesh);
+    FInstancedMeshGroupInitData Definitions;
+    FModelNodeData Node;
+    Node.MeshName = TEXT("Mesh");
+    Definitions.Nodes.Add(TEXT("Node"), Node);
+    Definitions.ReferencedMeshNames.Add(Node.MeshName);
+    Definitions.NodeBounds = FBox::BuildAABB(FVector::ZeroVector, FVector(50));
+    if (!TestTrue(TEXT("Group initializes"), Group->InitializeGroup(GroupName, MoveTemp(Definitions)))) return false;
+    Group->SetOwner(Scene);
+    Scene->OwnedInstancedMeshActors.Add(GroupName, Group);
+    Scene->AllMeshMap.Add(Node.MeshName, Mesh);
+    Scene->BakedAsset = NewObject<UWorldBakedModelAsset>();
+    Scene->bHasModelMetadata = true;
+    Scene->bAsyncLoading = true;
+    Scene->StreamingEvaluation.Capture(Scene->GetStreamingEvaluationInputs());
+    FWorldSceneStreamResult Failed;
+    Failed.GroupName = GroupName;
+    Failed.bGroupFailed = true;
+    Scene->OnStreamCompleted(Failed);
+    TestTrue(TEXT("Failure retains the group actor and immutable placements"),
+        IsValid(Group) && Scene->OwnedInstancedMeshActors.FindRef(GroupName).Get() == Group
+        && Group->CaptureDefinitions().IsValid() && Group->CaptureDefinitions()->Nodes.Num() == 1);
+    TestTrue(TEXT("Failure retains the mesh payload lookup"), Scene->AllMeshMap.Contains(Node.MeshName));
+    TestFalse(TEXT("Failure cannot publish a successful scene"), Scene->GetIsLoaded());
+    TestTrue(TEXT("Stationary observers are eligible for a new evaluation"),
+        Scene->StreamingEvaluation.NeedsEvaluation(Scene->GetStreamingEvaluationInputs()));
+    const double Deadline = Scene->StreamingRetry.GetRetryAfterSeconds();
+    Scene->StartStreamingStep();
+    TestTrue(TEXT("Cooldown prevents an immediate worker burst"),
+        Scene->ActiveStreamActions.IsEmpty() && !Scene->bAsyncLoading);
+    Scene->OnStreamCompleted(Failed);
+    TestEqual(TEXT("Failure wave does not indefinitely extend retry time"),
+        Scene->StreamingRetry.GetRetryAfterSeconds(), Deadline);
+
+    Scene->StreamingRetry.BeginAttempt();
+    Scene->StreamingEvaluation.Capture(Scene->GetStreamingEvaluationInputs());
+    FWorldSceneStreamResult Success;
+    Success.GroupName = GroupName;
+    Scene->OnStreamCompleted(Success);
+    TestTrue(TEXT("Successful retry restores readiness"), Scene->GetIsLoaded());
+    TestFalse(TEXT("Successful retry clears backoff"), Scene->StreamingRetry.HasFailedAttempt());
+
+    Scene->MetadataRequestSerial = 7;
+    Scene->ModelReference = TEXT("v3d://test-metadata-retry");
+    Scene->bAsyncLoading = true;
+    Scene->OnBuiltMetadataLoaded(7, Scene->ModelReference, FGuid(), nullptr, false,
+        FGWorldModelMetadata(), FGWorldModelManifest(), TEXT("injected metadata read failure"));
+    TestFalse(TEXT("Metadata failure never marks an empty scene loaded"), Scene->GetIsLoaded());
+    TestTrue(TEXT("Metadata failure schedules a new read"), Scene->bReloadMetadataOnRetry);
+    TestFalse(TEXT("Metadata retry releases the active-pass lock"), Scene->bAsyncLoading);
+    Scene->ReleaseRuntimeResourcesForWorldExit();
+    TestFalse(TEXT("Teardown cancels retries"), Scene->bReloadMetadataOnRetry);
+    TestFalse(TEXT("Teardown resets retry timing"), Scene->StreamingRetry.HasFailedAttempt());
+    Scene->OnBuiltMetadataLoaded(7, Scene->ModelReference, FGuid(), nullptr, false,
+        FGWorldModelMetadata(), FGWorldModelManifest(), TEXT("late callback"));
+    TestFalse(TEXT("Late metadata callback cannot restart a released scene"), Scene->bReloadMetadataOnRetry);
     return true;
 }
 #endif

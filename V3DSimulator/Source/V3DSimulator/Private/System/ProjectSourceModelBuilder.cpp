@@ -8,6 +8,7 @@
  */
 
 #include "System/ProjectSourceModelBuilder.h"
+#include "Model/V3DModelAnimation.h"
 #include "System/V3DTerrain.h"
 
 #include "Containers/Ticker.h"
@@ -172,12 +173,7 @@ namespace ProjectSourceModelBuilderPrivate
     {
         FglTFRuntimeMaterialsConfig Config;
         Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-        if (UGameManagerSubSystem* Manager =
-                UGameManagerSubSystem::GetSubSystem(Builder))
-        {
-            V3DMaterialOverrideUtils::ApplyOverrides(
-                Manager->GetMaterialDefaultReferences(), Config);
-        }
+
 
         Config.bGeneratesMipMaps = true;
         Config.bLoadMipMaps = true;
@@ -805,7 +801,17 @@ bool UProjectSourceModelBuilder::CaptureMeshBounds(
         OutError = TEXT("decoded mesh bounds are invalid");
         return false;
     }
-    SourceMeshSizes.Add(MeshIndex, FinalBounds.GetSize().GetAbs());
+    // Runtime metadata stores a pivot-centred box (Size/Extent), not a local bounds centre.
+    // GetSize() alone loses offsets for meshes whose vertices are far from their pivot, causing
+    // both scene and node culling to reject visible geometry. Enclose the actual local bounds.
+    const FVector Extent = FinalBounds.Min.GetAbs().ComponentMax(FinalBounds.Max.GetAbs());
+    const FVector Size = Extent * 2.0;
+    if (!IsFiniteVector(Size))
+    {
+        OutError = TEXT("pivot-centred mesh bounds exceed the supported range");
+        return false;
+    }
+    SourceMeshSizes.Add(MeshIndex, Size);
     return true;
 }
 
@@ -849,32 +855,6 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
 
     FglTFRuntimeMaterialsConfig MaterialsConfig =
         ProjectSourceModelBuilderPrivate::MakeMaterialsConfig(this, SourceAsset);
-
-    // Character materials must be baked against the same master material used by the runtime
-    // character loader. Resolve this once per native batch instead of reconstructing the override
-    // map for every source mesh.
-    if (Definition.ModelType == EModelDefinitionType::Character)
-    {
-        UMaterialInterface* CharacterMaterial = CharacterMaterialOverride.Get();
-        if (IsValid(CharacterMaterial))
-        {
-            TMap<EglTFRuntimeMaterialType, UMaterialInterface*> CharacterMaterialMap;
-            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::Opaque, CharacterMaterial);
-            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::Translucent, CharacterMaterial);
-            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::TwoSided, CharacterMaterial);
-            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, CharacterMaterial);
-            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::Masked, CharacterMaterial);
-            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, CharacterMaterial);
-            MaterialsConfig.UberMaterialsOverrideMap = CharacterMaterialMap;
-            MaterialsConfig.UnlitOverrideMap = CharacterMaterialMap;
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning,
-                TEXT("Character build has no injected DefaultCharacterMaterial. Model=%s"),
-                *Definition.GlbPath);
-        }
-    }
 
     // The old path intentionally yielded one engine frame after *every* source mesh. A 1,188-mesh
     // GLB therefore paid ~20 seconds of pure frame-yield latency at 60 Hz before decode/archive
@@ -1009,7 +989,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
                 for (const FGWorldBakedTextureParameter& TextureParameter : BakedMaterial.Textures)
                 {
                     if (TextureParameter.Name.Equals(TEXT("baseColorTexture"), ESearchCase::IgnoreCase)
-                        && (TextureParameter.TextureId != INDEX_NONE || !TextureParameter.AssetPath.IsEmpty()))
+                        && TextureParameter.TextureId != INDEX_NONE)
                     {
                         ++BaseColorTextureBindings;
                     }
@@ -1018,7 +998,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
             UE_LOG(LogTemp, Display,
                 TEXT("Character bake capture: Mesh=%d MaterialOverride=%s Materials=%d Textures=%d BaseColorBindings=%d"),
                 MeshIndex,
-                *GetNameSafe(CharacterMaterialOverride.Get()),
+                TEXT("source glTF"),
                 BakedData.Materials.Num(),
                 BakedData.Textures.Num(),
                 BaseColorTextureBindings);
@@ -1097,6 +1077,12 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
         }
     }
 
+    if (!bBlob && !V3DModelAnimation::Capture(SourceAsset, Definition.Bones, BakedData, Error))
+    {
+        Complete(false, FString(TEXT("animation capture failed: ")) + Error);
+        return;
+    }
+
     FGWorldModelMetadata Metadata;
     if (!BakedData.IsSane(&Error)
         || (!bBlob && !V3DTerrain::Bake(SourceAsset, BakedData, Error, this))
@@ -1112,6 +1098,14 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
         return;
     }
 
+    for (auto& Material : BakedData.Materials)
+    {
+        Material.Scalars.RemoveAll([](const auto& Value) { return Value.Name.StartsWith(TEXT("V3D.Internal.")); });
+        Material.Scalars.Add({TEXT("V3D.Internal.Family"), Definition.bToon ? 2.f : (Definition.ModelType == EModelDefinitionType::Static ? 0.f : 1.f)});
+        // Toon selection and dynamic camera fade are independent, including when reloaded without gameplay context.
+        Material.Scalars.Add({TEXT("V3D.Internal.Dynamic"), Definition.ModelType == EModelDefinitionType::Static ? 0.f : 1.f});
+        Material.Scalars.Add({TEXT("V3D.Internal.Mode"), float(Definition.MaterialMode)});
+    }
     CompletedModel.Definition = Definition;
     CompletedModel.DefinitionJson = DefinitionJson;
     CompletedModel.Metadata = MoveTemp(Metadata);
@@ -1461,16 +1455,56 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         FModelNodeData Node;
         Node.MeshName = MeshName;
         Node.Transform = *ModelTransform;
-        const bool bChunkAddressable =
-            ComputeSpatialChunk(Node.Transform.GetLocation(), Node.CoarseChunk, Node.FineChunk);
-        const FBox TransformedMeshBounds =
-            FBox(-Mesh->Extent.GetAbs(), Mesh->Extent.GetAbs()).TransformBy(Node.Transform);
-        const FVector EffectiveSize = TransformedMeshBounds.IsValid
-            ? TransformedMeshBounds.GetSize().GetAbs()
-            : FVector::ZeroVector;
-        Node.bAlwaysLoaded = !bChunkAddressable || !TransformedMeshBounds.IsValid
-            || !IsFiniteVector(EffectiveSize) || EffectiveSize.GetMax() > CoarseChunkCm;
         OutMetadata.SceneData.NodeMap.Add(StorageName, MoveTemp(Node));
+    }
+
+    // A family with only LOD1/2/3 still has geometry. Use its most detailed available level as
+    // the placement source; lower-detail siblings describe alternate geometry, not extra instances.
+    TMap<FName, int32> FallbackPlacementLods;
+    for (auto& Pair : OutMetadata.SceneData.MeshMap)
+    {
+        FModelMeshData& Mesh = Pair.Value;
+        if (Mesh.LOD0 == INDEX_NONE)
+        {
+            const int32 Lod = Mesh.LOD1 != INDEX_NONE ? 1 : Mesh.LOD2 != INDEX_NONE ? 2 : 3;
+            int32& Source = Lod == 1 ? Mesh.LOD1 : Lod == 2 ? Mesh.LOD2 : Mesh.LOD3;
+            if (Source != INDEX_NONE)
+            {
+                FallbackPlacementLods.Add(Pair.Key, Lod);
+                Mesh.LOD0 = Source;
+                Source = INDEX_NONE;
+            }
+        }
+        // Culling must enclose all selectable LODs, including off-pivot lower-detail geometry.
+        for (const int32 Index : { Mesh.LOD0, Mesh.LOD1, Mesh.LOD2, Mesh.LOD3 })
+            if (const FVector* Size = SourceMeshSizes.Find(Index))
+                Mesh.Size = Mesh.Size.ComponentMax(*Size);
+        Mesh.Extent = Mesh.Size * 0.5;
+    }
+    if (!FallbackPlacementLods.IsEmpty())
+    {
+        for (const FglTFRuntimeNode& SourceNode : Nodes)
+        {
+            if (IsWaterNode(SourceNode.Name)) continue;
+            const auto Parsed = USimulatorNodeTokenLibrary::ParseNodeName(SourceNode.Name);
+            const FName MeshName(*Parsed.BaseName.TrimStartAndEnd());
+            const int32* Lod = FallbackPlacementLods.Find(MeshName);
+            if (!Lod || !Parsed.HasEffectiveToken(FName(*FString::Printf(TEXT("LOD%d"), *Lod)))) continue;
+            const int32* Payload = NodeToBakedMeshIndex.Find(SourceNode.Index);
+            const FTransform* Transform = ModelTransforms.Find(SourceNode.Index);
+            if (!Payload || !Transform || !SourceMeshSizes.Contains(*Payload)) continue;
+            const FName StorageName = MakeUniqueStorageName(SourceNode.Name, SourceNode.Index,
+                OutMetadata.SceneData.NodeMap, OutMetadata.SceneData.WaterNodeMap);
+            if (StorageName.IsNone())
+            {
+                OutError = FString::Printf(TEXT("could not create a fallback placement for node %d"), SourceNode.Index);
+                return false;
+            }
+            FModelNodeData Node;
+            Node.MeshName = MeshName;
+            Node.Transform = *Transform;
+            OutMetadata.SceneData.NodeMap.Add(StorageName, MoveTemp(Node));
+        }
     }
 
     // JSON settings override only author-controlled behavior. Generated split families inherit the
@@ -1496,7 +1530,16 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         if (Settings) Mesh.Data = *Settings;
     }
     for (auto It = OutMetadata.SceneData.NodeMap.CreateIterator(); It; ++It)
-        if (!OutMetadata.SceneData.MeshMap.Contains(It.Value().MeshName)) It.RemoveCurrent();
+    {
+        FModelNodeData& Node = It.Value();
+        const FModelMeshData* Mesh = OutMetadata.SceneData.MeshMap.Find(Node.MeshName);
+        if (!Mesh) { It.RemoveCurrent(); continue; }
+        const bool bChunkAddressable = ComputeSpatialChunk(Node.Transform.GetLocation(), Node.CoarseChunk, Node.FineChunk);
+        const FBox Bounds = FBox(-Mesh->Extent, Mesh->Extent).TransformBy(Node.Transform);
+        const FVector Size = Bounds.IsValid ? Bounds.GetSize() : FVector::ZeroVector;
+        Node.bAlwaysLoaded = !bChunkAddressable || !Bounds.IsValid || !IsFiniteVector(Size)
+            || Size.GetMax() > CoarseChunkCm;
+    }
 
     TSet<FName> ReferencedMeshes;
     for (const TPair<FName, FModelNodeData>& Pair : OutMetadata.SceneData.NodeMap) ReferencedMeshes.Add(Pair.Value.MeshName);
@@ -1651,3 +1694,88 @@ void UProjectSourceModelBuilder::BeginDestroy()
     }
     Super::BeginDestroy();
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "UObject/StrongObjectPtr.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DSourceStreamingMetadataTest,
+    "V3DSimulator.Streaming.Regression.SourceMetadata",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DSourceStreamingMetadataTest::RunTest(const FString&)
+{
+    TStrongObjectPtr<UProjectSourceModelBuilder> Builder(NewObject<UProjectSourceModelBuilder>());
+    FString Error;
+    FglTFRuntimeMeshLOD OffsetLOD;
+    auto& Primitive = OffsetLOD.Primitives.AddDefaulted_GetRef();
+    Primitive.Positions = { FVector(1000000, -40, -10), FVector(1000100, 80, 30) };
+    if (!TestTrue(TEXT("Capture off-pivot geometry"), Builder->CaptureMeshBounds(0, OffsetLOD, Error))) return false;
+    TestTrue(TEXT("Stored size encloses the pivot offset, not just the vertex span"),
+        Builder->SourceMeshSizes.FindChecked(0).Equals(FVector(2000200, 160, 60)));
+
+    FglTFRuntimeMeshLOD NegativeLOD;
+    NegativeLOD.Primitives.AddDefaulted_GetRef().Positions = { FVector(-2000, -10, -5), FVector(-1000, 10, 5) };
+    if (!TestTrue(TEXT("Capture negative offsets"), Builder->CaptureMeshBounds(1, NegativeLOD, Error))) return false;
+    TestEqual(TEXT("Negative side is enclosed"), Builder->SourceMeshSizes.FindChecked(1).X, 4000.0);
+    NegativeLOD.AdditionalTransforms.Add(FTransform(FVector(4000, 0, 0)));
+    if (!TestTrue(TEXT("Capture baked additional transforms"), Builder->CaptureMeshBounds(2, NegativeLOD, Error))) return false;
+    TestEqual(TEXT("Additional transform remains in the stored bounds"), Builder->SourceMeshSizes.FindChecked(2).X, 6000.0);
+
+    Builder->DefinitionJson = TEXT("{}");
+    Builder->ImportSession = MakeShared<V3DSourceModelImport::FSession>(V3DSourceModelImport::EFormat::Glb);
+    Builder->BakedData.Meshes.SetNum(6);
+    Builder->SourceMeshSizes.Add(3, FVector(400));
+    Builder->SourceMeshSizes.Add(4, FVector(100));
+    Builder->SourceMeshSizes.Add(5, FVector(1800000, 100, 100));
+    const auto AddNode = [&](const TCHAR* Name, int32 Payload, const FVector& Location)
+    {
+        const int32 Index = Builder->ImportSession->Nodes.Num();
+        auto& Node = Builder->ImportSession->Nodes.AddDefaulted_GetRef();
+        Node.Index = Index;
+        Node.ParentIndex = INDEX_NONE;
+        Node.MeshIndex = Payload;
+        Node.Name = Name;
+        Node.Transform = FTransform(Location);
+        Builder->NodeToBakedMeshIndex.Add(Index, Payload);
+    };
+    AddNode(TEXT("Offset"), 0, FVector(123, 0, 0));
+    AddNode(TEXT("Fallback;LOD1"), 1, FVector(1000, 0, 0));
+    AddNode(TEXT("Fallback;LOD1;INST"), 1, FVector(2000, 0, 0));
+    AddNode(TEXT("Fallback;LOD2"), 3, FVector(1000, 0, 0));
+    AddNode(TEXT("Full;LOD0"), 4, FVector(0, 2000, 0));
+    AddNode(TEXT("Full;LOD2"), 5, FVector(0, 2000, 0));
+    AddNode(TEXT("Twin"), 1, FVector(100, 100, 0));
+    AddNode(TEXT("Twin"), 2, FVector(200, 100, 0));
+    AddNode(TEXT("OnlyThird;LOD3"), 3, FVector(3000, 0, 0));
+    FGWorldModelMetadata Metadata;
+    if (!TestTrue(TEXT("Build streaming metadata from source rows"), Builder->BuildMetadata(Metadata, Error)))
+    { AddError(Error); return false; }
+    TestEqual(TEXT("All placements survive without spawning lower-detail siblings"), Metadata.SceneData.NodeMap.Num(), 7);
+    const FModelMeshData* Fallback = Metadata.SceneData.MeshMap.Find(TEXT("Fallback"));
+    if (!TestNotNull(TEXT("LOD1-only family is retained"), Fallback)) return false;
+    TestTrue(TEXT("Best available LOD is promoted once, other LODs retained"),
+        Fallback->LOD0 == 1 && Fallback->LOD1 == INDEX_NONE && Fallback->LOD2 == 3);
+    TestEqual(TEXT("LOD3-only family is retained"), Metadata.SceneData.MeshMap.FindChecked(TEXT("OnlyThird")).LOD0, 3);
+    TestTrue(TEXT("LOD0 bounds enclose lower-detail geometry too"),
+        Metadata.SceneData.MeshMap.FindChecked(TEXT("Full")).Size.X == 1800000.0);
+    TestTrue(TEXT("Large alternate LOD updates cell admission metadata"),
+        Metadata.SceneData.NodeMap.FindChecked(TEXT("Full;LOD0")).bAlwaysLoaded);
+    const FBox ModelBounds = FBox::BuildAABB(Metadata.SceneData.ModelData.Center, Metadata.SceneData.ModelData.Size * 0.5);
+    for (const FVector& Position : Primitive.Positions)
+        TestTrue(TEXT("Coarse scene bounds contain actual off-pivot geometry"),
+            ModelBounds.IsInsideOrOn(Position + FVector(123, 0, 0)));
+    TestTrue(TEXT("Bare nodes with distinct payloads still get separate families"),
+        Metadata.SceneData.MeshMap.Contains(TEXT("Twin")) && Metadata.SceneData.MeshMap.Contains(TEXT("Twin__Mesh2")));
+
+    auto& Nodes = Builder->ImportSession->Nodes;
+    for (int32 Left = 0, Right = Nodes.Num() - 1; Left < Right; ++Left, --Right) Swap(Nodes[Left], Nodes[Right]);
+    FGWorldModelMetadata Reversed;
+    if (!TestTrue(TEXT("Reversed source order also builds"), Builder->BuildMetadata(Reversed, Error))) return false;
+    TestEqual(TEXT("Fallback placements are independent of traversal order"), Reversed.SceneData.NodeMap.Num(), Metadata.SceneData.NodeMap.Num());
+    TestEqual(TEXT("Fallback payload is independent of traversal order"), Reversed.SceneData.MeshMap.FindChecked(TEXT("Fallback")).LOD0, Fallback->LOD0);
+    AddNode(TEXT("Full;LOD0"), 3, FVector::ZeroVector);
+    TestFalse(TEXT("Conflicting explicit LOD0 payloads remain rejected"), Builder->BuildMetadata(Reversed, Error));
+    TestTrue(TEXT("Conflict reports its cause"), Error.Contains(TEXT("ambiguous mesh family")));
+    return true;
+}
+#endif

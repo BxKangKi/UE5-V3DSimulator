@@ -264,7 +264,7 @@ void URuntimeSoundSubsystem::LoadPcmAsync(const FString& SoundReference, FV3DPcm
     FGuid UUID;
     if (!FGWorldArchive::ParseSoundReference(SoundReference.TrimStartAndEnd(), UUID))
     {
-        (*Callback)(nullptr, TEXT("Sound reference must be gworld://sound/<UUID>."));
+        (*Callback)(nullptr, TEXT("Sound reference must be v3d://sound/<UUID>."));
         return;
     }
     UGameInstance* GameInstance = GetGameInstance();

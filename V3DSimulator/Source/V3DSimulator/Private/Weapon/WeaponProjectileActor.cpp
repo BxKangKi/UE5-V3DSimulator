@@ -16,6 +16,7 @@
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "System/GameUpdateSubSystem.h"
+#include "System/WorldSurfaceSubsystem.h"
 
 namespace WeaponProjectileTuning
 {
@@ -46,6 +47,7 @@ void AWeaponProjectileActor::BeginPlay()
 
     if (Collision)
     {
+        if (auto* Surfaces = UWorldSurfaceSubsystem::Get(this)) Surfaces->ApplyToPrimitive(Collision);
         Collision->OnComponentHit.AddUniqueDynamic(this, &AWeaponProjectileActor::OnProjectileHit);
         if (IsValid(GetOwner())) Collision->IgnoreActorWhenMoving(GetOwner(), true);
         if (IsValid(GetInstigator())) Collision->IgnoreActorWhenMoving(GetInstigator(), true);

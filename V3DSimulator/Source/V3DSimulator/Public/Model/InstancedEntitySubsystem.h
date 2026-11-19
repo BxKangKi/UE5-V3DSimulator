@@ -77,7 +77,7 @@ struct V3DSIMULATOR_API FInstancedVehicleTemplateData
 /**
  * Separates physics/entity actors from rendering.
  *
- * - One AInstancedEntityRenderActor is created per canonical gworld:// model UUID.
+ * - One AInstancedEntityRenderActor is created per canonical v3d:// model UUID.
  * - Every entity keeps only its physics/collision proxy and contributes transforms to shared ISMs.
  * - Interpolation math is performed from immutable snapshots in ParallelFor and applied in one batch
  *   per ISM component on the game thread.

@@ -1,102 +1,44 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
-
 #include "Materials/Material.h"
 #include "Model/MaterialDefaultAsset.h"
 #include "UObject/StrongObjectPtr.h"
-
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DRuntimeMaterialReadinessTest,
     "V3DSimulator.Materials.RuntimeReadinessWithoutSynchronousLoading",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
 bool FV3DRuntimeMaterialReadinessTest::RunTest(const FString&)
 {
-    TStrongObjectPtr<UMaterial> LoadedMaterial(NewObject<UMaterial>(GetTransientPackage()));
-    if (!TestNotNull(TEXT("Already resident material is available without an asset package"), LoadedMaterial.Get()))
-        return false;
-
-    FV3DMaterialSoftAssetReferences SoftReferences;
-    SoftReferences.Opaque = LoadedMaterial.Get();
-    SoftReferences.Masked = LoadedMaterial.Get();
-    SoftReferences.TwoSided = LoadedMaterial.Get();
-    SoftReferences.TwoSidedMasked = LoadedMaterial.Get();
-    SoftReferences.Translucent = LoadedMaterial.Get();
-    SoftReferences.TwoSidedTranslucent = LoadedMaterial.Get();
-    SoftReferences.ByMaterialName.Add(TEXT("  ResidentOverride  "), LoadedMaterial.Get());
-    SoftReferences.ByMaterialName.Add(TEXT("UnconfiguredOverride"), TSoftObjectPtr<UMaterialInterface>());
-    SoftReferences.ByMaterialName.Add(TEXT("   "), LoadedMaterial.Get());
-
-    // Reuse a previous world's output, including its independently resolved terrain material.
-    FV3DMaterialAssetReferences Resolved;
-    Resolved.Terrain = LoadedMaterial.Get();
-    Resolved.ByMaterialName.Add(TEXT("PreviousWorldOverride"), LoadedMaterial.Get());
-    TArray<FString> Failures = { TEXT("Previous world's failure") };
-    TestTrue(TEXT("Resident material references resolve with synchronous loading disabled"),
-        SoftReferences.Resolve(Resolved, Failures, false));
-    TestTrue(TEXT("All resident material categories preserve their original object"),
-        Resolved.Opaque.Get() == LoadedMaterial.Get()
-        && Resolved.Masked.Get() == LoadedMaterial.Get()
-        && Resolved.TwoSided.Get() == LoadedMaterial.Get()
-        && Resolved.TwoSidedMasked.Get() == LoadedMaterial.Get()
-        && Resolved.Translucent.Get() == LoadedMaterial.Get()
-        && Resolved.TwoSidedTranslucent.Get() == LoadedMaterial.Get());
-    TestTrue(TEXT("Successful resolution clears previous diagnostics"), Failures.IsEmpty());
-    TestNull(TEXT("A previous world's terrain reference cannot leak into the new set"), Resolved.Terrain.Get());
-    TestEqual(TEXT("Only the configured resident named override survives"), Resolved.ByMaterialName.Num(), 1);
-    const TObjectPtr<UMaterialInterface>* ResidentOverride = Resolved.ByMaterialName.Find(TEXT("ResidentOverride"));
-    TestTrue(TEXT("Named overrides keep the resident material and trim surrounding whitespace"),
-        ResidentOverride && ResidentOverride->Get() == LoadedMaterial.Get());
-    TestFalse(TEXT("The previous world's named override is discarded"),
-        Resolved.ByMaterialName.Contains(TEXT("PreviousWorldOverride")));
-
-    const FString MissingName = FString::Printf(TEXT("M_RuntimeReadiness_%s"),
-        *FGuid::NewGuid().ToString(EGuidFormats::Digits));
-    const FSoftObjectPath MissingPath(FString::Printf(TEXT("/Game/__V3DReadinessMissing__/%s.%s"),
-        *MissingName, *MissingName));
-    const TSoftObjectPtr<UMaterialInterface> MissingReference(MissingPath);
-    TestNull(TEXT("Unique missing asset is not already resident"), MissingReference.Get());
-    SoftReferences.Opaque = MissingReference;
-    SoftReferences.Masked = MissingReference;
-    SoftReferences.TwoSided = MissingReference;
-    SoftReferences.TwoSidedMasked = MissingReference;
-    SoftReferences.Translucent = MissingReference;
-    SoftReferences.TwoSidedTranslucent = MissingReference;
-    SoftReferences.ByMaterialName.Add(TEXT("  UnavailableOverride  "), MissingReference);
-
-    // Do not expect/suppress load errors: an accidental LoadSynchronous fallback must fail
-    // this test through the loader's unexpected missing-package errors, as well as diagnostics.
-    TestTrue(TEXT("Unavailable references are inspected without a blocking fallback"),
-        SoftReferences.Resolve(Resolved, Failures, false));
-    TestTrue(TEXT("Unavailable material categories remain null instead of retaining the previous material"),
-        !Resolved.Opaque && !Resolved.Masked && !Resolved.TwoSided
-        && !Resolved.TwoSidedMasked && !Resolved.Translucent && !Resolved.TwoSidedTranslucent);
-    TestEqual(TEXT("Each unavailable configured reference reports a failure"), Failures.Num(), 7);
-    const TCHAR* FailureLabels[] = {
-        TEXT("Opaque ->"), TEXT("Masked ->"), TEXT("TwoSided ->"), TEXT("TwoSidedMasked ->"),
-        TEXT("Translucent ->"), TEXT("TwoSidedTranslucent ->"), TEXT("ByMaterialName[UnavailableOverride]")
-    };
-    for (const TCHAR* Label : FailureLabels)
-    {
-        TestTrue(*FString::Printf(TEXT("Failure identifies %s and its configured asset"), Label),
-            Failures.ContainsByPredicate([Label, &MissingPath](const FString& Failure)
-            {
-                return Failure.StartsWith(Label) && Failure.Contains(MissingPath.ToString());
-            }));
-    }
-    TestFalse(TEXT("An unavailable named override is omitted"),
-        Resolved.ByMaterialName.Contains(TEXT("UnavailableOverride")));
-    ResidentOverride = Resolved.ByMaterialName.Find(TEXT("ResidentOverride"));
-    TestTrue(TEXT("A missing package does not discard another resident named override"),
-        Resolved.ByMaterialName.Num() == 1 && ResidentOverride && ResidentOverride->Get() == LoadedMaterial.Get());
-    TestNull(TEXT("Readiness inspection leaves the missing soft reference unloaded"), MissingReference.Get());
-    TestFalse(TEXT("Readiness inspection retains the configured soft asset path"), MissingReference.IsNull());
-
-    const FV3DMaterialSoftAssetReferences EmptyReferences;
-    TestTrue(TEXT("A world without configured defaults also resolves without loading"),
-        EmptyReferences.Resolve(Resolved, Failures, false));
-    TestTrue(TEXT("Empty defaults clear all previous strong references"), Resolved.IsEmpty());
-    TestTrue(TEXT("Empty defaults clear previous readiness failures"), Failures.IsEmpty());
+    TStrongObjectPtr<UMaterial> Parent(NewObject<UMaterial>());
+    FV3DMaterialSoftAssetReferences Soft;
+    Soft.MI_Opaque=Parent.Get(); Soft.MI_Toon=Parent.Get();
+    FV3DMaterialAssetReferences Resolved; Resolved.Terrain=Parent.Get(); TArray<FString> Failures={TEXT("old")};
+    TestTrue(TEXT("Resident assets need no synchronous load"),Soft.Resolve(Resolved,Failures,false));
+    TestTrue(TEXT("Resident identity retained"),Resolved.MI_Opaque==Parent.Get() && Resolved.MI_Toon==Parent.Get());
+    TestNull(TEXT("Previous world's terrain guard is cleared"),Resolved.Terrain.Get());
+    TestTrue(TEXT("Previous diagnostics cleared"),Failures.IsEmpty());
+    TArray<FSoftObjectPath> Paths;Soft.GetPreloadPaths(Paths);
+    TestEqual(TEXT("Shared parents are preloaded only once"),Paths.Num(),1);
+    const FString MissingName=TEXT("M_Missing_")+FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    const TSoftObjectPtr<UMaterialInterface> Missing(FSoftObjectPath(TEXT("/Game/__Missing__/")+MissingName+TEXT(".")+MissingName));
+    Soft.MI_Opaque=Missing;
+    TestTrue(TEXT("Unavailable references are inspected without blocking"),Soft.Resolve(Resolved,Failures,false));
+    TestEqual(TEXT("Missing configured slot reports one failure"),Failures.Num(),1);
+    TestNull(TEXT("Unavailable slot stays empty"),Resolved.MI_Opaque.Get());
+    TestTrue(TEXT("Other resident slots survive"),Resolved.MI_Toon==Parent.Get());
+    Parent->TwoSided=true;Soft.MI_Opaque.Reset();
+    Soft.Resolve(Resolved,Failures,false);
+    TestEqual(TEXT("Two-sided Toon is rejected"),Failures.Num(),1);
+    TestTrue(TEXT("Rejected parents are never published"),Resolved.IsEmpty());
+    TestTrue(TEXT("Registry validation never mutates authored parents"),Parent->IsTwoSided());
+    Parent->TwoSided=false; Parent->BlendMode=BLEND_Masked;
+    Soft.MI_Opaque=Parent.Get();Soft.Resolve(Resolved,Failures,false);
+    TestEqual(TEXT("Wrong-alpha default slot fails validation"),Failures.Num(),1);
+    TestNull(TEXT("Masked material cannot occupy Opaque slot"),Resolved.MI_Opaque.Get());
+    TestTrue(TEXT("Toon keeps its authored Masked state"),Resolved.MI_Toon==Parent.Get());
+    const FV3DMaterialSoftAssetReferences Empty;
+    Empty.Resolve(Resolved,Failures,false);
+    TestTrue(TEXT("An empty registry clears references and diagnostics"),Resolved.IsEmpty() && Failures.IsEmpty());
     return true;
 }
 #endif

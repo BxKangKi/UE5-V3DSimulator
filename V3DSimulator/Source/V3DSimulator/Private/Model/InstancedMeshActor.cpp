@@ -52,18 +52,6 @@ bool AInstancedMeshActor::InitializeGroup(
     GroupName = InGroupName;
     NodeBounds = InData.NodeBounds;
     MaxNodeScale = InData.MaxNodeScale;
-    if (!NodeBounds.IsValid)
-    {
-        // Compatibility for callers that supply nodes without precomputed worker bounds.
-        MaxNodeScale = 0.0;
-        for (const auto& Pair : InData.Nodes)
-        {
-            MaxNodeScale = FMath::Max(MaxNodeScale,
-                static_cast<double>(Pair.Value.Transform.GetScale3D().GetAbs().GetMax()));
-            NodeBounds += Pair.Value.Transform.GetLocation();
-        }
-    }
-    AlwaysLoadedNodeNames = MoveTemp(InData.AlwaysLoadedNodeNames);
     ReferencedMeshNames = MoveTemp(InData.ReferencedMeshNames);
     GroupDefinitions = MakeShared<FInstancedMeshGroupInitData, ESPMode::ThreadSafe>(MoveTemp(InData));
     LoadedNodes = MakeShared<TSet<FName>, ESPMode::ThreadSafe>();
@@ -83,13 +71,14 @@ void AInstancedMeshActor::BuildStreamNodeSnapshot(const FVector& Observer, const
     const float Radius, TMap<FName, FModelNodeData>& OutNodes) const
 {
     check(IsInGameThread());
-    if (GroupDefinitions.IsValid()) BuildNativeNodeSnapshot(*GroupDefinitions, *LoadedNodes, Observer, OwnerTransform, Radius, OutNodes);
+    if (GroupDefinitions.IsValid()) BuildNativeNodeSnapshot(*GroupDefinitions, *LoadedNodes, Observer, OwnerTransform, Radius, OutNodes,
+        V3DStreamingPolicy::GetMaxRenderDistanceCm(this));
     else OutNodes.Reset();
 }
 
 void AInstancedMeshActor::BuildNativeNodeSnapshot(const FInstancedMeshGroupInitData& Definitions,
     const TSet<FName>& Loaded, const FVector& Observer, const FTransform& OwnerTransform,
-    const float Radius, TMap<FName, FModelNodeData>& OutNodes)
+    const float Radius, TMap<FName, FModelNodeData>& OutNodes, const double MaxDistanceCm)
 {
     // Detached native tables only; no UObject, world, or component access on this worker path.
     OutNodes.Reset();
@@ -102,7 +91,9 @@ void AInstancedMeshActor::BuildNativeNodeSnapshot(const FInstancedMeshGroupInitD
     for (const auto& Pair : Definitions.StreamChunks)
     {
         const FBox Bounds = Pair.Value.LocalBounds.TransformBy(OwnerTransform);
-        if (!Bounds.IsValid || Bounds.ComputeSquaredDistanceToPoint(Observer) > FMath::Square(double(Radius))) continue;
+        const double QueryRadius = Pair.Value.bHasAlwaysLoadedNodes
+            ? FMath::Max(double(Radius), MaxDistanceCm) : double(Radius);
+        if (!Bounds.IsValid || Bounds.ComputeSquaredDistanceToPoint(Observer) > FMath::Square(QueryRadius)) continue;
         for (const FName Name : Pair.Value.Nodes)
             if (const FModelNodeData* Node = Definitions.Nodes.Find(Name)) OutNodes.Add(Name, *Node);
     }
@@ -164,7 +155,7 @@ UHierarchicalInstancedStaticMeshComponent* AInstancedMeshActor::CreateChunkCompo
         Surfaces->ApplyToStaticMesh(Component);
     Component->PreAllocateInstancesMemory(V3DHISMChunkPolicy::MaxInstancesPerComponent);
     AddInstanceComponent(Component);
-    Component->RegisterComponent(); // Registered empty: no bulk Chaos insertion during registration.
+    Component->RegisterComponent();
     ChunkComponents.Add(OutPage, Component);
     FChunkPage& Page = ChunkPages.Add(OutPage);
     Page.Chunk = Chunk;
@@ -255,6 +246,13 @@ bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
     else DirtyPages.Add(Slot.Page);
     if (LoadedNodes->IsEmpty())
     {
+        LoadedNodes->Empty();
+        InstanceSlots.Empty();
+        ChunkComponents.Empty();
+        ChunkPages.Empty();
+        OpenChunkPages.Empty();
+        DirtyPages.Empty();
+        if (DynamicComponentMap.IsEmpty()) DynamicComponentMap.Empty();
         MeshComponent->SetStaticMesh(nullptr);
         MeshComponent->EmptyOverrideMaterials();
         MeshComponent->SetPhysMaterialOverride(nullptr);
@@ -351,6 +349,9 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
     TArray<FName> Pages;
     ChunkComponents.GetKeys(Pages);
     for (const FName Page : Pages) DestroyChunkComponent(Page);
+    ChunkComponents.Empty();
+    ChunkPages.Empty();
+    DynamicComponentMap.Empty();
     OpenChunkPages.Empty();
     InstanceSlots.Empty();
     DirtyPages.Empty();
@@ -367,7 +368,6 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
         FV3DStreamingBudget::NotifyUnloaded();
     }
     GroupDefinitions.Reset();
-    AlwaysLoadedNodeNames.Empty();
     ReferencedMeshNames.Empty();
     LoadedNodes = MakeShared<TSet<FName>, ESPMode::ThreadSafe>();
     InstanceSlots.Empty();

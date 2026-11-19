@@ -214,6 +214,39 @@ bool FRecursiveWorldSourceDiscoveryTest::RunTest(const FString& Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DReferenceSchemeTest,
+    "V3DSimulator.Streaming.V3DReferenceScheme",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DReferenceSchemeTest::RunTest(const FString&)
+{
+    FGuid UUID;
+    FGuid::Parse(TEXT("ed3f9cfd-42a8-fd21-45fe-ddb4f2ea8af7"), UUID);
+    const FString Model = FGWorldArchive::MakeModelReference(UUID);
+    const FString Sound = FGWorldArchive::MakeSoundReference(UUID);
+    TestEqual(TEXT("Canonical model URI uses v3d"), Model,
+        FString(TEXT("v3d://model/ed3f9cfd-42a8-fd21-45fe-ddb4f2ea8af7")));
+    TestEqual(TEXT("Canonical sound URI uses v3d"), Sound,
+        FString(TEXT("v3d://sound/ed3f9cfd-42a8-fd21-45fe-ddb4f2ea8af7")));
+    FGuid Parsed;
+    TestTrue(TEXT("Model UUID round trips"), FGWorldArchive::ParseModelReference(Model, Parsed) && Parsed == UUID);
+    TestTrue(TEXT("Sound UUID round trips"), FGWorldArchive::ParseSoundReference(Sound, Parsed) && Parsed == UUID);
+    TestFalse(TEXT("Sound URI is not a model selector"), FGWorldArchive::ParseModelReference(Sound, Parsed));
+    TestFalse(TEXT("Model URI is not a sound selector"), FGWorldArchive::ParseSoundReference(Model, Parsed));
+    // Old URI strings are deliberately unsupported; there is no compatibility alias.
+    TestFalse(TEXT("Old model scheme is rejected"), FGWorldArchive::ParseModelReference(
+        Model.Replace(TEXT("v3d://"), TEXT("gworld://")), Parsed));
+    TestFalse(TEXT("Old sound scheme is rejected"), FGWorldArchive::ParseSoundReference(
+        Sound.Replace(TEXT("v3d://"), TEXT("gworld://")), Parsed));
+    TestFalse(TEXT("A filename is not accepted as an internal model selector"),
+        FGWorldArchive::ParseModelReference(TEXT("example.v3d"), Parsed));
+    TestFalse(TEXT("Zero UUID is rejected"),
+        FGWorldArchive::ParseModelReference(TEXT("v3d://model/00000000-0000-0000-0000-000000000000"), Parsed));
+    TestFalse(TEXT("Fragments are not silently included in model identity"),
+        FGWorldArchive::ParseModelReference(Model + TEXT("#definition"), Parsed));
+    TestTrue(TEXT("Invalid UUID produces no reference"), FGWorldArchive::MakeModelReference(FGuid()).IsEmpty());
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGWorldArchiveRoundTripTest,
     "V3DSimulator.Streaming.V3dRoundTrip",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -222,7 +255,7 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
 {
     (void)Parameters;
     using namespace WorldArchiveTestsPrivate;
-    const FString Sandbox = MakeTestRoot(TEXT("Gworld"));
+    const FString Sandbox = MakeTestRoot(TEXT("V3D"));
     const FString Root = FPaths::Combine(Sandbox, TEXT("Worlds"), TEXT("TestWorld"));
     ON_SCOPE_EXIT
     {
