@@ -3,7 +3,10 @@ static const TCHAR* EditorSchemaJson = TEXT(R"V3DSCHEMA({
   "Model": {
     "MeshData": {},
     "Shader": "Default",
-    "MaterialMode": "Auto"
+    "MaterialMode": "Auto",
+    "BuildTextureResolution": 1024,
+    "BuildTerrainTextureResolution": 1024,
+    "BuildTerrainFlipNormalGreen": false
   },
   "Dynamic": {
     "EnableCollision": true,

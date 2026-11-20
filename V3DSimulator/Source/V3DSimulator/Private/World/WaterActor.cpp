@@ -35,6 +35,102 @@ namespace
         return FName(*FString::Printf(TEXT("%s_%d"), Prefix, Index));
     }
 
+    // Apply physically-based pure/ocean water surface optical properties (IOR = 1.3333 -> F0 = 0.0204 -> UE Specular = 0.255)
+    // only to parameters that actually exist on the material graph.
+    void ApplyPhysicalWaterSurfaceParameters(UMaterialInstanceDynamic* MID)
+    {
+        if (!IsValid(MID))
+        {
+            return;
+        }
+
+        TArray<FMaterialParameterInfo> ScalarInfos;
+        TArray<FGuid> ScalarIds;
+        MID->GetAllScalarParameterInfo(ScalarInfos, ScalarIds);
+        auto HasScalar = [&ScalarInfos](const FName Name)
+        {
+            return ScalarInfos.ContainsByPredicate([Name](const FMaterialParameterInfo& Info) { return Info.Name == Name; });
+        };
+
+        TArray<FMaterialParameterInfo> VectorInfos;
+        TArray<FGuid> VectorIds;
+        MID->GetAllVectorParameterInfo(VectorInfos, VectorIds);
+        auto HasVector = [&VectorInfos](const FName Name)
+        {
+            return VectorInfos.ContainsByPredicate([Name](const FMaterialParameterInfo& Info) { return Info.Name == Name; });
+        };
+
+        // Beer-Lambert spectral absorption (cm^-1): shallow water stays transparent to the seabed,
+        // red extinguishes within a few metres, green at mid-depth, and deep water turns dark marine navy.
+        const FLinearColor BeerLambertAbsorption(0.00460f, 0.00140f, 0.00065f, 1.0f);
+        // Low single-scattering albedo keeps deep water dark and realistic instead of bright sky blue.
+        const FLinearColor DeepOceanScattering(0.000018f, 0.000068f, 0.000105f, 1.0f);
+
+        if (HasVector(TEXT("AbsorptionCoefficients")))
+        {
+            MID->SetVectorParameterValue(TEXT("AbsorptionCoefficients"), BeerLambertAbsorption);
+        }
+        if (HasVector(TEXT("Absorption")))
+        {
+            MID->SetVectorParameterValue(TEXT("Absorption"), BeerLambertAbsorption);
+        }
+        if (HasVector(TEXT("ScatteringCoefficients")))
+        {
+            MID->SetVectorParameterValue(TEXT("ScatteringCoefficients"), DeepOceanScattering);
+        }
+        if (HasVector(TEXT("Scattering")))
+        {
+            MID->SetVectorParameterValue(TEXT("Scattering"), DeepOceanScattering);
+        }
+        // Real water has near-zero diffuse albedo; its color comes from volumetric absorption and scattering.
+        if (HasVector(TEXT("Water Albedo")))
+        {
+            MID->SetVectorParameterValue(TEXT("Water Albedo"), FLinearColor(0.0005f, 0.0020f, 0.0040f, 1.0f));
+        }
+        if (HasVector(TEXT("ColorScaleBehindWater")))
+        {
+            MID->SetVectorParameterValue(TEXT("ColorScaleBehindWater"), FLinearColor(0.92f, 0.96f, 1.0f, 1.0f));
+        }
+        // Physical Fresnel specular for water IOR 1.3333 (F0 = 0.0204 -> UE Specular = F0 / 0.08 = 0.255).
+        if (HasScalar(TEXT("Water Specular")))
+        {
+            MID->SetScalarParameterValue(TEXT("Water Specular"), 0.255f);
+        }
+        if (HasScalar(TEXT("Water Fresnel Specular")))
+        {
+            MID->SetScalarParameterValue(TEXT("Water Fresnel Specular"), 0.255f);
+        }
+        if (HasScalar(TEXT("Water Roughness")))
+        {
+            MID->SetScalarParameterValue(TEXT("Water Roughness"), 0.03f);
+        }
+        if (HasScalar(TEXT("Water Fresnel Roughness")))
+        {
+            MID->SetScalarParameterValue(TEXT("Water Fresnel Roughness"), 0.02f);
+        }
+        if (HasScalar(TEXT("Water Fresnel  Exponenth")))
+        {
+            MID->SetScalarParameterValue(TEXT("Water Fresnel  Exponenth"), 5.0f);
+        }
+        if (HasScalar(TEXT("PhaseG")))
+        {
+            MID->SetScalarParameterValue(TEXT("PhaseG"), 0.65f);
+        }
+    }
+
+    void ApplyPhysicalLocalUnderwaterParameters(UMaterialInstanceDynamic* PostProcessMID)
+    {
+        if (!IsValid(PostProcessMID))
+        {
+            return;
+        }
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor(0.0015f, 0.016f, 0.042f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor(0.006f, 0.055f, 0.125f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor(0.009f, 0.068f, 0.140f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor(0.80f, 0.92f, 1.0f, 1.0f));
+        PostProcessMID->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
+    }
+
 }
 
 AWaterActor::AWaterActor()
@@ -67,6 +163,7 @@ AWaterActor::AWaterActor()
     StaticMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     StaticMesh->SetGenerateOverlapEvents(false);
     StaticMesh->SetCastShadow(false);
+    StaticMesh->SetRenderCustomDepth(false); // Shaft occlusion uses solid geometry only.
     StaticMesh->SetVisibility(true, true);
     StaticMesh->SetHiddenInGame(false, true);
 }
@@ -86,6 +183,7 @@ void AWaterActor::BeginPlay()
     }
     if (IsValid(StaticMesh.Get()))
     {
+        StaticMesh->SetRenderCustomDepth(false);
         StaticMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         StaticMesh->SetGenerateOverlapEvents(false);
         StaticMesh->SetVisibility(true, true);
@@ -150,6 +248,7 @@ void AWaterActor::BeginPlay()
     {
         PostProcess->AddOrUpdateBlendable(PostProcessMID, 1.0f);
         PostProcessMID->SetScalarParameterValue(FName("WaterLevel"), Level);
+        ApplyPhysicalLocalUnderwaterParameters(PostProcessMID);
     }
 }
 
@@ -159,6 +258,7 @@ void AWaterActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     {
         WaterQuery->UnregisterWaterActor(this);
     }
+    WaterMaterialInstances.Reset();
     Super::EndPlay(EndPlayReason);
 }
 
@@ -439,6 +539,10 @@ void AWaterActor::EnsureWaterMaterialInstances()
         UMaterialInstanceDynamic* MID = ExistingMID
             ? ExistingMID
             : StaticMesh->CreateDynamicMaterialInstance(MaterialIndex, StaticMesh->GetMaterial(MaterialIndex));
+        if (IsValid(MID) && !ExistingMID)
+        {
+            ApplyPhysicalWaterSurfaceParameters(MID);
+        }
         WaterMaterialInstances[MaterialIndex] = MID;
     }
 }

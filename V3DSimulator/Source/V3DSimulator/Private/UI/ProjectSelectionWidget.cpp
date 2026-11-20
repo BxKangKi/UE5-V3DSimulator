@@ -37,6 +37,7 @@
 #include "System/ProjectConfig.h"
 #include "UI/MainWorldWidget.h"
 #include "World/WorldData.h"
+#include "InputCoreTypes.h"
 
 namespace
 {
@@ -51,6 +52,7 @@ UProjectSelectionWidget::UProjectSelectionWidget(const FObjectInitializer& Objec
     ButtonHeight = 64.0f;
     BodyFontSize = 32;
     TitleFontSize = 100;
+    SetIsFocusable(true);
 }
 
 void UProjectSelectionWidget::NativeConstruct()
@@ -108,6 +110,17 @@ void UProjectSelectionWidget::NativeDestruct()
     BuildStatusWidget = nullptr;
 
     Super::NativeDestruct();
+}
+
+FReply UProjectSelectionWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+    if (!InKeyEvent.IsRepeat()
+        && (InKeyEvent.GetKey() == EKeys::Escape || InKeyEvent.GetKey() == EKeys::Gamepad_FaceButton_Right))
+    {
+        CloseProjectSelection();
+        return FReply::Handled();
+    }
+    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
 }
 
 void UProjectSelectionWidget::SetOwnerMainWidget(UMainWorldWidget* InOwnerWidget)

@@ -130,6 +130,9 @@ public:
     /** Synchronously resolves TerrainMaterial on the game thread. */
     UMaterialInterface* ResolveTerrainMaterial() const;
 
+    /** Synchronously resolves FoliageMaterial on the game thread. */
+    UMaterialInterface* ResolveFoliageMaterial() const;
+
     /** Loaded once by the world surface subsystem; the registry retains only the soft path. */
     UPhysicalMaterial* ResolveDefaultPhysicalMaterial() const;
 
@@ -221,13 +224,17 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> PlacementGridMaterial;
 
-    /** MI_Opaque / MI_Masked / MI_Translucent / MI_Toon. Dynamic models share these parents and set MID FadeDistance=50. */
+    /** MI_Opaque (Masked) / MI_Translucent / MI_Toon, their TwoSided versions, and reserved names. Dynamic models share these parents and set MID FadeDistance=50. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     FV3DMaterialSoftAssetReferences V3DMaterials;
 
     /** Base material used by baked V3D terrain palettes (Texture2DArray + vertex-color layer weights). */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> TerrainMaterial;
+
+    /** Parent material assigned to any material whose name ends with .foliage (e.g. TreeLeaf.foliage). */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UMaterialInterface> FoliageMaterial;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> StaticDecalLightMaterial;

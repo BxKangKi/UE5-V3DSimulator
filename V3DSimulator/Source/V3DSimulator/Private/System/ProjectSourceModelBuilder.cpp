@@ -8,6 +8,7 @@
  */
 
 #include "System/ProjectSourceModelBuilder.h"
+#include "Format/v3d.h"
 #include "Model/V3DModelAnimation.h"
 #include "System/V3DTerrain.h"
 
@@ -26,7 +27,6 @@
 #include "Model/V3DMaterialOverrideUtils.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
-#include "Setting/GameSettings.h"
 #include "Simulator/NodeTokenLibrary.h"
 #include "System/SimulatorFileServices.h"
 #include "System/GameManagerSubSystem.h"
@@ -131,7 +131,7 @@ namespace ProjectSourceModelBuilderPrivate
         NodeName.Mid(Delimiter + 1).ParseIntoArray(Segments, TEXT(";"), false);
         for (const FString& Raw : Segments)
         {
-            const FString Token = Raw.TrimStartAndEnd().ToUpper();
+            const FString Token = USimulatorNodeTokenLibrary::NormalizeSegment(Raw.TrimStartAndEnd());
             if (!Token.StartsWith(TEXT("LOD"), ESearchCase::CaseSensitive) || Token.Len() <= 3) continue;
 
             bool bNumeric = true;
@@ -180,23 +180,20 @@ namespace ProjectSourceModelBuilderPrivate
         Config.SpecularFactor = 0.0f;
         // Terrain array construction needs CPU pixels, before platform compression.
         const bool bTerrainSource = V3DTerrain::SourceHasTerrain(Source);
-        Config.ImagesConfig.bCompressMips = !bTerrainSource;
+        // Never bake a host-selected GPU compressor (BC on D3D vs raw/other formats on Metal).
+        // Runtime texture limits are applied when reading the archive, not while authoring it.
+        Config.ImagesConfig.bCompressMips = false;
         // Build-time textures are captured immediately from FTexturePlatformData on the game thread.
         // Keep glTFRuntime texture streaming disabled here. On UE 5.8, bStreaming=true attaches
         // glTFRuntime's custom mip provider before UpdateResource(); the provider can report a
         // different tiled layout from the transient texture and triggers StreamableTextureResource
         // validation. CaptureTexture() locks BulkData directly and no longer relies on the provider.
         Config.ImagesConfig.bStreaming = false;
-        int32 TextureLimit = UGameSettings::ResolveMaxTextureResolution(Builder);
+        int32 TextureLimit = FMath::Clamp(Builder->GetBuildTextureResolution(), 64, 8192);
         if (bTerrainSource && SourceContainsOnlyTerrainMaterials(Source))
         {
-            int32 TerrainLimit = 1024;
-            if (GConfig) GConfig->GetInt(TEXT("V3D.Terrain"), TEXT("MaxTextureSize"), TerrainLimit, GGameIni);
-            // Terrain-only sources can apply the palette's cap during decode too, avoiding
-            // full 8K CPU mip chains that will immediately be reduced to a 1K array. The image
-            // config is shared across the source: mixed world GLBs retain the user's texture
-            // cap so buildings/props keep their authored quality. Bake caps just their palette.
-            TextureLimit = FMath::Min(TextureLimit, FMath::Clamp(TerrainLimit, 1, 2048));
+            TextureLimit = FMath::Min(TextureLimit,
+                FMath::Clamp(Builder->GetBuildTerrainTextureResolution(), 64, 2048));
         }
         Config.ImagesConfig.MaxWidth = TextureLimit;
         Config.ImagesConfig.MaxHeight = TextureLimit;
@@ -635,104 +632,42 @@ void UProjectSourceModelBuilder::BeginDecodedCapture()
         }
     }
 
-    TMap<FString, int32> CanonicalSourceByKey;
-    TMap<FString, int32> CanonicalScoreByKey;
-    TArray<bool> SourceHasNonInstanceUse;
-    SourceHasNonInstanceUse.Init(false, MeshCount);
-
-    auto MakeCanonicalKey = [](const FglTFRuntimeNode& Node, int32& OutLod, bool& bOutInstance)
-    {
-        const FSimulatorParsedNodeName Parsed = USimulatorNodeTokenLibrary::ParseNodeName(Node.Name);
-        bOutInstance = Parsed.HasEffectiveToken(FName(TEXT("INST")));
-        OutLod = 0;
-        if (Parsed.HasEffectiveToken(FName(TEXT("LOD1")))) OutLod = 1;
-        else if (Parsed.HasEffectiveToken(FName(TEXT("LOD2")))) OutLod = 2;
-        else if (Parsed.HasEffectiveToken(FName(TEXT("LOD3")))) OutLod = 3;
-        const FString Base = Parsed.BaseName.TrimStartAndEnd().ToLower();
-        return Base.IsEmpty() ? FString() : FString::Printf(TEXT("%s#%d"), *Base, OutLod);
-    };
-
-    // Pass 1: choose a deterministic non-;INST canonical payload for each BaseName + LOD.
-    // Explicit ;LOD0 wins over a bare node, otherwise the lowest source mesh index wins.
+    std::vector<v3d::instance_source_node> SourceNodes;
+    SourceNodes.reserve(Nodes.Num());
     for (const FglTFRuntimeNode& Node : Nodes)
     {
-        if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount) continue;
-        int32 Lod = 0; bool bInstance = false;
-        const FString Key = MakeCanonicalKey(Node, Lod, bInstance);
-        if (!bInstance) SourceHasNonInstanceUse[Node.MeshIndex] = true;
-        if (bInstance || Key.IsEmpty()) continue;
-        const bool bExplicitLod0 = USimulatorNodeTokenLibrary::HasEffectiveToken(Node.Name, FName(TEXT("LOD0")));
-        const int32 Score = bExplicitLod0 ? 2 : 1;
-        const int32* ExistingScore = CanonicalScoreByKey.Find(Key);
-        const int32* ExistingSource = CanonicalSourceByKey.Find(Key);
-        if (!ExistingScore || Score > *ExistingScore
-            || (Score == *ExistingScore && ExistingSource && Node.MeshIndex < *ExistingSource))
-        {
-            CanonicalScoreByKey.Add(Key, Score);
-            CanonicalSourceByKey.Add(Key, Node.MeshIndex);
-        }
+        const auto Parsed = USimulatorNodeTokenLibrary::ParseNodeName(Node.Name);
+        v3d::instance_source_node Row;
+        Row.id = Node.Index; Row.mesh = Node.MeshIndex; Row.skin = Node.SkinIndex;
+        Row.base = TCHAR_TO_UTF8(*Parsed.BaseName.TrimStartAndEnd().ToLower());
+        Row.instance = Parsed.HasEffectiveToken(TEXT("INST"));
+        Row.explicit_lod0 = Parsed.HasEffectiveToken(TEXT("LOD0"));
+        if (Parsed.HasEffectiveToken(TEXT("LOD1"))) Row.lod = 1;
+        else if (Parsed.HasEffectiveToken(TEXT("LOD2"))) Row.lod = 2;
+        else if (Parsed.HasEffectiveToken(TEXT("LOD3"))) Row.lod = 3;
+        SourceNodes.push_back(MoveTemp(Row));
     }
-
-    // Source payloads are preserved unless they are used only by ;INST rows and every such row can
-    // resolve to a different canonical payload. This avoids storing duplicate instance geometry.
-    SourceMeshesToCapture.Reserve(MeshCount);
-    for (int32 MeshIndex = 0; MeshIndex < MeshCount; ++MeshIndex) SourceMeshesToCapture.Add(MeshIndex);
-    TArray<bool> InstanceOnlyCanAlias;
-    TArray<bool> SourceSeenByNode;
-    InstanceOnlyCanAlias.Init(true, MeshCount);
-    SourceSeenByNode.Init(false, MeshCount);
-    for (const FglTFRuntimeNode& Node : Nodes)
+    v3d::instance_capture_plan Plan;
+    std::string PlanError;
+    if (!v3d::build_instance_plan(SourceNodes, MeshCount, !bExtensionSource, Plan, PlanError))
     {
-        if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount) continue;
-        SourceSeenByNode[Node.MeshIndex] = true;
-        int32 Lod = 0; bool bInstance = false;
-        const FString Key = MakeCanonicalKey(Node, Lod, bInstance);
-        if (!bInstance)
-        {
-            InstanceOnlyCanAlias[Node.MeshIndex] = false;
-            continue;
-        }
-        const int32* Canonical = CanonicalSourceByKey.Find(Key);
-        if (!Canonical || *Canonical == Node.MeshIndex) InstanceOnlyCanAlias[Node.MeshIndex] = false;
+        Complete(false, UTF8_TO_TCHAR(PlanError.c_str()));
+        return;
     }
-    for (int32 MeshIndex = 0; MeshIndex < MeshCount; ++MeshIndex)
-    {
-        // An extension reports skeletal ownership only during decode. Retain its mesh payloads
-        // until then; an ;INST alias must never accidentally point at another mesh's joint map.
-        if (!bExtensionSource && SourceSeenByNode[MeshIndex] && !SourceHasNonInstanceUse[MeshIndex]
-            && InstanceOnlyCanAlias[MeshIndex])
-        {
-            SourceMeshesToCapture.Remove(MeshIndex);
-        }
-    }
-
-    TArray<int32> CapturedSources = SourceMeshesToCapture.Array();
-    CapturedSources.Sort();
     SourceToBakedMeshIndex.Init(INDEX_NONE, MeshCount);
-    for (int32 BakedIndex = 0; BakedIndex < CapturedSources.Num(); ++BakedIndex)
+    TArray<int32> CapturedSources;
+    for (int32 Source : Plan.sources)
     {
-        SourceToBakedMeshIndex[CapturedSources[BakedIndex]] = BakedIndex;
+        SourceToBakedMeshIndex[Source] = CapturedSources.Num();
+        CapturedSources.Add(Source);
+        SourceMeshesToCapture.Add(Source);
     }
     for (const FglTFRuntimeNode& Node : Nodes)
     {
-        if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount) continue;
-        int32 Lod = 0; bool bInstance = false;
-        const FString Key = MakeCanonicalKey(Node, Lod, bInstance);
-        int32 SourceForNode = Node.MeshIndex;
-        if (bInstance && !bExtensionSource)
-        {
-            if (const int32* Canonical = CanonicalSourceByKey.Find(Key)) SourceForNode = *Canonical;
-        }
-        if (!SourceToBakedMeshIndex.IsValidIndex(SourceForNode)
-            || SourceToBakedMeshIndex[SourceForNode] == INDEX_NONE)
-        {
-            // An unresolved instance source is deliberately retained, so this is a structural error.
-            Complete(false, FString::Printf(TEXT("node '%s' could not resolve a baked mesh payload"), *Node.Name));
-            return;
-        }
-        const int32 BakedIndex = SourceToBakedMeshIndex[SourceForNode];
-        NodeToBakedMeshIndex.Add(Node.Index, BakedIndex);
-        if (Node.SkinIndex >= 0) SkinMeshIndices.FindOrAdd(Node.SkinIndex).Add(BakedIndex);
+        const auto Found = Plan.node_meshes.find(Node.Index);
+        if (Found == Plan.node_meshes.end()) continue;
+        NodeToBakedMeshIndex.Add(Node.Index, Found->second);
+        if (Node.SkinIndex >= 0) SkinMeshIndices.FindOrAdd(Node.SkinIndex).Add(Found->second);
     }
 
     UE_LOG(LogTemp, Display,
@@ -1085,7 +1020,9 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
 
     FGWorldModelMetadata Metadata;
     if (!BakedData.IsSane(&Error)
-        || (!bBlob && !V3DTerrain::Bake(SourceAsset, BakedData, Error, this))
+        || (!bBlob && !V3DTerrain::Bake(SourceAsset, BakedData, Error, this,
+            FMath::Min(Definition.BuildTextureResolution, Definition.BuildTerrainTextureResolution),
+            Definition.bBuildTerrainFlipNormalGreen))
         || !BakedData.IsSane(&Error)
         || !BuildMetadata(Metadata, Error)
         || !Metadata.IsSane(&Error)
@@ -1109,6 +1046,9 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
     CompletedModel.Definition = Definition;
     CompletedModel.DefinitionJson = DefinitionJson;
     CompletedModel.Metadata = MoveTemp(Metadata);
+    UE_LOG(LogTemp, Display, TEXT("[V3DBuild] Portable texture policy: %s Limit=%d TerrainLimit=%d FlipGreen=%d Meshes=%d Materials=%d Textures=%d"),
+        *Definition.Name, Definition.BuildTextureResolution, Definition.BuildTerrainTextureResolution,
+        int32(Definition.bBuildTerrainFlipNormalGreen), BakedData.Meshes.Num(), BakedData.Materials.Num(), BakedData.Textures.Num());
     CompletedModel.BakedData = MoveTemp(BakedData);
     CompletedModel.SourceFileSize = SourceFileSize;
     CompletedModel.SourceTimestamp = SourceTimestamp;
@@ -1252,7 +1192,7 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         if (!RuntimeMeshPtr || *RuntimeMeshPtr < 0 || *RuntimeMeshPtr >= BakedMeshCount) continue;
 
         const FSimulatorParsedNodeName Parsed = USimulatorNodeTokenLibrary::ParseNodeName(SourceNode.Name);
-        if (!Parsed.HasEffectiveToken(FName(TEXT("LOD0")))) continue;
+        if (Parsed.HasEffectiveToken(TEXT("INST")) || !Parsed.HasEffectiveToken(FName(TEXT("LOD0")))) continue;
 
         const FString BaseText = Parsed.BaseName.TrimStartAndEnd();
         const FName BaseName(*BaseText);
@@ -1284,7 +1224,7 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         if (!RuntimeMeshPtr || *RuntimeMeshPtr < 0 || *RuntimeMeshPtr >= BakedMeshCount) continue;
 
         const FSimulatorParsedNodeName Parsed = USimulatorNodeTokenLibrary::ParseNodeName(SourceNode.Name);
-        if (Parsed.HasEffectiveToken(FName(TEXT("LOD1")))
+        if (Parsed.HasEffectiveToken(TEXT("INST")) || Parsed.HasEffectiveToken(FName(TEXT("LOD1")))
             || Parsed.HasEffectiveToken(FName(TEXT("LOD2")))
             || Parsed.HasEffectiveToken(FName(TEXT("LOD3"))))
         {
@@ -1335,6 +1275,7 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         return NAME_None;
     };
 
+    TArray<const FglTFRuntimeNode*> InstancePlacements;
     for (const FglTFRuntimeNode& SourceNode : Nodes)
     {
         const int32* RuntimeMeshPtr = NodeToBakedMeshIndex.Find(SourceNode.Index);
@@ -1379,6 +1320,11 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         const FName BaseMeshName(*BaseText);
         if (BaseMeshName.IsNone()) continue;
 
+        if (Parsed.HasEffectiveToken(TEXT("INST")))
+        {
+            InstancePlacements.Add(&SourceNode);
+            continue;
+        }
         FName MeshName = BaseMeshName;
         FModelMeshData* Mesh = &OutMetadata.SceneData.MeshMap.FindOrAdd(MeshName);
         SettingsKeyByMeshFamily.FindOrAdd(MeshName) = BaseMeshName;
@@ -1487,6 +1433,7 @@ bool UProjectSourceModelBuilder::BuildMetadata(
         {
             if (IsWaterNode(SourceNode.Name)) continue;
             const auto Parsed = USimulatorNodeTokenLibrary::ParseNodeName(SourceNode.Name);
+            if (Parsed.HasEffectiveToken(TEXT("INST"))) continue;
             const FName MeshName(*Parsed.BaseName.TrimStartAndEnd());
             const int32* Lod = FallbackPlacementLods.Find(MeshName);
             if (!Lod || !Parsed.HasEffectiveToken(FName(*FString::Printf(TEXT("LOD%d"), *Lod)))) continue;
@@ -1505,6 +1452,39 @@ bool UProjectSourceModelBuilder::BuildMetadata(
             Node.Transform = *Transform;
             OutMetadata.SceneData.NodeMap.Add(StorageName, MoveTemp(Node));
         }
+    }
+
+    // Store only an instance transform and a family reference. Instance-only families retain
+    // one canonical source as LOD0; accompanying ;LOD tokens never redefine a family's LODs.
+    for (const FglTFRuntimeNode* SourceNode : InstancePlacements)
+    {
+        const int32 RuntimeIndex = NodeToBakedMeshIndex.FindChecked(SourceNode->Index);
+        const FName BaseName(*USimulatorNodeTokenLibrary::GetBaseNodeName(SourceNode->Name).TrimStartAndEnd());
+        FName MeshName = BaseName;
+        FModelMeshData* Mesh = OutMetadata.SceneData.MeshMap.Find(MeshName);
+        if (Mesh && Mesh->LOD0 != RuntimeIndex && Mesh->LOD1 != RuntimeIndex
+            && Mesh->LOD2 != RuntimeIndex && Mesh->LOD3 != RuntimeIndex)
+        {
+            // Opaque extension decoders/other skins cannot safely share a source payload.
+            MeshName = MakeDistinctBareFamilyName(BaseName.ToString(), RuntimeIndex);
+            if (MeshName.IsNone()) { OutError = TEXT("could not name an isolated instance family"); return false; }
+            Mesh = OutMetadata.SceneData.MeshMap.Find(MeshName);
+        }
+        if (!Mesh)
+        {
+            Mesh = &OutMetadata.SceneData.MeshMap.Add(MeshName);
+            Mesh->LOD0 = RuntimeIndex;
+            Mesh->Size = SourceMeshSizes.FindChecked(RuntimeIndex);
+            Mesh->Extent = Mesh->Size * 0.5f;
+            SettingsKeyByMeshFamily.Add(MeshName, BaseName);
+        }
+        const FName StorageName = MakeUniqueStorageName(SourceNode->Name, SourceNode->Index,
+            OutMetadata.SceneData.NodeMap, OutMetadata.SceneData.WaterNodeMap);
+        if (StorageName.IsNone()) { OutError = TEXT("could not name an instance placement"); return false; }
+        FModelNodeData Node;
+        Node.MeshName = MeshName;
+        Node.Transform = ModelTransforms.FindChecked(SourceNode->Index);
+        OutMetadata.SceneData.NodeMap.Add(StorageName, MoveTemp(Node));
     }
 
     // JSON settings override only author-controlled behavior. Generated split families inherit the
@@ -1744,17 +1724,21 @@ bool FV3DSourceStreamingMetadataTest::RunTest(const FString&)
     AddNode(TEXT("Fallback;LOD2"), 3, FVector(1000, 0, 0));
     AddNode(TEXT("Full;LOD0"), 4, FVector(0, 2000, 0));
     AddNode(TEXT("Full;LOD2"), 5, FVector(0, 2000, 0));
+    AddNode(TEXT("Full;INSTwhatever"), 4, FVector(500, 2000, 0));
+    AddNode(TEXT("Full;LOD3;INST arbitrary"), 4, FVector(1000, 2000, 0));
     AddNode(TEXT("Twin"), 1, FVector(100, 100, 0));
     AddNode(TEXT("Twin"), 2, FVector(200, 100, 0));
     AddNode(TEXT("OnlyThird;LOD3"), 3, FVector(3000, 0, 0));
     FGWorldModelMetadata Metadata;
     if (!TestTrue(TEXT("Build streaming metadata from source rows"), Builder->BuildMetadata(Metadata, Error)))
     { AddError(Error); return false; }
-    TestEqual(TEXT("All placements survive without spawning lower-detail siblings"), Metadata.SceneData.NodeMap.Num(), 7);
+    TestEqual(TEXT("All placements survive without spawning lower-detail siblings"), Metadata.SceneData.NodeMap.Num(), 9);
     const FModelMeshData* Fallback = Metadata.SceneData.MeshMap.Find(TEXT("Fallback"));
     if (!TestNotNull(TEXT("LOD1-only family is retained"), Fallback)) return false;
     TestTrue(TEXT("Best available LOD is promoted once, other LODs retained"),
         Fallback->LOD0 == 1 && Fallback->LOD1 == INDEX_NONE && Fallback->LOD2 == 3);
+    TestEqual(TEXT("INST never creates a new LOD definition"), Metadata.SceneData.MeshMap.FindChecked(TEXT("Full")).LOD3, INDEX_NONE);
+    TestTrue(TEXT("INST arbitrary suffix stores its own transform"), Metadata.SceneData.NodeMap.FindChecked(TEXT("Full;INSTwhatever")).Transform.GetLocation().Equals(FVector(500, 2000, 0)));
     TestEqual(TEXT("LOD3-only family is retained"), Metadata.SceneData.MeshMap.FindChecked(TEXT("OnlyThird")).LOD0, 3);
     TestTrue(TEXT("LOD0 bounds enclose lower-detail geometry too"),
         Metadata.SceneData.MeshMap.FindChecked(TEXT("Full")).Size.X == 1800000.0);

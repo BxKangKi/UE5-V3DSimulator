@@ -9,7 +9,7 @@
 
 #include "System/WorldBakedModelAsset.h"
 #include "System/WorldGeneratedStaticMeshContext.h"
-#include "Format/material_policy.hpp"
+#include "Format/v3d.h"
 #include "Model/MaterialDefaultAsset.h"
 #include "System/WorldBakedTexture.h"
 #include "System/V3DTerrain.h"
@@ -374,14 +374,14 @@ namespace WorldBakedModelAssetPrivate
             if (!FMath::IsFinite(Value.Value)) continue;
             if (Value.Name == TEXT("V3D.Internal.Family")) Result.Family = FMath::RoundToInt(FMath::Clamp(Value.Value, 0.f, 2.f));
             if (Value.Name == TEXT("V3D.Internal.Dynamic")) DynamicState = Value.Value >= 0.5f ? 1 : 0;
-            if (Value.Name == TEXT("V3D.Internal.Mode")) Mode = v3d::normalize_material_mode(uint8(FMath::RoundToInt(FMath::Clamp(Value.Value, 0.f, 5.f))));
+            if (Value.Name == TEXT("V3D.Internal.Mode")) Mode = v3d::normalize_material_mode(uint8(FMath::RoundToInt(FMath::Clamp(Value.Value, 0.f, 7.f))));
         }
         if (Mode == 0)
-            for (uint8 Policy : {uint8(1), uint8(2), uint8(3), uint8(4), uint8(5)})
+            for (uint8 Policy : {uint8(1), uint8(2), uint8(3), uint8(4), uint8(5), uint8(6), uint8(7)})
                 if (Config.MaterialsOverrideByNameMap.Contains(FString::Printf(TEXT("V3D.Policy.%d"), Policy)))
                 { Mode = v3d::normalize_material_mode(Policy); break; }
         Result.Alpha = v3d::material_alpha(Baked.MaterialType, Mode);
-        Result.Slot = v3d::material_parent_slot(Result.Family, Result.Alpha);
+        Result.Slot = v3d::material_parent_slot(Result.Family, Result.Alpha, v3d::material_two_sided_override(Baked.MaterialType, Mode));
         Result.bDynamic = v3d::material_is_dynamic(DynamicState, RequestFamily);
         return Result;
     }
@@ -404,23 +404,38 @@ namespace WorldBakedModelAssetPrivate
                 if (IsValid(*Palette)) return SingleSided(*Palette);
             return SingleSided(V3DTerrain::ResolveMaterial(Context, Baked.BaseMaterialPath));
         }
-        const FString SlotKey = FString::Printf(TEXT("V3D.Slot.%d"), Selection.Slot);
+        const bool bTwoSided = v3d::material_is_two_sided(Baked.MaterialType);
+        const auto OpaqueFallback = [&Config, bTwoSided]() -> UMaterialInterface*
+        {
+            for (int32 Slot : {bTwoSided ? 4 : 0, 0})
+                if (UMaterialInterface* const* Parent = Config.MaterialsOverrideByNameMap.Find(FString::Printf(TEXT("V3D.Slot.%d"), Slot)))
+                    if (FV3DMaterialAssetReferences::MatchesSlot(*Parent, Slot)) return *Parent;
+            if (auto* Parent = FV3DMaterialAssetReferences::LoadFallback(bTwoSided)) return Parent;
+            return bTwoSided ? FV3DMaterialAssetReferences::LoadFallback(false) : nullptr;
+        };
+        const auto Supported = [](UMaterialInterface* Parent) -> UMaterialInterface*
+        { return FV3DMaterialAssetReferences::IsSupportedParent(Parent) ? Parent : nullptr; };
+        // Explicit overrides and reserved names must precede the generic registry slots.
+        if (auto* Forced = Supported(Config.ForceMaterial)) return Forced;
+        if (UMaterialInterface* const* Named = Config.MaterialsOverrideByNameMap.Find(Baked.Name))
+            return Supported(*Named) ? *Named : OpaqueFallback();
+        const FString NormalizedName = FV3DMaterialAssetReferences::NormalizeMaterialName(Baked.Name);
+        const FString ReservedKey = TEXT("V3D.Reserved.") + NormalizedName;
+        if (UMaterialInterface* const* Reserved = Config.MaterialsOverrideByNameMap.Find(ReservedKey))
+            return Supported(*Reserved) ? *Reserved : OpaqueFallback();
+        // Any material whose name ends with .foliage (case-insensitive, optional .001 suffix stripped)
+        // uses the dedicated AssetRegistry.FoliageMaterial parent (like TerrainMaterial), never exact "foliage".
+        if (NormalizedName.EndsWith(TEXT(".foliage")))
+        {
+            if (UMaterialInterface* const* Foliage = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Foliage")))
+                if (Supported(*Foliage)) return *Foliage;
+            if (UMaterialInterface* LoadedFoliage = LoadObject<UMaterialInterface>(nullptr, TEXT("/ShaderLibrary/Foliage/M_Foliage.M_Foliage")))
+                if (Supported(LoadedFoliage)) return LoadedFoliage;
+        }
         if (Config.MaterialsOverrideByNameMap.Contains(TEXT("V3D.Slot.0")))
         {
-            UMaterialInterface* const* Slot = Config.MaterialsOverrideByNameMap.Find(SlotKey);
-            return Slot && FV3DMaterialAssetReferences::MatchesSlot(*Slot, Selection.Slot) ? *Slot : nullptr;
-        }
-        if (IsValid(Config.ForceMaterial))
-        {
-            return SingleSided(Config.ForceMaterial);
-        }
-        if (UMaterialInterface* const* Named =
-                Config.MaterialsOverrideByNameMap.Find(Baked.Name))
-        {
-            if (IsValid(*Named))
-            {
-                return SingleSided(*Named);
-            }
+            UMaterialInterface* const* Slot = Config.MaterialsOverrideByNameMap.Find(FString::Printf(TEXT("V3D.Slot.%d"), Selection.Slot));
+            return Slot && FV3DMaterialAssetReferences::MatchesSlot(*Slot, Selection.Slot) ? *Slot : OpaqueFallback();
         }
 
         UMaterialInterface* SourceMaterial = LoadObject<UMaterialInterface>(nullptr, *Baked.BaseMaterialPath);
@@ -436,24 +451,30 @@ namespace WorldBakedModelAssetPrivate
         case EBakedMaterialFamily::Transmission: Overrides = &Config.TransmissionOverrideMap; break;
         default: break;
         }
-        const EglTFRuntimeMaterialType Type = static_cast<EglTFRuntimeMaterialType>(v3d::single_sided_material_type(Baked.MaterialType));
+        const EglTFRuntimeMaterialType Type = static_cast<EglTFRuntimeMaterialType>(v3d::runtime_material_type(Baked.MaterialType));
         if (Overrides)
         {
             if (UMaterialInterface* const* Typed = Overrides->Find(Type))
-                if (IsValid(*Typed)) return SingleSided(*Typed);
+                if (Supported(*Typed)) return *Typed;
         }
+        if (Overrides && Type != static_cast<EglTFRuntimeMaterialType>(Baked.MaterialType))
+            if (UMaterialInterface* const* Typed = Overrides->Find(static_cast<EglTFRuntimeMaterialType>(Baked.MaterialType)))
+                if (Supported(*Typed)) return *Typed;
         if (Family == EBakedMaterialFamily::MetallicRoughness)
         {
             if (UMaterialInterface* const* Typed = Config.UberMaterialsOverrideMap.Find(Type))
             {
-                if (IsValid(*Typed)) return SingleSided(*Typed);
+                if (Supported(*Typed)) return *Typed;
             }
         }
 
         // A generic PBR override cannot reproduce a clearcoat/transmission/cloth shader or an
         // unrecognized custom contract. Preserve the captured master when no matching family
         // override was supplied. Its cooked asset identity already exists in the archive format.
-        return SingleSided(SourceMaterial);
+        if (Family == EBakedMaterialFamily::MetallicRoughness)
+            if (UMaterialInterface* const* Typed = Config.UberMaterialsOverrideMap.Find(static_cast<EglTFRuntimeMaterialType>(Baked.MaterialType)))
+                if (Supported(*Typed)) return *Typed;
+        return Supported(SourceMaterial) ? SourceMaterial : OpaqueFallback();
     }
 
     bool CheckedMultiply(const int64 A, const int64 B, int64& Out)
@@ -1533,7 +1554,7 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
         const auto Selection = WorldBakedModelAssetPrivate::GetMaterialSelection(Baked, Config);
         OutError = V3DTerrain::IsPaletteMaterial(Baked)
             ? TEXT("TerrainMaterial is unavailable or Two Sided is enabled. Assign a single-sided terrain parent.")
-            : FString::Printf(TEXT("Material '%s' needs AssetRegistry.V3DMaterials.%s: assign an existing parent with matching BlendMode and Two Sided disabled."),
+            : FString::Printf(TEXT("Material '%s': %s and generated Opaque (Masked) fallback unavailable. Open the updated editor once to generate /Game/V3DGenerated/Materials, then cook those assets."),
                 *Baked.Name, FV3DMaterialAssetReferences::SlotName(Selection.Slot));
         return nullptr;
     }
@@ -1578,8 +1599,9 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     }
     ReferenceGuard.Add(Material);
 
+    Material->SetScalarParameterValue(TEXT("V3D_UseAlphaMask"), Baked.MaterialType == 0 || Baked.MaterialType == 2 ? 0.f : 1.f);
     const FName FadeDistanceName(TEXT("FadeDistance"));
-    // Static and dynamic models share the same four parents. Camera fade is a per-MID scalar:
+    // Static and dynamic models share the same sided parents. Camera fade is a per-MID scalar:
     // dynamic use (including Toon) enables 50 cm; static use disables it with the shader's -1 sentinel.
     Material->SetScalarParameterValue(FadeDistanceName, v3d::material_fade_distance(Selection.bDynamic));
     for (const FGWorldBakedScalarParameter& Parameter : Baked.Scalars)
@@ -3050,6 +3072,8 @@ bool FV3DBakedMaterialFamiliesTest::RunTest(const FString&)
     TStrongObjectPtr<UMaterial> Forced(NewObject<UMaterial>());
     TStrongObjectPtr<UMaterial> Palette(NewObject<UMaterial>());
 
+    for (UMaterial* Parent : {Source.Get(), Generic.Get(), ClearCoat.Get(), Sheen.Get(), Transmission.Get(),
+        SpecularGlossiness.Get(), Unlit.Get(), Named.Get(), Forced.Get(), Palette.Get()}) Parent->BlendMode = BLEND_Masked;
     FGWorldBakedMaterial Baked;
     Baked.Name = TEXT("AdvancedSurface");
     Baked.BaseMaterialPath = Source->GetPathName();
@@ -3121,8 +3145,9 @@ bool FV3DBakedMaterialFamiliesTest::RunTest(const FString&)
     Config.MetallicRoughnessOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Named.Get());
     TestTrue(TEXT("An explicit metallic/roughness map precedes the generic fallback"), Select() == Named.Get());
     Baked.MaterialType = static_cast<uint8>(EglTFRuntimeMaterialType::TwoSidedTranslucent);
-    Config.UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Translucent, Generic.Get());
-    TestTrue(TEXT("glTF sidedness is discarded at capture"), Select() == Generic.Get());
+    Generic->BlendMode = BLEND_Translucent; Generic->TwoSided = true;
+    Config.UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Generic.Get());
+    TestTrue(TEXT("glTF sidedness survives capture and family selection"), Select() == Generic.Get());
     return true;
 }
 
@@ -3359,64 +3384,60 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DShaderFamilySelectionTest, "V3DRuntime.Mate
 bool FV3DShaderFamilySelectionTest::RunTest(const FString&)
 {
     using namespace WorldBakedModelAssetPrivate;
-    FV3DMaterialSoftAssetReferences Soft;
-    TSoftObjectPtr<UMaterialInterface>* Slots[] = {&Soft.MI_Opaque, &Soft.MI_Masked, &Soft.MI_Translucent, &Soft.MI_Toon};
+    FV3DMaterialSoftAssetReferences Soft; Soft.ReservedMaterials.Reset();
+    TSoftObjectPtr<UMaterialInterface>* Slots[] = {&Soft.MI_Opaque, &Soft.MI_Masked, &Soft.MI_Translucent,
+        &Soft.MI_Toon, &Soft.MI_OpaqueTwoSided, &Soft.MI_OpaqueTwoSided, &Soft.MI_TranslucentTwoSided, &Soft.MI_ToonTwoSided};
     TArray<TStrongObjectPtr<UMaterial>> Parents;
-    const EBlendMode Blends[] = {BLEND_Opaque, BLEND_Masked, BLEND_Translucent, BLEND_Masked};
-    for (int32 Index = 0; Index < 4; ++Index)
+    for (int32 Slot = 0; Slot < 8; ++Slot)
     {
         Parents.Emplace(NewObject<UMaterial>());
-        Parents.Last()->BlendMode = Blends[Index]; Parents.Last()->TwoSided = false;
-        *Slots[Index] = Parents.Last().Get();
+        Parents.Last()->BlendMode = Slot % 4 == 2 ? BLEND_Translucent : BLEND_Masked;
+        Parents.Last()->TwoSided = Slot >= 4;
+        if (Slot != 1 && Slot != 5) *Slots[Slot] = Parents.Last().Get();
     }
+    Soft.ReservedMaterials.Add(TEXT("glass"), Parents[6].Get()); Soft.ReservedMaterials.Add(TEXT("tinted_glass"), Parents[2].Get());
+    Soft.ReservedMaterials.Add(TEXT(" Water "), Parents[6].Get());
     FV3DMaterialAssetReferences References; TArray<FString> Failures;
-    TestTrue(TEXT("Four resident parents resolve directly"), Soft.Resolve(References,Failures,false));
-    TestEqual(TEXT("All slots have valid single-sided parents"), Failures.Num(),0);
-    TArray<FSoftObjectPath> Paths; Soft.GetPreloadPaths(Paths);
-    TestEqual(TEXT("Exactly four authored assets are preloaded"), Paths.Num(),4);
-    FglTFRuntimeMaterialsConfig Config;
-    V3DMaterialOverrideUtils::ApplyOverrides(References,Config);
-    FGWorldBakedMaterial Baked; Baked.Name=TEXT("test");
-    const int32 AutoAlpha[] = {0,2,0,2,1,1};
-    const int32 ForcedAlpha[] = {0,1,1,2,2,0};
+    TestTrue(TEXT("Resident sided parents resolve"), Soft.Resolve(References, Failures, false));
+    TestTrue(TEXT("No slot errors"), Failures.IsEmpty());
+    FglTFRuntimeMaterialsConfig Config; V3DMaterialOverrideUtils::ApplyOverrides(References, Config);
+    FGWorldBakedMaterial Baked; Baked.Name = TEXT("test");
     for (int32 Family = 0; Family < 3; ++Family)
-        for (uint8 Source : {0, 1, 4})
+        for (uint8 Source = 0; Source < 6; ++Source)
             for (int32 Mode : {0, 1, 3, 5})
             {
-                Baked.MaterialType=Source;
-                Baked.Scalars={{TEXT("V3D.Internal.Family"),float(Family)},{TEXT("V3D.Internal.Mode"),float(Mode)}};
-                const int32 Alpha=Mode ? ForcedAlpha[Mode] : AutoAlpha[Source];
-                const int32 Slot=Family==2 ? 3 : Alpha;
-                auto* Parent=SelectBaseMaterial(Baked,Config,nullptr);
-                TestTrue(TEXT("Static/dynamic share alpha parents; Toon always selects its single parent"), Parent==Parents[Slot].Get());
-                TestTrue(TEXT("All selected parents are single-sided"), Parent && !Parent->IsTwoSided());
+                Baked.MaterialType = Source;
+                Baked.Scalars = {{TEXT("V3D.Internal.Family"), float(Family)}, {TEXT("V3D.Internal.Mode"), float(Mode)}};
+                const int32 Alpha = Mode == 3 ? 2 : Mode ? 0 : Source == 1 || Source == 3 ? 2 : 0;
+                const int32 Slot = (Family == 2 ? 3 : Alpha) + (Source == 2 || Source == 3 || Source == 5 ? 4 : 0);
+                auto* Parent = SelectBaseMaterial(Baked, Config, nullptr);
+                TestTrue(TEXT("Every mode/family preserves sides and uses Masked for Opaque"), Parent == Parents[Slot].Get());
             }
-    Baked.Scalars={{TEXT("V3D.Internal.Family"),2.f}}; Baked.MaterialType=4;
-    References.MaterialMode=5; V3DMaterialOverrideUtils::ApplyOverrides(References,Config);
-    TestTrue(TEXT("Global Opaque keeps the authored Toon parent"),SelectBaseMaterial(Baked,Config,nullptr)==Parents[3].Get());
-    Baked.Scalars.Add({TEXT("V3D.Internal.Mode"),3.f});
-    TestTrue(TEXT("Model Translucent also keeps the single Toon parent"),SelectBaseMaterial(Baked,Config,nullptr)==Parents[3].Get());
-    Baked.Scalars={{TEXT("V3D.Internal.Family"),0.f},{TEXT("V3D.Internal.Mode"),1.f}};
-    TestTrue(TEXT("Default shader obeys model Masked over global Opaque"),SelectBaseMaterial(Baked,Config,nullptr)==Parents[1].Get());
-    References.MI_Masked=nullptr; V3DMaterialOverrideUtils::ApplyOverrides(References,Config);
-    Config.ForceMaterial=Parents[2].Get();Config.MaterialsOverrideByNameMap.Add(Baked.Name,Parents[2].Get());
-    TestNull(TEXT("Missing slot cannot borrow another parent or bypass registry"),SelectBaseMaterial(Baked,Config,nullptr));
-    References.MI_Masked=Parents[1].Get();Parents[1]->TwoSided=true;
-    V3DMaterialOverrideUtils::ApplyOverrides(References,Config);
-    TestNull(TEXT("Two-sided parent is rejected"),SelectBaseMaterial(Baked,Config,nullptr));
-    Parents[1]->TwoSided=false;Parents[1]->BlendMode=BLEND_Opaque;
-    V3DMaterialOverrideUtils::ApplyOverrides(References,Config);
-    TestNull(TEXT("Wrong-alpha default parent is rejected"),SelectBaseMaterial(Baked,Config,nullptr));
-    Parents[1]->BlendMode=BLEND_Masked;References.MaterialMode=0;
-    V3DMaterialOverrideUtils::ApplyOverrides(References,Config,1);
-    const uint64 DynamicKey=BuildMaterialCacheKey(0,Config);
-    V3DMaterialOverrideUtils::ApplyOverrides(References,Config,0);
-    TestFalse(TEXT("Request reuse clears dynamic fade policy"),Config.MaterialsOverrideByNameMap.Contains(TEXT("V3D.DefaultFamily.1")));
-    TestTrue(TEXT("Shared parent MIDs are cached separately for dynamic/static use"),DynamicKey!=BuildMaterialCacheKey(0,Config));
-    TestFalse(TEXT("Previous global policy is cleared"),Config.MaterialsOverrideByNameMap.Contains(TEXT("V3D.Policy.5")));
-    const UMaterialInstanceDynamic* ToonInstance = UMaterialInstanceDynamic::Create(Parents[3].Get(), GetTransientPackage());
-    if (!TestNotNull(TEXT("Toon MID is created"), ToonInstance)) return false;
-    TestTrue(TEXT("MID retains the Toon parent's authored BlendMode"), ToonInstance->GetBlendMode() == BLEND_Masked);
+    Baked.MaterialType = 0; Baked.Scalars.Empty();
+    Baked.Name = TEXT("GLASS.032");
+    TestTrue(TEXT("Reserved glass precedes Opaque even in an old archive"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[6].Get());
+    Baked.Name = TEXT("tinted_glass");
+    TestTrue(TEXT("Tinted glass restored"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[2].Get());
+    Baked.Name = TEXT("water");
+    TestTrue(TEXT("Additional reserved names normalize deterministically"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[6].Get());
+    Baked.Name = TEXT("glass_opaque");
+    TestTrue(TEXT("Ordinary names do not match glass substrings"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[0].Get());
+    References.MI_Translucent = nullptr; Baked.MaterialType = 1;
+    V3DMaterialOverrideUtils::ApplyOverrides(References, Config);
+    TestTrue(TEXT("Missing Translucent uses Opaque, keeps mesh alive"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[0].Get());
+    References.MI_TranslucentTwoSided = Parents[0].Get(); Baked.MaterialType = 3;
+    V3DMaterialOverrideUtils::ApplyOverrides(References, Config);
+    TestTrue(TEXT("Wrong sided/blend parent uses sided Opaque fallback"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[4].Get());
+    References.ReservedMaterials[TEXT("glass")] = nullptr; Baked.Name = TEXT("glass");
+    V3DMaterialOverrideUtils::ApplyOverrides(References, Config);
+    TestTrue(TEXT("Invalid reserved parent also preserves geometry"), SelectBaseMaterial(Baked, Config, nullptr) == Parents[4].Get());
+    const uint64 Before = BuildMaterialCacheKey(0, Config);
+    References.ReservedMaterials[TEXT("glass")] = Parents[6].Get();
+    V3DMaterialOverrideUtils::ApplyOverrides(References, Config, 1);
+    TestTrue(TEXT("Reserved parent and fade policy invalidate material cache"), BuildMaterialCacheKey(0, Config) != Before);
+    References.ReservedMaterials.Empty(); V3DMaterialOverrideUtils::ApplyOverrides(References, Config);
+    TestFalse(TEXT("Reusing a request removes stale reserved names"), Config.MaterialsOverrideByNameMap.Contains(TEXT("V3D.Reserved.glass")));
+    TestFalse(TEXT("Reusing a request removes stale fade policy"), Config.MaterialsOverrideByNameMap.Contains(TEXT("V3D.DefaultFamily.1")));
     return true;
 }
 #endif

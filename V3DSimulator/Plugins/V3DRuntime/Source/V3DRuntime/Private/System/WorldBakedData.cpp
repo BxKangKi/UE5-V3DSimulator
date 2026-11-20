@@ -17,6 +17,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/ScopeExit.h"
 #include "PixelFormat.h"
+#include "Format/v3d.h"
 #include "Serialization/BulkData.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeParser.h"
@@ -242,7 +243,9 @@ namespace WorldBakedDataPrivate
         }
 
         OutTexture.TextureId = TextureId;
-        OutTexture.Name = Texture->GetName();
+        // UObject allocation suffixes vary with editor sessions, platforms and task completion.
+        // The source texture is addressed by its archive ID; a transient object name is not data.
+        OutTexture.Name = FString::Printf(TEXT("Texture_%08d"), TextureId);
         OutTexture.SizeX = PlatformData->SizeX;
         OutTexture.SizeY = PlatformData->SizeY;
         OutTexture.PixelFormat = static_cast<int32>(PlatformData->PixelFormat);
@@ -336,6 +339,11 @@ namespace WorldBakedDataPrivate
             Mip.SizeZ = 1;
             Mip.Bytes.SetNumUninitialized(static_cast<int32>(BulkSize));
             FMemory::Memcpy(Mip.Bytes.GetData(), SourceBytes, static_cast<SIZE_T>(BulkSize));
+            if (PlatformData->PixelFormat == PF_B8G8R8A8)
+            {
+                v3d::bgra_to_rgba(Mip.Bytes.GetData(), static_cast<size_t>(Mip.Bytes.Num()));
+                OutTexture.PixelFormat = PF_R8G8B8A8;
+            }
         }
         return true;
     }
@@ -400,7 +408,7 @@ namespace WorldBakedDataPrivate
         // Preserve the authored glTF material name. A transient MID name is allocation-order
         // dependent and would make MaterialsOverrideByNameMap stop matching after baking.
         Captured.Name = SourceMaterialName.IsEmpty()
-            ? Material->GetName()
+            ? FString::Printf(TEXT("Material_%08d"), Captured.MaterialId)
             : SourceMaterialName;
         Captured.BaseMaterialPath = BaseMaterial->GetPathName();
         Captured.bUnlit = BaseMaterial->GetShadingModels().HasShadingModel(MSM_Unlit);
@@ -419,6 +427,11 @@ namespace WorldBakedDataPrivate
         {
             Captured.MaterialType = static_cast<uint8>(EglTFRuntimeMaterialType::Opaque);
         }
+
+        // The serialized type retains source sidedness. Opaque conversion happens at parent
+        // selection, so legacy archives remain readable and no material data is discarded.
+        if (Material->IsTwoSided())
+            Captured.MaterialType = Captured.MaterialType == 4 ? 5 : Captured.MaterialType == 1 ? 3 : 2;
 
         TArray<FMaterialParameterInfo> ParameterInfos;
         TArray<FGuid> ParameterIds;
@@ -663,7 +676,7 @@ bool FGWorldBakedModel::IsSane(FString* OutError) const
     {
         const FGWorldBakedMaterial& Material = Materials[Index];
         if (Material.MaterialId != Index || Material.BaseMaterialPath.IsEmpty()
-            || (Material.MaterialType != 0 && Material.MaterialType != 1 && Material.MaterialType != 4)
+            || Material.MaterialType > 5
             || Material.Scalars.Num() > MaxMaterialParameters
             || Material.Vectors.Num() > MaxMaterialParameters
             || Material.Textures.Num() > MaxMaterialParameters)
@@ -1121,6 +1134,46 @@ bool FV3DBakedFadeDistanceInheritanceTest::RunTest(const FString&)
     TestTrue(TEXT("A non-default authored fade remains an explicit archive value"),
         Authored.Materials[0].Scalars.ContainsByPredicate([AuthoredFade](const auto& Parameter)
         { return Parameter.Name == TEXT("FadeDistance") && Parameter.Value == AuthoredFade; }));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DBakedPortableTextureTest,
+    "V3DSimulator.Build.PortableTextureCapture",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DBakedPortableTextureTest::RunTest(const FString&)
+{
+    const auto Make = [](EPixelFormat Format, FName Name)
+    {
+        UTexture2D* Texture = NewObject<UTexture2D>(GetTransientPackage(), Name);
+        auto* Data = new FTexturePlatformData();
+        Data->SizeX = 2; Data->SizeY = 2; Data->PixelFormat = Format;
+        auto* Mip = new FTexture2DMipMap();
+        Mip->SizeX = 2; Mip->SizeY = 2; Mip->SizeZ = 0; // glTFRuntime 2D convention
+        Mip->BulkData.Lock(LOCK_READ_WRITE);
+        uint8* Pixels = static_cast<uint8*>(Mip->BulkData.Realloc(16));
+        for (int32 Index = 0; Index < 4; ++Index)
+        {
+            Pixels[Index * 4] = Format == PF_B8G8R8A8 ? 31 : 231;
+            Pixels[Index * 4 + 1] = 87;
+            Pixels[Index * 4 + 2] = Format == PF_B8G8R8A8 ? 231 : 31;
+            Pixels[Index * 4 + 3] = 127;
+        }
+        Mip->BulkData.Unlock(); Data->Mips.Add(Mip);
+        Texture->SetPlatformData(Data);
+        return Texture;
+    };
+    TStrongObjectPtr<UTexture2D> Metal(Make(PF_B8G8R8A8,
+        MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), TEXT("Metal_Transient_Texture_Allocation_10000"))));
+    TStrongObjectPtr<UTexture2D> D3D(Make(PF_R8G8B8A8,
+        MakeUniqueObjectName(GetTransientPackage(), UTexture2D::StaticClass(), TEXT("D3D_1"))));
+    FGWorldBakedTexture A, B;
+    FString Error;
+    if (!TestTrue(TEXT("Capture BGRA host texture"), WorldBakedDataPrivate::CaptureTexture(Metal.Get(), 7, A, Error))
+        || !TestTrue(TEXT("Capture RGBA host texture"), WorldBakedDataPrivate::CaptureTexture(D3D.Get(), 7, B, Error))) return false;
+    TestEqual(TEXT("Transient allocation names are not serialized"), A.Name, B.Name);
+    TestEqual(TEXT("Same portable pixel format"), A.PixelFormat, B.PixelFormat);
+    TestEqual(TEXT("2D depth normalized"), A.Mips[0].SizeZ, 1);
+    TestTrue(TEXT("RGBA channels and alpha are identical"), A.Mips[0].Bytes == B.Mips[0].Bytes);
     return true;
 }
 #endif

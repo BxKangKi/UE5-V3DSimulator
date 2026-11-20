@@ -113,6 +113,7 @@ public:
     USettingsMenuWidget(const FObjectInitializer& ObjectInitializer);
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
+    virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
     virtual void ReleaseSlateResources(bool bReleaseChildren) override;
 
     /** Shared close contract used by both MainGameMode and the gameplay pause menu. */
@@ -285,6 +286,8 @@ public:
     void CycleCloudFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleShadowQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void CycleShadowDistanceMetersFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleTextureQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
@@ -396,10 +399,13 @@ private:
     float PendingBloomThreshold = -1.0f;
     float PendingAmbientOcclusionIntensity = 0.5f;
     int32 PendingExposure = -11;
+    float PendingAutoExposureMinEV = -5.0f;
+    float PendingAutoExposureMaxEV = 13.0f;
     bool bPendingRayTracing = true;
     bool bPendingHeightFog = true;
     bool bPendingCloud = true;
     int32 PendingShadowQuality = 2;
+    int32 PendingShadowDistanceMeters = 2048;
     int32 PendingTextureQuality = 2;
     int32 PendingMaxTextureResolution = 768;
     int32 PendingViewDistanceQuality = 2;

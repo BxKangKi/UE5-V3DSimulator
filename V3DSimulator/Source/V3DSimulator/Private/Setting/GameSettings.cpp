@@ -9,6 +9,7 @@
  */
 
 #include "Setting/GameSettings.h"
+#include "Setting/ShadowDistancePolicy.h"
 #include "Character/MouseLookPolicy.h"
 #include "System/SafeFileIO.h"
 #include "Serialization/JsonSerializer.h"
@@ -40,7 +41,10 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetNumberField(TEXT("BloomThreshold"), BloomThreshold);
     Json->SetNumberField(TEXT("AmbientOcclusionIntensity"), AmbientOcclusionIntensity);
     Json->SetNumberField(TEXT("Exposure"), Exposure);
+    Json->SetNumberField(TEXT("AutoExposureMinEV"), AutoExposureMinEV);
+    Json->SetNumberField(TEXT("AutoExposureMaxEV"), AutoExposureMaxEV);
     Json->SetNumberField(TEXT("ShadowQuality"), ShadowQuality);
+    Json->SetNumberField(TEXT("ShadowDistanceMeters"), GetClampedShadowDistanceMeters());
     Json->SetNumberField(TEXT("TextureQuality"), TextureQuality);
     Json->SetNumberField(TEXT("MaxTextureResolution"), GetClampedMaxTextureResolution());
     Json->SetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
@@ -72,7 +76,13 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(TEXT("AmbientOcclusionIntensity"), AmbientOcclusionIntensity);
         Json->TryGetNumberField(TEXT("Exposure"), Exposure);
         Exposure = Exposure <= -10.5f ? -11.0f : FMath::Clamp(Exposure, -10.0f, 20.0f);
+        Json->TryGetNumberField(TEXT("AutoExposureMinEV"), AutoExposureMinEV);
+        Json->TryGetNumberField(TEXT("AutoExposureMaxEV"), AutoExposureMaxEV);
+        AutoExposureMinEV = FMath::IsFinite(AutoExposureMinEV) ? FMath::Clamp(AutoExposureMinEV, -10.0f, 10.0f) : -5.0f;
+        AutoExposureMaxEV = FMath::IsFinite(AutoExposureMaxEV) ? FMath::Clamp(AutoExposureMaxEV, AutoExposureMinEV, 20.0f) : FMath::Max(AutoExposureMinEV, 13.0f);
         Json->TryGetNumberField(TEXT("ShadowQuality"), ShadowQuality);
+        Json->TryGetNumberField(TEXT("ShadowDistanceMeters"), ShadowDistanceMeters);
+        ShadowDistanceMeters = GetClampedShadowDistanceMeters();
         Json->TryGetNumberField(TEXT("TextureQuality"), TextureQuality);
         Json->TryGetNumberField(TEXT("MaxTextureResolution"), MaxTextureResolution);
         MaxTextureResolution = GetClampedMaxTextureResolution();
@@ -122,8 +132,12 @@ float UGameSettings::GetClampedMouseSensitivity() const
 int32 UGameSettings::GetClampedMaxTextureResolution() const
 {
     // Runtime texture decode cost grows quadratically with resolution. Keep a
-    // native clamp even when settings.json is edited by hand.
+    // tighter ceiling on mobile devices to prevent OOM crashes.
+#if PLATFORM_ANDROID || PLATFORM_IOS
+    return FMath::Clamp(MaxTextureResolution, 64, 1024);
+#else
     return FMath::Clamp(MaxTextureResolution, 64, 8192);
+#endif
 }
 
 namespace
@@ -140,6 +154,7 @@ void UGameSettings::ApplyQualityProfile(const EQualitySettings Profile)
     GlobalIlluminationQuality = ReflectionQuality = Quality;
     MaxTextureResolution = ProfileTextureLimits[Quality];
     MaxRenderDistanceMeters = ProfileRenderDistances[Quality];
+    ShadowDistanceMeters = V3DShadowDistance::Profile(Quality);
     bRayTracing = Quality >= 2;
     bCloud = Quality >= 1;
     bHeightFog = true;
@@ -155,10 +170,22 @@ int32 UGameSettings::GetQualityProfileIndex() const
         && ShadingQuality == Q && GlobalIlluminationQuality == Q && ReflectionQuality == Q
         && GetClampedMaxTextureResolution() == ProfileTextureLimits[Q]
         && GetClampedMaxRenderDistanceMeters() == ProfileRenderDistances[Q]
+        && GetClampedShadowDistanceMeters() == V3DShadowDistance::Profile(Q)
         && bRayTracing == (Q >= 2) && bCloud == (Q >= 1) && bHeightFog
         && DynamicGlobalIlluminationMethod == (Q >= 2 ? 1 : 0)
         && ReflectionMethod == (Q >= 2 ? 1 : (Q == 1 ? 2 : 0));
     return bMatches ? Q : INDEX_NONE;
+}
+
+int32 UGameSettings::GetClampedShadowDistanceMeters() const
+{
+    return V3DShadowDistance::Normalize(ShadowDistanceMeters);
+}
+
+float UGameSettings::GetEffectiveShadowDistanceCentimeters() const
+{
+    return V3DShadowDistance::EffectiveCentimetres(
+        ShadowDistanceMeters, GetClampedMaxRenderDistanceMeters());
 }
 
 int32 UGameSettings::GetClampedMaxRenderDistanceMeters() const
@@ -373,6 +400,7 @@ void UGameSettings::SaveSettingsData()
 void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
 {
     MouseSensitivity = GetClampedMouseSensitivity();
+    ShadowDistanceMeters = GetClampedShadowDistanceMeters();
     MaxRenderDistanceMeters = GetClampedMaxRenderDistanceMeters();
     if (!IsValid(GEngine))
         return;
@@ -403,7 +431,11 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
     // supported effects instead, keeping raster shadows available when RT is unavailable.
     if (!IsRunningCommandlet())
     {
+#if PLATFORM_ANDROID || PLATFORM_IOS
+        const bool bUseHardwareRayTracing = false;
+#else
         const bool bUseHardwareRayTracing = bRayTracing && IsRayTracingEnabled();
+#endif
         const auto SetRenderingOption = [](const TCHAR* Name, const int32 Value)
         {
             if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(Name))
@@ -420,6 +452,23 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing"), bUseHardwareRayTracing ? 1 : 0);
         SetRenderingOption(TEXT("r.RayTracing.Shadows"),
             bUseHardwareRayTracing && ShadowQuality > 0 ? 1 : 0);
+
+        // Apply after scalability, which otherwise silently scales the user's distance down.
+        const float ShadowRange = GetEffectiveShadowDistanceCentimeters();
+        SetRenderingOption(TEXT("r.Shadow.DistanceScale"), 1);
+        int32 LastLevel = V3DShadowDistance::LastClipmapLevel(ShadowRange);
+        if (const IConsoleVariable* FirstLevel = IConsoleManager::Get().FindConsoleVariable(
+            TEXT("r.Shadow.Virtual.Clipmap.FirstLevel")))
+            LastLevel = FMath::Max(LastLevel, FirstLevel->GetInt());
+        SetRenderingOption(TEXT("r.Shadow.Virtual.Clipmap.LastLevel"), LastLevel);
+        if (bUseHardwareRayTracing)
+        {
+            // Keep distance culling enabled; extend its coverage with the shadow budget.
+            // Otherwise RT removes casters after ~100-300 m even with a longer CSM/VSM range.
+            SetRenderingOption(TEXT("r.RayTracing.Culling.Radius"), FMath::RoundToInt(ShadowRange));
+            SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.CullClusterRadius"),
+                FMath::RoundToInt(ShadowRange));
+        }
     }
 
     if (IsValid(PostProcess))
@@ -453,8 +502,10 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
 
         if (bAutoExposure)
         {
-            PPSettings.AutoExposureMinBrightness = -5.0f;
-            PPSettings.AutoExposureMaxBrightness = 13.0f;
+            const float SafeMinEV = FMath::IsFinite(AutoExposureMinEV) ? FMath::Clamp(AutoExposureMinEV, -10.0f, 10.0f) : -5.0f;
+            const float SafeMaxEV = FMath::IsFinite(AutoExposureMaxEV) ? FMath::Clamp(AutoExposureMaxEV, SafeMinEV, 20.0f) : FMath::Max(SafeMinEV, 13.0f);
+            PPSettings.AutoExposureMinBrightness = SafeMinEV;
+            PPSettings.AutoExposureMaxBrightness = SafeMaxEV;
             // F-stops/second: faster bright-scene recovery, slightly gentler dark adaptation.
             PPSettings.AutoExposureSpeedUp = 6.0f;
             PPSettings.AutoExposureSpeedDown = 4.0f;

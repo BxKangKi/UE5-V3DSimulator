@@ -37,6 +37,10 @@ bool FSimulatorNodeTokenContractTest::RunTest(const FString& Parameters)
         InstancedLod0.BaseName, FString(TEXT("Tree")));
     TestFalse(TEXT("INST substring/underscore aliases are not directives"),
         USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Tree_INST")).HasEffectiveToken(TEXT("INST")));
+    for (const TCHAR* Name : {TEXT("Tree;INST.032"), TEXT("Tree;INSTanything"), TEXT("Tree;INST arbitrary text"), TEXT("Tree;inst_abc;LOD2"), TEXT("Tree;INSTANCE")})
+        TestTrue(TEXT("INST accepts every suffix after the semicolon"), USimulatorNodeTokenLibrary::HasEffectiveToken(Name, TEXT("INST")));
+    TestTrue(TEXT("LOD exporter suffix remains a LOD directive"), USimulatorNodeTokenLibrary::HasEffectiveToken(TEXT("Tree;LOD2.001"), TEXT("LOD2")));
+    TestFalse(TEXT("Arbitrary LOD suffix is not a directive"), USimulatorNodeTokenLibrary::HasEffectiveToken(TEXT("Tree;LOD2anything"), TEXT("LOD2")));
     const FSimulatorParsedNodeName UnsupportedLod = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Tree;LOD4"));
     TestFalse(TEXT("Only LOD0 through LOD3 are supported"), UnsupportedLod.HasEffectiveToken(TEXT("LOD4")));
     TestTrue(TEXT("Unsupported numeric LOD is retained as an invalid segment"),

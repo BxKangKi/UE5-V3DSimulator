@@ -128,7 +128,7 @@ struct V3DRUNTIME_API FGWorldSoundRecord
 };
 
 /**
- * Unreal adapter for the portable, single-header format declared in Format/v3d.hpp.
+ * Unreal adapter for the portable, single-header format declared in Format/v3d.h.
  * Files use the V3D binary signature, revision 7. Only the current format is accepted.
  *
  * Thread-safe immutable .v3d reader.

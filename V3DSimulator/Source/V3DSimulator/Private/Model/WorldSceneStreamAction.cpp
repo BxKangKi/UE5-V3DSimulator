@@ -28,6 +28,7 @@
 #include "Model/StaticActor.h"
 #include "Model/InstancedMeshActor.h"
 #include "Model/V3DHISMChunkPolicy.h"
+#include "Async/ParallelFor.h"
 #include "System/StreamingMovementGateSubsystem.h"
 #include "System/SafeFileIO.h"
 #include "System/WorldBakedModelAsset.h"
@@ -484,10 +485,15 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     LoadedWaterNodes.Empty();
     WaterActorMap.Empty();
     PendingUnavailableRegions.Empty();
+    PreparedInstances.Empty();
+    PreparedInstanceOffset = 0;
+    bInstancePreparationInFlight = false;
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
     PendingUnloadWaterNodes.Empty();
+    bRetryMeshLoadPending = false;
+    MeshLoadRecovery.Reset();
     MeshActor = nullptr;
     DecalLight = nullptr;
     ObserverLocations.Empty();
@@ -726,6 +732,11 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
     GeneratedMeshWorldContext = nullptr;
     PendingUnavailableRegions.Empty();
     CurrentUnavailableRegionIndex = 0;
+    bRetryMeshLoadPending = false;
+    MeshLoadRecovery.Reset();
+    PreparedInstances.Empty();
+    PreparedInstanceOffset = 0;
+    bInstancePreparationInFlight = false;
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
@@ -754,6 +765,100 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
     {
         RemoveFromRoot();
     }
+}
+
+void UWorldSceneStreamAction::StartInstanceBatchPreparation()
+{
+    check(IsInGameThread());
+    if (bInstancePreparationInFlight || bAbortRequested || !IsValid(MeshActor)) return;
+    // At most 2048 detached rows per active group; never duplicate a million-transform scene.
+    const int32 Count = FMath::Min(2048, PendingLoadNodes.Num() - CurrentLoadIndex);
+    if (Count <= 0) return;
+    TArray<FWorldPreparedInstance> Rows; Rows.SetNum(Count);
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        auto& Row = Rows[Index]; Row.NodeName = PendingLoadNodes[CurrentLoadIndex + Index];
+        if (const auto* Node = NodeMap.Find(Row.NodeName))
+        { Row.LocalTransform = Node->Transform; Row.bValid = !Node->MeshName.IsNone() && MeshMap.Contains(Node->MeshName); }
+    }
+    const FTransform ActorTransform = MeshActor->GetActorTransform();
+    const int32 Begin = CurrentLoadIndex;
+    const uint32 Serial = PreparationSerial;
+    const auto Cancellation = PreparationCancellation;
+    TWeakObjectPtr<UWorldSceneStreamAction> WeakThis(this);
+    bInstancePreparationInFlight = true;
+    const bool bQueued = FSafeFileIO::RunTrackedWorker(
+        [Rows = MoveTemp(Rows), ActorTransform, Begin, Serial, Cancellation, WeakThis]() mutable
+        {
+            if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
+            // A bounded four-lane job; each lane writes disjoint rows, and reads only native data.
+            const int32 Lanes = Rows.Num() >= 256 ? 4 : 1;
+            ParallelFor(Lanes, [&](int32 Lane)
+            {
+                for (int32 Index = Lane; Index < Rows.Num(); Index += Lanes)
+                {
+                    if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
+                    auto& Row = Rows[Index];
+                    Row.bValid &= !ActorTransform.ContainsNaN() && !Row.LocalTransform.ContainsNaN()
+                        && Row.LocalTransform.GetRotation().IsNormalized();
+                    if (Row.bValid) Row.WorldChunk = V3DHISMChunkPolicy::Key(ActorTransform.TransformPosition(Row.LocalTransform.GetLocation()));
+                }
+            });
+            if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
+            FSafeFileIO::DispatchTrackedGameThread([Rows = MoveTemp(Rows), ActorTransform, Begin, Serial, WeakThis]() mutable
+            {
+                auto* Action = WeakThis.Get();
+                if (!IsValid(Action) || Action->bAbortRequested || Action->PreparationSerial != Serial) return;
+                Action->bInstancePreparationInFlight = false;
+                if (Action->CurrentLoadIndex != Begin || !IsValid(Action->OwnerActor) || !IsValid(Action->MeshActor))
+                { Action->AbortAndRelease(); return; }
+                Action->PreparedInstances = MoveTemp(Rows); Action->PreparedInstanceOffset = 0;
+                Action->PreparedActorTransform = ActorTransform;
+                if (UWorld* World = Action->OwnerActor->GetWorld())
+                    Action->ProcessTimerHandle = World->GetTimerManager().SetTimerForNextTick(
+                        FTimerDelegate::CreateUObject(Action, &UWorldSceneStreamAction::ProcessChunk));
+                else Action->AbortAndRelease();
+            });
+        });
+    if (!bQueued) { bInstancePreparationInFlight = false; AbortAndRelease(); }
+}
+
+int32 UWorldSceneStreamAction::ApplyInstanceBatch(int32 MaxCount)
+{
+    check(IsInGameThread());
+    const int32 Count = FMath::Min(MaxCount, PreparedInstances.Num() - PreparedInstanceOffset);
+    if (Count <= 0 || !IsValid(MeshActor) || bAbortRequested) return 0;
+    if (!PendingLoadNodes.IsValidIndex(CurrentLoadIndex)
+        || PreparedInstances[PreparedInstanceOffset].NodeName != PendingLoadNodes[CurrentLoadIndex])
+    { PreparedInstances.Reset(); PreparedInstanceOffset = 0; return 0; }
+    TArray<FWorldPreparedInstance> Visible; Visible.Reserve(Count);
+    const FTransform ActorTransform = MeshActor->GetActorTransform();
+    const bool bOwnerMoved = !ActorTransform.Equals(PreparedActorTransform);
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        auto Row = PreparedInstances[PreparedInstanceOffset + Index];
+        if (!Row.bValid) { FailGroup(TEXT("InstancePreparation"), TEXT("Invalid instance transform"), Row.NodeName); return 0; }
+        if (MeshActor->IsNodeLoaded(Row.NodeName)) continue;
+        if (!IsNodeWithinCurrentRenderRange(Row.NodeName)) { OwnerActor->RequestStreamingRefresh(); continue; }
+        if (bOwnerMoved) Row.WorldChunk = V3DHISMChunkPolicy::Key(ActorTransform.TransformPosition(Row.LocalTransform.GetLocation()));
+        Visible.Add(MoveTemp(Row));
+    }
+    TArray<FName> Added;
+    const bool bAdded = MeshActor->AddNodeInstances(Visible, Added);
+    for (const FName Name : Added)
+    {
+        if (bAbortRequested || !IsValid(OwnerActor) || !IsValid(MeshActor)) return 0;
+        const FModelNodeData& Node = NodeMap.FindChecked(Name);
+        if (const auto* MeshData = MeshMap.Find(Node.MeshName)) SpawnStreamComponents(Name, Node, MeshData->Data);
+        if (bAbortRequested || !IsValid(OwnerActor) || !IsValid(MeshActor)) return 0;
+        if (UWorld* World = OwnerActor->GetWorld())
+            if (auto* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+                Gate->SetModelRegionAvailable(MeshActor.Get(), Name, FBox(ForceInit), true);
+    }
+    if (!bAdded) { FailGroup(TEXT("AddInstances"), TEXT("Batch registration failed; completed pages retained")); return 0; }
+    CurrentLoadIndex += Count; PreparedInstanceOffset += Count;
+    if (PreparedInstanceOffset == PreparedInstances.Num()) { PreparedInstances.Reset(); PreparedInstanceOffset = 0; }
+    return Count;
 }
 
 void UWorldSceneStreamAction::ProcessChunk()
@@ -787,7 +892,7 @@ void UWorldSceneStreamAction::ProcessChunk()
         const auto& Region = PendingUnavailableRegions[CurrentUnavailableRegionIndex++];
         if (UWorld* World = OwnerActor->GetWorld())
             if (auto* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
-                Gate->SetModelRegionAvailable(OwnerActor.Get(), Region.NodeName, Region.WorldBounds, false);
+                Gate->SetModelRegionAvailable(MeshActor.Get(), Region.NodeName, Region.WorldBounds, false);
         ++OperationsThisSlice;
     }
     if (CurrentSkippedOperationIndex < TotalSkippedOperationCount)
@@ -805,9 +910,37 @@ void UWorldSceneStreamAction::ProcessChunk()
         if (IsValid(MeshActor) && !MeshActor->CanMutateNode(PendingUnloadNodes[CurrentUnloadIndex])) break;
         ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true;
     }
+    // A fallback starts on a later slice, after the previous native callback has unwound
+    // and released its world pin. Never submit a second build from inside that callback.
+    if (bRetryMeshLoadPending && HasSliceBudget())
+    {
+        bRetryMeshLoadPending = false;
+        if (!bGroupFailed && IsNodeWithinCurrentRenderRange(CurrentLoadingNode))
+            LoadStaticMeshAsync(CurrentLoadingMesh);
+        else
+        {
+            OwnerActor->RequestStreamingRefresh();
+            ResetLoadState();
+        }
+        ++OperationsThisSlice;
+    }
     while (CurrentUnavailableRegionIndex >= PendingUnavailableRegions.Num()
         && !bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num() && HasSliceBudget())
     {
+        if (IsValid(MeshActor) && IsValid(MeshActor->GetMeshComponent())
+            && IsValid(MeshActor->GetMeshComponent()->GetStaticMesh()))
+        {
+            if (bInstancePreparationInFlight) break;
+            if (PreparedInstanceOffset >= PreparedInstances.Num())
+            {
+                StartInstanceBatchPreparation();
+                break;
+            }
+            const int32 Applied = ApplyInstanceBatch(FMath::Min(256, ChunkSize - OperationsThisSlice));
+            OperationsThisSlice += Applied; bProgressChanged |= Applied > 0;
+            if (Applied == 0 || bGroupFailed) break;
+            continue;
+        }
         const FName TargetNode = PendingLoadNodes[CurrentLoadIndex++]; ++OperationsThisSlice; bProgressChanged = true;
         if (IsValid(MeshActor) && MeshActor->IsNodeLoaded(TargetNode)) continue;
         if (ProcessLoadNode(TargetNode)) break;
@@ -841,6 +974,7 @@ void UWorldSceneStreamAction::ProcessChunk()
         Result.GroupName = GroupName;
         Result.bWaterGroup = bWaterGroup;
         Result.bGroupFailed = bGroupFailed;
+        Result.bMeshPayloadUnavailable = bMeshPayloadUnavailable;
         Result.FailureStage = FailureStage;
         Result.FailureReason = FailureReason;
         Result.FailedNode = FailedNode;
@@ -853,6 +987,8 @@ void UWorldSceneStreamAction::ProcessChunk()
         ReleaseActionReferences();
         return;
     }
+    if (bInstancePreparationInFlight && CurrentUnloadIndex >= PendingUnloadNodes.Num()
+        && CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num()) return; // Worker callback resumes the action.
     if (bStaticMeshLoadInFlight && bIsLoading
         && CurrentUnloadIndex >= PendingUnloadNodes.Num()
         && CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num())
@@ -999,6 +1135,11 @@ void UWorldSceneStreamAction::RefreshRenderRangeSnapshot()
     if (CurrentRenderObservers.IsEmpty()) CurrentRenderObservers = ObserverLocations;
     CurrentRenderOwnerTransform = OwnerActor->GetActorTransform();
     CurrentMaxRenderDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(OwnerActor.Get());
+    if (IsValid(MeshActor) && IsValid(MeshActor->GetMeshComponent()) && IsValid(MeshActor->GetMeshComponent()->GetStaticMesh()))
+    {
+        const double End = FMath::Min(CurrentMaxRenderDistanceCm, FMath::Max(2000.0, double(PlanningWorldRadius)));
+        MeshActor->SetInstanceCullDistances(FMath::FloorToInt(End * 0.85), FMath::FloorToInt(End));
+    }
 }
 
 bool UWorldSceneStreamAction::IsNodeWithinCurrentRenderRange(const FName& Name) const
@@ -1065,7 +1206,7 @@ void UWorldSceneStreamAction::ProcessUnloadNode(const FName &Name)
             {
                 const FTransform WorldTransform = Info->Transform * OwnerActor->GetActorTransform();
                 const FVector Extent = (Mesh->Size * 0.5f + BOX_BUFFER_SIZE).GetAbs();
-                Gate->SetModelRegionAvailable(OwnerActor.Get(), Name,
+                Gate->SetModelRegionAvailable(MeshActor.Get(), Name,
                     FBox(-Extent, Extent).TransformBy(WorldTransform), false);
             }
         }
@@ -1101,23 +1242,39 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
         AbortAndRelease(StaticMesh);
         return;
     }
-    if (!IsValid(StaticMesh))
-    {
-        // The payload/finalizer reports its request-specific error. A null callback can also
-        // mean cancellation; counting it again quarantines a model after just one failed build.
-        FailGroup(TEXT("MeshLoad"), TEXT("No mesh returned; see V3DStreaming Stage/Reason for these mesh indices"));
-        ResetLoadState();
-        return;
-    }
-
-    // Async builds may finish after the camera or setting changed. Refresh once at callback entry.
+    // Async builds may finish after the camera or setting changed. A stale/cancelled request
+    // must not consume a payload-failure attempt or restart an obsolete mesh build.
     RefreshRenderRangeSnapshot();
-    if (!IsNodeWithinCurrentRenderRange(CurrentLoadingNode))
+    if (bGroupFailed || !IsNodeWithinCurrentRenderRange(CurrentLoadingNode))
     {
         OwnerActor->RequestStreamingRefresh();
         ResetLoadState();
         return;
     }
+    if (!IsValid(StaticMesh))
+    {
+        const bool bCanRecover = IsValid(Asset) && MeshLoadRecovery.IsInitialized()
+            && !FSafeFileIO::IsShuttingDown() && !FV3DRuntimeSafety::IsCircuitOpen()
+            && (!IsValid(GeneratedMeshWorldContext) || !GeneratedMeshWorldContext->IsBuildCancelled());
+        if (bCanRecover && MeshLoadRecovery.AdvanceAfterFailure())
+        {
+            bRetryMeshLoadPending = true;
+            UE_LOG(LogTemp, Warning,
+                TEXT("Mesh load failed; retrying one authored LOD. Group=%s Node=%s Mesh=%s Index=%d"),
+                *GroupName.ToString(), *CurrentLoadingNode.ToString(), *CurrentLoadingMesh.ToString(),
+                MeshLoadRecovery.GetMeshIndex(0));
+            return;
+        }
+        // The payload/finalizer already logged the detailed reason. Do not count it twice in
+        // source quarantine; report only the exhausted pass to the scene's bounded recovery.
+        FailGroup(TEXT("MeshLoad"), TEXT("No usable mesh after the available LOD requests; see V3DStreaming Stage/Reason"),
+            NAME_None, NAME_None, bCanRecover);
+        ResetLoadState();
+        return;
+    }
+    if (MeshLoadRecovery.IsFallback())
+        UE_LOG(LogTemp, Warning, TEXT("Recovered streamed mesh using one LOD. Group=%s Mesh=%s Index=%d"),
+            *GroupName.ToString(), *CurrentLoadingMesh.ToString(), MeshLoadRecovery.GetMeshIndex(0));
 
     const FModelMeshData* ModelMeshData = MeshMap.Find(CurrentLoadingMesh);
 
@@ -1127,6 +1284,8 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
     {
         ISMC->SetRenderCustomDepth(true);
         ISMC->SetCustomDepthStencilValue(1);
+        const double End = FMath::Min(CurrentMaxRenderDistanceCm, FMath::Max(2000.0, double(PlanningWorldRadius)));
+        MeshActor->SetInstanceCullDistances(FMath::FloorToInt(End * 0.85), FMath::FloorToInt(End));
     }
 
     ConfigureGeneratedMeshCollision(
@@ -1210,40 +1369,18 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
         LocalIndices.AddUnique(MeshIndex);
     };
 
-    const bool bEnableRuntimeMultiLOD = CVarEnableRuntimeMultiLOD.GetValueOnGameThread() != 0;
-    if (bEnableRuntimeMultiLOD)
+    if (!MeshLoadRecovery.IsInitialized())
     {
         AddValidLOD(Mesh->LOD0, TEXT("LOD0"));
         AddValidLOD(Mesh->LOD1, TEXT("LOD1"));
         AddValidLOD(Mesh->LOD2, TEXT("LOD2"));
         AddValidLOD(Mesh->LOD3, TEXT("LOD3"));
+        MeshLoadRecovery.Begin(LocalIndices.GetData(), LocalIndices.Num(),
+            CVarEnableRuntimeMultiLOD.GetValueOnGameThread() != 0);
     }
-    else
-    {
-        // Prefer LOD0. A group authored with only a higher LOD tag still needs one render mesh when
-        // multi-LOD assembly is disabled, so select its first validated entry.
-        AddValidLOD(Mesh->LOD0, TEXT("LOD0"));
-        if (LocalIndices.IsEmpty())
-        {
-            AddValidLOD(Mesh->LOD1, TEXT("LOD1"));
-        }
-        if (LocalIndices.IsEmpty())
-        {
-            AddValidLOD(Mesh->LOD2, TEXT("LOD2"));
-        }
-        if (LocalIndices.IsEmpty())
-        {
-            AddValidLOD(Mesh->LOD3, TEXT("LOD3"));
-        }
-
-        if (Mesh->LOD1 != INDEX_NONE || Mesh->LOD2 != INDEX_NONE || Mesh->LOD3 != INDEX_NONE)
-        {
-            UE_LOG(LogTemp, VeryVerbose,
-                TEXT("Runtime multi-LOD assembly disabled; loading one validated LOD only. Mesh=%s Node=%s"),
-                *MeshName.ToString(),
-                *CurrentLoadingNode.ToString());
-        }
-    }
+    LocalIndices.Reset();
+    for (int32 Index = 0; Index < MeshLoadRecovery.GetRequestCount(); ++Index)
+        LocalIndices.Add(MeshLoadRecovery.GetMeshIndex(Index));
 
     const int32 Count = LocalIndices.Num();
     if (Count <= 0)
@@ -1253,7 +1390,8 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
             *MeshName.ToString(),
             *CurrentLoadingNode.ToString(),
             RuntimeMeshCount);
-        FailGroup(TEXT("MeshIndices"), TEXT("No valid runtime mesh index remains"));
+        FailGroup(TEXT("MeshIndices"), TEXT("No valid runtime mesh index remains"),
+            NAME_None, NAME_None, true);
         ResetLoadState();
         return;
     }
@@ -1374,7 +1512,7 @@ void UWorldSceneStreamAction::AddTransform(const FName &Name)
         if (UWorld* World = OwnerActor->GetWorld())
         {
             if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
-                Gate->SetModelRegionAvailable(OwnerActor.Get(), Name, FBox(ForceInit), true);
+                Gate->SetModelRegionAvailable(MeshActor.Get(), Name, FBox(ForceInit), true);
         }
     }
     ResetLoadState();
@@ -1490,17 +1628,24 @@ void UWorldSceneStreamAction::DestroyStreamComponents(const FName &NodeName)
     }
 }
 
-void UWorldSceneStreamAction::FailGroup(const TCHAR* Stage, const FString& Reason, const FName Node, const FName Mesh)
+void UWorldSceneStreamAction::FailGroup(const TCHAR* Stage, const FString& Reason, const FName Node,
+    const FName Mesh, const bool bPayloadUnavailable)
 {
     check(IsInGameThread());
     if (!bGroupFailed)
     {
+        bMeshPayloadUnavailable = bPayloadUnavailable;
         FailureStage = Stage;
         FailureReason = Reason.Left(2048);
         FailedNode = Node.IsNone() ? CurrentLoadingNode : Node;
         FailedMesh = Mesh.IsNone() ? CurrentLoadingMesh : Mesh;
     }
     bGroupFailed = true;
+    if (PreparationCancellation.IsValid()) PreparationCancellation->Increment();
+    ++PreparationSerial;
+    bInstancePreparationInFlight = false;
+    PreparedInstances.Reset(); PreparedInstanceOffset = 0;
+    CurrentLoadIndex = PendingLoadNodes.Num();
     NodeMap.Empty();
     // An unload failure may happen while a mesh load is outstanding. Its native callback still
     // owns the action/world pins; FailGroup must not reset bStaticMeshLoadInFlight here.
@@ -1515,6 +1660,8 @@ void UWorldSceneStreamAction::ResetLoadState()
 
     bIsLoading = false;
     bStaticMeshLoadInFlight = false;
+    bRetryMeshLoadPending = false;
+    MeshLoadRecovery.Reset();
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
     BroadcastProgress();
@@ -1695,4 +1842,73 @@ bool FV3DSceneFailureDiagnosticTest::RunTest(const FString&)
     TestEqual(TEXT("Error details survive until completion"), Action->FailureReason, FString(TEXT("injected removal failure")));
     return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DSceneMeshFallbackTest,
+    "V3DSimulator.Streaming.Regression.DeferredMeshLODFallback",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DSceneMeshFallbackTest::RunTest(const FString&)
+{
+    const auto Values = UWorld::InitializationValues().AllowAudioPlayback(false)
+        .CreatePhysicsScene(false).CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Fallback world"), World)) return false;
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    AStaticActor* Scene = World->SpawnActor<AStaticActor>();
+    AInstancedMeshActor* Group = World->SpawnActor<AInstancedMeshActor>();
+    if (!TestNotNull(TEXT("Scene"), Scene) || !TestNotNull(TEXT("Group"), Group)) return false;
+    const int Indices[] = {7, 2};
+    const auto MakeAction = [&]()
+    {
+        auto* Action = NewObject<UWorldSceneStreamAction>();
+        Action->OwnerActor = Scene;
+        Action->MeshActor = Group;
+        Action->WorldContextObject = Scene;
+        Action->Asset = NewObject<UWorldBakedModelAsset>();
+        Action->ObserverLocations.Add(FVector::ZeroVector);
+        Action->CurrentLoadingNode = TEXT("Node");
+        Action->CurrentLoadingMesh = TEXT("Mesh");
+        FModelNodeData Node;
+        Node.MeshName = Action->CurrentLoadingMesh;
+        Action->NodeMap.Add(Action->CurrentLoadingNode, Node);
+        FModelMeshData Mesh;
+        Mesh.LOD0 = 7; Mesh.LOD1 = 2; Mesh.Size = FVector(100);
+        Action->MeshMap.Add(Action->CurrentLoadingMesh, Mesh);
+        Action->MeshLoadRecovery.Begin(Indices, 2, true);
+        Action->bIsLoading = true;
+        Action->bStaticMeshLoadInFlight = true;
+        Action->bWaitingForMeshCallback = true;
+        return Action;
+    };
+    TStrongObjectPtr<UWorldSceneStreamAction> Action(MakeAction());
+    // Inject real terminal callback results without starting a glTFRuntime job in this fixture.
+    Action->SetStaticMesh(nullptr);
+    TestTrue(TEXT("Combined failure queues a later slice, not a reentrant native build"),
+        Action->bRetryMeshLoadPending && Action->bIsLoading && !Action->bStaticMeshLoadInFlight);
+    TestFalse(TEXT("A recoverable callback does not fail the whole group"), Action->bGroupFailed);
+    TestEqual(TEXT("The first fallback keeps authored LOD0"), Action->MeshLoadRecovery.GetMeshIndex(0), 7);
+    TestTrue(TEXT("Async completion wakes the action"), World->GetTimerManager().TimerExists(Action->ProcessTimerHandle));
+    Action->bRetryMeshLoadPending = false;
+    Action->bStaticMeshLoadInFlight = true;
+    Action->SetStaticMesh(nullptr);
+    TestEqual(TEXT("Failed LOD0 advances to the next authored LOD"), Action->MeshLoadRecovery.GetMeshIndex(0), 2);
+    TestFalse(TEXT("Remaining LODs keep the group alive"), Action->bGroupFailed);
+    Action->bRetryMeshLoadPending = false;
+    Action->bStaticMeshLoadInFlight = true;
+    Action->SetStaticMesh(nullptr);
+    TestTrue(TEXT("Only an exhausted payload reports a terminal group attempt"),
+        Action->bGroupFailed && Action->bMeshPayloadUnavailable && !Action->bRetryMeshLoadPending);
+    TestEqual(TEXT("Failure retains the node identity"), Action->FailedNode, FName(TEXT("Node")));
+    Action->CancelAndRelease();
+
+    TStrongObjectPtr<UWorldSceneStreamAction> Cancelled(MakeAction());
+    Cancelled->SetStaticMesh(nullptr);
+    const FTimerHandle RetryTimer = Cancelled->ProcessTimerHandle;
+    Cancelled->CancelAndRelease();
+    TestFalse(TEXT("Cancellation removes the scheduled fallback"), World->GetTimerManager().TimerExists(RetryTimer));
+    TestTrue(TEXT("Cancelled fallback releases its action state"),
+        Cancelled->IsFinished() && !Cancelled->bRetryMeshLoadPending && !Cancelled->MeshLoadRecovery.IsInitialized());
+    return true;
+}
+
 #endif

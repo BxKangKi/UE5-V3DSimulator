@@ -11,6 +11,7 @@ namespace V3DMeshRendering
     inline void ConfigureWorldMesh(UPrimitiveComponent* Component)
     {
         if (!IsValid(Component)) return;
+        Component->SetRenderCustomDepth(true);
         Component->SetCastShadow(true);
         Component->SetVisibleInRayTracing(true);
         if (!Component->bCastDynamicShadow || !Component->bCastStaticShadow)

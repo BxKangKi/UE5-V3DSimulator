@@ -5,6 +5,7 @@
 #include "WeatherRuntimeActor.generated.h"
 
 class UMaterialInstanceDynamic;
+class UMaterialParameterCollection;
 class UNiagaraComponent;
 class USceneCaptureComponent2D;
 class UPostProcessComponent;
@@ -66,9 +67,18 @@ private:
     void UpdateRainCaptureParameters();
     void UpdateWeatherPostProcess();
     TWeakObjectPtr<USceneComponent> WeatherCamera;
+
+    UPROPERTY(Transient)
     TObjectPtr<UMaterialInstanceDynamic> WeatherPostProcessMID;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialParameterCollection> CachedPostProcessMPC;
 
     FString WeatherPreset = TEXT("Rain");
     float WeatherIntensity = 0.0f;
     float SurfaceCoverage = 0.0f;
+    float LastAppliedCoverage = -1.0f;
+    float LastAppliedIntensity = -1.0f;
+    int32 LastAppliedSnowMode = -1;
+    bool bTriedLoadPostProcessMPC = false;
 };

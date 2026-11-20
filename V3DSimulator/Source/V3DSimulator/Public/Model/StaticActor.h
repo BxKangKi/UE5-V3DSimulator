@@ -17,6 +17,7 @@
 #include "Model/WorldSceneStreamTypes.h"
 #include "System/V3DStreamingEvaluation.h"
 #include "System/V3DStreamingRetrySchedule.h"
+#include "System/V3DMeshLoadRecovery.h"
 #include "glTFRuntimeParser.h"
 #include "StaticActor.generated.h"
 
@@ -71,6 +72,10 @@ public:
     UFUNCTION(BlueprintPure, Category="World|Streaming")
     float GetLoadingStatus() const { return LoadingStatus; }
 
+    /** Readiness may complete with unavailable groups; expose that degraded state explicitly. */
+    UFUNCTION(BlueprintPure, Category="World|Streaming")
+    int32 GetUnavailableMeshGroupCount() const;
+
     UWorldBakedModelAsset* GetBakedAsset() const { return BakedAsset.Get(); }
     void ReleaseRuntimeResourcesForWorldExit();
     void SetRenderOnlyStreaming(bool bRenderOnly);
@@ -113,6 +118,7 @@ protected:
 private:
     friend class FV3DStaticStreamingSchedulingTest;
     friend class FV3DStaticStreamingRecoveryTest;
+    friend class FV3DStaticMeshFailureIsolationTest;
     friend class FV3DSceneActionLifetimeTest;
     friend class UWorldSceneStreamAction;
     bool PreserveAbortedWaterState(const UWorldSceneStreamAction* Action, FWorldSceneStreamResult&& State);
@@ -174,6 +180,9 @@ private:
     bool bAsyncLoading = false;
     double NextStreamingUpdateSeconds = 0.0;
     FV3DStreamingRetrySchedule StreamingRetry;
+    /** Scoped to this metadata generation; healthy groups and other scene actors remain independent. */
+    TMap<FName, FV3DMeshGroupRecovery> MeshGroupRecovery;
+    bool IsMeshGroupUnavailable(FName GroupName) const;
     bool bReloadMetadataOnRetry = false;
     FV3DStreamingEvaluation StreamingEvaluation;
     bool bRenderOnlyStreaming = false;

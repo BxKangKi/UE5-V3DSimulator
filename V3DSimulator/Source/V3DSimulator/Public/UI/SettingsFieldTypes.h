@@ -41,7 +41,10 @@ enum class ESettingsField : uint8
     // Append fields to preserve serialized Blueprint enum values.
     MaxRenderDistanceMeters UMETA(DisplayName="Max Render Distance"),
     QualityProfile UMETA(DisplayName="Quality Profile"),
-    MouseSensitivity UMETA(DisplayName="Mouse Sensitivity")
+    MouseSensitivity UMETA(DisplayName="Mouse Sensitivity"),
+    ShadowDistanceMeters UMETA(DisplayName="Shadow Distance"),
+    AutoExposureMinEV UMETA(DisplayName="Auto Exposure Min EV"),
+    AutoExposureMaxEV UMETA(DisplayName="Auto Exposure Max EV")
 };
 
 UENUM(BlueprintType)

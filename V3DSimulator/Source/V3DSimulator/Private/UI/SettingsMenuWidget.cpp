@@ -28,7 +28,9 @@
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
 #include "Setting/GameSettings.h"
+#include "Setting/ShadowDistancePolicy.h"
 #include "System/GameManagerSubSystem.h"
+#include "InputCoreTypes.h"
 
 namespace
 {
@@ -99,10 +101,13 @@ namespace
             ESettingsField::BloomThreshold,
             ESettingsField::AmbientOcclusionIntensity,
             ESettingsField::Exposure,
+            ESettingsField::AutoExposureMinEV,
+            ESettingsField::AutoExposureMaxEV,
             ESettingsField::RayTracing,
             ESettingsField::HeightFog,
             ESettingsField::Cloud,
             ESettingsField::ShadowQuality,
+            ESettingsField::ShadowDistanceMeters,
             ESettingsField::TextureQuality,
             ESettingsField::MaxTextureResolution,
             ESettingsField::ViewDistanceQuality,
@@ -228,10 +233,13 @@ namespace
         case ESettingsField::BloomThreshold: return TEXT("BloomThreshold");
         case ESettingsField::AmbientOcclusionIntensity: return TEXT("AmbientOcclusionIntensity");
         case ESettingsField::Exposure: return TEXT("Exposure");
+        case ESettingsField::AutoExposureMinEV: return TEXT("AutoExposureMinEV");
+        case ESettingsField::AutoExposureMaxEV: return TEXT("AutoExposureMaxEV");
         case ESettingsField::RayTracing: return TEXT("RayTracing");
         case ESettingsField::HeightFog: return TEXT("HeightFog");
         case ESettingsField::Cloud: return TEXT("Cloud");
         case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
+        case ESettingsField::ShadowDistanceMeters: return TEXT("ShadowDistanceMeters");
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
         case ESettingsField::MaxTextureResolution: return TEXT("MaxTextureResolution");
         case ESettingsField::ViewDistanceQuality: return TEXT("ViewDistanceQuality");
@@ -385,6 +393,7 @@ void USettingsCycleButton::HandleClicked()
 USettingsMenuWidget::USettingsMenuWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
+    SetIsFocusable(true);
     BodyFontSize = 24;
     TitleFontSize = 100;
     ButtonHeight = 64.f;
@@ -771,6 +780,8 @@ ESettingsControlType USettingsMenuWidget::GetSettingControlType(ESettingsField F
     case ESettingsField::BloomIntensity:
     case ESettingsField::BloomThreshold:
     case ESettingsField::AmbientOcclusionIntensity:
+    case ESettingsField::AutoExposureMinEV:
+    case ESettingsField::AutoExposureMaxEV:
     case ESettingsField::StreamingDistanceMultiplier:
     case ESettingsField::StreamingUnloadDistanceMultiplier:
     case ESettingsField::ObjectStreamingRadiusMeters:
@@ -796,6 +807,10 @@ bool USettingsMenuWidget::GetSettingSliderRange(
         OutMin = BloomThresholdMin; OutMax = BloomThresholdMax; OutStep = 0.01f; return true;
     case ESettingsField::AmbientOcclusionIntensity:
         OutMin = AmbientOcclusionMin; OutMax = AmbientOcclusionMax; OutStep = 0.01f; return true;
+    case ESettingsField::AutoExposureMinEV:
+        OutMin = -10.0f; OutMax = 10.0f; OutStep = 0.5f; return true;
+    case ESettingsField::AutoExposureMaxEV:
+        OutMin = -10.0f; OutMax = 20.0f; OutStep = 0.5f; return true;
     case ESettingsField::StreamingDistanceMultiplier:
         OutMin = StreamingDistanceMin; OutMax = StreamingDistanceMax; OutStep = StreamingDistanceStep; return true;
     case ESettingsField::StreamingUnloadDistanceMultiplier:
@@ -841,6 +856,13 @@ void USettingsMenuWidget::SetSettingFromSliderValue(ESettingsField Field, const 
         PendingBloomThreshold = FMath::Clamp(Value, BloomThresholdMin, BloomThresholdMax); break;
     case ESettingsField::AmbientOcclusionIntensity:
         PendingAmbientOcclusionIntensity = FMath::Clamp(Value, AmbientOcclusionMin, AmbientOcclusionMax); break;
+    case ESettingsField::AutoExposureMinEV:
+        PendingAutoExposureMinEV = FMath::Clamp(Value, -10.0f, 10.0f);
+        if (PendingAutoExposureMaxEV < PendingAutoExposureMinEV) PendingAutoExposureMaxEV = PendingAutoExposureMinEV;
+        break;
+    case ESettingsField::AutoExposureMaxEV:
+        PendingAutoExposureMaxEV = FMath::Clamp(Value, PendingAutoExposureMinEV, 20.0f);
+        break;
     case ESettingsField::StreamingDistanceMultiplier:
         PendingStreamingDistanceMultiplier = FMath::Clamp(Value, StreamingDistanceMin, StreamingDistanceMax); break;
     case ESettingsField::StreamingUnloadDistanceMultiplier:
@@ -905,6 +927,8 @@ void USettingsMenuWidget::SetSettingFromDropdownSelection(
         PendingDynamicGlobalIlluminationMethod = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::ReflectionMethod:
         PendingReflectionMethod = FMath::Clamp(SelectedIndex, 0, 2); break;
+    case ESettingsField::ShadowDistanceMeters:
+        PendingShadowDistanceMeters = (FMath::Clamp(SelectedIndex, 0, 31) + 1) * V3DShadowDistance::Step; break;
     case ESettingsField::ShadowQuality: PendingShadowQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::TextureQuality: PendingTextureQuality = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::QualityProfile:
@@ -1106,6 +1130,10 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         break;
+    case ESettingsField::ShadowDistanceMeters:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI);
+        break;
     case ESettingsField::ShadowQuality:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
@@ -1214,6 +1242,7 @@ void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Butto
     case ESettingsField::RayTracing: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI); break;
     case ESettingsField::HeightFog: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI); break;
     case ESettingsField::Cloud: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI); break;
+    case ESettingsField::ShadowDistanceMeters: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI); break;
     case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
     case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
     case ESettingsField::MaxTextureResolution: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI); break;
@@ -1259,6 +1288,8 @@ float USettingsMenuWidget::GetPendingNumericValue(ESettingsField Field) const
     case ESettingsField::BloomIntensity: return PendingBloomIntensity;
     case ESettingsField::BloomThreshold: return PendingBloomThreshold;
     case ESettingsField::AmbientOcclusionIntensity: return PendingAmbientOcclusionIntensity;
+    case ESettingsField::AutoExposureMinEV: return PendingAutoExposureMinEV;
+    case ESettingsField::AutoExposureMaxEV: return PendingAutoExposureMaxEV;
     case ESettingsField::StreamingDistanceMultiplier: return PendingStreamingDistanceMultiplier;
     case ESettingsField::StreamingUnloadDistanceMultiplier: return PendingStreamingUnloadDistanceMultiplier;
     case ESettingsField::ObjectStreamingRadiusMeters: return PendingObjectStreamingRadiusMeters;
@@ -1314,10 +1345,13 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     PendingExposure = Settings->Exposure <= -10.5f
         ? ExposureAutoValue
         : FMath::Clamp(FMath::RoundToInt(Settings->Exposure), ExposureManualMin, ExposureManualMax);
+    PendingAutoExposureMinEV = FMath::IsFinite(Settings->AutoExposureMinEV) ? FMath::Clamp(Settings->AutoExposureMinEV, -10.0f, 10.0f) : -5.0f;
+    PendingAutoExposureMaxEV = FMath::IsFinite(Settings->AutoExposureMaxEV) ? FMath::Clamp(Settings->AutoExposureMaxEV, PendingAutoExposureMinEV, 20.0f) : FMath::Max(PendingAutoExposureMinEV, 13.0f);
     bPendingRayTracing = Settings->bRayTracing;
     bPendingHeightFog = Settings->bHeightFog;
     bPendingCloud = Settings->bCloud;
     PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
+    PendingShadowDistanceMeters = Settings->GetClampedShadowDistanceMeters();
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
     PendingMaxTextureResolution = FMath::Clamp(Settings->MaxTextureResolution, TextureResolutionMin, TextureResolutionMax);
     PendingViewDistanceQuality = FMath::Clamp(Settings->ViewDistanceQuality, QualityMin, QualityMax);
@@ -1345,10 +1379,13 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->BloomThreshold = PendingBloomThreshold;
     Settings->AmbientOcclusionIntensity = PendingAmbientOcclusionIntensity;
     Settings->Exposure = static_cast<float>(PendingExposure);
+    Settings->AutoExposureMinEV = FMath::Clamp(PendingAutoExposureMinEV, -10.0f, 10.0f);
+    Settings->AutoExposureMaxEV = FMath::Clamp(PendingAutoExposureMaxEV, Settings->AutoExposureMinEV, 20.0f);
     Settings->bRayTracing = bPendingRayTracing;
     Settings->bHeightFog = bPendingHeightFog;
     Settings->bCloud = bPendingCloud;
     Settings->ShadowQuality = PendingShadowQuality;
+    Settings->ShadowDistanceMeters = V3DShadowDistance::Normalize(PendingShadowDistanceMeters);
     Settings->TextureQuality = PendingTextureQuality;
     Settings->MaxTextureResolution = PendingMaxTextureResolution;
     Settings->ViewDistanceQuality = PendingViewDistanceQuality;
@@ -1447,6 +1484,17 @@ void USettingsMenuWidget::CloseSettingsFromUI()
     OnCloseRequested.Broadcast();
 }
 
+FReply USettingsMenuWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+    if (!InKeyEvent.IsRepeat()
+        && (InKeyEvent.GetKey() == EKeys::Escape || InKeyEvent.GetKey() == EKeys::Gamepad_FaceButton_Right))
+    {
+        CloseSettingsFromUI();
+        return FReply::Handled();
+    }
+    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+}
+
 TArray<ESettingsField> USettingsMenuWidget::GetSettingFieldList() const
 {
     return GetDefaultSettingsFields();
@@ -1461,10 +1509,13 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::BloomThreshold: return FText::FromString(TEXT("Bloom Threshold"));
     case ESettingsField::AmbientOcclusionIntensity: return FText::FromString(TEXT("Ambient Occlusion"));
     case ESettingsField::Exposure: return FText::FromString(TEXT("Exposure"));
+    case ESettingsField::AutoExposureMinEV: return FText::FromString(TEXT("Auto Exposure Min"));
+    case ESettingsField::AutoExposureMaxEV: return FText::FromString(TEXT("Auto Exposure Max"));
     case ESettingsField::RayTracing: return FText::FromString(TEXT("Ray Tracing"));
     case ESettingsField::HeightFog: return FText::FromString(TEXT("Height Fog"));
     case ESettingsField::Cloud: return FText::FromString(TEXT("Cloud"));
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
+    case ESettingsField::ShadowDistanceMeters: return FText::FromString(TEXT("Shadow Distance"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
     case ESettingsField::MaxTextureResolution: return FText::FromString(TEXT("Max Texture Resolution"));
     case ESettingsField::ViewDistanceQuality: return FText::FromString(TEXT("Render Distance Quality"));
@@ -1556,6 +1607,10 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
         for (int32 Quality = 0; Quality <= 3; ++Quality) Options.Add(GetQualityText(Quality));
         Options.Add(FText::FromString(TEXT("Custom")));
         break;
+    case ESettingsField::ShadowDistanceMeters:
+        for (int32 Value = V3DShadowDistance::Minimum; Value <= V3DShadowDistance::Maximum; Value += V3DShadowDistance::Step)
+            Options.Add(FText::FromString(FString::Printf(TEXT("%d m"), Value)));
+        break;
     case ESettingsField::MaxRenderDistanceMeters:
         for (int32 Value = 1024; Value <= 32768; Value += 1024)
             Options.Add(FText::FromString(FString::Printf(TEXT("%d m"), Value)));
@@ -1625,9 +1680,24 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::BloomThreshold: CycleFloat(PendingBloomThreshold, BloomThresholdMin, BloomThresholdMax, BloomStep, Direction); break;
     case ESettingsField::AmbientOcclusionIntensity: CycleFloat(PendingAmbientOcclusionIntensity, AmbientOcclusionMin, AmbientOcclusionMax, AmbientOcclusionStep, Direction); break;
     case ESettingsField::Exposure: CycleInt(PendingExposure, ExposureAutoValue, ExposureManualMax, Direction); break;
+    case ESettingsField::AutoExposureMinEV:
+        CycleFloat(PendingAutoExposureMinEV, -10.0f, 10.0f, 0.5f, Direction);
+        if (PendingAutoExposureMaxEV < PendingAutoExposureMinEV) PendingAutoExposureMaxEV = PendingAutoExposureMinEV;
+        break;
+    case ESettingsField::AutoExposureMaxEV:
+        CycleFloat(PendingAutoExposureMaxEV, -10.0f, 20.0f, 0.5f, Direction);
+        if (PendingAutoExposureMaxEV < PendingAutoExposureMinEV) PendingAutoExposureMinEV = PendingAutoExposureMaxEV;
+        break;
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
+    case ESettingsField::ShadowDistanceMeters:
+        {
+            int32 Step = V3DShadowDistance::Normalize(PendingShadowDistanceMeters) / V3DShadowDistance::Step;
+            CycleInt(Step, 1, 32, Direction);
+            PendingShadowDistanceMeters = Step * V3DShadowDistance::Step;
+        }
+        break;
     case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::MaxTextureResolution: CycleTextureResolution(PendingMaxTextureResolution, Direction); break;
@@ -1693,10 +1763,15 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
         return PendingExposure == ExposureAutoValue
             ? FText::FromString(TEXT("Auto"))
             : FText::FromString(FString::Printf(TEXT("%d EV"), PendingExposure));
+    case ESettingsField::AutoExposureMinEV:
+        return FText::FromString(FString::Printf(TEXT("%.1f EV"), PendingAutoExposureMinEV));
+    case ESettingsField::AutoExposureMaxEV:
+        return FText::FromString(FString::Printf(TEXT("%.1f EV"), PendingAutoExposureMaxEV));
     case ESettingsField::RayTracing: return GetBoolText(bPendingRayTracing);
     case ESettingsField::HeightFog: return GetBoolText(bPendingHeightFog);
     case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
+    case ESettingsField::ShadowDistanceMeters: return FText::FromString(FString::Printf(TEXT("%d m"), PendingShadowDistanceMeters));
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
     case ESettingsField::MaxTextureResolution: return FText::FromString(FString::Printf(TEXT("%d px"), PendingMaxTextureResolution));
     case ESettingsField::QualityProfile:
@@ -1775,6 +1850,7 @@ void USettingsMenuWidget::CycleExposureFromUI() { CycleSettingValueFromUI(ESetti
 void USettingsMenuWidget::CycleRayTracingFromUI() { CycleSettingValueFromUI(ESettingsField::RayTracing); }
 void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESettingsField::HeightFog); }
 void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
+void USettingsMenuWidget::CycleShadowDistanceMetersFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowDistanceMeters); }
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
 void USettingsMenuWidget::CycleMaxTextureResolutionFromUI() { CycleSettingValueFromUI(ESettingsField::MaxTextureResolution); }
@@ -1788,6 +1864,7 @@ int32 USettingsMenuWidget::GetPendingQualityProfileIndex() const
         && PendingGlobalIlluminationQuality == Q && PendingReflectionQuality == Q
         && PendingMaxTextureResolution == 256 * (Q + 1)
         && PendingMaxRenderDistanceMeters == (1024 << Q)
+        && PendingShadowDistanceMeters == V3DShadowDistance::Profile(Q)
         && bPendingRayTracing == (Q >= 2) && bPendingCloud == (Q >= 1) && bPendingHeightFog
         && PendingDynamicGlobalIlluminationMethod == (Q >= 2 ? 1 : 0)
         && PendingReflectionMethod == (Q >= 2 ? 1 : (Q == 1 ? 2 : 0));

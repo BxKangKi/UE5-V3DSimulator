@@ -7,6 +7,8 @@
 #include "HAL/PlatformFileManager.h"
 #include "System/EntityArchive.h"
 #include "System/SafeFileIO.h"
+#include "Setting/GameSettings.h"
+#include "UI/SettingsMenuWidget.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DJsonNoBackupTest,
     "V3DSimulator.Settings.NoJsonBackups",
@@ -68,6 +70,38 @@ bool FV3DCurrentDataFolderTest::RunTest(const FString&)
     if (TestTrue(TEXT("Current location reads"), Store.IsValid()))
         TestEqual(TEXT("Committed state is preserved"), Store->GetGeneration(), Generation);
     Store.Reset();
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DShadowDistancePersistenceTest,
+    "V3DSimulator.Settings.ShadowDistancePersistence",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DShadowDistancePersistenceTest::RunTest(const FString&)
+{
+    UGameSettings* Settings = NewObject<UGameSettings>();
+    const TSharedRef<FJsonObject> OldSettings = MakeShared<FJsonObject>();
+    TestTrue(TEXT("Older settings remain readable"), Settings->Deserialization(OldSettings));
+    TestEqual(TEXT("Missing field gets extended default"), Settings->ShadowDistanceMeters, 2048);
+    Settings->ShadowDistanceMeters = 4096;
+    UGameSettings* Restored = NewObject<UGameSettings>();
+    TestTrue(TEXT("Shadow setting round trips"), Restored->Deserialization(Settings->Serialization()));
+    TestEqual(TEXT("Shadow distance restored"), Restored->ShadowDistanceMeters, 4096);
+    Restored->MaxRenderDistanceMeters = 1024;
+    TestEqual(TEXT("Effective distance does not exceed geometry coverage"), Restored->GetEffectiveShadowDistanceCentimeters(), 102400.0f);
+    for (int32 Q = 0; Q < 4; ++Q)
+    {
+        Restored->ApplyQualityProfile(static_cast<EQualitySettings>(Q));
+        TestEqual(TEXT("Shadow range follows selected preset"), Restored->GetClampedShadowDistanceMeters(), 512 << Q);
+        TestEqual(TEXT("Profile still matches after round trip"), Restored->GetQualityProfileIndex(), Q);
+    }
+    const USettingsMenuWidget* Widget = GetDefault<USettingsMenuWidget>();
+    TestTrue(TEXT("Setting appears in generated UI"), Widget->GetSettingFieldList().Contains(ESettingsField::ShadowDistanceMeters));
+    const TArray<FText> Options = Widget->GetSettingOptionTexts(ESettingsField::ShadowDistanceMeters);
+    if (TestEqual(TEXT("All distance choices available"), Options.Num(), 32))
+    {
+        TestEqual(TEXT("Minimum option"), Options[0].ToString(), FString(TEXT("256 m")));
+        TestEqual(TEXT("Maximum option"), Options.Last().ToString(), FString(TEXT("8192 m")));
+    }
     return true;
 }
 #endif

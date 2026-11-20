@@ -14,6 +14,7 @@
 #include "System/GameManagerSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "System/SystemInfoFunctionLibrary.h"
+#include "World/WorldData.h"
 
 namespace DebugHUDWidgetPrivate
 {
@@ -151,15 +152,34 @@ void UDebugHUDWidget::UpdateDiagnostics(float DeltaSeconds)
         CameraRotation = DebugHUDWidgetPrivate::FormatRotation(TEXT("Camera rotation"), ViewRotation);
     }
     const UGameManagerSubSystem* Manager = UGameManagerSubSystem::FindGameManager(this);
+    FString WorldTimeText = TEXT("World time: N/A");
+    if (IsValid(Manager))
+    {
+        if (const UWorldData* WorldData = Manager->GetWorldData();
+            IsValid(WorldData) && FMath::IsFinite(WorldData->WorldTime)
+            && FMath::IsFinite(WorldData->OneDayTime) && WorldData->OneDayTime > UE_SMALL_NUMBER)
+        {
+            const double TotalSec = FMath::Max(0.0, static_cast<double>(WorldData->WorldTime));
+            const double DayLen = static_cast<double>(WorldData->OneDayTime);
+            const int32 DayIndex = static_cast<int32>(FMath::FloorToDouble(TotalSec / DayLen)) + 1;
+            const double SecInDay = FMath::Fmod(TotalSec, DayLen);
+            const double NormSeconds24h = (SecInDay / DayLen) * 86400.0;
+            const int32 Hours = static_cast<int32>(NormSeconds24h / 3600.0) % 24;
+            const int32 Minutes = static_cast<int32>(NormSeconds24h / 60.0) % 60;
+            const int32 Seconds = static_cast<int32>(NormSeconds24h) % 60;
+            WorldTimeText = FString::Printf(TEXT("World time: Day %d  %02d:%02d:%02d"), DayIndex, Hours, Minutes, Seconds);
+        }
+    }
     const ENetMode Mode = GetWorld() ? GetWorld()->GetNetMode() : NM_Standalone;
     const TCHAR* Network = Mode == NM_Client ? TEXT("Client")
         : Mode == NM_ListenServer ? TEXT("Listen server")
         : Mode == NM_DedicatedServer ? TEXT("Dedicated server") : TEXT("Standalone");
     const FText Value = FText::FromString(FString::Printf(
-        TEXT("%s\nMemory: %d / %d MB\nFPS: %.1f  Average: %.1f\n%s\n%s\n%s\n%s\n%s\n%s\nNetwork: %s\nWorld: %s"),
+        TEXT("%s\nMemory: %d / %d MB\nFPS: %.1f  Average: %.1f\n%s\n%s\n%s\n%s\n%s\n%s\n%s\nNetwork: %s\nWorld: %s"),
         *HardwareDescription, USystemInfoFunctionLibrary::GetUsedMemory(), TotalMemoryMB,
         FramesPerSecond, static_cast<double>(VisibleFrames) / FMath::Max(VisibleSeconds, UE_DOUBLE_SMALL_NUMBER),
-        *CharacterPosition, *CharacterRotation, *CameraPosition, *CameraRotation, *VelocityText, *SpeedText, Network,
+        *CharacterPosition, *CharacterRotation, *CameraPosition, *CameraRotation, *VelocityText, *SpeedText,
+        *WorldTimeText, Network,
         IsValid(Manager) && Manager->IsWorldLoading() ? TEXT("Loading") : TEXT("Ready")));
     if (!NativeDiagnostics->GetText().EqualTo(Value)) NativeDiagnostics->SetText(Value);
 }

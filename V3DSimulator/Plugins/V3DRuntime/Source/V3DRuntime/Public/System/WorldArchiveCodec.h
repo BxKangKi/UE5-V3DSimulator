@@ -12,7 +12,7 @@
 #include "CoreMinimal.h"
 #include "System/WorldArchive.h"
 
-/** Unreal adapters for the portable single-header V3D member codecs in Format/v3d.hpp. */
+/** Unreal adapters for the portable single-header V3D member codecs in Format/v3d.h. */
 namespace WorldArchiveCodec
 {
     V3DRUNTIME_API bool SerializeMesh(const FGWorldBakedMesh& Value, TArray<uint8>& Out, FString& Error);

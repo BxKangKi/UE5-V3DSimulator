@@ -29,6 +29,8 @@ void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
 {
     if (TerrainMaterial.IsNull())
         TerrainMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(V3DTerrain::DefaultMaterialPath));
+    if (FoliageMaterial.IsNull())
+        FoliageMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/ShaderLibrary/Foliage/M_Foliage.M_Foliage")));
     if (ShaderLibraryMPC.IsNull())
         ShaderLibraryMPC = TSoftObjectPtr<UMaterialParameterCollection>(FSoftObjectPath(
             TEXT("/ShaderLibrary/MPC_ShaderLibrary.MPC_ShaderLibrary")));
@@ -74,6 +76,24 @@ UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveTerrainMaterial() const
     }
 
     return TerrainMaterial.LoadSynchronous();
+}
+
+UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveFoliageMaterial() const
+{
+    if (!IsInGameThread() || IsGarbageCollecting() || FoliageMaterial.IsNull())
+    {
+        return nullptr;
+    }
+
+    if (UMaterialInterface* Existing = FoliageMaterial.Get())
+    {
+        if (IsValid(Existing))
+        {
+            return Existing;
+        }
+    }
+
+    return FoliageMaterial.LoadSynchronous();
 }
 
 UPhysicalMaterial* UV3DSimulatorAssetRegistry::ResolveDefaultPhysicalMaterial() const

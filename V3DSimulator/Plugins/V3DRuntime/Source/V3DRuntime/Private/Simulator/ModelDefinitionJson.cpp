@@ -224,18 +224,39 @@ bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root
         return false;
     }
 
+    const auto ReadBuildResolution = [&Root, &OutError](const TCHAR* Key, int32& Value, const int32 Maximum)
+    {
+        if (!Root->HasField(Key)) return true;
+        double Number = 0.0;
+        if (!Root->TryGetNumberField(Key, Number) || !FMath::IsFinite(Number)
+            || Number < 64.0 || Number > Maximum || Number != static_cast<double>(static_cast<int32>(Number)))
+        {
+            OutError = FString::Printf(TEXT("%s must be an integer from 64 to %d"), Key, Maximum);
+            return false;
+        }
+        Value = static_cast<int32>(Number);
+        return true;
+    };
+    if (!ReadBuildResolution(TEXT("BuildTextureResolution"), OutDefinition.BuildTextureResolution, 8192)
+        || !ReadBuildResolution(TEXT("BuildTerrainTextureResolution"), OutDefinition.BuildTerrainTextureResolution, 2048)) return false;
+    if (Root->HasField(TEXT("BuildTerrainFlipNormalGreen"))
+        && !Root->TryGetBoolField(TEXT("BuildTerrainFlipNormalGreen"), OutDefinition.bBuildTerrainFlipNormalGreen))
+    { OutError = TEXT("BuildTerrainFlipNormalGreen must be a boolean"); return false; }
+
     FString Shader = TEXT("Default"), Mode = TEXT("Auto");
     if ((Root->HasField(TEXT("Shader")) && !Root->TryGetStringField(TEXT("Shader"), Shader))
         || (Shader != TEXT("Default") && Shader != TEXT("Toon")))
     { OutError = TEXT("Shader must be Default or Toon"); return false; }
     OutDefinition.bToon = Shader == TEXT("Toon");
     if (Root->HasField(TEXT("MaterialMode")) && !Root->TryGetStringField(TEXT("MaterialMode"), Mode))
-    { OutError = TEXT("MaterialMode must be Auto, Opaque, Masked, or Translucent"); return false; }
+    { OutError = TEXT("MaterialMode must be Auto, Opaque, Opaque Two Sided, Translucent, or Translucent Two Sided"); return false; }
     if (Mode == TEXT("Auto")) OutDefinition.MaterialMode = 0;
     else if (Mode == TEXT("Opaque")) OutDefinition.MaterialMode = 5;
-    else if (Mode == TEXT("Masked")) OutDefinition.MaterialMode = 1;
+    else if (Mode == TEXT("Masked")) OutDefinition.MaterialMode = 5;
+    else if (Mode == TEXT("Opaque Two Sided") || Mode == TEXT("OpaqueTwoSided")) OutDefinition.MaterialMode = 6;
     else if (Mode == TEXT("Translucent")) OutDefinition.MaterialMode = 3;
-    else { OutError = TEXT("MaterialMode must be Auto, Opaque, Masked, or Translucent"); return false; }
+    else if (Mode == TEXT("Translucent Two Sided") || Mode == TEXT("TranslucentTwoSided")) OutDefinition.MaterialMode = 7;
+    else { OutError = TEXT("MaterialMode must be Auto, Opaque, Opaque Two Sided, Translucent, or Translucent Two Sided"); return false; }
 
     if (OutDefinition.ModelType == EModelDefinitionType::Dynamic)
     {

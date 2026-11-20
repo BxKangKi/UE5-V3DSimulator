@@ -63,6 +63,7 @@ void UBuildStatusWidget::BuildNativeLayout()
     NativeStatusText = AddText(NativeOutputScroll, FText::GetEmpty());
     NativeStatusText->SetAutoWrapText(true);
     NativeStatusText->SetJustification(ETextJustify::Right);
+    NativeCancelButton = AddButton(Output, NSLOCTEXT("V3DHUD", "CancelBuild", "Cancel Build"));
     NativeConfirmButton = AddButton(Output, NSLOCTEXT("V3DHUD", "Confirm", "Confirm"));
 }
 
@@ -77,6 +78,10 @@ void UBuildStatusWidget::BindNativeWidgets()
     if (IsValid(NativeConfirmButton) && !IsDesignTime())
     {
         NativeConfirmButton->OnClicked.AddUniqueDynamic(this, &UBuildStatusWidget::RequestConfirm);
+    }
+    if (IsValid(NativeCancelButton) && !IsDesignTime())
+    {
+        NativeCancelButton->OnClicked.AddUniqueDynamic(this, &UBuildStatusWidget::RequestCancelBuild);
     }
 }
 
@@ -111,6 +116,10 @@ void UBuildStatusWidget::NativeDestruct()
     if (IsValid(NativeConfirmButton))
     {
         NativeConfirmButton->OnClicked.RemoveDynamic(this, &UBuildStatusWidget::RequestConfirm);
+    }
+    if (IsValid(NativeCancelButton))
+    {
+        NativeCancelButton->OnClicked.RemoveDynamic(this, &UBuildStatusWidget::RequestCancelBuild);
     }
 
     if (IsValid(ConfirmButtonWidget))
@@ -569,6 +578,12 @@ void UBuildStatusWidget::UpdateAssignedWidgets()
         Text->SetText(FText::FromString(ObservedProjectName));
     }
 
+    const bool bShowCancel = IsBuildActive() && !bHasTerminalResult;
+    if (IsUsingNativeLayout() && IsValid(NativeCancelButton))
+    {
+        NativeCancelButton->SetIsEnabled(bShowCancel);
+        NativeCancelButton->SetVisibility(bShowCancel ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    }
     const bool bShowConfirm = bHasTerminalResult && !bConfirmationSent && !IsBuildActive();
     if (IsUsingNativeLayout() && IsValid(NativeConfirmButton))
     {
@@ -580,6 +595,17 @@ void UBuildStatusWidget::UpdateAssignedWidgets()
         ConfirmWidget->SetIsEnabled(bShowConfirm);
         ConfirmWidget->SetVisibility(bShowConfirm ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
     }
+}
+
+void UBuildStatusWidget::RequestCancelBuild()
+{
+    if (!IsBuildActive() || !IsValid(Manager))
+    {
+        return;
+    }
+    AppendOutputLine(TEXT("Cancelling project build..."));
+    Manager->CancelProjectBuild();
+    UpdateAssignedWidgets();
 }
 
 void UBuildStatusWidget::RequestConfirm()

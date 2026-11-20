@@ -8,7 +8,7 @@
  */
 
 #include "System/WorldArchive.h"
-#include "Format/v3d.hpp"
+#include "Format/v3d.h"
 
 #include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"
@@ -24,7 +24,7 @@
 
 namespace GWorldArchivePrivate
 {
-    // v3d.hpp owns the current archive revision; other revisions are rejected.
+    // v3d.h owns the current archive revision; other revisions are rejected.
     constexpr int32 HeaderBytes = v3d::archive_header_bytes;
     constexpr int64 PayloadAlignment = v3d::archive_alignment;
     constexpr int32 MaxNodesPerModel = 2000000;
@@ -132,7 +132,7 @@ namespace GWorldArchivePrivate
         return true;
     }
 
-    // The byte layout is owned by v3d.hpp. This layer only translates Unreal values.
+    // The byte layout is owned by v3d.h. This layer only translates Unreal values.
     std::string ToPortable(const FString& Value)
     {
         FTCHARToUTF8 Converted(*Value);
@@ -648,12 +648,11 @@ namespace GWorldArchivePrivate
         const FString& MemberName,
         const TArray<uint8>& RawBytes,
         FGWorldArchiveRange& OutRange,
-        FString& OutError,
-        bool bPreferFastRead = false)
+        FString& OutError)
     {
-        // Buffered archive members are metadata only. WAV payloads are intentionally forbidden
-        // here so they can only use WriteStoredFileMember(), which streams them in bounded chunks
-        // instead of creating another full-file TArray during the commit tail.
+        // Mesh, material, texture and metadata buffers share the same portable member layout.
+        // WAV payloads use WriteStoredFileMember() to stream bounded chunks without another
+        // full-file TArray during the commit tail.
         const bool bValidName = MemberName.EndsWith(TEXT(".dat"), ESearchCase::CaseSensitive)
             || MemberName.EndsWith(TEXT(".json"), ESearchCase::CaseSensitive);
         const bool bSafeName = !MemberName.IsEmpty()
@@ -669,48 +668,12 @@ namespace GWorldArchivePrivate
             return false;
         }
 
-        TArray<uint8> Compressed;
-        // Use the failure-reporting 64-bit compression API. The legacy return-value overload may
-        // assert when a bound cannot be represented, which is unacceptable for author-supplied
-        // models even though each final TArray member is capped below MAX_int32.
-        int64 Bound64 = 0;
-        const bool bBoundFitsArray = FCompression::CompressMemoryBound(
-                NAME_Zlib,
-                Bound64,
-                static_cast<int64>(RawBytes.Num()),
-                0)
-            && Bound64 > 0
-            && Bound64 <= FGWorldArchive::MaxDatMemberBytes
-            && Bound64 <= MAX_int32;
-        const int32 Bound = bBoundFitsArray ? static_cast<int32>(Bound64) : 0;
-        int64 CompressedSize = Bound64;
-        // Mesh/texture payloads are latency-sensitive range-read members.  Compressing hundreds or
-        // thousands of them creates a long zlib tail at the end of a world build and forces the
-        // first stream of each member to decompress again.  Metadata remains compressed normally.
-        bool bUseCompression = bBoundFitsArray && !bPreferFastRead;
-        if (bUseCompression)
-        {
-            Compressed.SetNumUninitialized(Bound);
-            bUseCompression = FCompression::CompressMemory(
-                NAME_Zlib,
-                Compressed.GetData(), CompressedSize,
-                RawBytes.GetData(), static_cast<int64>(RawBytes.Num()),
-                COMPRESS_BiasSpeed,
-                0)
-                && CompressedSize > 0
-                && CompressedSize < static_cast<int64>(RawBytes.Num())
-                && CompressedSize <= MAX_int32;
-
-
-            if (bUseCompression)
-            {
-                Compressed.SetNum(static_cast<int32>(CompressedSize), EAllowShrinking::No);
-            }
-            else Compressed.Reset();
-        }
-
-        const uint8* StoredData = bUseCompression ? Compressed.GetData() : RawBytes.GetData();
-        const int32 StoredSize = bUseCompression ? Compressed.Num() : RawBytes.Num();
+        // One portable storage policy for every host. Compressing metadata that contains
+        // payload CRCs makes tiny platform float differences change all subsequent offsets and
+        // total size. Stored members also avoid the startup decompression tail. Legacy zlib
+        // archives remain supported by ReadChecksummedRange.
+        const uint8* StoredData = RawBytes.GetData();
+        const int32 StoredSize = RawBytes.Num();
         if (InOutOffset > MaxArchiveBytes || StoredSize > MaxArchiveBytes - InOutOffset
             || !WriteExact(Handle, StoredData, StoredSize))
         {
@@ -723,7 +686,7 @@ namespace GWorldArchivePrivate
         OutRange.StoredSize = static_cast<uint64>(StoredSize);
         OutRange.UncompressedSize = static_cast<uint64>(RawBytes.Num());
         OutRange.Crc = FCrc::MemCrc32(RawBytes.GetData(), RawBytes.Num());
-        OutRange.Codec = bUseCompression ? 1 : 0;
+        OutRange.Codec = v3d::build_member_codec;
         InOutOffset += StoredSize;
         return true;
     }
@@ -1069,7 +1032,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("meshes/%d.dat"), Mesh.MeshIndex);
                 if (!WorldArchiveCodec::SerializeMesh(Mesh, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
                 Manifest.MeshRanges.Add(Mesh.MeshIndex, MoveTemp(Range));
                 Manifest.MeshNames.Add(Mesh.MeshIndex, Mesh.Name);
             }
@@ -1078,7 +1041,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("skins/%d.dat"), Skin.SkinIndex);
                 if (!WorldArchiveCodec::SerializeSkin(Skin, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
                 Manifest.SkinRanges.Add(Skin.SkinIndex, MoveTemp(Range));
             }
             for (const FGWorldBakedMaterial& Material : Model->BakedData.Materials)
@@ -1086,7 +1049,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("materials/%d.dat"), Material.MaterialId);
                 if (!WorldArchiveCodec::SerializeMaterial(Material, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
                 Manifest.MaterialRanges.Add(Material.MaterialId, MoveTemp(Range));
             }
             for (const FGWorldBakedTexture& Texture : Model->BakedData.Textures)
@@ -1094,7 +1057,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("textures/%d.dat"), Texture.TextureId);
                 if (!WorldArchiveCodec::SerializeTexture(Texture, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
                 Manifest.TextureRanges.Add(Texture.TextureId, MoveTemp(Range));
             }
             for (const v3d::animation& Clip : Model->BakedData.Animations)
@@ -1105,13 +1068,22 @@ namespace GWorldArchivePrivate
                 Bytes.Reset(); Bytes.Append(Encoded.data(), static_cast<int32>(Encoded.size()));
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("animations/%d.dat"), Clip.animation_id);
-                if (!WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
+                if (!WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
                 Manifest.AnimationRanges.Add(Clip.animation_id, MoveTemp(Range));
             }
             if (!Manifest.IsSane(Record.Summary, &OutError)
                 || !WorldArchiveCodec::SerializeManifest(Manifest, Bytes, OutError)
                 || !WriteDatMember(*Output, Offset, Prefix + TEXT("manifest.dat"), Bytes,
                     Record.ManifestRange, OutError)) return false;
+
+            uint64 MeshBytes = 0, TextureBytes = 0, TextureMipCount = 0;
+            for (const auto& Pair : Manifest.MeshRanges) MeshBytes += Pair.Value.StoredSize;
+            for (const auto& Pair : Manifest.TextureRanges) TextureBytes += Pair.Value.StoredSize;
+            for (const auto& Texture : Model->BakedData.Textures) TextureMipCount += Texture.Mips.Num();
+            UE_LOG(LogTemp, Display, TEXT("[V3DBuild.Layout] Model=%s Meshes=%d Textures=%d Mips=%llu MeshBytes=%llu TextureBytes=%llu Codec=Stored"),
+                *Model->Definition.Name, Manifest.MeshRanges.Num(), Manifest.TextureRanges.Num(),
+                static_cast<unsigned long long>(TextureMipCount), static_cast<unsigned long long>(MeshBytes),
+                static_cast<unsigned long long>(TextureBytes));
 
             // Catch an editor save that happened while this model's members were being written.
             if (FileManager.FileSize(*Model->Definition.GlbPath) != Model->SourceFileSize
@@ -2251,18 +2223,17 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         return true;
     };
 
+    // Bundle order becomes RuntimeLOD order. Archive ids are not LOD ranks: sorting them
+    // can turn LOD2 into LOD0 (including the collision source). Deduplicate stably instead.
     TArray<int32> UniqueMeshes;
-    UniqueMeshes = MeshIndices;
-    UniqueMeshes.Sort();
-    int32 UniqueCount = 0;
-    for (const int32 MeshIndex : UniqueMeshes)
+    UniqueMeshes.Reserve(MeshIndices.Num());
+    TSet<int32> SeenMeshes;
+    for (const int32 MeshIndex : MeshIndices)
     {
-        if (UniqueCount == 0 || UniqueMeshes[UniqueCount - 1] != MeshIndex)
-        {
-            UniqueMeshes[UniqueCount++] = MeshIndex;
-        }
+        if (SeenMeshes.Contains(MeshIndex)) continue;
+        SeenMeshes.Add(MeshIndex);
+        UniqueMeshes.Add(MeshIndex);
     }
-    UniqueMeshes.SetNum(UniqueCount, EAllowShrinking::No);
 
     TArray<FGWorldBakedMesh> MeshResults;
     MeshResults.SetNum(UniqueMeshes.Num());

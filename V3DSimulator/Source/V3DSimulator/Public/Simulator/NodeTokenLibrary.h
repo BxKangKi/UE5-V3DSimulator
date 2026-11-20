@@ -60,7 +60,7 @@ struct V3DSIMULATOR_API FSimulatorParsedNodeName
  * Single source of truth for reserved node-name directives.
  *
  * Grammar: <ordinary base name>[;<reserved token>[;<reserved token>...]]
- * A bare word, substring, prefix, suffix or underscore alias is never a directive.
+ * A semicolon is required. ;INST accepts ANY suffix. Other tokens accept .digits exporter suffixes.
  * Tokens from different families may coexist. Within one family the left-most token wins.
  */
 UCLASS()
@@ -69,6 +69,9 @@ class V3DSIMULATOR_API USimulatorNodeTokenLibrary final : public UBlueprintFunct
     GENERATED_BODY()
 
 public:
+    /** Normalize one segment. INST has prefix semantics; other directives remain exact. */
+    static FString NormalizeSegment(const FString& Segment);
+
     UFUNCTION(BlueprintPure, Category="glTF|Node Tokens")
     static FSimulatorParsedNodeName ParseNodeName(const FString& NodeName);
 

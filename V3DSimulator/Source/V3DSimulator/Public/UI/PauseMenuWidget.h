@@ -35,6 +35,7 @@ public:
 
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
+    virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
     UFUNCTION(BlueprintCallable, Category="Pause|Widgets")
     void SetTitleText(UTextBlock* InTitleText);

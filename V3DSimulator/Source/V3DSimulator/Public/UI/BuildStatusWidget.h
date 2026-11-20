@@ -115,6 +115,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Build Status")
     void RequestConfirm();
 
+    /** Cancels an active build in progress. */
+    UFUNCTION(BlueprintCallable, Category="Build Status")
+    void RequestCancelBuild();
+
     UFUNCTION(BlueprintPure, Category="Build Status")
     float GetDisplayedProgress() const { return DisplayedProgress; }
 
@@ -163,6 +167,8 @@ private:
     TObjectPtr<UScrollBox> NativeOutputScroll;
     UPROPERTY(Transient)
     TObjectPtr<UButton> NativeConfirmButton;
+    UPROPERTY(Transient)
+    TObjectPtr<UButton> NativeCancelButton;
 
     UFUNCTION()
     void HandleBuildProgress(float Progress);

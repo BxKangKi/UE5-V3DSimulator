@@ -68,6 +68,9 @@ public:
 
     UInstancedStaticMeshComponent* AssignStaticMesh(UStaticMesh* Mesh);
     bool AddNodeInstance(FName NodeName, const FTransform& LocalTransform);
+    /** Registers bounded arrays on GT; HISM tree construction remains asynchronous. */
+    bool AddNodeInstances(TConstArrayView<FWorldPreparedInstance> Instances, TArray<FName>& OutAdded);
+    void SetInstanceCullDistances(int32 Start, int32 End);
     bool RemoveNodeInstance(FName NodeName);
     /** Starts at most two bounded async tree builds per slice; never waits on the game thread. */
     bool FlushInstanceRenderUpdates(bool bFinalize = false);

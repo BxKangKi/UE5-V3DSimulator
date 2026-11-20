@@ -289,6 +289,7 @@ bool AStaticActor::IsLocationStreamingReady(const FVector& WorldLocation) const
     {
         const AInstancedMeshActor* Group = GroupPair.Value.Get();
         if (!IsValid(Group) || !Group->AreChunkTreesReady()) return false;
+        if (IsMeshGroupUnavailable(GroupPair.Key)) continue;
 
         float MaxWorldRadius = static_cast<float>(FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm));
         for (const FName MeshName : Group->GetReferencedMeshNames())
@@ -375,6 +376,7 @@ void AStaticActor::BeginPlay()
     WaterNodeMap.Empty();
     LoadedWaterNodes.Empty();
     OwnedInstancedMeshActors.Empty();
+    MeshGroupRecovery.Empty();
     WaterActorMap.Empty();
     PendingInstancedGroups.Empty();
     PendingInstancedGroupNames.Empty();
@@ -959,11 +961,29 @@ void AStaticActor::ReleaseInstancedMeshActors()
     {
         if (AInstancedMeshActor* Actor = Pair.Value.Get(); IsValid(Actor))
         {
+            if (UWorld* World = GetWorld())
+                if (auto* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+                    Gate->ClearModelRegions(Actor);
             Actor->ReleaseRuntimeResources();
             Actor->Destroy();
         }
     }
     OwnedInstancedMeshActors.Empty();
+    MeshGroupRecovery.Empty();
+}
+
+bool AStaticActor::IsMeshGroupUnavailable(const FName GroupName) const
+{
+    const FV3DMeshGroupRecovery* Recovery = MeshGroupRecovery.Find(GroupName);
+    return Recovery && Recovery->IsUnavailable();
+}
+
+int32 AStaticActor::GetUnavailableMeshGroupCount() const
+{
+    int32 Count = 0;
+    for (const auto& Pair : MeshGroupRecovery)
+        if (Pair.Value.IsUnavailable()) ++Count;
+    return Count;
 }
 
 void AStaticActor::PruneUnreferencedMeshMetadata()
@@ -1337,6 +1357,11 @@ void AStaticActor::LaunchNextStreamingBatch()
         {
             const FName GroupName = bWaterGroup
                 ? NAME_None : InstancedActor->GetGroupName();
+            if (!bWaterGroup && IsMeshGroupUnavailable(GroupName))
+            {
+                SetStreamGroupProgress(GroupName, 1.0f);
+                return true;
+            }
             // Unloaded groups outside a conservative bound need no action/snapshot/worker.
             // Loaded groups must still run so instances leaving the range can be released.
             if (!bWaterGroup && !InstancedActor->HasLoadedNodes()
@@ -1505,12 +1530,37 @@ void AStaticActor::OnStreamCompleted(
     }
     if (Result.bGroupFailed)
     {
-        RecordStreamingFailure();
-        WriteLogAsync(FString::Printf(
-            TEXT("Mesh group retained for retry. Static=%s Group=%s Node=%s Mesh=%s Stage=%s Reason=%s RetryIn=%.2fs"),
-            *ModelReference, *Result.GroupName.ToString(), *Result.FailedNode.ToString(),
-            *Result.FailedMesh.ToString(), *Result.FailureStage, *Result.FailureReason,
-            FMath::Max(0.0, StreamingRetry.GetRetryAfterSeconds() - FPlatformTime::Seconds())));
+        const bool bUnavailable = Result.bMeshPayloadUnavailable && !Result.bWaterGroup
+            && MeshGroupRecovery.FindOrAdd(Result.GroupName).RecordFailedPass();
+        if (bUnavailable)
+        {
+            // A completed pass exhausted every valid LOD three times. Keep definitions for a
+            // fresh world/metadata load, but stop letting this one unusable group freeze the world.
+            // Region ownership is per group so another group's pending collision stays protected.
+            if (const auto* Group = OwnedInstancedMeshActors.Find(Result.GroupName))
+                if (UWorld* World = GetWorld())
+                    if (auto* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+                        Gate->ClearModelRegions(Group->Get());
+            const FString Detail = FString::Printf(
+                TEXT("Mesh group unavailable after %d exhausted passes; continuing with missing geometry/collision until scene reload. Static=%s Group=%s Node=%s Mesh=%s Stage=%s Reason=%s"),
+                FV3DMeshGroupRecovery::MaxFailedPasses, *ModelReference, *Result.GroupName.ToString(),
+                *Result.FailedNode.ToString(), *Result.FailedMesh.ToString(), *Result.FailureStage, *Result.FailureReason);
+            WriteLogAsync(Detail);
+            UE_LOG(LogTemp, Warning, TEXT("%s"), *Detail);
+        }
+        else
+        {
+            RecordStreamingFailure();
+            WriteLogAsync(FString::Printf(
+                TEXT("Mesh group retained for retry. Static=%s Group=%s Node=%s Mesh=%s Stage=%s Reason=%s RetryIn=%.2fs"),
+                *ModelReference, *Result.GroupName.ToString(), *Result.FailedNode.ToString(),
+                *Result.FailedMesh.ToString(), *Result.FailureStage, *Result.FailureReason,
+                FMath::Max(0.0, StreamingRetry.GetRetryAfterSeconds() - FPlatformTime::Seconds())));
+        }
+    }
+    else
+    {
+        MeshGroupRecovery.Remove(Result.GroupName);
     }
     const bool bHasPendingGroups =
         PendingStreamGroupIndex < PendingStreamGroupNames.Num() || bPendingWaterStream;
@@ -1531,6 +1581,9 @@ void AStaticActor::OnStreamCompleted(
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
 #include "Engine/World.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "UObject/StrongObjectPtr.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DStaticStreamingSchedulingTest,
     "V3DSimulator.Streaming.Memory.StaticSchedulingLifetime",
@@ -1653,4 +1706,110 @@ bool FV3DStaticStreamingRecoveryTest::RunTest(const FString&)
     TestFalse(TEXT("Late metadata callback cannot restart a released scene"), Scene->bReloadMetadataOnRetry);
     return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FV3DStaticMeshFailureIsolationTest,
+    "V3DSimulator.Streaming.Regression.TerminalMeshFailureIsolation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FV3DStaticMeshFailureIsolationTest::RunTest(const FString&)
+{
+    const auto Values = UWorld::InitializationValues().AllowAudioPlayback(false)
+        .CreatePhysicsScene(true).CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false);
+    UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None,
+        nullptr, true, ERHIFeatureLevel::Num, &Values);
+    if (!TestNotNull(TEXT("Failure isolation world"), World)) return false;
+    ON_SCOPE_EXIT { World->DestroyWorld(false); };
+    AStaticActor* Scene = World->SpawnActor<AStaticActor>();
+    AInstancedMeshActor* Group = World->SpawnActor<AInstancedMeshActor>();
+    ACharacter* Character = World->SpawnActor<ACharacter>();
+    auto* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>();
+    if (!TestNotNull(TEXT("Scene"), Scene) || !TestNotNull(TEXT("Group"), Group)
+        || !TestNotNull(TEXT("Character"), Character) || !TestNotNull(TEXT("Gate"), Gate)) return false;
+    const FName GroupName(TEXT("BrokenMesh")), NodeName(TEXT("Node")), MeshName(TEXT("Mesh"));
+    FInstancedMeshGroupInitData Definitions;
+    FModelNodeData Node;
+    Node.MeshName = MeshName;
+    Definitions.Nodes.Add(NodeName, Node);
+    Definitions.NodeBounds = FBox::BuildAABB(FVector::ZeroVector, FVector(50));
+    Definitions.MaxNodeScale = 1.0;
+    Definitions.ReferencedMeshNames.Add(MeshName);
+    auto& Chunk = Definitions.StreamChunks.Add(FIntVector::ZeroValue);
+    Chunk.LocalBounds = Definitions.NodeBounds;
+    Chunk.Nodes.Add(NodeName);
+    if (!TestTrue(TEXT("Group initializes"), Group->InitializeGroup(GroupName, MoveTemp(Definitions)))) return false;
+    Group->SetOwner(Scene);
+    Scene->OwnedInstancedMeshActors.Add(GroupName, Group);
+    FModelMeshData Mesh;
+    Mesh.LOD0 = 0; Mesh.Size = FVector(100);
+    Scene->AllMeshMap.Add(MeshName, Mesh);
+    Scene->BakedAsset = NewObject<UWorldBakedModelAsset>();
+    Scene->bHasModelMetadata = true;
+    TestFalse(TEXT("Missing in-range geometry initially blocks destination readiness"),
+        Scene->IsLocationStreamingReady(FVector::ZeroVector));
+
+    Character->DispatchBeginPlay();
+    auto* Movement = Character->GetCharacterMovement();
+    const FVector Velocity(120, 30, 0);
+    Movement->SetMovementMode(MOVE_Custom, 7);
+    Movement->Velocity = Velocity;
+    const FBox Bounds(FVector(-1000), FVector(1000));
+    TStrongObjectPtr<UObject> OtherGroup(NewObject<UObject>());
+    Gate->SetModelRegionAvailable(Group, NodeName, Bounds, false);
+    Gate->SetModelRegionAvailable(OtherGroup.Get(), NodeName, Bounds, false);
+    Gate->Tick(1.0f / 60.0f);
+    TestTrue(TEXT("Pending collision pauses movement"), Movement->MovementMode == MOVE_None);
+
+    FWorldSceneStreamResult Failed;
+    Failed.GroupName = GroupName;
+    Failed.bGroupFailed = true;
+    Failed.bMeshPayloadUnavailable = true;
+    Failed.FailureStage = TEXT("MeshLoad");
+    Failed.FailureReason = TEXT("injected exhausted LOD pass");
+    Scene->StreamingEvaluation.Capture(Scene->GetStreamingEvaluationInputs());
+    Scene->bAsyncLoading = true;
+    Scene->OnStreamCompleted(Failed);
+    Scene->StreamingRetry.BeginAttempt();
+    Scene->StreamingEvaluation.Capture(Scene->GetStreamingEvaluationInputs());
+    FWorldSceneStreamResult Recovered;
+    Recovered.GroupName = GroupName;
+    Scene->OnStreamCompleted(Recovered);
+    TestFalse(TEXT("A successful pass clears this group's earlier failure history"),
+        Scene->MeshGroupRecovery.Contains(GroupName));
+
+    for (int32 Pass = 1; Pass <= FV3DMeshGroupRecovery::MaxFailedPasses; ++Pass)
+    {
+        Scene->StreamingRetry.BeginAttempt();
+        Scene->StreamingEvaluation.Capture(Scene->GetStreamingEvaluationInputs());
+        Scene->bAsyncLoading = true;
+        Scene->OnStreamCompleted(Failed);
+        if (Pass < FV3DMeshGroupRecovery::MaxFailedPasses)
+        {
+            TestFalse(TEXT("Transient failure retains the retry and collision barrier"), Scene->GetIsLoaded());
+            TestEqual(TEXT("Transient failure is not unavailable"), Scene->GetUnavailableMeshGroupCount(), 0);
+        }
+    }
+    TestTrue(TEXT("Exhausted geometry no longer blocks scene completion"), Scene->GetIsLoaded());
+    TestEqual(TEXT("Degraded state is observable"), Scene->GetUnavailableMeshGroupCount(), 1);
+    TestTrue(TEXT("Exhausted geometry no longer blocks destination readiness"),
+        Scene->IsLocationStreamingReady(FVector::ZeroVector));
+    TestTrue(TEXT("Immutable definitions and mesh metadata are retained for scene reload"),
+        Group->CaptureDefinitions().IsValid() && Scene->AllMeshMap.Contains(MeshName));
+    Gate->Tick(1.0f / 60.0f);
+    TestTrue(TEXT("Another group's pending collision is still protected"), Movement->MovementMode == MOVE_None);
+    Gate->ClearModelRegions(OtherGroup.Get());
+    Gate->Tick(1.0f / 60.0f);
+    TestTrue(TEXT("Unavailable group's barrier is gone and movement resumes"),
+        Movement->MovementMode == MOVE_Custom && Movement->CustomMovementMode == 7);
+    TestTrue(TEXT("Resuming restores the original velocity"), Movement->Velocity.Equals(Velocity));
+
+    Scene->StreamingRetry.Reset();
+    Scene->StreamingEvaluation.Invalidate();
+    Scene->NextStreamingUpdateSeconds = 0;
+    Scene->StartStreamingStep();
+    TestTrue(TEXT("Stationary refresh skips terminal payloads without launching another action"),
+        Scene->GetIsLoaded() && Scene->ActiveStreamActions.IsEmpty());
+    Scene->ReleaseRuntimeResourcesForWorldExit();
+    TestEqual(TEXT("World teardown resets the per-generation failure state"), Scene->GetUnavailableMeshGroupCount(), 0);
+    return true;
+}
+
 #endif

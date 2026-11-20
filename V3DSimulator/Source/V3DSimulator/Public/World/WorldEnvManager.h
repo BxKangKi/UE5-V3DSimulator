@@ -28,6 +28,7 @@ class UMaterialParameterCollection;
 struct FStreamableHandle;
 class UExponentialHeightFogComponent;
 class UGameUpdateSubSystem;
+class UUnderwaterShaftOcclusionComponent;
 
 /**
  * Rendering-only world actor.
@@ -122,8 +123,23 @@ private:
     void UnregisterGameUpdate();
     void UpdateFromGameUpdate(float DeltaSeconds);
 
-    /** Calculates and applies the current sun/moon rotations without a per-frame UObject. */
+    /** Calculates and applies the current sun/moon rotations and physical water optical tints. */
     void UpdateSkyLighting();
+    void UpdatePhysicalUnderwaterColors(float SunElevationSin, bool bForceUpdate = false);
+    void UpdateFoliageInteractors();
+    void UpdateUnderwaterLightShafts();
+    UPROPERTY(Transient)
+    TObjectPtr<UUnderwaterShaftOcclusionComponent> UnderwaterShaftOcclusion;
+    bool bShaftDefaultsCaptured = false;
+    bool bUnderwaterScreenShaftsSuppressed = false;
+    bool bAboveWaterSunOcclusion = false;
+    bool bAboveWaterSunBloom = false;
+    bool bAboveWaterMoonOcclusion = false;
+    bool bAboveWaterMoonBloom = false;
+    bool bLastShaftOceanActive = false;
+    float LastShaftOceanHeight = 0.0f;
+    TWeakObjectPtr<UMaterialInstanceDynamic> LastConfiguredShaftMaterial;
+    float LastAppliedWaterSunElevation = -999.0f;
 
     UPROPERTY(Transient)
     TObjectPtr<UWorldData> Data;
@@ -143,7 +159,6 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UMaterialParameterCollection> ShaderLibraryMPC;
-
 
     TSharedPtr<FStreamableHandle> EnvironmentAssetLoadHandle;
 

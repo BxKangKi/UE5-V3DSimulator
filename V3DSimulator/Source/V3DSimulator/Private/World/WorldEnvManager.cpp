@@ -9,6 +9,13 @@
  */
 
 #include "World/WorldEnvManager.h"
+#include "World/UnderwaterRenderPolicy.h"
+#include "World/UnderwaterShaftOcclusionComponent.h"
+#include "Camera/PlayerCameraManager.h"
+#include "Kismet/GameplayStatics.h"
+#include "EngineUtils.h"
+#include "GameFramework/Pawn.h"
+#include "Model/DynamicActor.h"
 
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
@@ -57,8 +64,9 @@ namespace WorldEnvManagerPrivate
 
     /**
      * Calculates a guarded solar direction directly from immutable values already read on the
-     * game thread. The former Blueprint async-action wrapper allocated a UObject for a few
-     * trigonometric operations and was the final legacy owner of this calculation.
+     * game thread. Returns the DirectionalLight propagation rotation (Forward = -ToSun),
+     * so positive solar altitude yields a downward-shining light (negative Pitch) and
+     * SkyAtmosphere / underwater shafts (-Sun->GetForwardVector()) align with the actual sun.
      */
     FRotator CalculateSunRotation(const UWorldData* WorldData)
     {
@@ -114,17 +122,21 @@ namespace WorldEnvManagerPrivate
                 - FMath::Sin(LatitudeRadians) * FMath::Cos(SunDeclination)
                     * FMath::Cos(HourAngleRadians));
         const float OrientedAzimuth = Azimuth + Deg2Rad * WorldData->Longitude;
-        const FVector Direction(
+
+        // Vector from observer TOWARD the sun in the sky (+Z when Altitude > 0).
+        const FVector ToSunDirection(
             FMath::Cos(Altitude) * FMath::Cos(OrientedAzimuth),
             FMath::Cos(Altitude) * FMath::Sin(OrientedAzimuth),
             FMath::Sin(Altitude));
-        if (Direction.IsNearlyZero())
+        if (ToSunDirection.IsNearlyZero())
         {
             return FRotator(-35.0f, -30.0f, 0.0f);
         }
 
+        // Unreal DirectionalLight Forward (+X) is the direction light rays TRAVEL (from sun to ground).
+        const FVector LightPropagationDir = (-ToSunDirection).GetSafeNormal();
         FRotator Rotation =
-            FRotationMatrix::MakeFromX(Direction.GetSafeNormal()).Rotator();
+            FRotationMatrix::MakeFromX(LightPropagationDir).Rotator();
         Rotation.Normalize();
         return Rotation;
     }
@@ -176,6 +188,7 @@ AWorldEnvManager::AWorldEnvManager()
     Moon->SetAtmosphereSunLightIndex(1);
     Moon->SetIntensity(0.005f);
     Moon->SetUseTemperature(true);
+    Moon->SetTemperature(4100.0f);
     Moon->SetEnableLightShaftOcclusion(true);
     Moon->SetEnableLightShaftBloom(true);
     Moon->SetBloomScale(0.0001f);
@@ -183,6 +196,8 @@ AWorldEnvManager::AWorldEnvManager()
     Moon->bCastShadowsOnAtmosphere = true;
     Moon->SetForwardShadingPriority(1);
     Moon->SetRelativeRotation(FRotator(35.0f, 150.0f, 0.0f));
+
+    UnderwaterShaftOcclusion = CreateDefaultSubobject<UUnderwaterShaftOcclusionComponent>(TEXT("UnderwaterShaftOcclusion"));
 
     PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProcess"));
     PostProcess->SetupAttachment(RootComponent);
@@ -233,7 +248,6 @@ void AWorldEnvManager::BeginPlay()
         Skybox->SetCastShadow(false);
         Skybox->SetVisibleInRayTracing(false);
     }
-
 
     SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     if (UGameManagerSubSystem* GameManager = SubSystem.Get())
@@ -400,6 +414,7 @@ void AWorldEnvManager::HandleEnvironmentAssetsReady()
     if (IsValid(Registry->OceanPostProcessMaterial.Get()))
     {
         OceanPostProcessMaterial = UMaterialInstanceDynamic::Create(Registry->OceanPostProcessMaterial.Get(), this);
+        LastAppliedWaterSunElevation = -999.0f;
         if (IsValid(PostProcess) && IsValid(OceanPostProcessMaterial))
         {
             // The underwater-only material has no cel shading or stencil dependency.
@@ -419,12 +434,18 @@ void AWorldEnvManager::HandleEnvironmentAssetsReady()
 
     ApplyCloudSettings();
     RefreshShaderLibraryParameters();
+    if (IsValid(Sun))
+    {
+        const float SunElevationSin = FMath::Clamp(static_cast<float>(-Sun->GetForwardVector().Z), -1.0f, 1.0f);
+        UpdatePhysicalUnderwaterColors(SunElevationSin, true);
+    }
 }
 
 void AWorldEnvManager::RefreshShaderLibraryParameters()
 {
     check(IsInGameThread());
 
+    UpdateUnderwaterLightShafts();
     const bool bOceanEnabled = IsValid(Data) && Data->bOcean && bRenderingActive;
     const float OceanHeight = bOceanEnabled && FMath::IsFinite(Data->OceanHeightCm)
         ? static_cast<float>(Data->OceanHeightCm) : 0.0f;
@@ -474,6 +495,14 @@ void AWorldEnvManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
         EnvironmentAssetLoadHandle.Reset();
     }
     StopRendering();
+    if (IsValid(PostProcess))
+    {
+        PostProcess->Settings.WeightedBlendables.Array.Reset();
+    }
+    OceanPostProcessMaterial = nullptr;
+    CloudMaterial = nullptr;
+    ShaderLibraryMPC = nullptr;
+    LastConfiguredShaftMaterial.Reset();
     SubSystem.Reset();
     Super::EndPlay(EndPlayReason);
 }
@@ -488,12 +517,15 @@ void AWorldEnvManager::InitializeRendering(UWorldData* InWorldData)
 
     Data = InWorldData;
     bRenderingActive = true;
+    LastAppliedWaterSunElevation = -999.0f;
     PrepareForWorldLoading();
     ConfigureRenderingSettings();
     ApplyCloudSettings();
     RefreshShaderLibraryParameters();
     RegisterGameUpdate();
     UpdateSkyLighting();
+    UpdateFoliageInteractors();
+    UpdateUnderwaterLightShafts();
 }
 
 void AWorldEnvManager::StopRendering()
@@ -546,6 +578,26 @@ void AWorldEnvManager::RefreshRuntimeSettings()
     if (!IsValid(Setting))
     {
         return;
+    }
+
+    // Apply to both lights on creation and every settings change; Blueprint defaults must
+    // not restore the engine's short 200 m shadow range after the user has set a longer one.
+    for (UDirectionalLightComponent* Light : {Sun.Get(), Moon.Get()})
+    {
+        if (!IsValid(Light)) continue;
+        WorldEnvManagerPrivate::ConfigureLightShadows(Light);
+        Light->SetCastShadows(Setting->ShadowQuality > 0);
+        const float ShadowRange = Setting->GetEffectiveShadowDistanceCentimeters();
+        Light->SetDynamicShadowDistanceMovableLight(ShadowRange);
+        Light->SetDynamicShadowDistanceStationaryLight(ShadowRange);
+#if PLATFORM_ANDROID || PLATFORM_IOS
+        Light->SetDynamicShadowCascades(2);
+#else
+        Light->SetDynamicShadowCascades(Setting->ShadowQuality >= 2 ? 4 : 3);
+#endif
+        Light->SetCascadeDistributionExponent(3.0f);
+        Light->SetCascadeTransitionFraction(0.15f);
+        Light->SetShadowDistanceFadeoutFraction(0.15f);
     }
 
     if (Setting->bHeightFog)
@@ -732,6 +784,7 @@ void AWorldEnvManager::UpdateFromGameUpdate(float /*DeltaSeconds*/)
 {
     // Cloud settings are applied when rendering/settings change, not redundantly every frame.
     UpdateSkyLighting();
+    UpdateUnderwaterLightShafts();
 }
 
 void AWorldEnvManager::UpdateSkyLighting()
@@ -744,13 +797,202 @@ void AWorldEnvManager::UpdateSkyLighting()
     const WorldEnvManagerPrivate::FSkyLightRotations Result =
         WorldEnvManagerPrivate::CalculateLightRotations(Data);
 
+    float SunElevationSin = 0.5f;
     if (IsValid(Sun))
     {
         Sun->SetWorldRotation(Result.Sun);
+        SunElevationSin = FMath::Clamp(static_cast<float>(-Sun->GetForwardVector().Z), -1.0f, 1.0f);
+        // Smooth physical sunrise/sunset attenuation and color temperature shift.
+        const float SunDayFactor = FMath::SmoothStep(-0.04f, 0.18f, SunElevationSin);
+        Sun->SetIntensity(20.0f * SunDayFactor);
+        const float TempAlpha = FMath::SmoothStep(0.0f, 0.45f, SunElevationSin);
+        Sun->SetTemperature(FMath::Lerp(2600.0f, 5800.0f, TempAlpha));
     }
 
     if (IsValid(Moon))
     {
         Moon->SetWorldRotation(Result.Moon);
+        const float MoonElevationSin = FMath::Clamp(static_cast<float>(-Moon->GetForwardVector().Z), -1.0f, 1.0f);
+        const float NightFactor = 1.0f - FMath::SmoothStep(-0.04f, 0.12f, SunElevationSin);
+        // Subtle realistic moonlight intensity so nights stay naturally dark.
+        Moon->SetIntensity(0.008f * FMath::SmoothStep(0.0f, 0.20f, MoonElevationSin) * NightFactor);
+    }
+
+    UpdatePhysicalUnderwaterColors(SunElevationSin, false);
+}
+
+void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSin, const bool bForceUpdate)
+{
+    if (!IsValid(OceanPostProcessMaterial))
+    {
+        return;
+    }
+    if (!bForceUpdate && FMath::Abs(SunElevationSin - LastAppliedWaterSunElevation) < 0.005f)
+    {
+        return;
+    }
+    LastAppliedWaterSunElevation = SunElevationSin;
+
+    // Physically-based clear ocean equilibrium colors derived from Jerlov Type I spectral
+    // absorption/scattering modulated by solar elevation and air-water Fresnel transmission.
+    const float Daylight = FMath::SmoothStep(-0.06f, 0.25f, SunElevationSin);
+    const float CosAir = FMath::Clamp(SunElevationSin, 0.0f, 1.0f);
+    const float OneMinusCos = 1.0f - CosAir;
+    const float Fresnel = 0.0204f + (1.0f - 0.0204f) * FMath::Pow(OneMinusCos, 5.0f);
+    const float SurfaceTrans = 1.0f - Fresnel;
+    const float LightScale = 0.03f + 0.97f * Daylight * SurfaceTrans;
+
+    // Darker deep-ocean ambient equilibrium matched to Beer-Lambert water surface optics.
+    const FLinearColor PhysicalFogAmbient(
+        0.0015f * LightScale,
+        0.016f * LightScale,
+        0.042f * LightScale,
+        1.0f);
+    // Single-scattering marine in-scatter color (dark ocean navy-teal, never bright sky blue).
+    const FLinearColor PhysicalFogScatter(
+        0.006f * LightScale,
+        0.055f * LightScale,
+        0.125f * LightScale,
+        1.0f);
+    // Waterline meniscus refraction band.
+    const FLinearColor PhysicalBandColor(
+        0.009f * LightScale,
+        0.068f * LightScale,
+        0.140f * LightScale,
+        1.0f);
+    // Neutral-warm shaft base tint (Beer-Lambert spectral extinction in Underwater.ush supplies depth color).
+    const float WarmShift = FMath::SmoothStep(0.0f, 0.35f, SunElevationSin);
+    const FLinearColor PhysicalShaftColor(
+        FMath::Lerp(0.95f, 0.80f, WarmShift),
+        FMath::Lerp(0.76f, 0.94f, WarmShift),
+        FMath::Lerp(0.55f, 1.00f, WarmShift),
+        1.0f);
+
+    OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Fog Ambient Color"), PhysicalFogAmbient);
+    OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Fog Scatter Color"), PhysicalFogScatter);
+    OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Band Color"), PhysicalBandColor);
+    OceanPostProcessMaterial->SetVectorParameterValue(TEXT("ShaftColor"), PhysicalShaftColor);
+    OceanPostProcessMaterial->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
+}
+
+void AWorldEnvManager::UpdateFoliageInteractors()
+{
+    if (!IsValid(ShaderLibraryMPC))
+    {
+        return;
+    }
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+    UMaterialParameterCollectionInstance* Parameters = World->GetParameterCollectionInstance(ShaderLibraryMPC);
+    if (!IsValid(Parameters))
+    {
+        return;
+    }
+
+    static const FName InteractorNames[4] = {
+        TEXT("FoliageInteractor0"),
+        TEXT("FoliageInteractor1"),
+        TEXT("FoliageInteractor2"),
+        TEXT("FoliageInteractor3")
+    };
+
+    FLinearColor Slots[4] = {
+        FLinearColor(0.f, 0.f, 0.f, 0.f),
+        FLinearColor(0.f, 0.f, 0.f, 0.f),
+        FLinearColor(0.f, 0.f, 0.f, 0.f),
+        FLinearColor(0.f, 0.f, 0.f, 0.f)
+    };
+    int32 SlotIndex = 0;
+
+    FVector ReferenceLocation = FVector::ZeroVector;
+    if (APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0); IsValid(PlayerPawn))
+    {
+        ReferenceLocation = PlayerPawn->GetActorLocation();
+        Slots[SlotIndex++] = FLinearColor(ReferenceLocation.X, ReferenceLocation.Y, ReferenceLocation.Z, 115.0f);
+    }
+
+    // Populate up to 3 nearest moving dynamic actors around the player for foliage bending.
+    struct FMovingCandidate
+    {
+        double DistSq;
+        FLinearColor Packed;
+    };
+    TArray<FMovingCandidate> Candidates;
+    constexpr double MaxTrackDistSq = 2500.0 * 2500.0;
+    for (TActorIterator<ADynamicActor> It(World); It; ++It)
+    {
+        ADynamicActor* Dyn = *It;
+        if (!IsValid(Dyn)) continue;
+        const FVector Vel = Dyn->GetVelocity();
+        if (Vel.SizeSquared() < 100.0) continue; // Only moving objects bend foliage dynamically.
+        const FVector Loc = Dyn->GetActorLocation();
+        const double DistSq = FVector::DistSquared(Loc, ReferenceLocation);
+        if (DistSq > MaxTrackDistSq) continue;
+        const FBox Bounds = Dyn->GetComponentsBoundingBox(true);
+        const float Radius = FMath::Clamp(static_cast<float>(Bounds.GetExtent().Size2D()) + 45.0f, 65.0f, 320.0f);
+        Candidates.Add({DistSq, FLinearColor(Loc.X, Loc.Y, Loc.Z, Radius)});
+    }
+    Candidates.Sort([](const FMovingCandidate& A, const FMovingCandidate& B) { return A.DistSq < B.DistSq; });
+    for (const FMovingCandidate& C : Candidates)
+    {
+        if (SlotIndex >= 4) break;
+        Slots[SlotIndex++] = C.Packed;
+    }
+
+    for (int32 i = 0; i < 4; ++i)
+    {
+        Parameters->SetVectorParameterValue(InteractorNames[i], Slots[i]);
+    }
+}
+
+void AWorldEnvManager::UpdateUnderwaterLightShafts()
+{
+    check(IsInGameThread());
+    if (!bShaftDefaultsCaptured)
+    {
+        // Capture after Blueprint defaults have been applied, before the first water transition.
+        bAboveWaterSunOcclusion = IsValid(Sun) && Sun->bEnableLightShaftOcclusion;
+        bAboveWaterSunBloom = IsValid(Sun) && Sun->bEnableLightShaftBloom;
+        bAboveWaterMoonOcclusion = IsValid(Moon) && Moon->bEnableLightShaftOcclusion;
+        bAboveWaterMoonBloom = IsValid(Moon) && Moon->bEnableLightShaftBloom;
+        bShaftDefaultsCaptured = true;
+    }
+    const APlayerCameraManager* Camera = UGameplayStatics::GetPlayerCameraManager(this, 0);
+    const bool bOceanActive = bRenderingActive && IsValid(Data) && Data->bOcean && IsValid(Camera);
+    const float OceanHeight = IsValid(Data) && FMath::IsFinite(Data->OceanHeightCm)
+        ? static_cast<float>(Data->OceanHeightCm) : 0.0f;
+    const bool bSuppress = V3DUnderwaterRender::SuppressScreenShafts(bOceanActive,
+        IsValid(OceanPostProcessMaterial), IsValid(Camera) ? Camera->GetCameraLocation().Z : 0.0,
+        OceanHeight, bUnderwaterScreenShaftsSuppressed);
+
+    if (IsValid(UnderwaterShaftOcclusion))
+    {
+        const bool bShaftConfigChanged = (LastConfiguredShaftMaterial.Get() != OceanPostProcessMaterial.Get())
+            || (bLastShaftOceanActive != bOceanActive)
+            || !FMath::IsNearlyEqual(LastShaftOceanHeight, OceanHeight, 0.1f);
+        if (bShaftConfigChanged)
+        {
+            UnderwaterShaftOcclusion->Configure(OceanPostProcessMaterial, Sun, bOceanActive, OceanHeight);
+            LastConfiguredShaftMaterial = OceanPostProcessMaterial;
+            bLastShaftOceanActive = bOceanActive;
+            LastShaftOceanHeight = OceanHeight;
+        }
+    }
+    if (bSuppress == bUnderwaterScreenShaftsSuppressed) return;
+    bUnderwaterScreenShaftsSuppressed = bSuppress;
+    // UE's radial SceneDepth occlusion cannot distinguish the water plane from a wall. It
+    // would apply a second, shifted silhouette over the new water volume integration.
+    if (IsValid(Sun))
+    {
+        Sun->SetEnableLightShaftOcclusion(!bSuppress && bAboveWaterSunOcclusion);
+        Sun->SetEnableLightShaftBloom(!bSuppress && bAboveWaterSunBloom);
+    }
+    if (IsValid(Moon))
+    {
+        Moon->SetEnableLightShaftOcclusion(!bSuppress && bAboveWaterMoonOcclusion);
+        Moon->SetEnableLightShaftBloom(!bSuppress && bAboveWaterMoonBloom);
     }
 }

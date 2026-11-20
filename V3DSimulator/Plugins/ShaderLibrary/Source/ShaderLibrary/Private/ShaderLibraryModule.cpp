@@ -61,24 +61,68 @@ void FShaderLibraryModule::EnsureShaderLibraryParameters()
         UE_LOG(LogShaderLibraryModule, Error, TEXT("MPC_ShaderLibrary could not be loaded."));
         return;
     }
+
     const FName ParameterName(TEXT("MaxRenderDistance"));
     const bool bAddDistance = !Collection->GetParameterId(ParameterName).IsValid();
     const FName RemovedParameter(TEXT("CelShadingMode"));
-    if (!bAddDistance && !Collection->GetParameterId(RemovedParameter).IsValid()) return;
+    const bool bRemoveCel = Collection->GetParameterId(RemovedParameter).IsValid();
 
-    FProperty* Property = FindFProperty<FProperty>(UMaterialParameterCollection::StaticClass(),
-        GET_MEMBER_NAME_CHECKED(UMaterialParameterCollection, ScalarParameters));
+    const FName FoliageVectorNames[] = {
+        TEXT("FoliageInteractor0"),
+        TEXT("FoliageInteractor1"),
+        TEXT("FoliageInteractor2"),
+        TEXT("FoliageInteractor3")
+    };
+    bool bAddFoliageVectors = false;
+    for (const FName& VecName : FoliageVectorNames)
+    {
+        if (!Collection->GetParameterId(VecName).IsValid())
+        {
+            bAddFoliageVectors = true;
+            break;
+        }
+    }
+
+    if (!bAddDistance && !bRemoveCel && !bAddFoliageVectors) return;
+
     Collection->Modify();
-    Collection->PreEditChange(Property);
-    FCollectionScalarParameter Parameter;
-    Parameter.ParameterName = ParameterName;
-    Parameter.Id = FGuid::NewGuid();
-    Parameter.DefaultValue = 819200.0f; // Unreal centimetres; runtime settings replace this value.
-    Collection->ScalarParameters.RemoveAll([RemovedParameter](const FCollectionScalarParameter& Item)
-        { return Item.ParameterName == RemovedParameter; });
-    if (bAddDistance) Collection->ScalarParameters.Add(Parameter);
-    FPropertyChangedEvent Event(Property, EPropertyChangeType::ValueSet);
-    Collection->PostEditChangeProperty(Event);
+    if (bAddDistance || bRemoveCel)
+    {
+        FProperty* ScalarProperty = FindFProperty<FProperty>(UMaterialParameterCollection::StaticClass(),
+            GET_MEMBER_NAME_CHECKED(UMaterialParameterCollection, ScalarParameters));
+        Collection->PreEditChange(ScalarProperty);
+        Collection->ScalarParameters.RemoveAll([RemovedParameter](const FCollectionScalarParameter& Item)
+            { return Item.ParameterName == RemovedParameter; });
+        if (bAddDistance)
+        {
+            FCollectionScalarParameter Parameter;
+            Parameter.ParameterName = ParameterName;
+            Parameter.Id = FGuid::NewGuid();
+            Parameter.DefaultValue = 819200.0f;
+            Collection->ScalarParameters.Add(Parameter);
+        }
+        FPropertyChangedEvent Event(ScalarProperty, EPropertyChangeType::ValueSet);
+        Collection->PostEditChangeProperty(Event);
+    }
+
+    if (bAddFoliageVectors)
+    {
+        FProperty* VectorProperty = FindFProperty<FProperty>(UMaterialParameterCollection::StaticClass(),
+            GET_MEMBER_NAME_CHECKED(UMaterialParameterCollection, VectorParameters));
+        Collection->PreEditChange(VectorProperty);
+        for (const FName& VecName : FoliageVectorNames)
+        {
+            if (Collection->GetParameterId(VecName).IsValid()) continue;
+            FCollectionVectorParameter VecParam;
+            VecParam.ParameterName = VecName;
+            VecParam.Id = FGuid::NewGuid();
+            VecParam.DefaultValue = FLinearColor(0.0f, 0.0f, 0.0f, 0.0f);
+            Collection->VectorParameters.Add(VecParam);
+        }
+        FPropertyChangedEvent Event(VectorProperty, EPropertyChangeType::ValueSet);
+        Collection->PostEditChangeProperty(Event);
+    }
+
     Collection->MarkPackageDirty();
 
     UPackage* Package = Collection->GetOutermost();
@@ -90,11 +134,11 @@ void FShaderLibraryModule::EnsureShaderLibraryParameters()
     if (!UPackage::SavePackage(Package, Collection, *Filename, SaveArgs))
     {
         UE_LOG(LogShaderLibraryModule, Error,
-            TEXT("MaxRenderDistance was added but %s could not be saved. Make the plugin asset writable and save it before cooking."),
+            TEXT("MPC_ShaderLibrary was updated but %s could not be saved. Make the plugin asset writable and save it before cooking."),
             *Filename);
         return;
     }
-    UE_LOG(LogShaderLibraryModule, Log, TEXT("Added MaxRenderDistance to %s."), *Filename);
+    UE_LOG(LogShaderLibraryModule, Log, TEXT("Updated MPC_ShaderLibrary parameters in %s."), *Filename);
 }
 #endif
 

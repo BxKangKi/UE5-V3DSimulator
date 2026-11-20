@@ -11,7 +11,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Format/v3d.hpp"
+#include "Format/v3d.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "TimerManager.h"

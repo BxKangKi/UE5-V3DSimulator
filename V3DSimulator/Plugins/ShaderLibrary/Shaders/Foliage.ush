@@ -1,0 +1,91 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+#ifndef SHADERLIBRARY_FOLIAGE_USH
+#define SHADERLIBRARY_FOLIAGE_USH
+#pragma once
+// /Plugin/ShaderLibrary/Foliage.ush
+
+// Computes natural stem-hinged bending when characters or moving objects approach,
+// combined with gentle ambient wind sway.
+float3 FoliageInteractiveBend(
+    float3 WorldPos,
+    float3 ObjectPivotWS,
+    float ObjectRadius,
+    float4 Interactor0,
+    float4 Interactor1,
+    float4 Interactor2,
+    float4 Interactor3,
+    float WindStrength,
+    float BendStrength,
+    float Time)
+{
+    const float SafeRadius = max(ObjectRadius, 25.0f);
+    const float BaseZ = ObjectPivotWS.z - SafeRadius * 0.5f;
+    const float HeightRatio = saturate((WorldPos.z - BaseZ) / max(SafeRadius * 1.4f, 40.0f));
+    const float FlexWeight = HeightRatio * HeightRatio;
+
+    float3 TotalBend = float3(0.0f, 0.0f, 0.0f);
+    const float4 Interactors[4] = { Interactor0, Interactor1, Interactor2, Interactor3 };
+
+    [unroll] for (int i = 0; i < 4; ++i)
+    {
+        const float Radius = Interactors[i].w;
+        [branch] if (Radius > 1.0f)
+        {
+            const float3 Delta = WorldPos - Interactors[i].xyz;
+            const float DistSq = dot(Delta, Delta);
+            const float RadiusSq = Radius * Radius;
+            if (DistSq < RadiusSq)
+            {
+                const float Dist = sqrt(max(DistSq, 1.0e-4f));
+                const float Falloff = 1.0f - saturate(Dist / Radius);
+                const float Push = Falloff * Falloff * (3.0f - 2.0f * Falloff);
+
+                const float2 Horiz = Delta.xy;
+                const float HorizLen = length(Horiz);
+                const float2 PushDirXY = (HorizLen > 1.0e-3f) ? (Horiz / HorizLen) : float2(1.0f, 0.0f);
+                const float HorizontalDisp = Push * Radius * 0.55f * BendStrength;
+                const float VerticalDrop = -Push * Push * Radius * 0.22f * BendStrength;
+
+                TotalBend += float3(PushDirXY * HorizontalDisp, VerticalDrop);
+            }
+        }
+    }
+
+    const float MaxDisp = SafeRadius * 0.85f;
+    const float BendLen = length(TotalBend);
+    if (BendLen > MaxDisp && BendLen > 1.0e-4f)
+    {
+        TotalBend *= (MaxDisp / BendLen);
+    }
+
+    const float Phase = WorldPos.x * 0.012f + WorldPos.y * 0.015f;
+    const float PrimaryWave = sin(Time * 1.65f + Phase);
+    const float SecondaryWave = cos(Time * 2.85f + Phase * 1.7f) * 0.35f;
+    const float3 WindOffset = float3(
+        (PrimaryWave + SecondaryWave) * 4.5f,
+        cos(Time * 1.35f + Phase * 0.85f) * 3.0f,
+        0.0f) * max(WindStrength, 0.0f);
+
+    return (TotalBend + WindOffset) * FlexWeight;
+}
+
+// Compact 5-input entry point: uses ResolvedView.GameTime and derives stem pivot
+// directly from the interactor/world height to minimize Custom node parameters.
+float3 FoliageInteractiveBendCompact(
+    float3 WorldPos,
+    float4 Interactor0,
+    float4 Interactor1,
+    float4 Interactor2,
+    float4 Interactor3)
+{
+    // Use a gentle vertical flex mask anchored near ground/interactor base height.
+    float RefBaseZ = (Interactor0.w > 1.0f) ? (Interactor0.z - 80.0f) : (WorldPos.z - 60.0f);
+    return FoliageInteractiveBend(
+        WorldPos,
+        float3(WorldPos.xy, RefBaseZ + 45.0f),
+        90.0f,
+        Interactor0, Interactor1, Interactor2, Interactor3,
+        1.0f, 1.0f, ResolvedView.GameTime);
+}
+
+#endif

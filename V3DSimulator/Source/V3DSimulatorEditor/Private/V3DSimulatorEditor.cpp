@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "NativeWidgetDesignerLibrary.h"
 #include "HumanoidAnimationBindings.h"
+#include "V3DMaterialDefaults.h"
 
 #include "Containers/Ticker.h"
 #include "Editor.h"
@@ -28,6 +29,8 @@ public:
     virtual void StartupModule() override
     {
         // Runs before interactive use and before commandlet cooking, once per schema change.
+        if (GEngine) V3DMaterialDefaults::EnsureCookedParents();
+        else MaterialDefaultsHandle = FCoreDelegates::GetOnPostEngineInit().AddStatic(&V3DMaterialDefaults::EnsureCookedParents);
         if (GEngine) HumanoidAnimationBindings::Upgrade();
         else AnimationBindingHandle = FCoreDelegates::GetOnPostEngineInit().AddStatic(&HumanoidAnimationBindings::Upgrade);
         if (IsRunningCommandlet()) return;
@@ -52,6 +55,7 @@ public:
 
     virtual void ShutdownModule() override
     {
+        FCoreDelegates::GetOnPostEngineInit().Remove(MaterialDefaultsHandle);
         FCoreDelegates::GetOnPostEngineInit().Remove(AnimationBindingHandle);
         if (!bRegistered) return;
         FKismetEditorUtilities::UnregisterAutoBlueprintNodeCreation(this);
@@ -136,6 +140,7 @@ private:
 
     TWeakObjectPtr<UAssetEditorSubsystem> AssetEditors;
     FDelegateHandle AnimationBindingHandle;
+    FDelegateHandle MaterialDefaultsHandle;
     FDelegateHandle OpeningHandle;
     FDelegateHandle PostEngineInitHandle;
     FDelegateHandle PropertyChangedHandle;

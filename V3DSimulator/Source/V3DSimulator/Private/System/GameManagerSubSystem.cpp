@@ -325,8 +325,10 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
     {
         bMaterialDefaultAssetResolved = true;
         UE_LOG(LogTemp, Warning,
-            TEXT("No central AssetRegistry is available; assign MI_Opaque, MI_Masked, MI_Translucent and MI_Toon before loading models."));
-        return true;
+            TEXT("No central AssetRegistry is available; using generated Opaque (Masked) defaults."));
+        FV3DMaterialSoftAssetReferences Defaults;
+        TArray<FString> Failures;
+        return Defaults.Resolve(NewCache->References, Failures);
     }
 
     TArray<FString> Failures;
@@ -343,15 +345,24 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
             *Registry->TerrainMaterial.ToSoftObjectPath().ToString()));
         NewCache->References.Terrain = nullptr;
     }
+    NewCache->References.Foliage = bRuntimeAssetsPreloaded
+        ? Registry->FoliageMaterial.Get() : Registry->ResolveFoliageMaterial();
+    if (!Registry->FoliageMaterial.IsNull() && !FV3DMaterialAssetReferences::IsSupportedParent(NewCache->References.Foliage))
+    {
+        Failures.Add(FString::Printf(
+            TEXT("FoliageMaterial -> %s (unavailable or unsupported blend mode)"),
+            *Registry->FoliageMaterial.ToSoftObjectPath().ToString()));
+        NewCache->References.Foliage = nullptr;
+    }
     bMaterialDefaultAssetResolved = true;
 
     for (const FString& Failure : Failures)
     {
-        UE_LOG(LogTemp, Warning, TEXT("Central glTF material reference skipped: %s"), *Failure);
+        UE_LOG(LogTemp, Warning, TEXT("Central V3D material fallback: %s"), *Failure);
     }
 
     UE_LOG(LogTemp, Display,
-        TEXT("Central V3D material slots resolved. Configured=%d/4 Failures=%d"),
+        TEXT("Central V3D material slots resolved. Configured=%d/6 Failures=%d"),
         Registry->V3DMaterials.NumConfiguredReferences(),
         Failures.Num());
     return bResolveCallSucceeded;
@@ -1001,6 +1012,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         AddPath(Registry->PlacementGridMaterial.ToSoftObjectPath());
         AddPath(Registry->LoadingWidgetClass.ToSoftObjectPath());
         AddPath(Registry->TerrainMaterial.ToSoftObjectPath());
+        AddPath(Registry->FoliageMaterial.ToSoftObjectPath());
         const FV3DMaterialSoftAssetReferences& Materials = Registry->V3DMaterials;
         TArray<FSoftObjectPath> MaterialPaths; Materials.GetPreloadPaths(MaterialPaths);
         for (const auto& Path : MaterialPaths) AddPath(Path);
@@ -5443,6 +5455,7 @@ void UGameManagerSubSystem::CompleteProjectArchiveBuild(
 
 void UGameManagerSubSystem::CancelProjectBuild()
 {
+    const bool bWasActive = IsProjectBuildInProgress();
     if (ProjectBuild.Cancellation.IsValid())
     {
         ProjectBuild.Cancellation->Store(true);
@@ -5459,6 +5472,11 @@ void UGameManagerSubSystem::CancelProjectBuild()
     }
     ActiveProjectBuildTask = nullptr;
     ProjectBuild.Reset();
+    if (bWasActive)
+    {
+        LastSaveMessage = TEXT("Project build cancelled.");
+        OnProjectBuildCompleted.Broadcast(false, LastSaveMessage);
+    }
 }
 
 bool UGameManagerSubSystem::LoadSavedScene()

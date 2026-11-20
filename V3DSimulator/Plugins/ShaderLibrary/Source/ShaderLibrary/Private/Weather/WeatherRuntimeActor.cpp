@@ -64,8 +64,11 @@ AWeatherRuntimeActor::AWeatherRuntimeActor()
 void AWeatherRuntimeActor::BeginPlay()
 {
     Super::BeginPlay();
-    SceneCapture->OrthoWidth = CaptureOrthoWidth;
-    SceneCapture->MaxViewDistanceOverride = CaptureMaxViewDistance;
+    if (IsValid(SceneCapture))
+    {
+        SceneCapture->OrthoWidth = CaptureOrthoWidth;
+        SceneCapture->MaxViewDistanceOverride = CaptureMaxViewDistance;
+    }
     UpdateRainCaptureParameters();
     UpdateWeatherPostProcess();
 }
@@ -73,6 +76,10 @@ void AWeatherRuntimeActor::BeginPlay()
 void AWeatherRuntimeActor::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
+    if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds <= 0.0f)
+    {
+        return;
+    }
 
     if (USceneComponent* Camera = WeatherCamera.Get())
     {
@@ -113,9 +120,15 @@ void AWeatherRuntimeActor::Tick(float DeltaSeconds)
 
 void AWeatherRuntimeActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    WeatherCamera.Reset();
+    WeatherPostProcessMID = nullptr;
+    CachedPostProcessMPC = nullptr;
+    bTriedLoadPostProcessMPC = false;
+    LastAppliedCoverage = -1.0f;
+    LastAppliedIntensity = -1.0f;
+    LastAppliedSnowMode = -1;
     Super::EndPlay(EndPlayReason);
 }
-
 
 void AWeatherRuntimeActor::ConfigureWeather(const FString& InPreset, float InIntensity, USceneComponent* InCamera)
 {
@@ -174,23 +187,46 @@ void AWeatherRuntimeActor::UpdateWeatherPostProcess()
     }
 
     const bool bSnow = IsSnowPreset(WeatherPreset);
-    WeatherPostProcessMID->SetScalarParameterValue(NAME_Precipitation, FMath::Clamp(SurfaceCoverage, 0.0f, 1.0f));
-    WeatherPostProcessMID->SetScalarParameterValue(TEXT("Wetness"), bSnow ? 0.0f : SurfaceCoverage);
-    WeatherPostProcessMID->SetScalarParameterValue(TEXT("SnowAccumulation"), bSnow ? SurfaceCoverage : 0.0f);
+    const int32 SnowMode = bSnow ? 1 : 0;
+    const float ClampedCoverage = FMath::Clamp(SurfaceCoverage, 0.0f, 1.0f);
+
+    const bool bCoverageChanged = !FMath::IsNearlyEqual(ClampedCoverage, LastAppliedCoverage, 0.001f);
+    const bool bIntensityChanged = !FMath::IsNearlyEqual(WeatherIntensity, LastAppliedIntensity, 0.001f);
+    const bool bModeChanged = (SnowMode != LastAppliedSnowMode);
+
+    if (!bCoverageChanged && !bIntensityChanged && !bModeChanged)
+    {
+        return;
+    }
+
+    WeatherPostProcessMID->SetScalarParameterValue(NAME_Precipitation, ClampedCoverage);
+    WeatherPostProcessMID->SetScalarParameterValue(TEXT("Wetness"), bSnow ? 0.0f : ClampedCoverage);
+    WeatherPostProcessMID->SetScalarParameterValue(TEXT("SnowAccumulation"), bSnow ? ClampedCoverage : 0.0f);
     WeatherPostProcessMID->SetScalarParameterValue(TEXT("WeatherIntensity"), WeatherIntensity);
 
-    if (UWorld* World = GetWorld())
+    if (bModeChanged)
     {
-        if (UGameInstance* GameInstance = World->GetGameInstance())
+        if (!bTriedLoadPostProcessMPC)
         {
-            if (UMaterialParameterCollection* MPC = LoadObject<UMaterialParameterCollection>(nullptr, TEXT("/ShaderLibrary/PostProcess/MPC_PostProcess.MPC_PostProcess")))
+            bTriedLoadPostProcessMPC = true;
+            CachedPostProcessMPC = LoadObject<UMaterialParameterCollection>(
+                nullptr, TEXT("/ShaderLibrary/PostProcess/MPC_PostProcess.MPC_PostProcess"));
+        }
+
+        if (IsValid(CachedPostProcessMPC))
+        {
+            if (UWorld* World = GetWorld())
             {
                 UKismetMaterialLibrary::SetScalarParameterValue(
-                    GameInstance->GetWorld(),
-                    MPC,
+                    World,
+                    CachedPostProcessMPC.Get(),
                     NAME_WeatherMode,
                     bSnow ? 1.0f : 0.0f);
             }
         }
     }
+
+    LastAppliedCoverage = ClampedCoverage;
+    LastAppliedIntensity = WeatherIntensity;
+    LastAppliedSnowMode = SnowMode;
 }

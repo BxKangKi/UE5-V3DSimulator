@@ -10,7 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Format/v3d.hpp"
+#include "Format/v3d.h"
 
 class UMaterialInterface;
 class USkeleton;

@@ -101,6 +101,7 @@ ACharacterController::ACharacterController(const FObjectInitializer& ObjectIniti
     // animation initialization, or network smoothing caches those defaults.
     if (USkeletalMeshComponent* MeshComponent = GetMesh())
     {
+        MeshComponent->SetRenderCustomDepth(true);
         MeshComponent->SetRelativeLocationAndRotation(
             CharacterControllerTuning::MeshDefaultRelativeLocation,
             CharacterControllerTuning::MeshDefaultRelativeRotation);
@@ -595,9 +596,12 @@ void ACharacterController::OnLoadCompleted(bool Result)
     }
 
     RestoreAfterMeshReload();
-    if (USkeletalMeshComponent* Mesh = GetMesh())
-        if (auto* Animation = Cast<UCharacterAnimInstance>(Mesh->GetAnimInstance()))
+    if (USkeletalMeshComponent* MeshComp = GetMesh())
+    {
+        MeshComp->SetRenderCustomDepth(true);
+        if (auto* Animation = Cast<UCharacterAnimInstance>(MeshComp->GetAnimInstance()))
             Animation->InstallModelAnimations(RuntimeModelAnimations);
+    }
 
     if (Result)
     {

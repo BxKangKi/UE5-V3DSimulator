@@ -41,6 +41,7 @@
 #include "Misc/Paths.h"
 #include "HAL/PlatformProcess.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "InputCoreTypes.h"
 
 namespace
 {
@@ -59,6 +60,7 @@ UMainWorldWidget::UMainWorldWidget(const FObjectInitializer& ObjectInitializer)
     ButtonHeight = 96.0f;
     BodyFontSize = 48;
     TitleFontSize = 100;
+    SetIsFocusable(true);
 }
 
 void UMainWorldWidget::NativeConstruct()
@@ -92,6 +94,21 @@ void UMainWorldWidget::NativeDestruct()
     JoinButton.Reset();
     MainGameMode.Reset();
     Super::NativeDestruct();
+}
+
+FReply UMainWorldWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+    if (!InKeyEvent.IsRepeat()
+        && (InKeyEvent.GetKey() == EKeys::Escape || InKeyEvent.GetKey() == EKeys::Gamepad_FaceButton_Right))
+    {
+        if (UButton* Button = BackButton.Get();
+            IsValid(Button) && Button->IsVisible() && Button->GetIsEnabled())
+        {
+            ExecuteReturnToMainMenuFromWorldSelection();
+            return FReply::Handled();
+        }
+    }
+    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
 }
 
 void UMainWorldWidget::SetMainGameMode(AMainGameMode* InMainGameMode)

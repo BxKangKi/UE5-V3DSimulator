@@ -64,6 +64,8 @@ public:
     float GetProgress() const { return ProgressValue; }
     const FString& GetError() const { return FailureReason; }
     const FString& GetSourcePath() const { return Definition.GlbPath; }
+    int32 GetBuildTextureResolution() const { return Definition.BuildTextureResolution; }
+    int32 GetBuildTerrainTextureResolution() const { return Definition.BuildTerrainTextureResolution; }
 
     /** Moves the completed build payload out without duplicating vertex or texture arrays. */
     FGWorldBuildModel TakeBuildModel();

@@ -4,22 +4,139 @@
 #pragma once
 // /Plugin/ShaderLibrary/Underwater.ush
 
-// Opaque and masked meshes (including the player) participate without a custom-depth pass.
-float UW_SceneDepth(float2 ViewportUV)
+// Fallback scene-texture & shading-model IDs for Material Function preview / non-PP permutations.
+#ifndef PPI_SceneDepth
+#define PPI_SceneDepth 1
+#endif
+#ifndef PPI_CustomDepth
+#define PPI_CustomDepth 13
+#endif
+#ifndef PPI_PostProcessInput0
+#define PPI_PostProcessInput0 14
+#endif
+#ifndef PPI_ShadingModelID
+#define PPI_ShadingModelID 23
+#endif
+#ifndef SHADINGMODELID_UNLIT
+#define SHADINGMODELID_UNLIT 0
+#endif
+#ifndef SHADINGMODELID_SINGLELAYERWATER
+#define SHADINGMODELID_SINGLELAYERWATER 10
+#endif
+
+// Physically-based ocean water optical coefficients (Beer-Lambert law, cm^-1).
+// Matched with SingleLayerWater (M_Water / WaterActor) so surface and underwater
+// transition seamlessly: red attenuates within metres, green at mid-depth, and
+// deep water (both character & seafloor) darkens naturally into deep marine navy.
+static const float3 UW_WATER_ABSORPTION = float3(0.00460f, 0.00140f, 0.00065f);
+static const float3 UW_WATER_SCATTERING = float3(0.000018f, 0.000068f, 0.000105f);
+static const float3 UW_WATER_EXTINCTION = float3(0.004618f, 0.001468f, 0.000755f);
+// Pre-multiplied by log2(e) = 1.44269504f so inner loops use single-instruction exp2().
+static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.0066623657f, 0.0021178763f, 0.0010892348f);
+static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.0039f, 0.0463f, 0.1391f);
+static const float  UW_WATER_IOR = 1.3333f;
+static const float  UW_WATER_INV_IOR = 0.75001875f;
+static const float  UW_WATER_F0 = 0.0204f; // ((1.3333 - 1) / (1.3333 + 1))^2
+static const float  UW_MAX_VALID_DEPTH_CM = 1.0e7f; // 100 km safe finite far-plane ceiling (avoids ConvertFromDeviceZ(0) / 0).
+
+// Unified ViewportUV -> SceneTextureUV helper so SceneColor, SceneDepth, CustomDepth,
+// and ShadingModelID always sample the exact same screen pixel.
+float2 UW_ToSceneTextureUV(float2 ViewportUV, uint SceneTextureId)
 {
-    const float2 UV = ClampSceneTextureUV(
-        ViewportUVToSceneTextureUV(saturate(ViewportUV), 1), 1);
-    return SceneTextureLookup(UV, 1, false).r;
+#if POST_PROCESS_MATERIAL || NEEDS_SCENE_TEXTURES
+    return ClampSceneTextureUV(
+        ViewportUVToSceneTextureUV(saturate(ViewportUV), SceneTextureId), SceneTextureId);
+#else
+    return saturate(ViewportUV);
+#endif
 }
 
-float UW_OpenWaterVisibility(float Depth)
+float UW_SceneDepth(float2 ViewportUV)
 {
-    // Invalid samples are closed; they must never leak light through the foreground.
-    return Depth > 0.0f ? smoothstep(900000.0f, 995000.0f, Depth) : 0.0f;
+#if POST_PROCESS_MATERIAL || NEEDS_SCENE_TEXTURES
+    return SceneTextureLookup(UW_ToSceneTextureUV(ViewportUV, PPI_SceneDepth), PPI_SceneDepth, false).r;
+#else
+    return UW_MAX_VALID_DEPTH_CM;
+#endif
+}
+
+float4 UW_SceneColor(float2 ViewportUV)
+{
+#if POST_PROCESS_MATERIAL || NEEDS_SCENE_TEXTURES
+    return SceneTextureLookup(UW_ToSceneTextureUV(ViewportUV, PPI_PostProcessInput0), PPI_PostProcessInput0, false);
+#else
+    return float4(0.0f, 0.0f, 0.0f, 1.0f);
+#endif
+}
+
+bool UW_ValidSolidDepth(float Depth)
+{
+    return isfinite(Depth) && Depth > 0.0f && Depth < UW_MAX_VALID_DEPTH_CM;
+}
+
+float UW_ShaftDepth(float2 ViewportUV)
+{
+#if POST_PROCESS_MATERIAL || NEEDS_SCENE_TEXTURES
+    const float2 ClampedUV = saturate(ViewportUV);
+    const float Depth = SceneTextureLookup(UW_ToSceneTextureUV(ClampedUV, PPI_SceneDepth), PPI_SceneDepth, false).r;
+    const float CustomDepth = SceneTextureLookup(UW_ToSceneTextureUV(ClampedUV, PPI_CustomDepth), PPI_CustomDepth, false).r;
+    const float NoSolid = 1.0e9f;
+    const float SolidDepth = UW_ValidSolidDepth(CustomDepth) ? CustomDepth : NoSolid;
+    if (!isfinite(Depth) || Depth <= 0.0f) return (SolidDepth < NoSolid) ? SolidDepth : 0.0f;
+    if (!UW_ValidSolidDepth(Depth)) return SolidDepth;
+
+    const float ShadingModel = SceneTextureLookup(UW_ToSceneTextureUV(ClampedUV, PPI_ShadingModelID), PPI_ShadingModelID, false).r;
+    const bool bWater = abs(ShadingModel - (float)SHADINGMODELID_SINGLELAYERWATER) < 0.5f;
+    const bool bSky = abs(ShadingModel - (float)SHADINGMODELID_UNLIT) < 0.5f;
+    return (bWater || bSky) ? SolidDepth : min(Depth, SolidDepth);
+#else
+    return 0.0f;
+#endif
+}
+
+float UW_ShaftRayLength(float SolidViewDepth, float ViewCosine, float RayUp, float CameraWaterDepth)
+{
+    if (!(SolidViewDepth > 0.0f) || !(ViewCosine > 1.0e-4f) || !(CameraWaterDepth > 0.0f))
+        return 0.0f;
+    float End = min(max(SolidViewDepth - 1.0f, 0.0f) / ViewCosine, 10000.0f);
+    if (RayUp > 1.0e-5f) End = min(End, CameraWaterDepth / RayUp);
+    return max(End, 0.0f);
+}
+
+float3 UW_ReconstructViewRay(float2 ViewportUV, float3 CameraTS)
+{
+    const float2 ScreenPosition = (ViewportUV * 2.0f - 1.0f) * float2(1.0f, -1.0f);
+    const float4 Probe = mul(float4(ScreenPosition * 1000.0f, 1000.0f, 1.0f), ResolvedView.ScreenToTranslatedWorld);
+    const float3 RayVector = Probe.xyz * rcp(max(abs(Probe.w), 1.0e-6f)) - CameraTS;
+    const float RayLenSq = dot(RayVector, RayVector);
+    return (isfinite(RayLenSq) && RayLenSq > 1.0e-8f) ? (RayVector * rsqrt(RayLenSq)) : ResolvedView.ViewForward;
+}
+
+float UW_AirToWaterTransmittance(float CosIncidence)
+{
+    const float OneMinusCos = 1.0f - saturate(CosIncidence);
+    const float OneMinusCos2 = OneMinusCos * OneMinusCos;
+    const float Fresnel = UW_WATER_F0 + (1.0f - UW_WATER_F0) * (OneMinusCos2 * OneMinusCos2 * OneMinusCos);
+    return 1.0f - Fresnel;
+}
+
+float3 UW_RefractToSunDirection(float3 ToSunAir)
+{
+    const float2 Horizontal = ToSunAir.xy * UW_WATER_INV_IOR;
+    const float ZSq = max(1.0f - dot(Horizontal, Horizontal), 1.0e-4f);
+    return normalize(float3(Horizontal, sqrt(ZSq)));
+}
+
+float3 UW_AtmosphericSunTint(float SunElevationSin)
+{
+    const float SinEl = saturate(SunElevationSin);
+    const float AirMass = min(rcp(max(SinEl + 0.15f * pow(max(SinEl * 57.29578f + 3.885f, 0.5f), -1.253f), 0.05f)), 18.0f);
+    const float3 AtmosOpticalDepthLog2 = float3(0.0793482f, 0.1659099f, 0.3678872f); // (0.055, 0.115, 0.255) * log2(e)
+    return saturate(exp2(-AtmosOpticalDepthLog2 * max(AirMass - 1.0f, 0.0f)));
 }
 
 // -----------------------------------------------------------------------------
-// Underwater light shaft helper functions
+// Crisp multi-ray underwater caustic shaft pattern (optimized single macro evaluation)
 // -----------------------------------------------------------------------------
 
 float UW_Hash21(float2 p)
@@ -31,362 +148,450 @@ float UW_Hash21(float2 p)
 
 float UW_ValueNoise(float2 p)
 {
-    float2 ip = floor(p);
-    float2 fp = frac(p);
-
-    float2 u = fp * fp * (3.0f - 2.0f * fp);
-
-    float a = UW_Hash21(ip + float2(0.0f, 0.0f));
-    float b = UW_Hash21(ip + float2(1.0f, 0.0f));
-    float c = UW_Hash21(ip + float2(0.0f, 1.0f));
-    float d = UW_Hash21(ip + float2(1.0f, 1.0f));
-
+    const float2 ip = floor(p);
+    const float2 fp = frac(p);
+    const float2 u = fp * fp * (3.0f - 2.0f * fp);
+    const float a = UW_Hash21(ip);
+    const float b = UW_Hash21(ip + float2(1.0f, 0.0f));
+    const float c = UW_Hash21(ip + float2(0.0f, 1.0f));
+    const float d = UW_Hash21(ip + float2(1.0f, 1.0f));
     return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
-float UW_FBM(float2 p)
+// Band-limited multi-octave wave-focusing ridge pattern.
+// Evaluates macro noise once and early-skips 4 high-frequency octaves when far away.
+float UW_FilteredPattern(float2 P, float Time, float Footprint)
 {
-    float v = 0.0f;
-    float a = 0.5f;
+    const float Blend = smoothstep(0.55f, 1.65f, Footprint);
+    const float MacroNoise = UW_ValueNoise(P * 0.37f + float2(Time * 0.03f, -Time * 0.025f));
+    const float Average = 0.04f + 0.14f * MacroNoise;
+    [branch] if (Blend >= 0.999f)
+    {
+        return Average;
+    }
 
-    v += a * UW_ValueNoise(p);
-    p = p * 2.02f + 17.13f;
-    a *= 0.5f;
-    v += a * UW_ValueNoise(p);
-    p = p * 2.03f + 31.71f;
-    a *= 0.5f;
-    v += a * UW_ValueNoise(p);
-    p = p * 2.01f + 11.57f;
-    a *= 0.5f;
-    v += a * UW_ValueNoise(p);
+    // Primary wave lenses (~1.2 m - 2.0 m spacing): distinct sunbeam columns.
+    const float w1 = UW_ValueNoise(P + float2(Time * 0.11f, -Time * 0.08f));
+    const float w2 = UW_ValueNoise(P * 1.63f + float2(-Time * 0.09f, Time * 0.12f) + 13.7f);
+    const float ridge1 = 1.0f - abs(w1 - w2) * 2.6f;
 
-    return saturate(v);
-}
+    // Secondary finer wave ripples (~0.6 m spacing): split wide shafts into fine rays.
+    const float w3 = UW_ValueNoise(P * 2.45f + float2(Time * 0.16f, Time * 0.10f) + 29.3f);
+    const float w4 = UW_ValueNoise(P * 3.15f + float2(-Time * 0.14f, -Time * 0.13f) + 47.1f);
+    const float ridge2 = 1.0f - abs(w3 - w4) * 2.8f;
 
-float UW_CausticLikePattern(float2 p, float t)
-{
-    // 두 개의 다른 속도/스케일 노이즈를 겹쳐서 수면 굴절 그림자 느낌을 만듭니다.
-    float n1 = UW_FBM(p * 1.15f + float2(t * 0.17f, -t * 0.11f));
-    float n2 = UW_FBM(p * 1.85f + float2(-t * 0.09f, t * 0.13f));
+    const float primaryRays = smoothstep(0.42f, 0.92f, saturate(ridge1));
+    const float fineRays = smoothstep(0.48f, 0.94f, saturate(ridge2));
+    const float combined = max(primaryRays * primaryRays, fineRays * 0.65f);
+    const float macroMask = smoothstep(0.22f, 0.78f, MacroNoise);
+    const float Detail = 0.015f + 0.985f * combined * lerp(0.20f, 1.0f, macroMask);
 
-    float lines = 1.0f - abs(n1 - n2) * 2.75f;
-    lines = pow(saturate(lines), 3.25f);
-
-    float broad = UW_FBM(p * 0.35f + float2(t * 0.035f, -t * 0.045f));
-
-    return saturate(0.42f + broad * 0.32f + lines * 1.15f);
+    return lerp(Detail, Average, Blend);
 }
 
 float UW_HenyeyGreensteinApprox(float mu, float g)
 {
-    // 물속 미세 입자 산란은 전방 산란이 강한 편이라 g를 0.65~0.80 정도로 둡니다.
-    float gg = g * g;
-    float denom = max(1.0f + gg - 2.0f * g * mu, 0.045f);
-    return (1.0f - gg) / pow(denom, 1.5f);
+    const float gg = g * g;
+    const float denom = max(1.0f + gg - 2.0f * g * mu, 0.045f);
+    return (1.0f - gg) * rcp(denom * sqrt(denom));
+}
+
+float UW_ShadowCompare(float Receiver, float Occluder, float Bias)
+{
+    if (!isfinite(Occluder)) return 0.0f;
+    return (Receiver <= Occluder + Bias) ? 1.0f : 0.0f;
+}
+
+float UW_ShadowPCF(Texture2D DepthMap, SamplerState DepthSampler,
+    float2 UV, float Receiver, float Resolution, float InvResolution, float Bias)
+{
+    const float2 Pixel = UV * Resolution - 0.5f;
+    const float2 BaseUV = (floor(Pixel) + 0.5f) * InvResolution;
+    const float2 F = frac(Pixel);
+    const float A = UW_ShadowCompare(Receiver, Texture2DSampleLevel(DepthMap, DepthSampler, BaseUV, 0).r, Bias);
+    const float B = UW_ShadowCompare(Receiver, Texture2DSampleLevel(DepthMap, DepthSampler, BaseUV + float2(InvResolution, 0.0f), 0).r, Bias);
+    const float C = UW_ShadowCompare(Receiver, Texture2DSampleLevel(DepthMap, DepthSampler, BaseUV + float2(0.0f, InvResolution), 0).r, Bias);
+    const float D = UW_ShadowCompare(Receiver, Texture2DSampleLevel(DepthMap, DepthSampler, BaseUV + float2(InvResolution, InvResolution), 0).r, Bias);
+    return lerp(lerp(A, B, F.x), lerp(C, D, F.x), F.y);
 }
 
 // -----------------------------------------------------------------------------
-// More realistic screen-space underwater shaft
+// Primary minimal-parameter matrix entry point for MF_UnderWaterShaft Custom Node
+// ShadowParams rows:
+//   [0] = float4(NearOrigin.xyz, ShadowReady)
+//   [1] = float4(FarOrigin.xyz,  WaterLevel)
+//   [2] = float4(ShadowRight.xyz, ScreenUV.x)
+//   [3] = float4(ShadowForward.xyz, ScreenUV.y)
 // -----------------------------------------------------------------------------
+float4 UnderWaterShaftMatrix(
+    Texture2D ShadowNear, SamplerState ShadowNearSampler,
+    Texture2D ShadowFar, SamplerState ShadowFarSampler,
+    float4x4 ShadowParams)
+{
+    const float ShadowReady = ShadowParams[0].w;
+    const float WaterLevel = ShadowParams[1].w;
+    [branch] if (!(ShadowReady >= 0.5f) || !isfinite(WaterLevel))
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    const float3 SunDir = ResolvedView.AtmosphereLightDirection[0].xyz;
+    const float SunLengthSquared = dot(SunDir, SunDir);
+    [branch] if (!isfinite(SunLengthSquared) || SunLengthSquared < 1.0e-8f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+    const float3 L = SunDir * rsqrt(SunLengthSquared);
+    const float SunAboveWater = smoothstep(-0.02f, 0.15f, L.z);
+    [branch] if (SunAboveWater <= 0.001f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    // UE 5.4-5.8 DoubleFloat-safe LWC demotion for PreViewTranslation.
+    const float3 PreViewTranslation = LWCHackToFloat(ResolvedView.PreViewTranslation);
+    const float3 CameraTS = ResolvedView.TranslatedWorldCameraOrigin;
+    const float3 CameraWS = CameraTS - PreViewTranslation;
+    const float CameraWaterDepth = WaterLevel - CameraWS.z;
+    const float UnderwaterMask = smoothstep(5.0f, 150.0f, CameraWaterDepth);
+    [branch] if (UnderwaterMask <= 0.001f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    const float2 AlignedUV = saturate(float2(ShadowParams[2].w, ShadowParams[3].w));
+    const float3 Ray = UW_ReconstructViewRay(AlignedUV, CameraTS);
+    const float ViewCosine = dot(Ray, ResolvedView.ViewForward);
+    const float RayEnd = UW_ShaftRayLength(UW_ShaftDepth(AlignedUV), ViewCosine, Ray.z, CameraWaterDepth);
+    [branch] if (RayEnd <= 0.001f)
+        return float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+    // Derive orthonormal light-capture basis (Forward = -ToSunInWater, Right, Up).
+    const float3 ShadowForwardRaw = ShadowParams[3].xyz;
+    const float ShadowFwdLenSq = dot(ShadowForwardRaw, ShadowForwardRaw);
+    const float3 SafeForward = (isfinite(ShadowFwdLenSq) && ShadowFwdLenSq > 1.0e-6f)
+        ? (ShadowForwardRaw * rsqrt(ShadowFwdLenSq))
+        : (-UW_RefractToSunDirection(L));
+
+    const float3 ShadowRightRaw = ShadowParams[2].xyz;
+    const float ShadowRightLenSq = dot(ShadowRightRaw, ShadowRightRaw);
+    float3 SafeRight;
+    if (isfinite(ShadowRightLenSq) && ShadowRightLenSq > 1.0e-6f)
+    {
+        SafeRight = ShadowRightRaw * rsqrt(ShadowRightLenSq);
+    }
+    else
+    {
+        const float3 FallbackUp = (abs(SafeForward.z) < 0.99f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
+        SafeRight = normalize(cross(FallbackUp, SafeForward));
+    }
+    // In UE left-handed coordinates, Up = cross(Forward, Right).
+    const float3 UpRaw = cross(SafeForward, SafeRight);
+    const float UpLenSq = dot(UpRaw, UpRaw);
+    const float3 SafeUp = (isfinite(UpLenSq) && UpLenSq > 1.0e-6f) ? (UpRaw * rsqrt(UpLenSq)) : float3(0.0f, 0.0f, 1.0f);
+    const float3 ToSunInWater = -SafeForward;
+
+    // Precompute loop-invariant light-space ray stepping via 3x3 basis matrix.
+    // Replaces 6 dot() products + vector subtractions per raymarch sample with 6 MADs.
+    const float3x3 LightBasis = float3x3(SafeRight, SafeUp, SafeForward);
+    const float3 RayLight = mul(LightBasis, Ray);
+    const float3 NearOriginLight = mul(LightBasis, ShadowParams[0].xyz);
+    const float3 FarOriginLight = mul(LightBasis, ShadowParams[1].xyz);
+
+    const float InvNearWidth = rcp(6400.0f);
+    const float InvFarWidth = rcp(25600.0f);
+    const float2 NearUVBase = float2(0.5f - NearOriginLight.x * InvNearWidth, 0.5f + NearOriginLight.y * InvNearWidth);
+    const float2 NearUVStep = float2(RayLight.x * InvNearWidth, -RayLight.y * InvNearWidth);
+    const float  NearDepthBase = -NearOriginLight.z;
+    const float  NearDepthStep = RayLight.z;
+
+    const float2 FarUVBase = float2(0.5f - FarOriginLight.x * InvFarWidth, 0.5f + FarOriginLight.y * InvFarWidth);
+    const float2 FarUVStep = float2(RayLight.x * InvFarWidth, -RayLight.y * InvFarWidth);
+    const float  FarDepthBase = -FarOriginLight.z;
+    const float  FarDepthStep = RayLight.z;
+
+    // Query actual render target dimensions once outside the loop (adapts to desktop & mobile).
+    uint NearW = 1024, NearH = 1024, FarW = 1024, FarH = 1024;
+    ShadowNear.GetDimensions(NearW, NearH);
+    ShadowFar.GetDimensions(FarW, FarH);
+    const float NearRes = max((float)NearW, 1.0f);
+    const float InvNearRes = rcp(NearRes);
+    const float FarRes = max((float)FarW, 1.0f);
+    const float InvFarRes = rcp(FarRes);
+
+    const float SurfaceTransmittance = UW_AirToWaterTransmittance(L.z);
+    const float3 SunSpectralTint = UW_AtmosphericSunTint(L.z);
+    const float Phase = min(1.6f, 0.08f + UW_HenyeyGreensteinApprox(dot(Ray, ToSunInWater), 0.72f) * 0.048f);
+
+    // 32 stratified samples with interleaved gradient noise: fast & clean under TAA.
+    static const int SampleCount = 32;
+    const float InvSamples = rcp((float)SampleCount);
+    const float Jitter = frac(52.9829189f * frac(dot(floor(AlignedUV * ResolvedView.ViewSizeAndInvSize.xy),
+        float2(0.06711056f, 0.00583715f))));
+
+    const float PatternScale = 0.0058f;
+    const float Time = ResolvedView.GameTime;
+
+    const float InvToSunZ = rcp(max(ToSunInWater.z, 0.05f));
+    const float2 SurfaceSlope = Ray.xy - ToSunInWater.xy * (Ray.z * InvToSunZ);
+    const float SurfaceSlopeScaled = length(SurfaceSlope) * PatternScale;
+    const float2 PBase = (CameraWS.xy + ToSunInWater.xy * (CameraWaterDepth * InvToSunZ)) * PatternScale;
+    const float2 PStep = SurfaceSlope * PatternScale;
+    const float2 WaveTime1 = float2(Time * 0.06f, 0.0f);
+    const float2 WaveTime2 = float2(0.0f, -Time * 0.05f);
+
+    const float3 EffectiveScatterAlbedo = UW_WATER_SCATTER_ALBEDO * 4.5f;
+
+    float3 Accumulated = 0.0f;
+    float3 PrevTransmittance = float3(1.0f, 1.0f, 1.0f);
+
+    [loop] for (int i = 0; i < SampleCount; ++i)
+    {
+        const float A = (float)i * InvSamples;
+        const float B = (float)(i + 1) * InvSamples;
+        const float Begin = 10000.0f * A * A;
+        [branch] if (Begin >= RayEnd) break;
+        const float End = min(RayEnd, 10000.0f * B * B);
+
+        const float3 EndTransmittance = exp2(-UW_WATER_EXTINCTION_LOG2 * End);
+        const float3 SegmentWeight = max(PrevTransmittance - EndTransmittance, 0.0f);
+        PrevTransmittance = EndTransmittance;
+        if (max(SegmentWeight.r, max(SegmentWeight.g, SegmentWeight.b)) < 1.0e-5f)
+            break;
+
+        const float Distance = lerp(Begin, End, 0.25f + 0.5f * Jitter);
+        const float SampleDepth = max(CameraWaterDepth - Ray.z * Distance, 0.0f);
+        const float SunPath = SampleDepth * InvToSunZ;
+        const float3 SunTransmittance = exp2(-UW_WATER_EXTINCTION_LOG2 * SunPath);
+        const float3 WeightFactor = SegmentWeight * SunTransmittance;
+        if (max(WeightFactor.r, max(WeightFactor.g, WeightFactor.b)) < 1.0e-5f)
+            continue;
+
+        // Evaluate shadow visibility FIRST so occluded pixels skip all caustic noise ALU.
+        const float2 NearUV = NearUVBase + NearUVStep * Distance;
+        const float Edge = max(abs(NearUV.x - 0.5f), abs(NearUV.y - 0.5f));
+        const float CascadeBlend = smoothstep(0.46f, 0.49f, Edge);
+        float Visibility = 0.0f;
+        [branch] if (CascadeBlend < 1.0f)
+        {
+            Visibility = UW_ShadowPCF(ShadowNear, ShadowNearSampler, NearUV,
+                NearDepthBase + NearDepthStep * Distance, NearRes, InvNearRes, 2.0f);
+        }
+        [branch] if (CascadeBlend > 0.0f)
+        {
+            const float2 FarUV = FarUVBase + FarUVStep * Distance;
+            float FarVis = 0.0f;
+            [branch] if (min(FarUV.x, FarUV.y) >= 0.001f && max(FarUV.x, FarUV.y) <= 0.999f)
+            {
+                FarVis = UW_ShadowPCF(ShadowFar, ShadowFarSampler, FarUV,
+                    FarDepthBase + FarDepthStep * Distance, FarRes, InvFarRes, 4.0f);
+            }
+            Visibility = lerp(Visibility, FarVis, CascadeBlend);
+        }
+        [branch] if (Visibility <= 1.0e-4f)
+            continue;
+
+        const float2 P = PBase + PStep * Distance;
+        const float2 Waves = float2(
+            UW_ValueNoise(P * 0.65f + WaveTime1),
+            UW_ValueNoise(P * 0.85f + WaveTime2)) - 0.5f;
+        const float Footprint = SurfaceSlopeScaled * (End - Begin);
+        const float Pattern = UW_FilteredPattern(P + Waves * 0.30f, Time, Footprint);
+
+        Accumulated += WeightFactor * (Pattern * Visibility);
+    }
+
+    const float3 Result = Accumulated * EffectiveScatterAlbedo * SunSpectralTint
+        * (Phase * SunAboveWater * SurfaceTransmittance * UnderwaterMask * 1.15f);
+    return float4(max(all(isfinite(Result)) ? Result : float3(0.0f, 0.0f, 0.0f), 0.0f), 1.0f);
+}
+
+// Backward-compatible overloads (float4 and float3 NearOrigin) so legacy / un-migrated
+// Material Functions compile without errors before Editor migration runs.
+float4 UnderWaterShaft(
+    float2 ScreenUV,
+    float WaterLevel,
+    Texture2D ShadowNear, SamplerState ShadowNearSampler,
+    Texture2D ShadowFar, SamplerState ShadowFarSampler,
+    float4 ShadowNearOriginAndReady,
+    float3 ShadowFarOrigin,
+    float3 ShadowRight,
+    float3 ShadowForward)
+{
+    const float4x4 ShadowParams = float4x4(
+        ShadowNearOriginAndReady,
+        float4(ShadowFarOrigin, WaterLevel),
+        float4(ShadowRight, ScreenUV.x),
+        float4(ShadowForward, ScreenUV.y)
+    );
+    return UnderWaterShaftMatrix(ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler, ShadowParams);
+}
 
 float4 UnderWaterShaft(
     float2 ScreenUV,
-    float3 WorldPos,
-    float3 SunDir,
-    float NumSamples,
-    float Weight,
-    float Exposure,
     float WaterLevel,
-    float NoiseScale,
-    float RefractionStrength,
-    float Activation)
+    Texture2D ShadowNear, SamplerState ShadowNearSampler,
+    Texture2D ShadowFar, SamplerState ShadowFarSampler,
+    float3 ShadowNearOrigin,
+    float3 ShadowFarOrigin,
+    float3 ShadowRight,
+    float3 ShadowForward)
 {
-    [branch] if (Activation < 0.5f)
-    {
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    }
-
-    float SunLengthSquared = dot(SunDir, SunDir);
-    [branch] if (SunLengthSquared < 1.0e-8f || Weight <= 0.0f || Exposure <= 0.0f)
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    float3 L = SunDir * rsqrt(SunLengthSquared);
-
-    float3 V = normalize(ResolvedView.ViewForward);
-    float Time = ResolvedView.GameTime;
-
-    float4x4 WorldToClipMatrix = LWCToFloat(ResolvedView.TranslatedWorldToClip);
-
-    float3 preViewTranslation = LWCToFloat(ResolvedView.PreViewTranslation);
-    float3 cameraPosTS = ResolvedView.TranslatedWorldCameraOrigin;
-    float3 cameraPosWS = cameraPosTS - preViewTranslation;
-
-    // UE 월드 단위가 cm라는 전제. WaterLevel은 absolute world Z라고 가정합니다.
-    float cameraWaterDepth = WaterLevel - cameraPosWS.z;
-    float underwaterMask = smoothstep(5.0f, 150.0f, cameraWaterDepth);
-
-    [branch] if (underwaterMask <= 0.001f)
-    {
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    }
-
-    // 태양의 화면 위치. SunDir은 "월드에서 태양을 향하는 방향"이라고 가정합니다.
-    float4 sunWorldPos = float4(cameraPosTS + L * 150000000.0f, 1.0f);
-    float4 sunClipPos = mul(sunWorldPos, WorldToClipMatrix);
-
-    float sunClipW = max(abs(sunClipPos.w), 1.0e-4f);
-    float2 sunScreenUV = (sunClipPos.xy / sunClipW) * float2(0.5f, -0.5f) + 0.5f;
-
-    // 태양이 카메라 앞/수면 위/시야 방향에 있을수록 강하게.
-    float sunInFront = smoothstep(-0.02f, 0.08f, sunClipPos.w);
-    float sunAboveWater = smoothstep(0.01f, 0.22f, L.z);
-    float viewSunDot = dot(V, L);
-
-    // 태양 방향을 볼 때 가장 강하지만, 반대 방향에서도 완전히 사라지지 않게 유지.
-    // 실제 물속 부유 입자 산란/수면 caustic shaft는 모든 방향에서 약하게는 보일 수 있음.
-    float viewFacing = lerp(
-        0.38f,
-        1.0f,
-        smoothstep(-0.35f, 0.45f, viewSunDot));
-
-    // 화면 밖 태양도 어느 정도 허용하되 너무 멀면 줄입니다.
-    float2 sunOff = abs(sunScreenUV - 0.5f);
-    float sunOffAmount = max(sunOff.x, sunOff.y);
-    float offscreenFade = 1.0f - smoothstep(1.25f, 1.50f, sunOffAmount);
-    [branch] if (sunInFront * sunAboveWater * offscreenFade <= 0.001f)
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-
-    // 화면공간 radial shaft.
-    float sampleCountF = clamp(floor(NumSamples + 0.5f), 1.0f, 96.0f);
-    int sampleCount = (int)sampleCountF;
-    float noiseScaleSafe = max(NoiseScale, 1.0e-6f);
-    float invSampleCount = rcp(sampleCountF);
-
-    float2 rayDelta = (ScreenUV - sunScreenUV) * invSampleCount;
-
-    // 픽셀별 고정 지터. 샘플 밴딩을 줄입니다.
-    float2 worldSeed = WorldPos.xy * 0.0005f;
-    float jitter = UW_Hash21(ScreenUV * 173.17f + worldSeed + Time * 0.037f);
-
-    // Never start beyond the foreground silhouette because of jitter/refraction.
-    float pathVisibility = UW_OpenWaterVisibility(UW_SceneDepth(ScreenUV));
-    [branch] if (pathVisibility <= 0.001f)
-        return float4(0.0f, 0.0f, 0.0f, 1.0f);
-    float2 currentUV = ScreenUV - rayDelta * jitter;
-
-    float3 accumulatedLight = 0.0f;
-
-    // 프로젝트 far clip에 따라 조정하세요.
-    // 너무 작으면 멀리 있는 지형이 하늘로 판정되고, 너무 크면 shaft가 약해질 수 있습니다.
-    const float FarSceneDepth = 1000000.0f;
-
-    // 수중 색 흡수 계수. R이 가장 빨리 사라지고 B가 가장 오래 남습니다.
-    // 단위는 UE cm 기준으로 튜닝한 값입니다.
-    const float3 WaterAbsorption = float3(0.00155f, 0.00052f, 0.00016f);
-    const float3 WaterScatterTint = float3(0.10f, 0.56f, 1.00f);
-
-    float translatedWaterZ = WaterLevel + preViewTranslation.z;
-
-    [loop] for (int i = 0; i < 100; i++)
-    {
-        [branch] if (i >= sampleCount)
-        {
-            break;
-        }
-
-        float stepProgress = ((float)i + jitter) * invSampleCount;
-
-        [branch] if (currentUV.x < 0.0f || currentUV.x > 1.0f || currentUV.y < 0.0f || currentUV.y > 1.0f)
-        {
-            break;
-        }
-
-        // ---------------------------------------------------------------------
-        // 수면 굴절 느낌: sin/cos 대신 노이즈 기반으로 약간 더 자연스럽게 흔듭니다.
-        // ---------------------------------------------------------------------
-        float2 waveP = currentUV * 18.0f + worldSeed * 60.0f;
-
-        float2 waveNoise = float2(
-                               UW_ValueNoise(waveP + float2(Time * 0.80f, Time * 0.21f)),
-                               UW_ValueNoise(waveP * 1.73f + float2(-Time * 0.35f, Time * 0.64f))) -
-                           0.5f;
-
-        float refractionAmount = 0.0055f * RefractionStrength;
-        refractionAmount *= lerp(1.0f, 0.35f, stepProgress);
-
-        float2 refractedUV = saturate(currentUV + waveNoise * refractionAmount);
-
-        // Conservative sampling prevents refraction from stepping around a silhouette.
-        float sceneDepth = min(UW_SceneDepth(currentUV), UW_SceneDepth(refractedUV));
-        float openWaterVisibility = UW_OpenWaterVisibility(sceneDepth);
-        pathVisibility = min(pathVisibility, openWaterVisibility);
-        [branch] if (pathVisibility <= 0.001f)
-        {
-            // No samples beyond a blocker may illuminate this radial ray.
-            accumulatedLight = 0.0f;
-            break;
-        }
-        sceneDepth = min(sceneDepth, FarSceneDepth);
-
-        // ---------------------------------------------------------------------
-        // 현재 샘플 방향의 월드 레이 근사.
-        // 실제 3D 볼륨 레이마치가 아니라 포스트 프로세스 근사이므로,
-        // 너무 먼 sky depth는 적당히 cap해서 월드 노이즈가 튀지 않게 합니다.
-        // ---------------------------------------------------------------------
-        float probeDepth = min(sceneDepth, 35000.0f);
-
-        float2 screenPos = (refractedUV * 2.0f - 1.0f) * float2(1.0f, -1.0f);
-        float4 hProbePos = mul(float4(screenPos * probeDepth, probeDepth, 1.0f), ResolvedView.ScreenToTranslatedWorld);
-
-        float invW = rcp(max(abs(hProbePos.w), 1.0e-4f));
-        float3 probePosTS = hProbePos.xyz * invW;
-
-        float3 viewVec = probePosTS - cameraPosTS;
-        float probeLen = max(length(viewVec), 1.0f);
-        float3 viewDir = viewVec / probeLen;
-
-        float3 probePosWS = probePosTS - preViewTranslation;
-        float sampleWaterDepth = max(WaterLevel - probePosWS.z, 0.0f);
-
-        // ---------------------------------------------------------------------
-        // 수면/수중 패턴 위치를 월드에 고정.
-        // 카메라가 움직여도 노이즈가 화면에 붙어 보이지 않게 합니다.
-        // ---------------------------------------------------------------------
-        float canHitSurface = smoothstep(0.02f, 0.12f, viewDir.z);
-        float tToSurface = max((translatedWaterZ - cameraPosTS.z) / max(viewDir.z, 0.04f), 0.0f);
-
-        float3 surfacePosTS = cameraPosTS + viewDir * tToSurface;
-        float3 volumePosTS = cameraPosTS + viewDir * lerp(300.0f, 12000.0f, stepProgress);
-
-        float3 patternPosTS = lerp(volumePosTS, surfacePosTS, canHitSurface);
-        float2 patternPosWS = (patternPosTS - preViewTranslation).xy;
-
-        float2 p = patternPosWS * noiseScaleSafe;
-
-        float causticShadow = UW_CausticLikePattern(p + worldSeed * 2.0f, Time);
-        float sliceNoise = UW_FBM(p * 0.37f + float2(Time * 0.035f, -Time * 0.045f) + stepProgress * 2.0f);
-
-        float shaftBreakup = lerp(0.55f, 1.18f, sliceNoise) * causticShadow;
-
-        // ---------------------------------------------------------------------
-        // 물속 산란: 전방 산란 + Beer-Lambert식 색 흡수 근사.
-        // 태양 방향을 바라볼수록 shaft가 더 선명하게 보입니다.
-        // ---------------------------------------------------------------------
-        float mu = dot(viewDir, L);
-        float phase = saturate(0.08f + UW_HenyeyGreensteinApprox(mu, 0.72f) * 0.055f);
-
-        float effectiveDepth = max(cameraWaterDepth, sampleWaterDepth * 0.35f);
-        float verticalSunPath = effectiveDepth / max(L.z, 0.08f);
-
-        float3 spectralTransmittance = exp(-WaterAbsorption * verticalSunPath);
-        float3 scatterColor = WaterScatterTint * spectralTransmittance;
-
-        float distanceFade = exp(-probeLen * 0.000018f);
-        float depthFade = exp(-effectiveDepth * 0.00016f);
-        float radialDecay = exp(-stepProgress * 2.15f);
-
-        float contribution =
-            openWaterVisibility *
-            radialDecay *
-            phase *
-            depthFade *
-            distanceFade *
-            shaftBreakup;
-
-        accumulatedLight += scatterColor * contribution;
-
-        currentUV -= rayDelta;
-    }
-
-    float2 toSun = ScreenUV - sunScreenUV;
-    float radialScreenFade = exp(-dot(toSun, toSun) * 0.32f);
-
-    float sunFactor =
-        sunInFront *
-        sunAboveWater *
-        viewFacing *
-        offscreenFade *
-        radialScreenFade;
-
-    float3 finalShaft =
-        accumulatedLight *
-        pathVisibility *
-        invSampleCount *
-        Weight *
-        Exposure *
-        underwaterMask *
-        sunFactor;
-
-    return float4(max(finalShaft, 0.0f), 1.0f);
+    const float Ready = (dot(ShadowForward, ShadowForward) > 1.0e-6f) ? 1.0f : 0.0f;
+    const float4x4 ShadowParams = float4x4(
+        float4(ShadowNearOrigin, Ready),
+        float4(ShadowFarOrigin, WaterLevel),
+        float4(ShadowRight, ScreenUV.x),
+        float4(ShadowForward, ScreenUV.y)
+    );
+    return UnderWaterShaftMatrix(ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler, ShadowParams);
 }
 
-float4 UnderWaterHazeBlur(
+float4 UnderWaterShaftCompact(
     float2 ScreenUV,
-    float3 WorldPos,
     float WaterLevel,
-    float BlurStrength,
-    float HazeStrength,
-    float MaxBlurRadius)
+    Texture2D ShadowNear, SamplerState ShadowNearSampler,
+    Texture2D ShadowFar, SamplerState ShadowFarSampler,
+    float4 ShadowNearOriginAndReady,
+    float3 ShadowFarOrigin,
+    float3 ShadowRight,
+    float3 ShadowForward)
 {
-    float3 preViewTranslation = LWCToFloat(ResolvedView.PreViewTranslation);
-    float3 cameraPosTS = ResolvedView.TranslatedWorldCameraOrigin;
-    float3 cameraPosWS = cameraPosTS - preViewTranslation;
+    return UnderWaterShaft(ScreenUV, WaterLevel, ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler,
+        ShadowNearOriginAndReady, ShadowFarOrigin, ShadowRight, ShadowForward);
+}
 
-    float cameraWaterDepth = WaterLevel - cameraPosWS.z;
-    float underwaterMask = smoothstep(5.0f, 150.0f, cameraWaterDepth);
+float4 UnderWaterShaftCompact(
+    float2 ScreenUV,
+    float WaterLevel,
+    Texture2D ShadowNear, SamplerState ShadowNearSampler,
+    Texture2D ShadowFar, SamplerState ShadowFarSampler,
+    float3 ShadowNearOrigin,
+    float3 ShadowFarOrigin,
+    float3 ShadowRight,
+    float3 ShadowForward)
+{
+    return UnderWaterShaft(ScreenUV, WaterLevel, ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler,
+        ShadowNearOrigin, ShadowFarOrigin, ShadowRight, ShadowForward);
+}
 
-    if (underwaterMask <= 0.001f)
+// -----------------------------------------------------------------------------
+// Primary minimal-parameter entry point for MF_UnderWaterHazeBlur Custom Node
+// ScreenUVAndWaterLevel = float3(ScreenUV.xy, WaterLevel)
+// -----------------------------------------------------------------------------
+float4 UnderWaterHaze(float3 ScreenUVAndWaterLevel)
+{
+    const float2 AlignedUV = saturate(ScreenUVAndWaterLevel.xy);
+    const float WaterLevel = ScreenUVAndWaterLevel.z;
+    float4 col = UW_SceneColor(AlignedUV);
+    [branch] if (!isfinite(WaterLevel))
     {
-        float2 sceneUV = ClampSceneTextureUV(ViewportUVToSceneTextureUV(ScreenUV, 14), 14);
-        return SceneTextureLookup(sceneUV, 14, false);
+        return col;
     }
 
-    float2 sceneUV = ClampSceneTextureUV(ViewportUVToSceneTextureUV(ScreenUV, 14), 14);
-    float sceneDepth = max(UW_SceneDepth(ScreenUV), 0.0f);
+    const float3 preViewTranslation = LWCHackToFloat(ResolvedView.PreViewTranslation);
+    const float3 cameraPosTS = ResolvedView.TranslatedWorldCameraOrigin;
+    const float3 cameraPosWS = cameraPosTS - preViewTranslation;
 
-    float depthFactor = saturate(sceneDepth / 18000.0f);
-    depthFactor = pow(depthFactor, 0.65f);
-
-    float waterFog = saturate(cameraWaterDepth / 3500.0f);
-    float blurAmount = underwaterMask * BlurStrength * depthFactor * waterFog;
-
-    float2 texel = ResolvedView.BufferSizeAndInvSize.zw;
-    float radius = max(MaxBlurRadius * blurAmount, 0.0f);
-    [branch] if (radius <= 0.001f && underwaterMask * HazeStrength * depthFactor * waterFog <= 0.001f)
-        return SceneTextureLookup(sceneUV, 14, false);
-
-    float4 col = 0.0f;
-    float total = 0.0f;
-
-    float w0 = 0.22f;
-    col += SceneTextureLookup(sceneUV, 14, false) * w0;
-    total += w0;
-
-    float2 offsets[8] = {
-        float2(1.0f, 0.0f),
-        float2(-1.0f, 0.0f),
-        float2(0.0f, 1.0f),
-        float2(0.0f, -1.0f),
-        float2(0.707f, 0.707f),
-        float2(-0.707f, 0.707f),
-        float2(0.707f, -0.707f),
-        float2(-0.707f, -0.707f)};
-
-    [unroll] for (int i = 0; i < 8; i++)
+    const float cameraWaterDepth = WaterLevel - cameraPosWS.z;
+    const float underwaterMask = smoothstep(5.0f, 150.0f, cameraWaterDepth);
+    [branch] if (underwaterMask <= 0.001f)
     {
-        float w = 0.0975f;
-        float2 uv = ClampSceneTextureUV(sceneUV + offsets[i] * texel * radius, 14);
-        col += SceneTextureLookup(uv, 14, false) * w;
-        total += w;
+        return col;
     }
 
-    col /= total;
+    const float sceneDepth = UW_SceneDepth(AlignedUV);
+    if (!isfinite(sceneDepth) || sceneDepth <= 0.0f)
+        return col;
 
-    float3 hazeTint = float3(0.08f, 0.42f, 0.72f);
-    float hazeAmount = underwaterMask * HazeStrength * depthFactor * waterFog;
+    // Exact 3D Euclidean view ray & hit position for true per-pixel underwater depth.
+    const float3 viewRay = UW_ReconstructViewRay(AlignedUV, cameraPosTS);
+    const float viewCosine = max(dot(viewRay, ResolvedView.ViewForward), 0.1f);
+    const bool bValidSolid = UW_ValidSolidDepth(sceneDepth);
+    const float linearDist = bValidSolid ? (sceneDepth / viewCosine) : 15000.0f;
+    float viewDist = min(linearDist, 15000.0f);
 
-    col.rgb = lerp(col.rgb, hazeTint, hazeAmount);
+    const float3 hitPosWS = cameraPosWS + viewRay * viewDist;
+    float pixelWaterDepth = max(WaterLevel - hitPosWS.z, 0.0f);
 
-    return col;
+    // If looking up through the water surface, stop water optical path at the waterline.
+    if (viewRay.z > 1.0e-5f)
+    {
+        const float distToSurface = max(cameraWaterDepth, 0.0f) / viewRay.z;
+        if (distToSurface < viewDist)
+        {
+            viewDist = distToSurface;
+            pixelWaterDepth = 0.0f;
+        }
+    }
+
+    // Fast 4-tap bilateral blur (only for distant underwater background; strict depth rejection
+    // prevents foreground character silhouette from ever smearing or ghosting).
+    const float distNorm = saturate(viewDist * 0.0001f);
+    const float sqrtDist = sqrt(distNorm);
+    const float depthFactor = sqrtDist * sqrt(sqrtDist); // x^0.75 without pow()
+    const float radius = clamp(3.5f * underwaterMask * depthFactor * saturate(cameraWaterDepth * 0.0005f), 0.0f, 4.5f);
+    [branch] if (radius > 0.15f)
+    {
+        const float2 texel = ResolvedView.ViewSizeAndInvSize.zw * radius;
+        const float w0 = 0.40f;
+        float4 accum = col * w0;
+        float total = w0;
+        static const float2 offsets[4] = {
+            float2(0.7071f, 0.7071f),
+            float2(-0.7071f, 0.7071f),
+            float2(0.7071f, -0.7071f),
+            float2(-0.7071f, -0.7071f)
+        };
+        const float invDepthScale = rcp(max(6.0f, sceneDepth * 0.012f));
+        [unroll] for (int i = 0; i < 4; ++i)
+        {
+            const float2 sampleUV = saturate(AlignedUV + offsets[i] * texel);
+            const float nDepth = UW_SceneDepth(sampleUV);
+            if (!isfinite(nDepth) || nDepth <= 0.0f) continue;
+            const float diff = abs(nDepth - sceneDepth) * invDepthScale;
+            const float w = 0.15f * exp2(-diff * diff * 3.6067376f); // -2.5 * log2(e)
+            accum += UW_SceneColor(sampleUV) * w;
+            total += w;
+        }
+        col = accum * rcp(max(total, 1.0e-5f));
+    }
+
+    // Sun direction & atmospheric transmittance for physical downwelling irradiance.
+    const float3 sunDirAir = ResolvedView.AtmosphereLightDirection[0].xyz;
+    const float sunLenSq = dot(sunDirAir, sunDirAir);
+    const float sunElevation = (isfinite(sunLenSq) && sunLenSq > 1.0e-6f) ? (sunDirAir.z * rsqrt(sunLenSq)) : 0.6f;
+    const float daylight = smoothstep(-0.08f, 0.22f, sunElevation);
+    const float posSunEl = max(sunElevation, 0.0f);
+    const float surfaceTrans = UW_AirToWaterTransmittance(posSunEl);
+    const float3 sunTint = UW_AtmosphericSunTint(posSunEl);
+
+    const float satSunEl = saturate(sunElevation);
+    const float sinWaterSq = (1.0f - satSunEl * satSunEl) * (UW_WATER_INV_IOR * UW_WATER_INV_IOR);
+    const float invCosWater = rsqrt(max(1.0f - sinWaterSq, 0.15f));
+
+    // 1) Downwelling Beer-Lambert attenuation on the underwater surface/character itself.
+    const float sunPathToPixel = pixelWaterDepth * invCosWater;
+    const float3 surfaceDepthAtten = bValidSolid
+        ? (exp2(-UW_WATER_EXTINCTION_LOG2 * sunPathToPixel) + float3(0.001f, 0.004f, 0.009f) * daylight)
+        : float3(1.0f, 1.0f, 1.0f);
+    const float3 attenuatedScene = col.rgb * saturate(surfaceDepthAtten);
+
+    // 2) View-ray Beer-Lambert transmission + depth-attenuated volumetric in-scattering.
+    const float clampedCamDepth = max(cameraWaterDepth, 0.0f);
+    const float downwellingPathCam = clampedCamDepth * invCosWater;
+    const float3 directDownwelling = sunTint * (daylight * surfaceTrans * 0.75f) * exp2(-UW_WATER_EXTINCTION_LOG2 * downwellingPathCam);
+    const float3 skyDownwelling = float3(0.06f, 0.15f, 0.26f) * (0.015f + 0.20f * daylight) * exp2(-UW_WATER_EXTINCTION_LOG2 * (clampedCamDepth * 1.15f));
+    const float3 inScatterRadiance = (directDownwelling + skyDownwelling) * UW_WATER_SCATTER_ALBEDO;
+
+    const float3 viewTransmittance = exp2(-UW_WATER_EXTINCTION_LOG2 * viewDist);
+    const float3 physicalUnderwater = attenuatedScene * viewTransmittance + inScatterRadiance * (1.0f - viewTransmittance);
+    const float3 safeUnderwater = max(all(isfinite(physicalUnderwater)) ? physicalUnderwater : col.rgb, 0.0f);
+
+    return float4(lerp(col.rgb, safeUnderwater, underwaterMask), col.a);
+}
+
+// Backward-compatible overloads for 2-argument callers.
+float4 UnderWaterHaze(float2 ScreenUV, float WaterLevel)
+{
+    return UnderWaterHaze(float3(ScreenUV, WaterLevel));
+}
+
+float4 UnderWaterHazeCompact(float2 ScreenUV, float WaterLevel)
+{
+    return UnderWaterHaze(float3(ScreenUV, WaterLevel));
 }
 
 #endif

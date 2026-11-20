@@ -6,6 +6,7 @@
  */
 
 #include "Simulator/NodeTokenLibrary.h"
+#include "Format/v3d.h"
 
 namespace SimulatorNodeTokens
 {
@@ -88,6 +89,12 @@ FName FSimulatorParsedNodeName::GetEffectiveTokenForFamily(const FName Family) c
     return Found ? Found->Token : NAME_None;
 }
 
+FString USimulatorNodeTokenLibrary::NormalizeSegment(const FString& Segment)
+{
+    if (v3d::instance_segment(*Segment, Segment.Len())) return TEXT("INST");
+    return Segment.Left(static_cast<int32>(v3d::exporter_stem_length(*Segment, Segment.Len()))).ToUpper();
+}
+
 FSimulatorParsedNodeName USimulatorNodeTokenLibrary::ParseNodeName(const FString& NodeName)
 {
     FSimulatorParsedNodeName Result;
@@ -107,8 +114,8 @@ FSimulatorParsedNodeName USimulatorNodeTokenLibrary::ParseNodeName(const FString
     for (int32 Ordinal = 0; Ordinal < Segments.Num(); ++Ordinal)
     {
         const FString Raw = Segments[Ordinal];
-        const FString Normalized = Raw.ToUpper();
-        if (Raw.IsEmpty() || Raw != Raw.TrimStartAndEnd() || Normalized.Contains(TEXT(" ")))
+        const FString Normalized = NormalizeSegment(Raw);
+        if (Normalized != TEXT("INST") && (Raw.IsEmpty() || Raw != Raw.TrimStartAndEnd() || Normalized.Contains(TEXT(" "))))
         {
             Result.InvalidSegments.Add(Raw);
             continue;
@@ -147,7 +154,7 @@ FString USimulatorNodeTokenLibrary::GetBaseNodeName(const FString& NodeName)
 
 FName USimulatorNodeTokenLibrary::GetTokenFamily(const FName Token)
 {
-    return SimulatorNodeTokens::ResolveFamily(Token.ToString().ToUpper());
+    return SimulatorNodeTokens::ResolveFamily(NormalizeSegment(Token.ToString()));
 }
 
 bool USimulatorNodeTokenLibrary::IsSupportedToken(const FName Token)

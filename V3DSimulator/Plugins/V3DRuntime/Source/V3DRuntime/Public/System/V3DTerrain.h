@@ -33,5 +33,6 @@ namespace V3DTerrain
      * as an image decode failure or copied back from a platform-encoded GPU texture.
      * Large pure pixel conversions run in parallel; UObject/material resolution stays on the caller.
      */
-    V3DRUNTIME_API bool Bake(UglTFRuntimeAsset* Source, FGWorldBakedModel& Model, FString& Error, const UObject* WorldContextObject = nullptr);
+    V3DRUNTIME_API bool Bake(UglTFRuntimeAsset* Source, FGWorldBakedModel& Model, FString& Error, const UObject* WorldContextObject = nullptr,
+        int32 BuildTextureResolution = 1024, bool bFlipNormalGreen = false);
 }

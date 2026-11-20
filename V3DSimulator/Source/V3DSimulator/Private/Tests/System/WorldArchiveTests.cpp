@@ -9,7 +9,7 @@
 #include "System/GameManagerSubSystem.h"
 #include "System/WorldArchive.h"
 #include <atomic>
-#include "Format/v3d.hpp"
+#include "Format/v3d.h"
 #include "System/WorldBakedModelAsset.h"
 #include "System/WorldBakedTexture.h"
 #include "System/WorldObjectStreamingSubsystem.h"
@@ -203,6 +203,8 @@ bool FRecursiveWorldSourceDiscoveryTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Untyped Model definition remains buildable"),
         ModelDefinitionJson::LoadDefinition(
             DirectJson, DirectGlb, ParsedDefinition, ParseError, &CanonicalJson));
+    TestEqual(TEXT("Portable build resolution default"), ParsedDefinition.BuildTextureResolution, 1024);
+    TestEqual(TEXT("Portable terrain resolution default"), ParsedDefinition.BuildTerrainTextureResolution, 1024);
     TestTrue(TEXT("Untyped definition defaults AssetType to Model"),
         ParsedDefinition.AssetType == EAssetDefinitionType::Model);
     TestTrue(TEXT("Untyped definition normalizes to Static"),
@@ -417,20 +419,12 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
         if (Count) FMemory::Memcpy(Destination, PortableFixture.GetData() + Offset, Count);
         return true;
     };
-    const auto Inflate = [](const uint8* Source, size_t SourceSize, uint8* Destination,
-        size_t DestinationSize, std::string& Failure)
-    {
-        const bool Ok = FCompression::UncompressMemory(NAME_Zlib, Destination,
-            static_cast<int64>(DestinationSize), Source, static_cast<int64>(SourceSize), COMPRESS_NoFlags, 0);
-        if (!Ok) Failure = "zlib decode failed";
-        return Ok;
-    };
     if (!TestTrue(TEXT("Standalone V3D API opens Unreal output"),
-        PortableReader.open(PortableRead, PortableFixture.Num(), PortableError, Inflate))) return false;
-    TestEqual(TEXT("Public format revision is 6"), static_cast<uint64>(PortableReader.header().revision), uint64(6));
+        PortableReader.open(PortableRead, PortableFixture.Num(), PortableError))) return false;
+    TestEqual(TEXT("Public format revision matches writer"), static_cast<uint64>(PortableReader.header().revision), static_cast<uint64>(v3d::archive_revision));
     if (!TestEqual(TEXT("Portable directory contains model"), static_cast<int32>(PortableReader.directory().models.size()), 1)) return false;
     v3d::model_metadata PortableMetadata;
-    TestTrue(TEXT("Standalone API reads compressed metadata"), PortableReader.read_metadata(
+    TestTrue(TEXT("Standalone API reads stored metadata without a decompressor"), PortableReader.read_metadata(
         PortableReader.directory().models[0], PortableMetadata, PortableError));
     TestEqual(TEXT("Portable node transform count"), static_cast<int32>(PortableMetadata.nodes.size()), 1);
     TestEqual(TEXT("Portable instance count"), static_cast<int32>(PortableMetadata.instances.size()), 1);
@@ -564,6 +558,18 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
     MeshDependencies = Bundle.MeshMaterialDependencies.Find(0);
     TestTrue(TEXT("Collision-only read still learns material dependency IDs"),
         MeshDependencies && MeshDependencies->Contains(0));
+
+    Bundle.Reset();
+    const TArray<int32> AuthoredLODOrder = {1, 0, 1};
+    if (TestTrue(TEXT("Non-monotonic LOD bundle loads"), Reader->ReadMeshBundle(
+        Model.Definition.UUID, Manifest, AuthoredLODOrder, INDEX_NONE, true, Bundle, Error))
+        && TestEqual(TEXT("Duplicate mesh ids are read once"), Bundle.Meshes.Num(), 2))
+    {
+        TestEqual(TEXT("LOD0 retains the first requested mesh id"), Bundle.Meshes[0].MeshIndex, 1);
+        TestEqual(TEXT("LOD1 retains the next distinct requested id"), Bundle.Meshes[1].MeshIndex, 0);
+        TestEqual(TEXT("LOD0 retains its own material"), Bundle.Meshes[0].Primitives[0].MaterialId, 1);
+        TestEqual(TEXT("LOD1 retains its own material"), Bundle.Meshes[1].Primitives[0].MaterialId, 0);
+    }
 
     // Runtime must remain independent from authoring source files after a verified build exists.
     TestTrue(TEXT("Delete source GLB after build"), IFileManager::Get().Delete(*GlbPath));

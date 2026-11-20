@@ -12,7 +12,7 @@ public class V3DSimulatorEditor : ModuleRules
         });
         PrivateDependencyModuleNames.AddRange(new[]
         {
-            "V3DSimulator", "V3DRuntime", "Slate", "SlateCore", "ToolMenus", "BlueprintGraph", "AnimGraph", "KismetCompiler"
+            "V3DSimulator", "V3DRuntime", "Slate", "SlateCore", "ToolMenus", "BlueprintGraph", "AnimGraph", "KismetCompiler", "MaterialEditor", "AssetRegistry", "DeveloperToolSettings"
         });
     }
 }

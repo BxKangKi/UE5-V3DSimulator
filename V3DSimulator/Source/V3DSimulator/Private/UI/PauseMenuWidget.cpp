@@ -22,6 +22,7 @@
 #include "Components/VerticalBox.h"
 #include "Components/TextBlock.h"
 #include "Kismet/GameplayStatics.h"
+#include "InputCoreTypes.h"
 
 UPauseMenuWidget::UPauseMenuWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
@@ -33,6 +34,7 @@ UPauseMenuWidget::UPauseMenuWidget(const FObjectInitializer& ObjectInitializer)
     TitleFontSize = 100;
     BackgroundColor = V3DHUDStyle::PauseBackground;
     PanelColor = FLinearColor::Transparent;
+    SetIsFocusable(true);
 }
 
 void UPauseMenuWidget::NativeConstruct()
@@ -51,6 +53,17 @@ void UPauseMenuWidget::NativeDestruct()
     AssignedSettingsButton.Reset();
     AssignedExitButton.Reset();
     Super::NativeDestruct();
+}
+
+FReply UPauseMenuWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+    if (!InKeyEvent.IsRepeat()
+        && (InKeyEvent.GetKey() == EKeys::Escape || InKeyEvent.GetKey() == EKeys::Gamepad_FaceButton_Right))
+    {
+        ContinueFromUI();
+        return FReply::Handled();
+    }
+    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
 }
 
 void UPauseMenuWidget::SetTitleText(UTextBlock* InTitleText)

@@ -22,8 +22,8 @@
 // Geometry uses centimeters, left-handed Z-up (+X forward,+Y right,+Z up).
 // Quaternion component order is XYZW; transforms are scale, then rotate, then translate.
 // See Docs/V3D_FORMAT.md for the container and shader/material conventions.
-#ifndef V3D_HPP_INCLUDED
-#define V3D_HPP_INCLUDED
+#ifndef V3D_H_INCLUDED
+#define V3D_H_INCLUDED
 
 #include <algorithm>
 #include <array>
@@ -108,7 +108,7 @@ struct texture_parameter { std::string name; std::int32_t texture_id=-1; };
 struct material {
     std::int32_t material_id=-1;
     std::string name,base_material_path; // Engine hint; external readers need not load it.
-    std::uint8_t material_type=0; // 0 opaque, 1 translucent, 4 masked; all single-sided.
+    std::uint8_t material_type=0; // 0 opaque, 1 translucent, 2 two-sided opaque, 3 two-sided translucent, 4 masked, 5 two-sided masked.
     bool unlit=false;
     std::vector<scalar_parameter> scalars;
     std::vector<vector_parameter> vectors;
@@ -390,7 +390,7 @@ inline bool decode(const std::uint8_t* data,std::size_t size,skin& out,std::stri
     out=std::move(s);error.clear();return true;
 }
 inline bool validate(const material& m,std::string& error) {
-    if(m.material_id<0||!detail::valid_name(m.name)||(m.material_type!=0&&m.material_type!=1&&m.material_type!=4)||m.scalars.size()>65536||m.vectors.size()>65536||m.textures.size()>65536)return detail::failure(error,"Invalid material id/name/type/count");
+    if(m.material_id<0||!detail::valid_name(m.name)||m.material_type>5||m.scalars.size()>65536||m.vectors.size()>65536||m.textures.size()>65536)return detail::failure(error,"Invalid material id/name/type/count");
     std::set<std::string> names;
     for(const auto& p:m.scalars)if(!detail::valid_name(p.name)||!std::isfinite(p.value)||!names.insert(p.name).second)return detail::failure(error,"Invalid or duplicate scalar parameter");
     for(const auto& p:m.scalars) {
@@ -1430,5 +1430,172 @@ public:
     }
 };
 
+
+// --- Material Policy (merged from material_policy.hpp) ---
+// Stable wire values:
+// 0 = Auto, 1 = legacy Opaque alias -> 5, 3 = Translucent, 5 = Opaque (Masked shader),
+// 6 = Opaque Two Sided, 7 = Translucent Two Sided.
+constexpr std::uint8_t normalize_material_mode(std::uint8_t mode)
+{ return mode == 1 ? 5 : (mode == 0 || mode == 3 || mode == 5 || mode == 6 || mode == 7) ? mode : 0; }
+constexpr bool material_is_two_sided(std::uint8_t type)
+{ return type == 2 || type == 3 || type == 5; }
+constexpr bool material_two_sided_override(std::uint8_t source_type, std::uint8_t override_mode)
+{
+    const auto mode = normalize_material_mode(override_mode);
+    return (mode == 6 || mode == 7) ? true : material_is_two_sided(source_type);
+}
+// Slots 1 and 5 are retained as legacy aliases, never a separate Masked option in the UI.
+constexpr int material_alpha(std::uint8_t source_type, std::uint8_t override_mode)
+{
+    const auto mode = normalize_material_mode(override_mode);
+    return (mode == 3 || mode == 7) ? 2 : (mode == 5 || mode == 6) ? 0 : (source_type == 1 || source_type == 3) ? 2 : 0;
+}
+constexpr std::uint8_t runtime_material_type(std::uint8_t source_type)
+{
+    return material_alpha(source_type, 0) == 2
+        ? (material_is_two_sided(source_type) ? 3 : 1)
+        : (material_is_two_sided(source_type) ? 5 : 4);
+}
+constexpr int material_parent_slot(int family, int alpha, bool two_sided = false)
+{ return (family == 2 ? 3 : alpha == 2 ? 2 : 0) + (two_sided ? 4 : 0); }
+constexpr bool material_is_dynamic(int dynamic_state, int request_family)
+{ return request_family == 1 || dynamic_state != 0; }
+constexpr float material_fade_distance(bool dynamic)
+{ return dynamic ? 50.0f : -1.0f; }
+
+
+// --- Animation Names (merged from animation_names.h) ---
+inline std::string animation_key(std::string name) {
+    const auto separator=name.find_last_of("|:/\\");
+    if(separator!=std::string::npos)name.erase(0,separator+1);
+    if(name.size()>3&&(name.substr(0,3)=="AS_"||name.substr(0,3)=="as_"))name.erase(0,3);
+    std::string key;for(unsigned char c:name){if(c>='A'&&c<='Z')c+=32;if((c>='a'&&c<='z')||(c>='0'&&c<='9'))key+=char(c);}
+    if(key=="walking")return "walk";
+    if(key=="running")return "run";
+    if(key=="jumping")return "jump";
+    if(key=="crouched"||key=="crouching"||key=="crouchidle")return "crouch";
+    if(key=="crouchedwalking"||key=="crouchwalking")return "crouchwalk";
+    if(key=="swimming")return "swim";
+    if(key=="swimmingrun"||key=="swimrun")return "swimfast";
+    if(key=="treadingwater")return "swimidle";
+    if(key=="swimmingup")return "swimup";
+    if(key=="swimmingdown")return "swimdown";
+    if(key=="falling")return "fall";
+    if(key=="landing")return "land";
+    if(key=="flying")return "fly";
+    if(key=="floating")return "flyidle";
+    if(key=="diving")return "dive";
+    if(key=="gettingup"||key=="getup")return "getupback";
+    if(key=="standingup")return "getupfront";
+    return key;
+}
+inline std::vector<std::string> animation_candidates(const std::string& name) {
+    const auto key=animation_key(name);std::vector<std::string> keys{key};
+    if(key=="walkinplace")keys.push_back("walk");
+    if(key=="crouchwalk")keys.push_back("crouch");
+    if(key=="swimfast"||key=="swimup"||key=="swimdown")keys.push_back("swim");
+    if(key=="fallloop")keys.push_back("fall");
+    return keys;
+}
+
+// --- Build Policy (merged from build_policy.h) ---
+// Authoring defaults, independent of machine graphics settings and active GPU/RHI.
+    constexpr int build_texture_resolution = 1024;
+    constexpr int build_terrain_texture_resolution = 1024;
+    constexpr std::uint8_t build_member_codec = 0; // Stored, deterministic layout; reader still accepts zlib.
+
+    inline bool valid_build_texture_resolution(int value)
+    {
+        return value >= 64 && value <= 8192;
+    }
+
+    // Same RGBA8 wire layout for Metal's and D3D's CPU texture channel orders.
+    inline bool bgra_to_rgba(std::uint8_t* pixels, std::size_t byte_count)
+    {
+        if ((!pixels && byte_count) || byte_count % 4) return false;
+        for (std::size_t i = 0; i < byte_count; i += 4)
+        {
+            const std::uint8_t red = pixels[i + 2];
+            pixels[i + 2] = pixels[i];
+            pixels[i] = red;
+        }
+        return true;
+    }
+
+// --- Instance Plan (merged from instance_plan.h) ---
+struct instance_source_node {
+    int id = -1, mesh = -1, skin = -1, lod = 0;
+    std::string base;
+    bool instance = false, explicit_lod0 = false;
+};
+struct instance_capture_plan {
+    std::vector<int> sources;
+    std::map<int, int> node_meshes; // node id -> dense baked payload index
+};
+// INST is placement-only, regardless of an accompanying LOD directive. A family without
+// LOD0 uses its most detailed source; an instance-only family retains one source as a root.
+// Skin ownership is part of the key. Opaque extension decoders opt out of geometry aliasing.
+inline bool build_instance_plan(const std::vector<instance_source_node>& nodes, int mesh_count,
+    bool allow_alias, instance_capture_plan& output, std::string& error)
+{
+    output = {}; error.clear();
+    if (mesh_count < 0) { error = "negative mesh count"; return false; }
+    using key = std::pair<std::string, int>;
+    std::map<key, const instance_source_node*> canonical;
+    const auto score = [](const instance_source_node& n) {
+        // Authored sources outrank INST, then LOD0 > LOD1 > ..., explicit LOD0 > bare.
+        return std::make_pair((n.instance ? 100 : 0) + n.lod * 2 + (n.explicit_lod0 ? 0 : 1), n.mesh);
+    };
+    for (const auto& n : nodes) {
+        if (n.mesh >= mesh_count || n.mesh < -1 || n.id < 0) { error = "invalid node/mesh index"; return false; }
+        if (n.mesh < 0 || n.base.empty()) continue;
+        const key k(n.base, n.skin);
+        const auto old = canonical.find(k);
+        if (old == canonical.end() || score(n) < score(*old->second)) canonical[k] = &n;
+    }
+    std::vector<bool> seen(mesh_count, false), needed(mesh_count, false);
+    std::map<int, int> node_sources;
+    for (const auto& n : nodes) {
+        if (n.mesh >= 0) seen[n.mesh] = true;
+        int source = n.mesh;
+        if (n.instance && (allow_alias || source < 0)) {
+            const auto found = canonical.find(key(n.base, n.skin));
+            if (found != canonical.end()) source = found->second->mesh;
+        }
+        if (source < 0) {
+            if (n.instance) { error = "instance has no canonical mesh: " + n.base; return false; }
+            continue;
+        }
+        if (!node_sources.emplace(n.id, source).second) { error = "duplicate node id"; return false; }
+        needed[source] = true;
+    }
+    std::vector<int> dense(mesh_count, -1);
+    for (int i = 0; i < mesh_count; ++i) {
+        // Retain unreferenced source payloads; extensions/animations may consume them later.
+        if (needed[i] || !seen[i]) { dense[i] = static_cast<int>(output.sources.size()); output.sources.push_back(i); }
+    }
+    for (const auto& pair : node_sources) output.node_meshes.emplace(pair.first, dense[pair.second]);
+    return true;
+}
+
+// --- Name Policy (merged from name_policy.h) ---
+// Blender-style numeric suffixes are metadata only after a recognized directive/name.
+template<class Char> std::size_t exporter_stem_length(const Char* text, std::size_t size)
+{
+    std::size_t i = size;
+    while (i > 0 && text[i-1] >= Char('0') && text[i-1] <= Char('9')) --i;
+    return i > 0 && i < size && text[i-1] == Char('.') ? i-1 : size;
+}
+template<class Char> bool instance_segment(const Char* text, std::size_t size)
+{
+    const char prefix[] = "INST";
+    if (size < 4) return false;
+    for (std::size_t i = 0; i < 4; ++i) {
+        const Char c = text[i] >= Char('a') && text[i] <= Char('z') ? text[i]-Char('a')+Char('A') : text[i];
+        if (c != Char(prefix[i])) return false;
+    }
+    return true; // ;INST followed by ANY characters is an instance directive.
+}
+
 } // namespace v3d
-#endif // V3D_HPP_INCLUDED
+#endif // V3D_H_INCLUDED

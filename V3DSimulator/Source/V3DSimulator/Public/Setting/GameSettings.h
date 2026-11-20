@@ -57,6 +57,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess", meta=(ClampMin="-11.0", ClampMax="20.0"))
     float Exposure = -11.0f;
 
+    /** Minimum EV100 limit when Auto Exposure is enabled. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess", meta=(ClampMin="-10.0", ClampMax="10.0"))
+    float AutoExposureMinEV = -5.0f;
+
+    /** Maximum EV100 limit when Auto Exposure is enabled. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess", meta=(ClampMin="-10.0", ClampMax="20.0"))
+    float AutoExposureMaxEV = 13.0f;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering")
     // Requests hardware Lumen and RT shadows; unsupported renderers use raster shadows.
     bool bRayTracing = true;
@@ -70,6 +78,16 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ShadowQuality = 2;
+
+    /** Shadow coverage from the camera; bounded by MaxRenderDistanceMeters. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering", meta=(ClampMin="256", ClampMax="8192", UIMin="256", UIMax="8192", Delta="256", Units="m"))
+    int32 ShadowDistanceMeters = 2048;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Rendering")
+    int32 GetClampedShadowDistanceMeters() const;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Rendering")
+    float GetEffectiveShadowDistanceCentimeters() const;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 TextureQuality = 2;

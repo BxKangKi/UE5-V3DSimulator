@@ -409,12 +409,10 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
         {
             auto Options = MakeShared<TArray<TSharedPtr<FString>>>();
             FString DisplayValue=ValueText(Value);
-            if (Key==TEXT("MaterialMode"))
-            {
-            }
+            if (Key == TEXT("MaterialMode") && DisplayValue == TEXT("Masked")) DisplayValue = TEXT("Opaque");
             TArray<FString> Names;
             if (Key == TEXT("Shader")) Names = {TEXT("Default"), TEXT("Toon")};
-            else if (Key == TEXT("MaterialMode")) Names = {TEXT("Auto"), TEXT("Opaque"), TEXT("Masked"), TEXT("Translucent")};
+            else if (Key == TEXT("MaterialMode")) Names = {TEXT("Auto"), TEXT("Opaque"), TEXT("Opaque Two Sided"), TEXT("Translucent"), TEXT("Translucent Two Sided")};
             else if (Key == TEXT("AssetType")) Names = {TEXT("Model"),TEXT("Sound")};
             if (Key == TEXT("ModelType")) Names = {TEXT("Static"),TEXT("Dynamic"),TEXT("Character")};
             if (Key == TEXT("EntityType")) Names = {TEXT("Prop"),TEXT("Vehicle"),TEXT("Animal")};

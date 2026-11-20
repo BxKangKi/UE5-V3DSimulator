@@ -13,6 +13,7 @@ class FJsonObject;
 #include "Simulator/AssetDefinitionTypes.h"
 #include "Simulator/ModelDefinitionTypes.h"
 #include "System/ProjectTypes.h"
+#include "Format/v3d.h"
 
 /** Strict, immutable view of one author-owned model JSON document. */
 struct V3DRUNTIME_API FModelDefinition
@@ -28,7 +29,11 @@ struct V3DRUNTIME_API FModelDefinition
     EModelEntityType EntityType = EModelEntityType::None;
     EModelItemType ItemType = EModelItemType::None;
     bool bToon = false;
-    uint8 MaterialMode = 0; // Stable wire values: 0 Auto, 1 Masked, 3 Translucent, 5 Opaque. Always single-sided.
+    uint8 MaterialMode = 0; // Stable wire values: 0 Auto, 1 legacy Opaque alias, 3 Translucent, 5 Opaque (Masked shader). Sidedness comes from the source.
+    // These authoring values travel with the model JSON, never with settings.json or the GPU.
+    int32 BuildTextureResolution = v3d::build_texture_resolution;
+    int32 BuildTerrainTextureResolution = v3d::build_terrain_texture_resolution;
+    bool bBuildTerrainFlipNormalGreen = false;
     TMap<FString, FString> Bones;
     FGravityFieldSettings GravityField;
 

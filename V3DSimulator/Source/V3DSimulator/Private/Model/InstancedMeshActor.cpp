@@ -142,6 +142,7 @@ UHierarchicalInstancedStaticMeshComponent* AInstancedMeshActor::CreateChunkCompo
     Component->SetMobility(EComponentMobility::Movable);
     Component->SetupAttachment(Root);
     Component->SetGenerateOverlapEvents(false);
+    Component->SetCullDistances(MeshComponent->InstanceStartCullDistance, MeshComponent->InstanceEndCullDistance);
     Component->SetCanEverAffectNavigation(MeshComponent->CanEverAffectNavigation());
     Component->SetStaticMesh(MeshComponent->GetStaticMesh());
     Component->SetCollisionProfileName(MeshComponent->GetCollisionProfileName());
@@ -175,21 +176,78 @@ bool AInstancedMeshActor::CanMutateNode(const FName NodeName) const
 bool AInstancedMeshActor::AddNodeInstance(const FName NodeName, const FTransform& LocalTransform)
 {
     check(IsInGameThread());
-    if (!IsValid(MeshComponent) || !IsValid(MeshComponent->GetStaticMesh())
-        || NodeName.IsNone() || LocalTransform.ContainsNaN() || !GetNodeMapRef().Contains(NodeName)) return false;
-    if (LoadedNodes->Contains(NodeName)) return true;
-    const FIntVector Chunk = V3DHISMChunkPolicy::Key(GetActorTransform().TransformPosition(LocalTransform.GetLocation()));
-    FName PageName = OpenChunkPages.FindRef(Chunk);
-    auto* Component = ChunkComponents.FindRef(PageName).Get();
-    if (!IsValid(Component) || Component->IsAsyncBuilding()
-        || Component->GetNumInstances() >= V3DHISMChunkPolicy::MaxInstancesPerComponent)
-        Component = CreateChunkComponent(Chunk, PageName);
-    const int32 Index = Component->AddInstance(LocalTransform);
-    if (Index == INDEX_NONE) return false;
-    ChunkPages.FindChecked(PageName).Nodes.Add(NodeName);
-    InstanceSlots.Add(NodeName, FInstanceSlot{PageName, Index});
-    LoadedNodes->Add(NodeName);
-    DirtyPages.Add(PageName);
+    FWorldPreparedInstance Row;
+    Row.NodeName = NodeName; Row.LocalTransform = LocalTransform;
+    Row.WorldChunk = V3DHISMChunkPolicy::Key(GetActorTransform().TransformPosition(LocalTransform.GetLocation()));
+    Row.bValid = !LocalTransform.ContainsNaN() && LocalTransform.GetRotation().IsNormalized();
+    TArray<FName> Added;
+    return AddNodeInstances(MakeArrayView(&Row, 1), Added);
+}
+
+void AInstancedMeshActor::SetInstanceCullDistances(int32 Start, int32 End)
+{
+    check(IsInGameThread());
+    if (!IsValid(MeshComponent)) return;
+    Start = FMath::Max(0, Start); End = FMath::Max(Start, End);
+    if (MeshComponent->InstanceStartCullDistance == Start && MeshComponent->InstanceEndCullDistance == End) return;
+    MeshComponent->SetCullDistances(Start, End);
+    for (const auto& Pair : ChunkComponents)
+        if (IsValid(Pair.Value)) Pair.Value->SetCullDistances(Start, End);
+}
+
+bool AInstancedMeshActor::AddNodeInstances(TConstArrayView<FWorldPreparedInstance> Instances, TArray<FName>& OutAdded)
+{
+    check(IsInGameThread());
+    OutAdded.Reset();
+    if (bRuntimeResourcesReleased || !IsValid(MeshComponent) || !IsValid(MeshComponent->GetStaticMesh())) return false;
+    TSet<FName> Seen;
+    TArray<const FWorldPreparedInstance*> Rows;
+    // Reject invalid/duplicate input before mutating components or slot bookkeeping.
+    for (const auto& Row : Instances)
+    {
+        if (!Row.bValid || Row.NodeName.IsNone() || Row.LocalTransform.ContainsNaN()
+            || !Row.LocalTransform.GetRotation().IsNormalized() || !GetNodeMapRef().Contains(Row.NodeName)) return false;
+        if (LoadedNodes->Contains(Row.NodeName) || Seen.Contains(Row.NodeName)) continue;
+        Seen.Add(Row.NodeName); Rows.Add(&Row);
+    }
+    int32 Offset = 0;
+    while (Offset < Rows.Num())
+    {
+        const FIntVector Chunk = Rows[Offset]->WorldChunk;
+        FName PageName = OpenChunkPages.FindRef(Chunk);
+        auto* Component = ChunkComponents.FindRef(PageName).Get();
+        if (!IsValid(Component) || Component->IsAsyncBuilding()
+            || Component->GetNumInstances() >= V3DHISMChunkPolicy::MaxInstancesPerComponent)
+            Component = CreateChunkComponent(Chunk, PageName);
+        const int32 Capacity = V3DHISMChunkPolicy::MaxInstancesPerComponent - Component->GetNumInstances();
+        TArray<FTransform> Transforms;
+        Transforms.Reserve(FMath::Min(Capacity, Rows.Num() - Offset));
+        while (Transforms.Num() < Capacity && Offset + Transforms.Num() < Rows.Num()
+            && Rows[Offset + Transforms.Num()]->WorldChunk == Chunk)
+            Transforms.Add(Rows[Offset + Transforms.Num()]->LocalTransform);
+        const int32 FirstIndex = Component->GetNumInstances();
+        const TArray<int32> Indices = Component->AddInstances(Transforms, true, false, false);
+        bool bComplete = Indices.Num() == Transforms.Num();
+        for (int32 Index = 0; bComplete && Index < Indices.Num(); ++Index) bComplete = Indices[Index] == FirstIndex + Index;
+        if (!bComplete)
+        {
+            // HISM appends synchronously on GT. Roll back only this append, in reverse order.
+            for (int32 Index = Component->GetNumInstances() - 1; Index >= FirstIndex; --Index) Component->RemoveInstance(Index);
+            if (FirstIndex == 0) DestroyChunkComponent(PageName);
+            else DirtyPages.Add(PageName);
+            return false;
+        }
+        FChunkPage& Page = ChunkPages.FindChecked(PageName);
+        for (int32 Index = 0; Index < Indices.Num(); ++Index)
+        {
+            const FName Name = Rows[Offset + Index]->NodeName;
+            Page.Nodes.Add(Name);
+            InstanceSlots.Add(Name, FInstanceSlot{PageName, Indices[Index]});
+            LoadedNodes->Add(Name); OutAdded.Add(Name);
+        }
+        DirtyPages.Add(PageName);
+        Offset += Transforms.Num();
+    }
     return true;
 }
 

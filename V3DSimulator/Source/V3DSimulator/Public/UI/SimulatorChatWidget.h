@@ -5,10 +5,11 @@
 #include "Components/EditableTextBox.h"
 #include "SimulatorChatWidget.generated.h"
 
+class UButton;
 class UTextBlock;
 class UScrollBox;
 
-/** Native command chat: Enter opens, Enter submits, Escape closes. No WBP asset is required. */
+/** Native custom chat: T/Enter opens, Enter/Send submits, Escape/Close closes. Works in Shipping and Mobile builds. */
 UCLASS(Blueprintable, BlueprintType)
 class V3DSIMULATOR_API USimulatorChatWidget : public UResponsiveHUDWidget
 {
@@ -31,8 +32,13 @@ protected:
     virtual FReply NativeOnPreviewKeyDown(const FGeometry& Geometry, const FKeyEvent& Event) override;
 private:
     UPROPERTY(Transient) TObjectPtr<UEditableTextBox> Input;
+    UPROPERTY(Transient) TObjectPtr<UButton> SendButton;
+    UPROPERTY(Transient) TObjectPtr<UButton> CloseButton;
     UPROPERTY(Transient) TObjectPtr<UTextBlock> Output;
     UPROPERTY(Transient) TObjectPtr<UScrollBox> OutputScroll;
     TArray<FString> History;
+    void SubmitCurrentInput();
     UFUNCTION() void Commit(const FText& Text, ETextCommit::Type Method);
+    UFUNCTION() void HandleSendClicked();
+    UFUNCTION() void HandleCloseClicked();
 };

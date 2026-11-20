@@ -1,8 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-// The wire format belongs to Format/v3d.hpp. This file only translates Unreal values.
+// The wire format belongs to Format/v3d.h. This file only translates Unreal values.
 #include "System/WorldArchiveCodec.h"
 #include "System/V3DTerrain.h"
-#include "Format/v3d.hpp"
+#include "Format/v3d.h"
 #include "Async/ParallelFor.h"
 #include "HAL/PlatformMisc.h"
 #include "PixelFormat.h"

@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/WorldArchiveCodec.h"
-#include "Format/v3d.hpp"
+#include "Format/v3d.h"
 #include "Misc/AutomationTest.h"
 #include "PixelFormat.h"
 #include "Engine/Texture.h"

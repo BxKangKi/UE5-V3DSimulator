@@ -5,6 +5,14 @@
 class AWaterActor;
 class UShapeComponent;
 class ULightComponent;
+/** Detached worker result. No UObject access is needed to validate/place a transform. */
+struct FWorldPreparedInstance
+{
+    FName NodeName;
+    FTransform LocalTransform = FTransform::Identity;
+    FIntVector WorldChunk = FIntVector::ZeroValue;
+    bool bValid = false;
+};
 /** Runtime collider/light components owned by one streamed scene node. */
 USTRUCT()
 struct V3DSIMULATOR_API FComponentGroup
@@ -32,6 +40,10 @@ struct V3DSIMULATOR_API FWorldSceneStreamResult
 
     UPROPERTY()
     bool bGroupFailed = false;
+
+    /** All valid LOD requests failed. Excludes cancellation and instance/owner failures. */
+    UPROPERTY()
+    bool bMeshPayloadUnavailable = false;
 
     /** First failure of this pass, captured before per-node load state is released. */
     UPROPERTY()

@@ -35,6 +35,7 @@ public:
 
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
+    virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
     /** Internal owner assigned when this widget is registered with UMainWorldWidget. */
     void SetOwnerMainWidget(UMainWorldWidget* InOwnerWidget);

@@ -288,6 +288,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Projects")
     bool BuildProjectByName(const FString& ProjectName);
 
+    /** Cancels an active project build and notifies BuildStatusWidget listeners. */
+    UFUNCTION(BlueprintCallable, Category="Game|Projects")
+    void CancelProjectBuild();
+
     UFUNCTION(BlueprintPure, Category="Game|Projects")
     static FString GetProjectsRootPath();
 
@@ -909,7 +913,6 @@ private:
     void HandleProjectBuildModelFinished(UProjectSourceModelBuilder* BuildTask, bool bSuccess);
     void FinishProjectBuild();
     void CompleteProjectArchiveBuild(bool bSuccess, const FString& ArchivePath, const FString& Error);
-    void CancelProjectBuild();
     /** Ends only the runtime-world initialization/loading transaction; the environment actor stays alive for diagnostics. */
     void FailWorldStartup(const FString& Message);
     void ContinueWorldStartupAfterDatabase();

@@ -12,6 +12,7 @@
 
 #include "CoreMinimal.h"
 #include "System/WorldGeneratedStaticMeshContext.h"
+#include "System/V3DMeshLoadRecovery.h"
 #include "Model/ModelData.h"
 #include "Model/WorldSceneStreamTypes.h"
 #include "glTFRuntimeAsset.h"
@@ -91,6 +92,7 @@ private:
     friend class FV3DSceneActionLifetimeTest;
     friend class FV3DSceneCellAdmissionTest;
     friend class FV3DSceneFailureDiagnosticTest;
+    friend class FV3DSceneMeshFallbackTest;
 
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
@@ -146,6 +148,9 @@ private:
     FName GroupName = NAME_None;
     bool bWaterGroup = false;
     bool bGroupFailed = false;
+    bool bMeshPayloadUnavailable = false;
+    bool bRetryMeshLoadPending = false;
+    FV3DMeshLoadRecovery MeshLoadRecovery;
     FString FailureStage;
     FString FailureReason;
     FName FailedNode;
@@ -185,11 +190,18 @@ private:
     void SetStaticMesh(UStaticMesh *StaticMesh);
 
     void ProcessChunk();
+    void StartInstanceBatchPreparation();
+    int32 ApplyInstanceBatch(int32 MaxCount);
+    TArray<FWorldPreparedInstance> PreparedInstances;
+    int32 PreparedInstanceOffset = 0;
+    FTransform PreparedActorTransform = FTransform::Identity;
+    bool bInstancePreparationInFlight = false;
     void StartStreamPlanAsync();
     void ApplyPreparedPlan(FWorldSceneStreamPlan&& Plan, uint32 Serial);
     void AbortAndRelease(UStaticMesh* OrphanedMesh = nullptr);
     void ResetLoadState();
-    void FailGroup(const TCHAR* Stage, const FString& Reason, FName Node = NAME_None, FName Mesh = NAME_None);
+    void FailGroup(const TCHAR* Stage, const FString& Reason, FName Node = NAME_None,
+        FName Mesh = NAME_None, bool bPayloadUnavailable = false);
     void LoadStaticMeshAsync(const FName &Name);
     void AddTransform(const FName &Name);
     void ProcessUnloadNode(const FName &Name);

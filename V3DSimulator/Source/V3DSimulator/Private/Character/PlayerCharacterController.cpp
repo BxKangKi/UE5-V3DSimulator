@@ -121,10 +121,22 @@ void APlayerCharacterController::ServerExecuteSimulatorCommand_Implementation(co
 
 bool APlayerCharacterController::SubmitChatCommand(const FString& CommandLine)
 {
-    if (!IsLocalController() || !USimulatorCommandSubsystem::IsSimulatorCommand(*CommandLine)) return false;
-    if (CommandLine.Len() > 1024) { ClientSimulationCommandResult(TEXT("Command exceeds 1024 characters.")); return true; }
-    ServerExecuteSimulatorCommand(CommandLine);
-    return true;
+    if (!IsLocalController()) return false;
+    const FString Trimmed = CommandLine.TrimStartAndEnd();
+    if (Trimmed.IsEmpty()) return false;
+    if (Trimmed.Len() > 1024) { ClientSimulationCommandResult(TEXT("Message exceeds 1024 characters.")); return true; }
+    if (USimulatorCommandSubsystem::IsSimulatorCommand(*Trimmed))
+    {
+        ServerExecuteSimulatorCommand(Trimmed);
+        return true;
+    }
+    // Plain chat message (works in Shipping builds without console/cheat dependencies).
+    if (!Trimmed.StartsWith(TEXT("/")))
+    {
+        ClientMessage(Trimmed);
+        return true;
+    }
+    return false;
 }
 void APlayerCharacterController::ClientSimulationCommandResult_Implementation(const FString& Message)
 {
@@ -494,7 +506,11 @@ void APlayerCharacterController::SetupInputComponent()
     }
     BindConfiguredInputActions();
     BindDirectMouseInputs();
-    if (InputComponent && bEnableSimulationChat) InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &APlayerCharacterController::OpenSimulationChat);
+    if (InputComponent && bEnableSimulationChat)
+    {
+        InputComponent->BindKey(EKeys::T, IE_Pressed, this, &APlayerCharacterController::OpenSimulationChat);
+        InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &APlayerCharacterController::OpenSimulationChat);
+    }
 }
 
 void APlayerCharacterController::BeginPlayingState()
@@ -1758,7 +1774,7 @@ void APlayerCharacterController::Input_PausePressed()
 
     if (IsMenuWidgetVisible(SettingsMenuWidget.Get()))
     {
-        ReturnToPauseMenuFromSettings();
+        SettingsMenuWidget->CloseSettingsFromUI();
         return;
     }
 

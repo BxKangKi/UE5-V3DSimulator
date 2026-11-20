@@ -26,7 +26,7 @@
 #include "Animation/AnimSequence.h"
 #include "Animation/BlendSpace.h"
 #include "Serialization/ArchiveReplaceObjectRef.h"
-#include "Format/animation_names.hpp"
+#include "Format/v3d.h"
 
 namespace
 {

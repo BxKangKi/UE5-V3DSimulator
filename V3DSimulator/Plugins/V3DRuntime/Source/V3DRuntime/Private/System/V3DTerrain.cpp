@@ -890,7 +890,8 @@ namespace V3DTerrain
         return nullptr;
     }
 
-    bool Bake(UglTFRuntimeAsset* Source, FGWorldBakedModel& Model, FString& Error, const UObject* WorldContextObject)
+    bool Bake(UglTFRuntimeAsset* Source, FGWorldBakedModel& Model, FString& Error, const UObject* WorldContextObject,
+        const int32 BuildTextureResolution, const bool bFlipNormalGreen)
     {
         TArray<int32> TerrainIds;
         for (int32 Id = 0; Id < Model.Materials.Num(); ++Id)
@@ -940,14 +941,9 @@ namespace V3DTerrain
         if (TerrainIds.Num() > Private::Layers)
         { Error = TEXT("Terrain blending supports at most four .terrain materials per model; split the model into palettes"); return false; }
         const UObject* EffectiveContext = IsValid(WorldContextObject) ? WorldContextObject : Source;
-        int32 MaxSize = 1024; bool FlipGreen = false;
-        if (GConfig)
-        {
-            GConfig->GetInt(TEXT("V3D.Terrain"),TEXT("MaxTextureSize"),MaxSize,GGameIni);
-            GConfig->GetBool(TEXT("V3D.Terrain"),TEXT("FlipNormalGreen"),FlipGreen,GGameIni);
-        }
-        MaxSize = FMath::Min(FMath::Clamp(MaxSize,1,2048),
-            FMath::Max(1,FV3DRuntimeServices::MaxTextureResolution(EffectiveContext)));
+        // Archive pixels belong to the authoring JSON, not this machine's quality/device profile.
+        const int32 MaxSize = FMath::Clamp(BuildTextureResolution, 64, 2048);
+        const bool FlipGreen = bFlipNormalGreen;
         Private::FSourceTextureCache SourceTextures;
         SourceTextures.Source = Source;
         SourceTextures.MaxSize = MaxSize;
