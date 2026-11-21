@@ -54,6 +54,13 @@ bool FV3DAudioConfigurationTest::RunTest(const FString&)
     Json.JsonObject->GetObjectField(TEXT("Audio"))->SetStringField(TEXT("WaterLoop"), TEXT("false"));
     TestFalse(TEXT("Invalid channel loop rejected"), FV3DEnvironmentConfig::Parse(Json.JsonObject, Environment, Error));
 
+    auto CrossfadeJson = FSafeFileIO::ParseJsonText(TEXT(R"({"Audio":{"bBiomeAudioCrossfade":true,"BiomeCrossfadeSeconds":2.5}})"), TEXT("crossfade"));
+    TestTrue(TEXT("Biome audio crossfade settings parse"), FV3DEnvironmentConfig::Parse(CrossfadeJson.JsonObject, Environment, Error));
+    TestTrue(TEXT("Crossfade enabled"), Environment.Audio.bBiomeAudioCrossfade);
+    TestEqual(TEXT("Crossfade duration preserved"), Environment.Audio.BiomeCrossfadeSeconds, 2.5f);
+    CrossfadeJson.JsonObject->GetObjectField(TEXT("Audio"))->SetNumberField(TEXT("BiomeCrossfadeSeconds"), -1.0);
+    TestFalse(TEXT("Negative crossfade duration rejected"), FV3DEnvironmentConfig::Parse(CrossfadeJson.JsonObject, Environment, Error));
+
     TStrongObjectPtr<USimulationCommandObject> Stop(NewObject<USimulationCommandObject>());
     TestTrue(TEXT("Loop stop command parses"), Stop->InitializeFromJson(TEXT(R"({"Name":"stop_slide","Actions":[{"Type":"sound_event","Event":"Slide","Stop":true}]})"), Error));
     TestTrue(TEXT("Loop stop survives serialization"), Stop->ToJson().Contains(TEXT("\"Stop\": true")) || Stop->ToJson().Contains(TEXT("\"Stop\":true")));

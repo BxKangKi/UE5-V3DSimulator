@@ -11,6 +11,10 @@ struct V3DSIMULATOR_API FV3DWorldAudioSettings
     TOptional<bool> DefaultFootstepLoop, WaterLoop, UnderwaterLoop, EnvironmentMusicLoop;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") bool bGlobalAcoustics = false;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") bool bEnvironmentMusic = true;
+    /** Enable smooth crossfade when transitioning ambient/environment audio between biomes. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") bool bBiomeAudioCrossfade = true;
+    /** Crossfade duration in seconds when transitioning biome ambient audio. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio", meta=(ClampMin="0", ClampMax="30")) float BiomeCrossfadeSeconds = 1.5f;
     /** Empty uses AssetRegistry. "none" explicitly mutes. Otherwise v3d://sound/UUID. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") FString DefaultFootstep;
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Audio") FString Water;

@@ -307,12 +307,31 @@ bool AWeaponActor::LoadConfigJson(const FString& DefinitionJson)
     RootObject->TryGetStringField(V3DSimulatorJsonMetadata::Version, Config.Version);
 
     FString SocketName;
-    if (RootObject->TryGetStringField(TEXT("AttachSocketName"), SocketName))
+    const bool bHasDirectSocket = RootObject->TryGetStringField(TEXT("AttachSocketName"), SocketName) && !SocketName.IsEmpty();
+    if (bHasDirectSocket)
     {
         Config.AttachSocketName = FName(SocketName);
     }
 
-    TryReadTransform(RootObject, TEXT("HoldTransform"), Config.HoldTransform);
+    const bool bHasDirectHold = TryReadTransform(RootObject, TEXT("HoldTransform"), Config.HoldTransform);
+    const TSharedPtr<FJsonObject>* InteractionObj = nullptr;
+    if ((!bHasDirectSocket || !bHasDirectHold) && RootObject->TryGetObjectField(TEXT("EquipmentInteraction"), InteractionObj)
+        && InteractionObj && InteractionObj->IsValid())
+    {
+        const TSharedPtr<FJsonObject>* GripObj = nullptr;
+        if ((*InteractionObj)->TryGetObjectField(TEXT("RightGrip"), GripObj) && GripObj && GripObj->IsValid())
+        {
+            FString GripSocket;
+            if (!bHasDirectSocket && (*GripObj)->TryGetStringField(TEXT("CharacterSocket"), GripSocket) && !GripSocket.IsEmpty())
+            {
+                Config.AttachSocketName = FName(GripSocket);
+            }
+            if (!bHasDirectHold)
+            {
+                TryReadTransform(*GripObj, TEXT("AttachmentOffset"), Config.HoldTransform);
+            }
+        }
+    }
     TryReadTransform(RootObject, TEXT("RightHandIK"), Config.RightHandIK);
     TryReadTransform(RootObject, TEXT("LeftHandIK"), Config.LeftHandIK);
     TryReadVector(RootObject, TEXT("MuzzleOffset"), Config.MuzzleOffset);

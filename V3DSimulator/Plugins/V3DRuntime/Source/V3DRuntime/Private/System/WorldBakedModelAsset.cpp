@@ -3385,7 +3385,7 @@ bool FV3DShaderFamilySelectionTest::RunTest(const FString&)
 {
     using namespace WorldBakedModelAssetPrivate;
     FV3DMaterialSoftAssetReferences Soft; Soft.ReservedMaterials.Reset();
-    TSoftObjectPtr<UMaterialInterface>* Slots[] = {&Soft.MI_Opaque, &Soft.MI_Masked, &Soft.MI_Translucent,
+    TSoftObjectPtr<UMaterialInterface>* Slots[] = {&Soft.MI_Opaque, &Soft.MI_Opaque, &Soft.MI_Translucent,
         &Soft.MI_Toon, &Soft.MI_OpaqueTwoSided, &Soft.MI_OpaqueTwoSided, &Soft.MI_TranslucentTwoSided, &Soft.MI_ToonTwoSided};
     TArray<TStrongObjectPtr<UMaterial>> Parents;
     for (int32 Slot = 0; Slot < 8; ++Slot)

@@ -41,11 +41,13 @@ void USurvivalHUDWidget::BuildNativeLayout()
 void USurvivalHUDWidget::ApplyNativeStyle()
 {
     Super::ApplyNativeStyle();
+#if WITH_EDITOR
     if (IsDesignTime())
     {
         SetVisibility(ESlateVisibility::HitTestInvisible);
         SetHealth(75.0f, 100.0f);
     }
+#endif
 }
 
 void USurvivalHUDWidget::SetHealth(float CurrentHealth, float MaximumHealth)

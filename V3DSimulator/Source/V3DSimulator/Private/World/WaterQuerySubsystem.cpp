@@ -239,8 +239,28 @@ bool UWaterQuerySubsystem::QueryWaterAtLocation(
     return true;
 }
 
+void UWaterQuerySubsystem::RequestExclusionRenderRefresh()
+{
+    if (!ensure(IsInGameThread()) || ExclusionRenderRefreshTimer.IsValid()) return;
+    if (UWorld* World = GetWorld(); IsValid(World) && !World->bIsTearingDown)
+        ExclusionRenderRefreshTimer = World->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateUObject(this, &UWaterQuerySubsystem::FlushExclusionRenderRefresh));
+}
+
+void UWaterQuerySubsystem::FlushExclusionRenderRefresh()
+{
+    ExclusionRenderRefreshTimer.Invalidate();
+    if (UWorld* World = GetWorld(); !IsValid(World) || World->bIsTearingDown) return;
+    CompactInvalidWaterActors();
+    for (const auto& Weak : WaterActors)
+        if (AWaterActor* Water = Weak.Get(); IsValid(Water) && !Water->IsActorBeingDestroyed())
+            Water->ApplyWaterExclusionRenderParameters();
+}
+
 void UWaterQuerySubsystem::Deinitialize()
 {
+    if (UWorld* World = GetWorld()) World->GetTimerManager().ClearTimer(ExclusionRenderRefreshTimer);
+    ExclusionRenderRefreshTimer.Invalidate();
     WaterActors.Reset();
     GlobalOcean.Reset();
     Super::Deinitialize();

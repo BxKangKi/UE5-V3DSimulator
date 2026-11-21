@@ -13,6 +13,7 @@ void SV3DModelPreview::SetModel(const FGWorldBuildModel& Model)
 {
     Edges.Reset(3000); FBox Bounds(ForceInit);
     TMap<int32, const FGWorldNodeTransform*> Nodes;
+    Nodes.Reserve(Model.Metadata.NodeTransforms.Num());
     for (const auto& Node : Model.Metadata.NodeTransforms) Nodes.Add(Node.NodeIndex, &Node);
     for (const auto& Node : Model.Metadata.NodeTransforms)
     {
@@ -54,22 +55,30 @@ int32 SV3DModelPreview::OnPaint(const FPaintArgs& Args, const FGeometry& Geometr
     FSlateWindowElementList& Out, int32 Layer, const FWidgetStyle& Style, bool bEnabled) const
 {
     const FVector2D Size = Geometry.GetLocalSize();
+    if (Edges.Num() < 3 || Size.X <= 1.0 || Size.Y <= 1.0 || !FMath::IsFinite(Radius) || Radius <= KINDA_SMALL_NUMBER)
+    {
+        return Layer;
+    }
     const FQuat Rotation = FRotator(Pitch, Yaw, 0).Quaternion();
-    const float Scale = FMath::Min(Size.X, Size.Y) * .43f * Zoom / Radius;
-    auto Project = [&](const FVector& Point)
+    const float Scale = static_cast<float>(FMath::Min(Size.X, Size.Y)) * .43f * Zoom / Radius;
+    const FLinearColor LineColor = FLinearColor(.8f, .9f, 1.f, .85f) * Style.GetColorAndOpacityTint();
+    const FPaintGeometry PaintGeometry = Geometry.ToPaintGeometry();
+    auto Project = [&](const FVector& Point) -> FVector2f
     {
         const FVector P = Rotation.UnrotateVector(Point - Center);
-        return FVector2D(Size.X * .5f + P.Y * Scale, Size.Y * .5f - P.Z * Scale);
+        return FVector2f(static_cast<float>(Size.X * .5 + P.Y * Scale), static_cast<float>(Size.Y * .5 - P.Z * Scale));
     };
-    // SetModel emits three consecutive edges per triangle. A closed polyline uses
-    // one Slate draw element/allocation per triangle instead of three per-edge calls.
+    // Reuse one small buffer across triangles to avoid per-triangle heap allocations during paint.
+    TArray<FVector2f> Points;
+    Points.SetNumUninitialized(4);
     for (int32 Index = 0; Index + 2 < Edges.Num(); Index += 3)
     {
-        TArray<FVector2f> Points = {FVector2f(Project(Edges[Index].Key)),
-            FVector2f(Project(Edges[Index].Value)), FVector2f(Project(Edges[Index + 1].Value)),
-            FVector2f(Project(Edges[Index + 2].Value))};
-        FSlateDrawElement::MakeLines(Out, Layer, Geometry.ToPaintGeometry(), MoveTemp(Points),
-            ESlateDrawEffect::None, FLinearColor(.8f,.9f,1.f,.85f) * Style.GetColorAndOpacityTint(), true, 1.f);
+        Points[0] = Project(Edges[Index].Key);
+        Points[1] = Project(Edges[Index].Value);
+        Points[2] = Project(Edges[Index + 1].Value);
+        Points[3] = Project(Edges[Index + 2].Value);
+        FSlateDrawElement::MakeLines(Out, Layer, PaintGeometry, Points,
+            ESlateDrawEffect::None, LineColor, true, 1.f);
     }
     return Layer;
 }

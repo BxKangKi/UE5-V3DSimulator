@@ -194,6 +194,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Input|System")
     void Input_PausePressed();
 
+    UFUNCTION(BlueprintCallable, Category = "Input|System")
+    void Input_ChatPressed();
+
     /** Restores normal gameplay mouse capture: cursor hidden, camera look enabled. */
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
     void ApplyGameInputMode();
@@ -401,6 +404,10 @@ public:
     UPROPERTY(Transient, BlueprintReadOnly, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> DebugAction;
 
+    /** Boolean action for opening the simulation chat window. Assign in AssetRegistry (default T). */
+    UPROPERTY(Transient, BlueprintReadOnly, Category = "Input|Enhanced Input|System")
+    TObjectPtr<UInputAction> ChatAction;
+
 private:
     UPROPERTY(Transient) TObjectPtr<USimulatorChatWidget> SimulationChat;
     double NextSimulatorCommandAt = 0;
@@ -413,6 +420,10 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<USettingsMenuWidget> SettingsMenuWidget;
+
+    /** Runtime duplicate of InputMappingContext carrying user keybinding overrides without mutating cooked assets. */
+    UPROPERTY(Transient)
+    TObjectPtr<UInputMappingContext> RuntimeInputMappingContext;
 
     void ResolveCentralAssets();
     /** Loads startup UI classes together without synchronously flushing gameplay packages. */
@@ -485,6 +496,7 @@ private:
     double LastToggleItemListInputTime = -1.0;
     double LastSnapInputTime = -1.0;
     double LastDebugInputTime = -1.0;
+    double LastChatInputTime = -1.0;
 
     UPROPERTY()
     TObjectPtr<UGameManagerSubSystem> SubSystem;

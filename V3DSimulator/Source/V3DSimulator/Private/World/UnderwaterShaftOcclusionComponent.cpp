@@ -4,6 +4,7 @@
 #include "Camera/PlayerCameraManager.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
+#include "Engine/Texture2D.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
@@ -21,7 +22,6 @@ namespace
 #endif
     constexpr float Widths[] = {6400.0f, 25600.0f};
     constexpr double DepthExtent = 200000.0; // +/- 2 km along the refracted light ray.
-    constexpr double WaterIOR = 1.3333;
     constexpr float IdleReleaseDelaySeconds = 5.0f;
     constexpr uint32 FarCascadeCaptureInterval = 2; // Re-capture 256m far cascade every 2nd frame unless moved/rotated.
     const FName TextureNames[] = {TEXT("V3DUWShadowNear"), TEXT("V3DUWShadowFar")};
@@ -74,6 +74,16 @@ void UUnderwaterShaftOcclusionComponent::Configure(UMaterialInstanceDynamic* Mat
     {
         bLastReadyState = true; // Force write of Ready=0.0 on the old material if valid.
         SetReady(false);
+        if (IsValid(TargetMaterial))
+        {
+            if (UTexture2D* SafeFallback = GetFallbackTexture())
+            {
+                for (const FName Name : TextureNames)
+                {
+                    TargetMaterial->SetTextureParameterValue(Name, SafeFallback);
+                }
+            }
+        }
         bMaterialBindingsAvailable = false;
         bTexturesBound = false;
         ResetCachedParameters();
@@ -98,7 +108,13 @@ void UUnderwaterShaftOcclusionComponent::Configure(UMaterialInstanceDynamic* Mat
     const bool bEnabled = bOceanEnabled && bMaterialBindingsAvailable && IsValid(Material) && IsValid(Sun)
         && FMath::IsFinite(WaterHeight) && GetWorld() && GetWorld()->GetNetMode() != NM_DedicatedServer;
     SetComponentTickEnabled(bEnabled);
-    if (!bEnabled) ReleaseResources();
+    if (!bEnabled)
+    {
+        // Keep DepthTargets rooted in UPROPERTY(Transient) for the component lifetime so
+        // in-flight RenderThread/RDG material uniform expressions can never see a GC'd texture
+        // (UE-23902 / EXCEPTION_ACCESS_VIOLATION). Simply mark Ready=0 and stop capturing.
+        SetReady(false);
+    }
 }
 
 bool UUnderwaterShaftOcclusionComponent::EnsureResources()
@@ -195,28 +211,17 @@ void UUnderwaterShaftOcclusionComponent::TickComponent(float DeltaTime, ELevelTi
     if (CameraLocation.ContainsNaN() || ToSun.ContainsNaN() || ToSun.IsNearlyZero()
         || CameraLocation.Z >= WaterLevel - 1.f || ToSun.Z <= 0.001f)
     {
+        // Stay idle at zero GPU cost without destroying/GC'ing DepthTargets mid-session,
+        // preventing UE-23902 / render-thread use-after-free on V3DUWShadowNear.
         SetReady(false);
-        // Reclaim R32F capture targets promptly after staying above water or at night.
-        if (Captures.Num() > 0 && FMath::IsFinite(DeltaTime) && DeltaTime > 0.0f)
-        {
-            InactiveElapsedSeconds += DeltaTime;
-            if (InactiveElapsedSeconds >= IdleReleaseDelaySeconds)
-            {
-                ReleaseResources();
-            }
-        }
         return;
     }
 
     InactiveElapsedSeconds = 0.0f;
     if (!EnsureResources()) { SetReady(false); return; }
 
-    // Exact Snell's law refraction at the horizontal air-water interface (n_air = 1.0 -> n_water = 1.3333).
-    const double InvIOR = 1.0 / WaterIOR;
-    const double RefractX = ToSun.X * InvIOR;
-    const double RefractY = ToSun.Y * InvIOR;
-    const double RefractZSq = FMath::Max(1.0 - (RefractX * RefractX + RefractY * RefractY), 1.0e-4);
-    const FVector ToLight = FVector(RefractX, RefractY, FMath::Sqrt(RefractZSq)).GetSafeNormal();
+    // Align underwater light shafts directly with the actual sun direction in the sky.
+    const FVector ToLight = ToSun;
     if (ToLight.ContainsNaN() || ToLight.IsNearlyZero()) { SetReady(false); return; }
 
     const FQuat Rotation = (-ToLight).ToOrientationQuat();
@@ -244,7 +249,7 @@ void UUnderwaterShaftOcclusionComponent::TickComponent(float DeltaTime, ELevelTi
         const FVector Origin = CameraLocation + Right * (FMath::GridSnap(X, Texel) - X)
             + Up * (FMath::GridSnap(Y, Texel) - Y);
 
-        if (!bTexturesBound)
+        if (!bTexturesBound && DepthTargets.IsValidIndex(Index) && IsValid(DepthTargets[Index]))
         {
             TargetMaterial->SetTextureParameterValue(TextureNames[Index], DepthTargets[Index]);
         }
@@ -287,6 +292,9 @@ void UUnderwaterShaftOcclusionComponent::TickComponent(float DeltaTime, ELevelTi
             }
         }
     }
+    // Clear transient raw actor pointers immediately after capture dispatch so no stale
+    // AWaterActor* reference can ever linger across frames.
+    CachedWaterActors.Reset();
     bTexturesBound = true;
 
     // Only write light basis vectors when sun direction actually changed.
@@ -302,6 +310,16 @@ void UUnderwaterShaftOcclusionComponent::TickComponent(float DeltaTime, ELevelTi
         bHasCachedLightBasis = true;
     }
     SetReady(true);
+}
+
+UTexture2D* UUnderwaterShaftOcclusionComponent::GetFallbackTexture()
+{
+    if (!IsValid(FallbackTexture))
+    {
+        FallbackTexture = LoadObject<UTexture2D>(nullptr,
+            TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+    }
+    return FallbackTexture.Get();
 }
 
 void UUnderwaterShaftOcclusionComponent::ReleaseResources()
@@ -322,16 +340,18 @@ void UUnderwaterShaftOcclusionComponent::ReleaseResources()
     Captures.Empty();
     if (IsValid(TargetMaterial))
     {
-        for (const FName Name : TextureNames) TargetMaterial->SetTextureParameterValue(Name, nullptr);
-    }
-    for (const auto& TargetPtr : DepthTargets)
-    {
-        if (UTextureRenderTarget2D* Target = TargetPtr.Get(); IsValid(Target))
+        // Never bind nullptr to a material texture parameter (triggers UE-23902 ensure
+        // and render-thread null dereference when in-flight frames evaluate uniform expressions).
+        if (UTexture2D* SafeFallback = GetFallbackTexture())
         {
-            Target->ReleaseResource();
-            Target->MarkAsGarbage();
+            for (const FName Name : TextureNames)
+            {
+                TargetMaterial->SetTextureParameterValue(Name, SafeFallback);
+            }
         }
     }
+    // Release our strong references and let UE GC tear down the render targets via
+    // BeginDestroy()/FRenderCommandFence after all in-flight GPU/RenderThread frames finish.
     DepthTargets.Empty();
     CachedWaterActors.Empty();
 }

@@ -14,6 +14,7 @@
 #include "Dom/JsonObject.h"
 #include "Interface/JsonData.h"
 #include "Engine/EngineTypes.h"
+#include "InputCoreTypes.h"
 #include "GameSettings.generated.h"
 
 class UPostProcessComponent;
@@ -44,6 +45,23 @@ public:
     UFUNCTION(BlueprintPure, Category="Settings|Input")
     float GetClampedMouseSensitivity() const;
 
+    /** Persistent keybinding overrides: logical action ID (e.g. "Jump", "Chat") -> FKey name. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Input")
+    TMap<FName, FName> KeyMappings;
+
+    /** Persists Project Editor dark mode preference across sessions. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Editor")
+    bool bEditorDarkMode = false;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Input")
+    FKey GetKeyMappingOverride(FName ActionId) const;
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Input")
+    void SetKeyMappingOverride(FName ActionId, FKey NewKey);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Input")
+    void ResetKeyMappingsToDefaults();
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess")
     float BloomIntensity = 0.675f;
 
@@ -59,7 +77,7 @@ public:
 
     /** Minimum EV100 limit when Auto Exposure is enabled. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess", meta=(ClampMin="-10.0", ClampMax="10.0"))
-    float AutoExposureMinEV = -5.0f;
+    float AutoExposureMinEV = -1.5f;
 
     /** Maximum EV100 limit when Auto Exposure is enabled. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|PostProcess", meta=(ClampMin="-10.0", ClampMax="20.0"))

@@ -1,0 +1,29 @@
+// Stable, world-anchored slope normals for the supplied packed T_Water_H texture.
+#ifndef V3D_WATER_SURFACE_USH
+#define V3D_WATER_SURFACE_USH
+
+float3 V3DWaterSurfaceNormal(Texture2D WaveTexture, SamplerState WaveSampler,
+    float2 Position, float Time, float Speed, float NearScale, float FarScale,
+    float NearStrength, float FarStrength, float ViewDepth, float BlendStart, float BlendLength)
+{
+    // Always sample each wavelength at its own fixed world scale. Interpolating UV scale
+    // stretches/swims the texture; ceil(distance) switches the entire pattern at once.
+    float2 nearUV = Position / max(abs(NearScale), 100.0f);
+    float2 farUV = Position / max(abs(FarScale), 100.0f);
+    float t = Time * clamp(Speed, -4.0f, 4.0f);
+    float2 nearA = Texture2DSample(WaveTexture, WaveSampler, nearUV + t * float2(0.035f, 0.021f)).rg - 0.5f;
+    float2 rotatedUV = float2(-nearUV.y, nearUV.x) * 0.73f;
+    float2 nearB = Texture2DSample(WaveTexture, WaveSampler, rotatedUV + t * float2(-0.025f, 0.031f)).rg - 0.5f;
+    // Rotate the sampled slope back along with its UV basis.
+    nearB = float2(nearB.y, -nearB.x);
+    float2 farSlope = Texture2DSample(WaveTexture, WaveSampler, farUV + t * float2(0.012f, -0.009f)).rg - 0.5f;
+    float blend = saturate((max(ViewDepth, 0.0f) - max(BlendStart, 0.0f)) / max(BlendLength, 100.0f));
+    blend = blend * blend * (3.0f - 2.0f * blend);
+    // Blend slopes, then normalize once. No zero-strength band at the near/far boundary.
+    float2 slope = lerp((nearA + nearB) * clamp(NearStrength, 0.0f, 1.0f),
+        farSlope * (2.0f * clamp(FarStrength, 0.0f, 1.0f)), blend);
+    if (!all(isfinite(slope))) return float3(0.0f, 0.0f, 1.0f);
+    slope = clamp(slope, -0.5f, 0.5f);
+    return float3(slope, 1.0f) * rsqrt(1.0f + dot(slope, slope));
+}
+#endif

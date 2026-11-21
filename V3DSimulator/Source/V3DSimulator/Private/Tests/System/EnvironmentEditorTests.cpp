@@ -59,6 +59,20 @@ bool FV3DEditorAssetSchemaTest::RunTest(const FString&)
     TestTrue(TEXT("Unknown author fields survive"), Canonical.Contains(TEXT("AuthorCustomKey")));
     Doc.Json->SetStringField(TEXT("ItemType"), TEXT("Weapon"));
     TestFalse(TEXT("Mutually exclusive subtype rejected before write"), ModelDefinitionJson::ValidateDefinition(Doc.Json, Doc.Path, Doc.SourcePath, Model, Error));
+    Doc.Json->RemoveField(TEXT("EntityType"));
+    Doc.Json->SetStringField(TEXT("ItemType"), TEXT("Weapon"));
+    Fields = V3DProjectEditor::Suggestions(Doc);
+    TestTrue(TEXT("Weapon exposes HoldTransform"), Fields->HasField(TEXT("HoldTransform")));
+    TestTrue(TEXT("Weapon exposes AttachSocketName"), Fields->HasField(TEXT("AttachSocketName")));
+    TestTrue(TEXT("Weapon exposes EquipmentInteraction"), Fields->HasField(TEXT("EquipmentInteraction")));
+    TestTrue(TEXT("Weapon exposes Damage"), Fields->HasField(TEXT("Damage")));
+    TestFalse(TEXT("Weapon does not expose private runtime flags"), Fields->HasField(TEXT("bRuntimeResourcesReleased")));
+
+    Doc.Json->SetStringField(TEXT("ItemType"), TEXT("Tool"));
+    Fields = V3DProjectEditor::Suggestions(Doc);
+    TestTrue(TEXT("Item/Tool exposes HoldTransform"), Fields->HasField(TEXT("HoldTransform")));
+    TestTrue(TEXT("Item/Tool exposes EquipmentInteraction"), Fields->HasField(TEXT("EquipmentInteraction")));
+
     Doc.Json->SetStringField(TEXT("AssetType"), TEXT("Sound"));
     Fields = V3DProjectEditor::Suggestions(Doc);
     TestFalse(TEXT("Sound has no ModelType suggestions"), Fields->HasField(TEXT("ModelType")));

@@ -86,6 +86,12 @@ bool FV3DShadowDistancePersistenceTest::RunTest(const FString&)
     UGameSettings* Restored = NewObject<UGameSettings>();
     TestTrue(TEXT("Shadow setting round trips"), Restored->Deserialization(Settings->Serialization()));
     TestEqual(TEXT("Shadow distance restored"), Restored->ShadowDistanceMeters, 4096);
+    Settings->SetKeyMappingOverride(TEXT("Chat"), EKeys::Y);
+    Settings->bEditorDarkMode = true;
+    UGameSettings* RestoredControls = NewObject<UGameSettings>();
+    TestTrue(TEXT("Controls & editor settings round trip"), RestoredControls->Deserialization(Settings->Serialization()));
+    TestEqual(TEXT("Custom chat key restored"), RestoredControls->GetKeyMappingOverride(TEXT("Chat")), EKeys::Y);
+    TestTrue(TEXT("Editor dark mode restored"), RestoredControls->bEditorDarkMode);
     Restored->MaxRenderDistanceMeters = 1024;
     TestEqual(TEXT("Effective distance does not exceed geometry coverage"), Restored->GetEffectiveShadowDistanceCentimeters(), 102400.0f);
     for (int32 Q = 0; Q < 4; ++Q)

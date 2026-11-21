@@ -677,12 +677,14 @@ void UProjectSelectionWidget::BuildNativeLayout()
     NativeProjectList = Scroll;
     UVerticalBoxSlot* ListSlot = Box->AddChildToVerticalBox(Scroll);
     ListSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+#if WITH_EDITOR
     if (IsDesignTime())
     {
         AddButton(Scroll, NSLOCTEXT("V3DMenu", "CreateProject", "Create Project"));
         AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewProjectOne", "Example Project [World]"));
         AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewProjectTwo", "Character Library [Character]"));
     }
+#endif
 }
 
 void UProjectSelectionWidget::ApplyNativeStyle()

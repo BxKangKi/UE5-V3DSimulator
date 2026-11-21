@@ -3,6 +3,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
+#include "TimerManager.h"
 #include "WaterQuerySubsystem.generated.h"
 
 class AActor;
@@ -88,10 +89,14 @@ public:
     void SetGlobalOceanActor(AWaterActor* WaterActor, bool bIsGlobalOcean);
     void GetRegisteredWaterActors(TArray<AWaterActor*>& OutWaterActors);
 
+    /** Coalesces all exclusion edits in one frame into one render-parameter update. */
+    void RequestExclusionRenderRefresh();
     virtual void Deinitialize() override;
 
 private:
     void CompactInvalidWaterActors();
+    void FlushExclusionRenderRefresh();
+    FTimerHandle ExclusionRenderRefreshTimer;
 
     TArray<TWeakObjectPtr<AWaterActor>> WaterActors;
     TWeakObjectPtr<AWaterActor> GlobalOcean;

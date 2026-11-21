@@ -9,6 +9,7 @@
  */
 
 #include "System/GameManagerSubSystem.h"
+#include "World/WorldFogConfig.h"
 #include "System/WorldSurfaceSubsystem.h"
 #include "System/ProjectScripts.h"
 #include "System/SimulationScriptSubsystem.h"
@@ -2594,7 +2595,7 @@ void UGameManagerSubSystem::FlushPendingInitialTransformSaves()
 
 bool UGameManagerSubSystem::CaptureCurrentPlayerTransformForPersistence()
 {
-    check(IsInGameThread());
+    if (!IsInGameThread()) return false;
     UWorld* World = GetWorld();
     if (!IsValid(World) || World->GetNetMode() == NM_Client) return false;
     AActor* LivePlayer = PlayerActor.Get();
@@ -4867,6 +4868,7 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
         FV3DWorldSurfaceConfig SurfaceConfig;
         FV3DSimulationCommandConfig CommandConfig;
         FV3DEnvironmentConfig EnvironmentConfig;
+        FV3DWorldFogConfig FogConfig;
         FString ValidationError;
         FV3DSimulatorProjectConfig ProjectConfig;
         TSharedPtr<FJsonObject> Canonical;
@@ -4875,8 +4877,12 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
             && Canonical.IsValid()
             && FV3DProjectScripts::Load(ProjectRoot, Scripts, ValidationError)
             && Scripts.Parse(SurfaceConfig, CommandConfig, ValidationError)
-            && FV3DEnvironmentConfig::Parse(Canonical, EnvironmentConfig, ValidationError))
+            && FV3DEnvironmentConfig::Parse(Canonical, EnvironmentConfig, ValidationError)
+            && FV3DWorldFogConfig::Load(ProjectRoot, FogConfig, ValidationError))
         {
+            // Compile scripts/environments.json into the existing immutable config member. The three-script
+            // archive layout and authored config.json stay unchanged, including older worlds.
+            Canonical->SetObjectField(TEXT("Fog"), FogConfig.ToJson());
             const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
                 TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ConfigJson);
             if (!FJsonSerializer::Serialize(Canonical.ToSharedRef(), Writer) || ConfigJson.IsEmpty())

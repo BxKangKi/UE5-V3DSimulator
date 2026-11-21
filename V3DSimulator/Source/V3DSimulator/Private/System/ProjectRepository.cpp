@@ -1,5 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/ProjectRepository.h"
+#include "World/WorldFogConfig.h"
 
 #include "HAL/FileManager.h"
 #include "Misc/Guid.h"
@@ -124,7 +125,8 @@ bool V3DSimulatorProjectRepository::CreateProject(
 
     const FSafeFileWriteResult Save = FSafeFileIO::SaveJsonBlocking(
         Json, V3DSimulatorProjectWorkspace::ConfigPath(SafeName));
-    if (!Save.IsSuccess() || !FV3DProjectScripts::CreateDefaults(Root, OutError))
+    if (!Save.IsSuccess() || !FV3DProjectScripts::CreateDefaults(Root, OutError)
+        || (ProjectType == EV3DSimulatorProjectType::World && !FV3DWorldFogConfig::CreateDefaultFile(Root, OutError)))
     {
         Files.DeleteDirectory(*Root, false, true);
         if (OutError.IsEmpty()) OutError = Save.Error.IsEmpty() ? TEXT("Project config creation failed.") : Save.Error;

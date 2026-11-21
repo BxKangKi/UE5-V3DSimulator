@@ -218,6 +218,7 @@ void APlayerCharacterController::ResolveCentralAssets()
     VehicleStopAction = ResolveAction(Registry->VehicleStopAction);
     PauseAction = ResolveAction(Registry->PauseAction);
     DebugAction = ResolveAction(Registry->DebugAction);
+    ChatAction = ResolveAction(Registry->ChatAction);
 
 
 }
@@ -508,8 +509,7 @@ void APlayerCharacterController::SetupInputComponent()
     BindDirectMouseInputs();
     if (InputComponent && bEnableSimulationChat)
     {
-        InputComponent->BindKey(EKeys::T, IE_Pressed, this, &APlayerCharacterController::OpenSimulationChat);
-        InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &APlayerCharacterController::OpenSimulationChat);
+        InputComponent->BindKey(EKeys::Enter, IE_Pressed, this, &APlayerCharacterController::Input_ChatPressed);
     }
 }
 
@@ -662,6 +662,7 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
     DebugWidget = nullptr;
     PauseMenuWidget = nullptr;
     SettingsMenuWidget = nullptr;
+    RuntimeInputMappingContext = nullptr;
 
     Super::EndPlay(EndPlayReason);
 }
@@ -1090,7 +1091,119 @@ void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
         return true;
     };
 
-    bAnyInputMappingContextApplied |= AddContextIfValid(InputMappingContext.Get(), InputMappingPriority);
+    // Always remove any prior runtime override context before rebuilding.
+    if (IsValid(RuntimeInputMappingContext))
+    {
+        EnhancedInputSubsystem->RemoveMappingContext(RuntimeInputMappingContext.Get());
+        RuntimeInputMappingContext = nullptr;
+    }
+
+    const UInputMappingContext* ActivePrimaryContext = InputMappingContext.Get();
+    const UGameManagerSubSystem* Manager = IsValid(SubSystem.Get())
+        ? SubSystem.Get() : UGameManagerSubSystem::FindGameManager(this);
+    const UGameSettings* Settings = IsValid(Manager) ? Manager->GetGameSettings() : nullptr;
+    if (IsValid(InputMappingContext.Get()) && IsValid(Settings) && !Settings->KeyMappings.IsEmpty())
+    {
+        UInputMappingContext* OverrideContext = DuplicateObject<UInputMappingContext>(InputMappingContext.Get(), this);
+        if (IsValid(OverrideContext))
+        {
+            const auto RemapSingleAction = [OverrideContext](UInputAction* Action, const FKey& NewKey)
+            {
+                if (!IsValid(Action) || !NewKey.IsValid()) return;
+                TArray<FEnhancedActionKeyMapping> ExistingMappings;
+                for (const FEnhancedActionKeyMapping& Mapping : OverrideContext->GetMappings())
+                {
+                    if (Mapping.Action == Action)
+                    {
+                        ExistingMappings.Add(Mapping);
+                    }
+                }
+                if (!ExistingMappings.IsEmpty())
+                {
+                    FEnhancedActionKeyMapping First = ExistingMappings[0];
+                    OverrideContext->UnmapAllKeysFromAction(Action);
+                    FEnhancedActionKeyMapping& Rebound = OverrideContext->MapKey(Action, NewKey);
+                    Rebound.Triggers = First.Triggers;
+                    Rebound.Modifiers = First.Modifiers;
+                    for (int32 Idx = 1; Idx < ExistingMappings.Num(); ++Idx)
+                    {
+                        FEnhancedActionKeyMapping& Extra = OverrideContext->MapKey(Action, ExistingMappings[Idx].Key);
+                        Extra.Triggers = ExistingMappings[Idx].Triggers;
+                        Extra.Modifiers = ExistingMappings[Idx].Modifiers;
+                    }
+                }
+                else
+                {
+                    OverrideContext->MapKey(Action, NewKey);
+                }
+            };
+
+            const auto RemapDirectionalKey = [OverrideContext](UInputAction* Action, const FKey& DefaultKey, const FKey& NewKey)
+            {
+                if (!IsValid(Action) || !NewKey.IsValid()) return;
+                TArray<FEnhancedActionKeyMapping> All = OverrideContext->GetMappings();
+                bool bReplaced = false;
+                for (const FEnhancedActionKeyMapping& Mapping : All)
+                {
+                    if (Mapping.Action == Action && Mapping.Key == DefaultKey)
+                    {
+                        FEnhancedActionKeyMapping Saved = Mapping;
+                        OverrideContext->UnmapKey(Action, DefaultKey);
+                        FEnhancedActionKeyMapping& Rebound = OverrideContext->MapKey(Action, NewKey);
+                        Rebound.Triggers = Saved.Triggers;
+                        Rebound.Modifiers = Saved.Modifiers;
+                        bReplaced = true;
+                        break;
+                    }
+                }
+                if (!bReplaced)
+                {
+                    OverrideContext->MapKey(Action, NewKey);
+                }
+            };
+
+            const auto ApplyIfSet = [&](const FName ActionId, UInputAction* Action, const FKey& DirectionalDefault = EKeys::Invalid)
+            {
+                const FKey OverrideKey = Settings->GetKeyMappingOverride(ActionId);
+                if (!OverrideKey.IsValid()) return;
+                if (DirectionalDefault.IsValid())
+                {
+                    RemapDirectionalKey(Action, DirectionalDefault, OverrideKey);
+                }
+                else
+                {
+                    RemapSingleAction(Action, OverrideKey);
+                }
+            };
+
+            ApplyIfSet(TEXT("MoveForward"), MoveAction.Get(), EKeys::W);
+            ApplyIfSet(TEXT("MoveBackward"), MoveAction.Get(), EKeys::S);
+            ApplyIfSet(TEXT("MoveLeft"), MoveAction.Get(), EKeys::A);
+            ApplyIfSet(TEXT("MoveRight"), MoveAction.Get(), EKeys::D);
+            ApplyIfSet(TEXT("Jump"), JumpAction.Get());
+            ApplyIfSet(TEXT("Sprint"), SprintAction.Get());
+            ApplyIfSet(TEXT("Crouch"), CrouchAction.Get());
+            ApplyIfSet(TEXT("Fly"), FlyAction.Get());
+            ApplyIfSet(TEXT("Ragdoll"), RagdollAction.Get());
+            ApplyIfSet(TEXT("Interact"), InteractAction.Get());
+            ApplyIfSet(TEXT("ToggleFirstPerson"), ToggleFirstPersonAction.Get());
+            ApplyIfSet(TEXT("ChangeCharacter"), ChangeCharacterAction.Get());
+            ApplyIfSet(TEXT("ToggleItemList"), ToggleItemListAction.Get());
+            ApplyIfSet(TEXT("Snap"), SnapAction.Get());
+            ApplyIfSet(TEXT("Pause"), PauseAction.Get());
+            ApplyIfSet(TEXT("Debug"), DebugAction.Get());
+            ApplyIfSet(TEXT("Chat"), ChatAction.Get());
+
+            RuntimeInputMappingContext = OverrideContext;
+            ActivePrimaryContext = OverrideContext;
+        }
+    }
+
+    if (IsValid(InputMappingContext.Get()) && ActivePrimaryContext != InputMappingContext.Get())
+    {
+        EnhancedInputSubsystem->RemoveMappingContext(InputMappingContext.Get());
+    }
+    bAnyInputMappingContextApplied |= AddContextIfValid(ActivePrimaryContext, InputMappingPriority);
 
     for (const FPlayerInputMappingContextConfig& ContextConfig : AdditionalInputMappingContexts)
     {
@@ -1242,6 +1355,10 @@ void APlayerCharacterController::BindConfiguredInputActions()
     {
         EnhancedInputComponent->BindAction(DebugAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_DebugPressed);
     }
+    if (ChatAction)
+    {
+        EnhancedInputComponent->BindAction(ChatAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ChatPressed);
+    }
 }
 
 int32 APlayerCharacterController::CountConfiguredInputMappingContexts() const
@@ -1287,6 +1404,7 @@ int32 APlayerCharacterController::CountAssignedEnhancedInputActions() const
     CountIfValid(VehicleStopAction.Get());
     CountIfValid(PauseAction.Get());
     CountIfValid(DebugAction.Get());
+    CountIfValid(ChatAction.Get());
 
     return Count;
 }
@@ -1746,6 +1864,16 @@ void APlayerCharacterController::Input_DebugPressed()
 
     bIsDebug = !bIsDebug;
     DebugWidget->SetVisibility(bIsDebug ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
+}
+
+void APlayerCharacterController::Input_ChatPressed()
+{
+    if (!bEnableSimulationChat || !ConsumeInputDebounce(LastChatInputTime))
+    {
+        return;
+    }
+
+    OpenSimulationChat();
 }
 
 void APlayerCharacterController::Input_PausePressed()

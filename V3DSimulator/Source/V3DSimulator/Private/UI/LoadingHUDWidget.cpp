@@ -69,11 +69,13 @@ void ULoadingHUDWidget::ApplyNativeStyle()
     Super::ApplyNativeStyle();
     if (IsValid(NativeTitle)) NativeTitle->SetText(LoadingTitle);
     if (IsValid(NativeProgress)) NativeProgress->SetFillColorAndOpacity(AccentColor);
+#if WITH_EDITOR
     if (IsDesignTime())
     {
         if (IsValid(NativeProgress)) NativeProgress->SetPercent(0.65f);
         if (IsValid(NativeStatus)) NativeStatus->SetText(NSLOCTEXT("V3DHUD", "LoadingPreview", "Loading world data... 65%"));
     }
+#endif
 }
 
 void ULoadingHUDWidget::NativeConstruct()

@@ -836,11 +836,13 @@ void UMainWorldWidget::BuildNativeLayout()
         NativeWorldChoice = WidgetTree->ConstructWidget<UComboBoxString>();
         NativeWorldChoice->OnGenerateWidgetEvent.BindDynamic(this, &UMainWorldWidget::GenerateNativeWorldChoice);
         Box->AddChildToVerticalBox(NativeWorldChoice)->SetPadding(FMargin(0.0f, 8.0f));
+#if WITH_EDITOR
         if (IsDesignTime())
         {
             NativeWorldChoice->AddOption(TEXT("Example World"));
             NativeWorldChoice->SetSelectedIndex(0);
         }
+#endif
         AddText(Box, NSLOCTEXT("V3DMenu", "ServerAddressLabel", "Server address"));
         NativeServerAddress = WidgetTree->ConstructWidget<UEditableTextBox>();
         NativeServerAddress->SetHintText(NSLOCTEXT("V3DMenu", "ServerAddressHint", "127.0.0.1:7777"));

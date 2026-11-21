@@ -20,10 +20,7 @@ bool FV3DRuntimeMaterialReadinessTest::RunTest(const FString&)
     TestTrue(TEXT("Diagnostics cleared"), Failures.IsEmpty());
     TArray<FSoftObjectPath> Paths; Soft.GetPreloadPaths(Paths);
     TestEqual(TEXT("Shared authored parents deduplicated; four safety parents preloaded"), Paths.Num(), 5);
-    Soft.MI_Opaque.Reset(); Soft.MI_Masked = Parent.Get();
-    Soft.Resolve(Resolved, Failures, false);
-    TestTrue(TEXT("Removed Masked property migrates to Opaque"), Resolved.MI_Opaque == Parent.Get());
-    Soft.MI_Masked.Reset(); Parent->BlendMode = BLEND_Opaque; Soft.MI_Opaque = Parent.Get(); Soft.MI_Toon.Reset();
+    Parent->BlendMode = BLEND_Opaque; Soft.MI_Opaque = Parent.Get(); Soft.MI_Toon.Reset();
     Soft.Resolve(Resolved, Failures, false);
     TestEqual(TEXT("Actual Opaque blending reports one fallback diagnostic"), Failures.Num(), 1);
     TestTrue(TEXT("Invalid authored parent never published or modified"), Resolved.MI_Opaque != Parent.Get() && Parent->GetBlendMode() == BLEND_Opaque);

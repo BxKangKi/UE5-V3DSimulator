@@ -12,6 +12,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "World/FogProfileMath.h"
 #include "WorldEnvManager.generated.h"
 
 class UGameManagerSubSystem;
@@ -117,6 +118,7 @@ private:
     void ApplyCloudSettings();
     void DestroyCloudComponent();
     void DestroyFogComponent();
+    void UpdateFogProfile(float DeltaSeconds);
     void ReleaseDynamicRenderingResources();
 
     void RegisterGameUpdate();
@@ -125,6 +127,8 @@ private:
 
     /** Calculates and applies the current sun/moon rotations and physical water optical tints. */
     void UpdateSkyLighting();
+    void EnsureSkyMaterialInstances();
+    void UpdateSkyMaterialParameters(float SunElevationSin, float MoonElevationSin);
     void UpdatePhysicalUnderwaterColors(float SunElevationSin, bool bForceUpdate = false);
     void UpdateFoliageInteractors();
     void UpdateUnderwaterLightShafts();
@@ -140,6 +144,18 @@ private:
     float LastShaftOceanHeight = 0.0f;
     TWeakObjectPtr<UMaterialInstanceDynamic> LastConfiguredShaftMaterial;
     float LastAppliedWaterSunElevation = -999.0f;
+    float LastAppliedSunIntensity = -1.0f;
+    float LastAppliedSunTemp = -1.0f;
+    float LastAppliedMoonIntensity = -1.0f;
+    float LastAppliedSkyLightIntensity = -1.0f;
+    float LastMoonDiskVisibility = -1.0f;
+    float LastSunDiskVisibility = -1.0f;
+    FVector LastMoonDiskDirection = FVector::ZeroVector;
+    FVector LastSunDiskDirection = FVector::ZeroVector;
+    float LastStarIntensity = -1.0f;
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<UMaterialInstanceDynamic>> SkyMaterialInstances;
 
     UPROPERTY(Transient)
     TObjectPtr<UWorldData> Data;
@@ -152,6 +168,11 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UExponentialHeightFogComponent> Fog;
+
+    V3DFog::FTransition FogTransition;
+    V3DFog::FProfile LastAppliedFogProfile;
+    float FogProfilePollSeconds = 0.f;
+    bool bFogProfileApplied = false;
 
     /** Strong refs for asynchronously resolved global shader assets. */
     UPROPERTY(Transient)

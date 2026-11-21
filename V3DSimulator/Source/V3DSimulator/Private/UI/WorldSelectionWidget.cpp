@@ -168,11 +168,13 @@ void UWorldSelectionWidget::BuildNativeLayout()
     NativeWorldEmpty->SetVisibility(IsDesignTime() ? ESlateVisibility::Collapsed : ESlateVisibility::HitTestInvisible);
     UVerticalBoxSlot* ListSlot = Box->AddChildToVerticalBox(Scroll);
     ListSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+#if WITH_EDITOR
     if (IsDesignTime())
     {
         AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewWorldOne", "Example World"));
         AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewWorldTwo", "City Simulation"));
     }
+#endif
 }
 
 void UWorldSelectionWidget::ApplyNativeStyle()

@@ -125,6 +125,51 @@ namespace
         return Fields;
     }
 
+    struct FRebindableActionDef
+    {
+        const TCHAR* ActionId;
+        const TCHAR* DisplayLabel;
+        FKey DefaultKey;
+    };
+
+    const TArray<FRebindableActionDef>& GetRebindableActionDefs()
+    {
+        static const TArray<FRebindableActionDef> Defs = {
+            {TEXT("MoveForward"), TEXT("Move Forward"), EKeys::W},
+            {TEXT("MoveBackward"), TEXT("Move Backward"), EKeys::S},
+            {TEXT("MoveLeft"), TEXT("Move Left"), EKeys::A},
+            {TEXT("MoveRight"), TEXT("Move Right"), EKeys::D},
+            {TEXT("Jump"), TEXT("Jump"), EKeys::SpaceBar},
+            {TEXT("Sprint"), TEXT("Sprint"), EKeys::LeftShift},
+            {TEXT("Crouch"), TEXT("Crouch"), EKeys::LeftControl},
+            {TEXT("Fly"), TEXT("Fly"), EKeys::V},
+            {TEXT("Ragdoll"), TEXT("Ragdoll"), EKeys::R},
+            {TEXT("Interact"), TEXT("Interact"), EKeys::F},
+            {TEXT("ToggleFirstPerson"), TEXT("First Person View"), EKeys::C},
+            {TEXT("ChangeCharacter"), TEXT("Change Character"), EKeys::U},
+            {TEXT("ToggleItemList"), TEXT("Item List / Inventory"), EKeys::E},
+            {TEXT("Snap"), TEXT("Grid Snap"), EKeys::G},
+            {TEXT("Chat"), TEXT("Open Chat"), EKeys::T},
+            {TEXT("Pause"), TEXT("Pause Menu"), EKeys::Escape},
+            {TEXT("Debug"), TEXT("Debug Overlay"), EKeys::F3}
+        };
+        return Defs;
+    }
+
+    FKey FindDefaultKeyForAction(const FName ActionId)
+    {
+        for (const FRebindableActionDef& Def : GetRebindableActionDefs())
+        {
+            if (ActionId == Def.ActionId) return Def.DefaultKey;
+        }
+        return EKeys::Invalid;
+    }
+
+    bool IsControlsTabField(const ESettingsField Field)
+    {
+        return Field == ESettingsField::MouseSensitivity;
+    }
+
     bool IsAutomaticStreamingField(const ESettingsField Field)
     {
         switch (Field)
@@ -357,6 +402,38 @@ UObject* USettingsControlBinding::GetControlObject() const
     return ToggleButton.Get();
 }
 
+void USettingsKeyMappingBinding::BindButton(USettingsMenuWidget* InOwner, const FName InActionId, UButton* InButton)
+{
+    Unbind();
+    OwnerWidget = InOwner;
+    ActionId = InActionId;
+    Button = InButton;
+    if (IsValid(Button))
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsKeyMappingBinding::HandleClicked);
+        Button->OnClicked.AddDynamic(this, &USettingsKeyMappingBinding::HandleClicked);
+    }
+}
+
+void USettingsKeyMappingBinding::Unbind()
+{
+    if (IsValid(Button))
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsKeyMappingBinding::HandleClicked);
+    }
+    Button = nullptr;
+    OwnerWidget = nullptr;
+    ActionId = NAME_None;
+}
+
+void USettingsKeyMappingBinding::HandleClicked()
+{
+    if (IsValid(OwnerWidget) && !ActionId.IsNone())
+    {
+        OwnerWidget->BeginListeningForKeyMapping(ActionId);
+    }
+}
+
 void USettingsCycleButton::SetupCycleButton(USettingsMenuWidget* InOwner, ESettingsField InField, int32 InDirection)
 {
     OwnerWidget = InOwner;
@@ -438,6 +515,24 @@ void USettingsMenuWidget::NativeDestruct()
         if (IsValid(Binding)) Binding->Unbind();
     }
     ControlBindings.Empty();
+    for (USettingsKeyMappingBinding* Binding : KeyMappingBindings)
+    {
+        if (IsValid(Binding)) Binding->Unbind();
+    }
+    KeyMappingBindings.Empty();
+    if (IsValid(NativeRenderingTabButton))
+    {
+        NativeRenderingTabButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::HandleRenderingTabClicked);
+    }
+    if (IsValid(NativeControlsTabButton))
+    {
+        NativeControlsTabButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::HandleControlsTabClicked);
+    }
+    if (IsValid(NativeResetKeyMappingsButton))
+    {
+        NativeResetKeyMappingsButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ResetKeyMappingsFromUI);
+    }
+    ListeningKeyActionId = NAME_None;
     Super::NativeDestruct();
 }
 
@@ -1365,6 +1460,8 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     PendingReflectionQuality = FMath::Clamp(Settings->ReflectionQuality, QualityMin, QualityMax);
     PendingDynamicGlobalIlluminationMethod = FMath::Clamp(Settings->DynamicGlobalIlluminationMethod, QualityMin, QualityMax);
     PendingReflectionMethod = FMath::Clamp(Settings->ReflectionMethod, ReflectionMethodMin, ReflectionMethodMax);
+    PendingKeyMappings = Settings->KeyMappings;
+    ListeningKeyActionId = NAME_None;
 }
 
 void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
@@ -1399,6 +1496,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->ReflectionQuality = PendingReflectionQuality;
     Settings->DynamicGlobalIlluminationMethod = PendingDynamicGlobalIlluminationMethod;
     Settings->ReflectionMethod = PendingReflectionMethod;
+    Settings->KeyMappings = PendingKeyMappings;
 }
 
 void USettingsMenuWidget::RefreshSettingsValues()
@@ -1421,6 +1519,7 @@ void USettingsMenuWidget::RefreshSettingsValues()
     }
     RefreshRegisteredControls();
     RefreshGeneratedSettingWidgets();
+    RefreshKeyMappingButtons();
 }
 
 void USettingsMenuWidget::CycleSettingValueFromUI(ESettingsField Field, int32 Direction)
@@ -1486,6 +1585,35 @@ void USettingsMenuWidget::CloseSettingsFromUI()
 
 FReply USettingsMenuWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
 {
+    if (!ListeningKeyActionId.IsNone())
+    {
+        if (InKeyEvent.IsRepeat()) return FReply::Handled();
+        const FKey PressedKey = InKeyEvent.GetKey();
+        if (PressedKey == EKeys::Escape)
+        {
+            ListeningKeyActionId = NAME_None;
+            RefreshKeyMappingButtons();
+            return FReply::Handled();
+        }
+        if (PressedKey.IsValid() && !PressedKey.IsAxis1D() && !PressedKey.IsAxis2D() && !PressedKey.IsAxis3D())
+        {
+            const FName TargetAction = ListeningKeyActionId;
+            ListeningKeyActionId = NAME_None;
+            const FKey DefaultKey = FindDefaultKeyForAction(TargetAction);
+            if (DefaultKey.IsValid() && PressedKey == DefaultKey)
+            {
+                PendingKeyMappings.Remove(TargetAction);
+            }
+            else
+            {
+                PendingKeyMappings.Add(TargetAction, PressedKey.GetFName());
+            }
+            ApplyAndSaveSettingsFromUI();
+            return FReply::Handled();
+        }
+        return FReply::Handled();
+    }
+
     if (!InKeyEvent.IsRepeat()
         && (InKeyEvent.GetKey() == EKeys::Escape || InKeyEvent.GetKey() == EKeys::Gamepad_FaceButton_Right))
     {
@@ -1897,13 +2025,109 @@ void USettingsMenuWidget::CycleReflectionQualityFromUI() { CycleSettingValueFrom
 void USettingsMenuWidget::CycleDynamicGlobalIlluminationMethodFromUI() { CycleSettingValueFromUI(ESettingsField::DynamicGlobalIlluminationMethod); }
 void USettingsMenuWidget::CycleReflectionMethodFromUI() { CycleSettingValueFromUI(ESettingsField::ReflectionMethod); }
 
+void USettingsMenuWidget::SelectSettingsTab(const ESettingsTab Tab)
+{
+    ActiveTab = Tab;
+    ListeningKeyActionId = NAME_None;
+    if (IsValid(NativeRenderingScroll))
+    {
+        NativeRenderingScroll->SetVisibility(ActiveTab == ESettingsTab::Rendering ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    }
+    if (IsValid(NativeControlsScroll))
+    {
+        NativeControlsScroll->SetVisibility(ActiveTab == ESettingsTab::Controls ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    }
+    UpdateTabAppearance();
+    RefreshKeyMappingButtons();
+}
+
+void USettingsMenuWidget::HandleRenderingTabClicked()
+{
+    SelectSettingsTab(ESettingsTab::Rendering);
+}
+
+void USettingsMenuWidget::HandleControlsTabClicked()
+{
+    SelectSettingsTab(ESettingsTab::Controls);
+}
+
+void USettingsMenuWidget::BeginListeningForKeyMapping(const FName ActionId)
+{
+    if (ActionId.IsNone()) return;
+    ListeningKeyActionId = (ListeningKeyActionId == ActionId) ? NAME_None : ActionId;
+    SetKeyboardFocus();
+    RefreshKeyMappingButtons();
+}
+
+void USettingsMenuWidget::ResetKeyMappingsFromUI()
+{
+    ListeningKeyActionId = NAME_None;
+    PendingKeyMappings.Reset();
+    ApplyAndSaveSettingsFromUI();
+}
+
+FText USettingsMenuWidget::GetKeyMappingButtonText(const FName ActionId) const
+{
+    if (ListeningKeyActionId == ActionId)
+    {
+        return NSLOCTEXT("V3DUI", "PressAnyKey", "Press any key... (Esc: Cancel)");
+    }
+    if (const FName* OverrideName = PendingKeyMappings.Find(ActionId))
+    {
+        const FKey OverrideKey(*OverrideName);
+        if (OverrideKey.IsValid())
+        {
+            return OverrideKey.GetDisplayName();
+        }
+    }
+    const FKey DefaultKey = FindDefaultKeyForAction(ActionId);
+    return DefaultKey.IsValid() ? DefaultKey.GetDisplayName() : NSLOCTEXT("V3DUI", "Unbound", "Unbound");
+}
+
+void USettingsMenuWidget::RefreshKeyMappingButtons()
+{
+    for (int32 Index = 0; Index < NativeKeyMappingButtons.Num() && Index < NativeKeyActionIds.Num(); ++Index)
+    {
+        if (UButton* Button = NativeKeyMappingButtons[Index].Get())
+        {
+            SetButtonTextFromUI(Button, GetKeyMappingButtonText(NativeKeyActionIds[Index]));
+        }
+    }
+}
+
+void USettingsMenuWidget::UpdateTabAppearance()
+{
+    const FLinearColor ActiveColor = AccentColor;
+    const FLinearColor InactiveColor = FLinearColor(
+        ButtonColor.R * 0.65f, ButtonColor.G * 0.65f, ButtonColor.B * 0.65f, ButtonColor.A);
+    if (IsValid(NativeRenderingTabButton))
+    {
+        V3DHUDStyle::ApplyButton(*NativeRenderingTabButton,
+            ActiveTab == ESettingsTab::Rendering ? ActiveColor : InactiveColor, HoveredButtonTint);
+    }
+    if (IsValid(NativeControlsTabButton))
+    {
+        V3DHUDStyle::ApplyButton(*NativeControlsTabButton,
+            ActiveTab == ESettingsTab::Controls ? ActiveColor : InactiveColor, HoveredButtonTint);
+    }
+}
+
 void USettingsMenuWidget::BuildNativeLayout()
 {
     NativeControls.Reset();
     NativeValueLabels.Reset();
     NativeFieldLabels.Reset();
     NativeControlFields.Reset();
+    NativeKeyActionLabels.Reset();
+    NativeKeyMappingButtons.Reset();
+    NativeKeyActionIds.Reset();
     NativeApply = nullptr;
+    NativeRenderingTabButton = nullptr;
+    NativeControlsTabButton = nullptr;
+    NativeRenderingScroll = nullptr;
+    NativeControlsScroll = nullptr;
+    NativeKeyMappingsHeader = nullptr;
+    NativeResetKeyMappingsButton = nullptr;
 
     UBorder* Panel = AddPanel(PanelSize, FVector2D::ZeroVector);
     UVerticalBox* Content = WidgetTree->ConstructWidget<UVerticalBox>();
@@ -1927,17 +2151,60 @@ void USettingsMenuWidget::BuildNativeLayout()
         BackOverlaySlot->SetPadding(FMargin(32.f, 0.f));
     }
 
-    UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>();
-    Scroll->SetAnimateWheelScrolling(true);
-    Content->AddChildToVerticalBox(Scroll)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-    UVerticalBox* List = WidgetTree->ConstructWidget<UVerticalBox>();
-    Scroll->AddChild(List);
+    // Tab bar: Rendering | Controls
+    UHorizontalBox* TabBar = WidgetTree->ConstructWidget<UHorizontalBox>();
+    if (UVerticalBoxSlot* TabBarSlot = Content->AddChildToVerticalBox(TabBar))
+    {
+        TabBarSlot->SetPadding(FMargin(32.f, 8.f, 32.f, 12.f));
+    }
+    NativeRenderingTabButton = AddButton(TabBar, NSLOCTEXT("V3DUI", "TabRendering", "Rendering"));
+    if (USizeBox* TabSize = Cast<USizeBox>(NativeRenderingTabButton->GetParent()))
+    {
+        if (UHorizontalBoxSlot* TabSlot = Cast<UHorizontalBoxSlot>(TabSize->Slot))
+        {
+            TabSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            TabSlot->SetPadding(FMargin(0.f, 0.f, 8.f, 0.f));
+        }
+    }
+    NativeControlsTabButton = AddButton(TabBar, NSLOCTEXT("V3DUI", "TabControls", "Controls"));
+    if (USizeBox* TabSize = Cast<USizeBox>(NativeControlsTabButton->GetParent()))
+    {
+        if (UHorizontalBoxSlot* TabSlot = Cast<UHorizontalBoxSlot>(TabSize->Slot))
+        {
+            TabSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            TabSlot->SetPadding(FMargin(8.f, 0.f, 0.f, 0.f));
+        }
+    }
 
-    for (ESettingsField Field : GetDefaultSettingsFields())
+    // Tab content container (Overlay hosting Rendering and Controls scroll boxes)
+    UOverlay* TabBody = WidgetTree->ConstructWidget<UOverlay>();
+    Content->AddChildToVerticalBox(TabBody)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+
+    NativeRenderingScroll = WidgetTree->ConstructWidget<UScrollBox>();
+    NativeRenderingScroll->SetAnimateWheelScrolling(true);
+    if (UOverlaySlot* RenderSlot = TabBody->AddChildToOverlay(NativeRenderingScroll))
+    {
+        RenderSlot->SetHorizontalAlignment(HAlign_Fill);
+        RenderSlot->SetVerticalAlignment(VAlign_Fill);
+    }
+    UVerticalBox* RenderingList = WidgetTree->ConstructWidget<UVerticalBox>();
+    NativeRenderingScroll->AddChild(RenderingList);
+
+    NativeControlsScroll = WidgetTree->ConstructWidget<UScrollBox>();
+    NativeControlsScroll->SetAnimateWheelScrolling(true);
+    if (UOverlaySlot* ControlsSlot = TabBody->AddChildToOverlay(NativeControlsScroll))
+    {
+        ControlsSlot->SetHorizontalAlignment(HAlign_Fill);
+        ControlsSlot->SetVerticalAlignment(VAlign_Fill);
+    }
+    UVerticalBox* ControlsList = WidgetTree->ConstructWidget<UVerticalBox>();
+    NativeControlsScroll->AddChild(ControlsList);
+
+    auto AppendSettingRow = [this](UVerticalBox* TargetList, ESettingsField Field)
     {
         const ESettingsControlType Type = GetSettingControlType(Field);
         UVerticalBox* Row = WidgetTree->ConstructWidget<UVerticalBox>();
-        List->AddChildToVerticalBox(Row)->SetPadding(FMargin(8.f));
+        TargetList->AddChildToVerticalBox(Row)->SetPadding(FMargin(8.f));
         UTextBlock* Label = WidgetTree->ConstructWidget<UTextBlock>();
         Label->SetText(GetSettingLabelText(Field));
         Label->SetAutoWrapText(true);
@@ -1999,7 +2266,61 @@ void USettingsMenuWidget::BuildNativeLayout()
         NativeControls.Add(Control);
         NativeValueLabels.Add(Value);
         NativeFieldLabels.Add(Label);
+    };
+
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        AppendSettingRow(IsControlsTabField(Field) ? ControlsList : RenderingList, Field);
     }
+
+    // Key Mappings section inside the Controls tab
+    UHorizontalBox* KeyHeaderRow = WidgetTree->ConstructWidget<UHorizontalBox>();
+    ControlsList->AddChildToVerticalBox(KeyHeaderRow)->SetPadding(FMargin(16.f, 24.f, 16.f, 8.f));
+    NativeKeyMappingsHeader = WidgetTree->ConstructWidget<UTextBlock>();
+    NativeKeyMappingsHeader->SetText(NSLOCTEXT("V3DUI", "KeyMappingsHeader", "Key Mappings"));
+    if (UHorizontalBoxSlot* HeaderSlot = KeyHeaderRow->AddChildToHorizontalBox(NativeKeyMappingsHeader))
+    {
+        HeaderSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        HeaderSlot->SetVerticalAlignment(VAlign_Center);
+    }
+    NativeResetKeyMappingsButton = AddButton(KeyHeaderRow, NSLOCTEXT("V3DUI", "ResetKeyMappings", "Reset Defaults"));
+    if (USizeBox* ResetSize = Cast<USizeBox>(NativeResetKeyMappingsButton->GetParent()))
+    {
+        ResetSize->SetMinDesiredWidth(220.f);
+    }
+
+    for (const FRebindableActionDef& Def : GetRebindableActionDefs())
+    {
+        UHorizontalBox* KeyRow = WidgetTree->ConstructWidget<UHorizontalBox>();
+        ControlsList->AddChildToVerticalBox(KeyRow)->SetPadding(FMargin(16.f, 4.f));
+
+        UTextBlock* ActionLabel = WidgetTree->ConstructWidget<UTextBlock>();
+        ActionLabel->SetText(FText::FromString(Def.DisplayLabel));
+        ActionLabel->SetAutoWrapText(true);
+        if (UHorizontalBoxSlot* ActionSlot = KeyRow->AddChildToHorizontalBox(ActionLabel))
+        {
+            ActionSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            ActionSlot->SetVerticalAlignment(VAlign_Center);
+            ActionSlot->SetPadding(FMargin(8.f));
+        }
+
+        UButton* KeyButton = AddButton(KeyRow, GetKeyMappingButtonText(Def.ActionId));
+        if (USizeBox* KeySize = Cast<USizeBox>(KeyButton->GetParent()))
+        {
+            KeySize->SetMinDesiredWidth(280.f);
+            if (UHorizontalBoxSlot* ButtonSlot = Cast<UHorizontalBoxSlot>(KeySize->Slot))
+            {
+                ButtonSlot->SetVerticalAlignment(VAlign_Center);
+                ButtonSlot->SetPadding(FMargin(8.f));
+            }
+        }
+
+        NativeKeyActionIds.Add(FName(Def.ActionId));
+        NativeKeyActionLabels.Add(ActionLabel);
+        NativeKeyMappingButtons.Add(KeyButton);
+    }
+
+    SelectSettingsTab(ActiveTab);
 }
 
 void USettingsMenuWidget::BindNativeWidgets()
@@ -2011,6 +2332,39 @@ void USettingsMenuWidget::BindNativeWidgets()
     SetBackButton(NativeBack);
     SetConfirmButton(nullptr);
     SetCancelButton(nullptr);
+
+    if (IsValid(NativeRenderingTabButton))
+    {
+        NativeRenderingTabButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::HandleRenderingTabClicked);
+        NativeRenderingTabButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::HandleRenderingTabClicked);
+    }
+    if (IsValid(NativeControlsTabButton))
+    {
+        NativeControlsTabButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::HandleControlsTabClicked);
+        NativeControlsTabButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::HandleControlsTabClicked);
+    }
+    if (IsValid(NativeResetKeyMappingsButton))
+    {
+        NativeResetKeyMappingsButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ResetKeyMappingsFromUI);
+        NativeResetKeyMappingsButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ResetKeyMappingsFromUI);
+    }
+
+    for (USettingsKeyMappingBinding* Binding : KeyMappingBindings)
+    {
+        if (IsValid(Binding)) Binding->Unbind();
+    }
+    KeyMappingBindings.Reset();
+    for (int32 Index = 0; Index < NativeKeyMappingButtons.Num() && Index < NativeKeyActionIds.Num(); ++Index)
+    {
+        UButton* Button = NativeKeyMappingButtons[Index].Get();
+        if (!IsValid(Button)) continue;
+        USettingsKeyMappingBinding* Binding = NewObject<USettingsKeyMappingBinding>(this);
+        if (IsValid(Binding))
+        {
+            Binding->BindButton(this, NativeKeyActionIds[Index], Button);
+            KeyMappingBindings.Add(Binding);
+        }
+    }
 
     // Bind current native controls after Blueprint construction.
     // Replace only adapters that were replaced by that graph; retain live adapters on refresh.
@@ -2029,17 +2383,21 @@ void USettingsMenuWidget::BindNativeWidgets()
         else if (UButton* Button = Cast<UButton>(Control)) RegisterSettingToggleButton(Field, Button);
     }
     CollectAssignedWidgetReferences();
+    SelectSettingsTab(ActiveTab);
     RefreshSettingsValues();
 }
 
 void USettingsMenuWidget::ApplyNativeStyle()
 {
     Super::ApplyNativeStyle();
-    // The original Settings header uses the engine's default font; generated rows use Pretendard.
+    if (!IsValid(FontObject))
+    {
+        FontObject = V3DHUDStyle::FindFontRuntime();
+    }
     if (NativeTitle)
     {
-        FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();
-        V3DHUDStyle::ApplyFont(Font, nullptr, TitleFontSize, FontOutlineSize);
+        FSlateFontInfo Font = NativeTitle->GetFont();
+        V3DHUDStyle::ApplyFont(Font, FontObject, TitleFontSize, FontOutlineSize);
         NativeTitle->SetFont(Font);
     }
     if (NativeBack)
@@ -2047,8 +2405,34 @@ void USettingsMenuWidget::ApplyNativeStyle()
         if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
         if (UTextBlock* Label = Cast<UTextBlock>(NativeBack->GetContent()))
         {
-            FSlateFontInfo Font = GetDefault<UTextBlock>()->GetFont();
-            V3DHUDStyle::ApplyFont(Font, nullptr, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), FontOutlineSize);
+            FSlateFontInfo Font = Label->GetFont();
+            V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), FontOutlineSize);
+            Label->SetFont(Font);
+        }
+    }
+    UpdateTabAppearance();
+    if (IsValid(NativeKeyMappingsHeader))
+    {
+        FSlateFontInfo Font = NativeKeyMappingsHeader->GetFont();
+        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), 1);
+        NativeKeyMappingsHeader->SetFont(Font);
+        NativeKeyMappingsHeader->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    for (UTextBlock* ActionLabel : NativeKeyActionLabels)
+    {
+        if (!IsValid(ActionLabel)) continue;
+        FSlateFontInfo Font = ActionLabel->GetFont();
+        V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+        ActionLabel->SetFont(Font);
+        ActionLabel->SetColorAndOpacity(FSlateColor(TextColor));
+    }
+    for (UButton* KeyButton : NativeKeyMappingButtons)
+    {
+        if (!IsValid(KeyButton)) continue;
+        if (UTextBlock* Label = Cast<UTextBlock>(KeyButton->GetContent()))
+        {
+            FSlateFontInfo Font = Label->GetFont();
+            V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 0.85f), 1);
             Label->SetFont(Font);
         }
     }

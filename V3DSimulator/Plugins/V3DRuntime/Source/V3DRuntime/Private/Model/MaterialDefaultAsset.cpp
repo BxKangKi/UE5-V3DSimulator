@@ -68,7 +68,7 @@ bool FV3DMaterialAssetReferences::IsEmpty() const
 const TSoftObjectPtr<UMaterialInterface>& FV3DMaterialSoftAssetReferences::Get(int32 Slot) const
 {
     check(Slot >= 0 && Slot < FV3DMaterialAssetReferences::SlotCount);
-    const TSoftObjectPtr<UMaterialInterface>* Slots[] = {&MI_Opaque, &MI_Masked, &MI_Translucent, &MI_Toon,
+    const TSoftObjectPtr<UMaterialInterface>* Slots[] = {&MI_Opaque, &MI_Opaque, &MI_Translucent, &MI_Toon,
         &MI_OpaqueTwoSided, &MI_OpaqueTwoSided, &MI_TranslucentTwoSided, &MI_ToonTwoSided};
     return *Slots[Slot];
 }
@@ -96,12 +96,6 @@ bool FV3DMaterialSoftAssetReferences::Resolve(FV3DMaterialAssetReferences& OutRe
             TEXT("%s -> %s: missing or incompatible blend/sidedness; using Opaque (Masked) fallback."),
             FV3DMaterialAssetReferences::SlotName(Slot), *Ref.ToSoftObjectPath().ToString()));
     }
-    // Migrate the removed Masked slot without changing or saving the user's assets at runtime.
-    if (!OutReferences.MI_Opaque)
-    {
-        auto* Legacy = Load(MI_Masked);
-        if (FV3DMaterialAssetReferences::MatchesSlot(Legacy, 0)) OutReferences.MI_Opaque = Legacy;
-    }
     if (!OutReferences.MI_Opaque) OutReferences.MI_Opaque = FV3DMaterialAssetReferences::LoadFallback(false, bAllowSynchronousLoading);
     if (!OutReferences.MI_OpaqueTwoSided) OutReferences.MI_OpaqueTwoSided = FV3DMaterialAssetReferences::LoadFallback(true, bAllowSynchronousLoading);
     OutReferences.MI_Masked = OutReferences.MI_Opaque;
@@ -126,7 +120,7 @@ void FV3DMaterialSoftAssetReferences::GetPreloadPaths(TArray<FSoftObjectPath>& P
 {
     const auto Add = [&Paths](const TSoftObjectPtr<UMaterialInterface>& Ref)
     { if (!Ref.IsNull()) Paths.AddUnique(Ref.ToSoftObjectPath()); };
-    for (int32 Slot : {0, 1, 2, 3, 4, 6, 7}) Add(Get(Slot));
+    for (int32 Slot : {0, 2, 3, 4, 6, 7}) Add(Get(Slot));
     for (const auto& Pair : ReservedMaterials) Add(Pair.Value);
     Paths.AddUnique(FSoftObjectPath(FV3DMaterialAssetReferences::FallbackPath(false)));
     Paths.AddUnique(FSoftObjectPath(FV3DMaterialAssetReferences::FallbackPath(true)));

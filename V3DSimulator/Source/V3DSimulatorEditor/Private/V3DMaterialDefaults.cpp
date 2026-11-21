@@ -1,5 +1,7 @@
 // Generated fallback shaders are editor assets, never runtime BlendMode overrides.
 #include "V3DMaterialDefaults.h"
+#include "V3DPhysicalMaterialUpgrade.h"
+#include "World/PhysicalMaterialProfile.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "MaterialEditingLibrary.h"
 #include "Materials/Material.h"
@@ -12,15 +14,14 @@
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionSceneTexture.h"
 #include "Materials/MaterialExpressionScreenPosition.h"
-#include "Materials/MaterialExpressionSingleLayerWaterMaterialOutput.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionTextureObjectParameter.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionCollectionParameter.h"
 #include "Materials/MaterialExpressionConstant.h"
-#include "Materials/MaterialExpressionObjectPositionWS.h"
-#include "Materials/MaterialExpressionObjectRadius.h"
-#include "Materials/MaterialExpressionTime.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
+#include "Materials/MaterialExpressionQualitySwitch.h"
+#include "SceneTypes.h"
 #include "Materials/MaterialExpressionWorldPosition.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "Materials/MaterialFunctionInterface.h"
@@ -54,7 +55,8 @@ namespace V3DMaterialDefaults
                 if (Custom->Code.Contains(TEXT("UnderWaterShaft("))
                     || Custom->Code.Contains(TEXT("UnderWaterShaftShadowed("))
                     || Custom->Code.Contains(TEXT("UnderWaterShaftCompact("))
-                    || Custom->Code.Contains(TEXT("UnderWaterShaftMatrix("))) ShaftNodes.Add(Custom);
+                    || Custom->Code.Contains(TEXT("UnderWaterShaftMatrix("))
+                    || Custom->Code.Contains(TEXT("UnderWaterShaftMatrixWithParams("))) ShaftNodes.Add(Custom);
         bool bChanged = false;
         for (auto* Custom : ShaftNodes)
         {
@@ -149,7 +151,7 @@ namespace V3DMaterialDefaults
                 "    float4(V3DUWShadowRight.xyz, ScreenUV.x),\n"
                 "    float4(V3DUWShadowForward.xyz, ScreenUV.y)\n"
                 ");\n"
-                "return UnderWaterShaftMatrix(V3DUWShadowNear, V3DUWShadowNearSampler, V3DUWShadowFar, V3DUWShadowFarSampler, ShadowParams);");
+                "return UnderWaterShaftMatrixWithParams(Parameters, V3DUWShadowNear, V3DUWShadowNearSampler, V3DUWShadowFar, V3DUWShadowFarSampler, ShadowParams);");
             if (Custom->Code != MatrixCode)
             {
                 Custom->Modify();
@@ -214,7 +216,8 @@ namespace V3DMaterialDefaults
                 {
                     if (Custom->Code.Contains(TEXT("UnderWaterHazeBlur"))
                         || Custom->Code.Contains(TEXT("UnderWaterHazeCompact"))
-                        || Custom->Code.Contains(TEXT("UnderWaterHaze(")))
+                        || Custom->Code.Contains(TEXT("UnderWaterHaze("))
+                        || Custom->Code.Contains(TEXT("UnderWaterHazeWithParams(")))
                     {
                         const int32 Pruned = Custom->Inputs.RemoveAll([](const FCustomInput& In)
                         {
@@ -223,7 +226,7 @@ namespace V3DMaterialDefaults
                         const FString UnderwaterInclude = TEXT("/Plugin/ShaderLibrary/Underwater.ush");
                         const bool bNeedIncludeUpdate = (Custom->IncludeFilePaths.Num() != 1)
                             || (Custom->IncludeFilePaths[0] != UnderwaterInclude);
-                        const FString CompactHaze = TEXT("return UnderWaterHaze(float3(ScreenUV, WaterLevel));");
+                        const FString CompactHaze = TEXT("return UnderWaterHazeWithParams(Parameters, WaterLevel);");
                         if (Pruned > 0 || bNeedIncludeUpdate || Custom->Code != CompactHaze)
                         {
                             HazeFn->Modify();
@@ -313,12 +316,68 @@ namespace V3DMaterialDefaults
                 else if (auto* SceneTex = Cast<UMaterialExpressionSceneTexture>(Expr))
                 {
                     // Leaving Coordinates unconnected guarantees pixel-exact default SceneTextureUV for both depth and color.
-                    if ((SceneTex->SceneTextureId == PPI_SceneDepth || SceneTex->SceneTextureId == PPI_PostProcessInput0)
+                    if ((SceneTex->SceneTextureId == PPI_SceneDepth
+                        || SceneTex->SceneTextureId == PPI_PostProcessInput0
+                        || SceneTex->SceneTextureId == PPI_CustomDepth
+                        || SceneTex->SceneTextureId == PPI_ShadingModelID)
                         && SceneTex->Coordinates.IsConnected())
                     {
                         UnderWaterFn->Modify();
                         SceneTex->Coordinates.Expression = nullptr;
                         bUWChanged = true;
+                    }
+                }
+            }
+
+            // Gate MF_UnderWaterShaft output behind a QualitySwitch so underwater shafts are
+            // disabled on Low quality even for local water post-process volumes.
+            UMaterialExpressionMaterialFunctionCall* ShaftCall = nullptr;
+            bool bHasShaftQualityGate = false;
+            for (UMaterialExpression* Expr : UnderWaterFn->GetExpressions())
+            {
+                if (auto* Call = Cast<UMaterialExpressionMaterialFunctionCall>(Expr))
+                {
+                    if (GetNameSafe(Call->MaterialFunction) == TEXT("MF_UnderWaterShaft"))
+                    {
+                        ShaftCall = Call;
+                    }
+                }
+                else if (auto* QSwitch = Cast<UMaterialExpressionQualitySwitch>(Expr))
+                {
+                    if (QSwitch->Desc == TEXT("V3D_ShaftMediumPlus"))
+                    {
+                        bHasShaftQualityGate = true;
+                    }
+                }
+            }
+            if (ShaftCall && !bHasShaftQualityGate)
+            {
+                UnderWaterFn->Modify();
+                auto* ZeroColor = CastChecked<UMaterialExpressionConstant3Vector>(
+                    UMaterialEditingLibrary::CreateMaterialExpressionInFunction(
+                        UnderWaterFn, UMaterialExpressionConstant3Vector::StaticClass(),
+                        ShaftCall->MaterialExpressionEditorX + 180, ShaftCall->MaterialExpressionEditorY + 140));
+                ZeroColor->Constant = FLinearColor::Black;
+
+                auto* QSwitch = CastChecked<UMaterialExpressionQualitySwitch>(
+                    UMaterialEditingLibrary::CreateMaterialExpressionInFunction(
+                        UnderWaterFn, UMaterialExpressionQualitySwitch::StaticClass(),
+                        ShaftCall->MaterialExpressionEditorX + 340, ShaftCall->MaterialExpressionEditorY));
+                QSwitch->Desc = TEXT("V3D_ShaftMediumPlus");
+                QSwitch->Default.Connect(0, ShaftCall);
+                QSwitch->Inputs[EMaterialQualityLevel::Low].Connect(0, ZeroColor);
+
+                for (UMaterialExpression* Expr : UnderWaterFn->GetExpressions())
+                {
+                    if (!Expr || Expr == QSwitch || Expr == ShaftCall) continue;
+                    for (FExpressionInputIterator It{Expr}; It; ++It)
+                    {
+                        if (It->Expression == ShaftCall)
+                        {
+                            Expr->Modify();
+                            It->Connect(0, QSwitch);
+                            bUWChanged = true;
+                        }
                     }
                 }
             }
@@ -337,120 +396,8 @@ namespace V3DMaterialDefaults
             }
         }
 
-        // Apply physically-based Beer-Lambert absorption & darker deep-ocean scattering defaults
-        // directly to M_Water so SingleLayerWater changes color naturally with water depth.
-        if (auto* WaterMat = LoadObject<UMaterial>(nullptr,
-            TEXT("/ShaderLibrary/Water/WaterSurface/M_Water.M_Water")))
-        {
-            const FLinearColor BeerLambertAbsorption(0.00460f, 0.00140f, 0.00065f, 1.0f);
-            const FLinearColor DeepOceanScattering(0.000018f, 0.000068f, 0.000105f, 1.0f);
-            const FLinearColor DarkWaterAlbedo(0.0005f, 0.0020f, 0.0040f, 1.0f);
-            bool bWaterChanged = false;
-            bool bHasAbsorptionParam = false;
-            bool bHasScatteringParam = false;
-
-            for (UMaterialExpression* Expr : WaterMat->GetExpressions())
-            {
-                if (auto* VecParam = Cast<UMaterialExpressionVectorParameter>(Expr))
-                {
-                    if (VecParam->ParameterName == TEXT("AbsorptionCoefficients")
-                        || VecParam->ParameterName == TEXT("Absorption"))
-                    {
-                        bHasAbsorptionParam = true;
-                        if (!VecParam->DefaultValue.Equals(BeerLambertAbsorption, 1.0e-6f))
-                        {
-                            WaterMat->Modify();
-                            VecParam->Modify();
-                            VecParam->DefaultValue = BeerLambertAbsorption;
-                            bWaterChanged = true;
-                        }
-                    }
-                    else if (VecParam->ParameterName == TEXT("ScatteringCoefficients")
-                        || VecParam->ParameterName == TEXT("Scattering"))
-                    {
-                        bHasScatteringParam = true;
-                        if (!VecParam->DefaultValue.Equals(DeepOceanScattering, 1.0e-6f))
-                        {
-                            WaterMat->Modify();
-                            VecParam->Modify();
-                            VecParam->DefaultValue = DeepOceanScattering;
-                            bWaterChanged = true;
-                        }
-                    }
-                    else if (VecParam->ParameterName == TEXT("Water Albedo"))
-                    {
-                        if (!VecParam->DefaultValue.Equals(DarkWaterAlbedo, 1.0e-5f))
-                        {
-                            WaterMat->Modify();
-                            VecParam->Modify();
-                            VecParam->DefaultValue = DarkWaterAlbedo;
-                            bWaterChanged = true;
-                        }
-                    }
-                }
-                else if (auto* ScalarParam = Cast<UMaterialExpressionScalarParameter>(Expr))
-                {
-                    if (ScalarParam->ParameterName == TEXT("PhaseG")
-                        && !FMath::IsNearlyEqual(ScalarParam->DefaultValue, 0.65f, 1.0e-4f))
-                    {
-                        WaterMat->Modify();
-                        ScalarParam->Modify();
-                        ScalarParam->DefaultValue = 0.65f;
-                        bWaterChanged = true;
-                    }
-                }
-            }
-
-            // If M_Water wired constants into SingleLayerWaterMaterialOutput instead of named parameters,
-            // expose AbsorptionCoefficients & ScatteringCoefficients so Beer-Lambert depth physics takes effect.
-            if (!bHasAbsorptionParam || !bHasScatteringParam)
-            {
-                for (UMaterialExpression* Expr : WaterMat->GetExpressions())
-                {
-                    if (auto* SLW = Cast<UMaterialExpressionSingleLayerWaterMaterialOutput>(Expr))
-                    {
-                        WaterMat->Modify();
-                        if (!bHasAbsorptionParam)
-                        {
-                            auto* AbsNode = CastChecked<UMaterialExpressionVectorParameter>(
-                                UMaterialEditingLibrary::CreateMaterialExpression(
-                                    WaterMat, UMaterialExpressionVectorParameter::StaticClass(),
-                                    SLW->MaterialExpressionEditorX - 350, SLW->MaterialExpressionEditorY + 120));
-                            AbsNode->ParameterName = TEXT("AbsorptionCoefficients");
-                            AbsNode->DefaultValue = BeerLambertAbsorption;
-                            SLW->AbsorptionCoefficients.Connect(0, AbsNode);
-                            bWaterChanged = true;
-                        }
-                        if (!bHasScatteringParam)
-                        {
-                            auto* ScatNode = CastChecked<UMaterialExpressionVectorParameter>(
-                                UMaterialEditingLibrary::CreateMaterialExpression(
-                                    WaterMat, UMaterialExpressionVectorParameter::StaticClass(),
-                                    SLW->MaterialExpressionEditorX - 350, SLW->MaterialExpressionEditorY - 120));
-                            ScatNode->ParameterName = TEXT("ScatteringCoefficients");
-                            ScatNode->DefaultValue = DeepOceanScattering;
-                            SLW->ScatteringCoefficients.Connect(0, ScatNode);
-                            bWaterChanged = true;
-                        }
-                        break;
-                    }
-                }
-            }
-
-            if (bWaterChanged)
-            {
-                WaterMat->PostEditChange();
-                UPackage* Package = WaterMat->GetOutermost();
-                Package->MarkPackageDirty();
-                const FString Filename = FPackageName::LongPackageNameToFilename(
-                    Package->GetName(), FPackageName::GetAssetPackageExtension());
-                FSavePackageArgs Args;
-                Args.TopLevelFlags = RF_Public | RF_Standalone;
-                Args.SaveFlags = SAVE_NoError;
-                if (!UPackage::SavePackage(Package, WaterMat, *Filename, Args))
-                    UE_LOG(LogTemp, Error, TEXT("Could not save Beer-Lambert M_Water defaults: %s"), *Filename);
-            }
-        }
+        // Surface optics are owned by UpgradeWaterReflectionMaterials.
+        // Do not reset PNO to zero or guess coefficient output indices here.
 
         auto* Rendering = GetMutableDefault<URendererSettings>();
         if (Rendering->CustomDepthStencil == ECustomDepthStencil::Disabled)
@@ -523,7 +470,8 @@ namespace V3DMaterialDefaults
         Material->SetShadingModel(MSM_DefaultLit);
         Material->SetUsageByFlag(MATUSAGE_InstancedStaticMeshes, true);
         Material->SetUsageByFlag(MATUSAGE_SkeletalMesh, true);
-        Material->DitheredLODTransition = true;
+        Material->DitheredLODTransition = GlassOpacity >= 1.f;
+        if (GlassOpacity < 1.f) Material->TranslucencyLightingMode = TLM_SurfacePerPixelLighting;
         Material->OpacityMaskClipValue = 0.333f;
 
         auto* Color = Expression<UMaterialExpressionVectorParameter>(Material);
@@ -539,8 +487,10 @@ namespace V3DMaterialDefaults
         TintedSurface->A.Connect(0, Surface); TintedSurface->B.Connect(0, Tint);
         UMaterialEditingLibrary::ConnectMaterialProperty(TintedSurface, TEXT(""), MP_BaseColor);
         UMaterialEditingLibrary::ConnectMaterialProperty(Scalar(Material, TEXT("metallicFactor"), 0.f), TEXT(""), MP_Metallic);
-        UMaterialEditingLibrary::ConnectMaterialProperty(Scalar(Material, TEXT("roughnessFactor"), GlassOpacity < 1.f ? 0.1f : 0.8f), TEXT(""), MP_Roughness);
+        UMaterialEditingLibrary::ConnectMaterialProperty(Scalar(Material, TEXT("roughnessFactor"), GlassOpacity < 1.f ? V3DPhysicalMaterial::GlassRoughness : 0.65f), TEXT(""), MP_Roughness);
 
+        UMaterialEditingLibrary::ConnectMaterialProperty(Scalar(Material, TEXT("specularFactor"),
+            V3DPhysicalMaterial::DielectricSpecular), TEXT(""), MP_Specular);
         auto* Coverage = Expression<UMaterialExpressionCustom>(Material);
         Coverage->OutputType = CMOT_Float1;
         Coverage->Description = TEXT("glTF coverage and distance fade");
@@ -703,6 +653,7 @@ namespace V3DMaterialDefaults
         bReady &= CreateParent(TEXT("M_OpaqueTwoSided"), true, 1.f);
         bReady &= CreateParent(TEXT("M_Glass"), true, 0.25f);
         bReady &= CreateParent(TEXT("M_TintedGlass"), true, 0.5f);
+        UpgradePhysicalMaterials();
         if (!bReady) return;
         UProjectPackagingSettings* Packaging = GetMutableDefault<UProjectPackagingSettings>();
         const FString Directory = TEXT("/Game/V3DGenerated/Materials");

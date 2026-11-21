@@ -227,6 +227,11 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
         }
         Data->Audio = Environment.Audio;
         Data->Biomes = MoveTemp(Environment.Biomes);
+        if (!FV3DWorldFogConfig::ParseWorldConfig(Json, Data->Fog, EnvironmentError))
+        {
+            UE_LOG(LogTemp, Error, TEXT("%s"), *EnvironmentError);
+            return false;
+        }
         const TSharedPtr<FJsonObject>* CloudObject = nullptr;
         if (Json->TryGetObjectField(TEXT("Cloud"), CloudObject) && CloudObject && CloudObject->IsValid())
         {

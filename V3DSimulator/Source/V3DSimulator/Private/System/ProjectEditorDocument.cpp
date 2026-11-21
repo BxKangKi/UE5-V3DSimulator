@@ -12,6 +12,7 @@
 #include "Character/CharacterBoneSchema.h"
 #include "World/WorldData.h"
 #include "World/WorldEnvironmentConfig.h"
+#include "World/WorldFogConfig.h"
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
 #include "Serialization/JsonSerializer.h"
@@ -21,10 +22,20 @@
 namespace
 {
     // Cache parsing per calling thread; default TSharedPtr JSON nodes are not thread-safe.
+    FString BuildEditorSchemaJson()
+    {
+        FString Combined;
+        for (const TCHAR* Part : EditorSchemaJsonParts)
+        {
+            Combined += Part;
+        }
+        return Combined;
+    }
+
     const TSharedPtr<FJsonObject>& EditorTemplates()
     {
         static thread_local const FSafeJsonLoadResult Templates =
-            FSafeFileIO::ParseJsonText(EditorSchemaJson, TEXT("Editor schema"));
+            FSafeFileIO::ParseJsonText(BuildEditorSchemaJson(), TEXT("Editor schema"));
         return Templates.JsonObject;
     }
 
@@ -77,11 +88,13 @@ bool V3DProjectEditor::Discover(const FString& Project, TArray<TSharedPtr<FV3DEd
     IFileManager::Get().FindFilesRecursive(Files, *Resources, TEXT("*.json"), true, false);
     Files.Sort();
     Files.Insert(V3DSimulatorProjectWorkspace::ConfigPath(Project), 0);
+    if (Config.ProjectType == EV3DSimulatorProjectType::World) Files.Add(FPaths::Combine(Root, FV3DWorldFogConfig::MemberName()));
     for (int32 I = 0; I < 3; ++I) Files.Add(FPaths::Combine(Root, FV3DProjectScripts::MemberName(I)));
-    if (Files.Num() > 4100) { Error = TEXT("Too many editor documents."); return false; }
+    if (Files.Num() > 4101) { Error = TEXT("Too many editor documents."); return false; }
     int64 TotalBytes = 0;
     for (const auto& Path : Files)
     {
+        const bool bEnvironment = Path == FPaths::Combine(Root, FV3DWorldFogConfig::MemberName());
         const int64 Bytes = IFileManager::Get().FileSize(*Path);
         if (Bytes > 16ll * 1024 * 1024 || (Bytes > 0 && (TotalBytes += Bytes) > 64ll * 1024 * 1024))
         { Error = TEXT("Editor JSON memory limit exceeded (16 MiB per file, 64 MiB total)."); return false; }
@@ -90,9 +103,14 @@ bool V3DProjectEditor::Discover(const FString& Project, TArray<TSharedPtr<FV3DEd
         Doc->Label = Path; FPaths::MakePathRelativeTo(Doc->Label, *(Root / TEXT("")));
         if (const auto* Source = Sources.Find(Doc->Path.ToLower())) Doc->SourcePath = *Source;
         FSafeJsonLimits Limits; Limits.MaxFileBytes = 16ll * 1024 * 1024;
-        const auto Loaded = FSafeFileIO::LoadJsonBlocking(Doc->Path, Limits);
-        if (!FFileHelper::LoadFileToString(Doc->DiskText, *Doc->Path))
+        const auto Loaded = FSafeFileIO::LoadJsonBlocking(Path, Limits);
+        if (!FFileHelper::LoadFileToString(Doc->DiskText, *Path))
         {
+            if (Loaded.Status == ESafeFileIOStatus::Missing && bEnvironment)
+            {
+                Doc->Json = FV3DWorldFogConfig().ToJson();
+                Doc->bNewFile = Doc->bDirty = true; Documents.Add(Doc); continue;
+            }
             int32 ScriptIndex = INDEX_NONE;
             for (int32 I = 0; I < 3; ++I) if (Doc->Path.EndsWith(FV3DProjectScripts::MemberName(I))) ScriptIndex = I;
             if (Loaded.Status != ESafeFileIOStatus::Missing || ScriptIndex == INDEX_NONE) continue;
@@ -110,6 +128,11 @@ bool V3DProjectEditor::Validate(const FV3DEditorDocument& Doc, const FString& Pr
     Error.Reset();
     if (!Doc.Json.IsValid()) { Error = TEXT("Invalid JSON object."); return false; }
     const FString ConfigPath = V3DSimulatorProjectWorkspace::ConfigPath(Project);
+    if (Doc.Path == FSafeFileIO::NormalizeFilePath(V3DSimulatorProjectWorkspace::ProjectRoot(Project) / FV3DWorldFogConfig::MemberName()))
+    {
+        FV3DWorldFogConfig Fog;
+        return FV3DWorldFogConfig::Parse(Doc.Json, Fog, Error);
+    }
     if (Doc.Path == FSafeFileIO::NormalizeFilePath(ConfigPath))
     {
         FV3DSimulatorProjectConfig C; FV3DEnvironmentConfig E;
@@ -161,7 +184,7 @@ bool V3DProjectEditor::Save(FV3DEditorDocument& Doc, const FString& Project, FSt
     if ((Doc.bNewFile && bExists) || (!Doc.bNewFile && (!FFileHelper::LoadFileToString(Current, *Doc.Path) || Current != Doc.DiskText)))
     { Error = TEXT("File changed outside Editor. Reload before saving: ") + Doc.Label; return false; }
     if (Doc.bNewFile && !IFileManager::Get().MakeDirectory(*FPaths::GetPath(Doc.Path), true))
-    { Error = TEXT("Could not create scripts directory."); return false; }
+    { Error = TEXT("Could not create document directory."); return false; }
     const auto Written = FSafeFileIO::SaveJsonBlocking(Doc.Json.ToSharedRef(), Doc.Path);
     if (!Written.IsSuccess()) { Error = Written.Error; return false; }
     FFileHelper::LoadFileToString(Doc.DiskText, *Doc.Path);
@@ -172,6 +195,8 @@ bool V3DProjectEditor::Save(FV3DEditorDocument& Doc, const FString& Project, FSt
 
 TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& Doc)
 {
+    // Relative labels distinguish this script from resources/environments.json.
+    if (Doc.Label == FV3DWorldFogConfig::MemberName()) return FV3DWorldFogConfig().ToJson();
     auto Result = MakeShared<FJsonObject>();
     const auto& Templates = EditorTemplates();
     if (!Templates.IsValid() || !Doc.Json.IsValid()) return Result;
@@ -217,8 +242,16 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
                 auto Bones = MakeShared<FJsonObject>();
                 for (const auto& Key : CharacterBoneSchema::GetRequiredKeys()) Bones->SetStringField(Key.ToString(), Key.ToString());
                 Result->SetObjectField(TEXT("Bones"), Bones);
+                Merge(TEXT("CharacterInteraction"));
             }
-            else Merge(TEXT("Gravity"));
+            else
+            {
+                Merge(TEXT("Gravity"));
+                if (Subtype.IsEmpty() || Subtype == TEXT("Static"))
+                {
+                    Merge(TEXT("StaticInteraction"));
+                }
+            }
             if (Subtype == TEXT("Dynamic"))
             {
                 Merge(TEXT("Dynamic"));
@@ -227,6 +260,7 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
                 if (Item.IsEmpty()) Result->SetStringField(TEXT("EntityType"), Entity.IsEmpty() ? TEXT("Prop") : Entity);
                 if (Entity.IsEmpty()) Result->SetStringField(TEXT("ItemType"), Item.IsEmpty() ? TEXT("Misc") : Item);
                 if (Entity == TEXT("Vehicle")) Merge(TEXT("Vehicle"));
+                if (!Item.IsEmpty()) Merge(TEXT("Item"));
                 if (Item == TEXT("Weapon")) Merge(TEXT("Weapon"));
             }
         }
@@ -236,6 +270,8 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
 
 TSharedPtr<FJsonObject> V3DProjectEditor::EntryTemplate(const FString& Container)
 {
+    if (Container == TEXT("WeatherProfiles") || Container == TEXT("BiomeProfiles"))
+        return FV3DWorldFogConfig::ProfileTemplate();
     static const TMap<FString, FString> Keys = {
         {TEXT("SoundLists"), TEXT("SoundListEntry")}, {TEXT("Events"), TEXT("SoundEventEntry")},
         {TEXT("MeshData"), TEXT("MeshEntry")}, {TEXT("Biomes"), TEXT("BiomeEntry")},

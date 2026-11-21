@@ -51,6 +51,9 @@ public:
     FString GetCurrentWeatherPreset() const { return CurrentPreset; }
 
     UFUNCTION(BlueprintPure, Category="Weather")
+    float GetCurrentWeatherIntensity() const { return CurrentIntensity; }
+
+    UFUNCTION(BlueprintPure, Category="Weather")
     bool IsWeatherActive() const { return bWeatherSystemEnabled; }
 
 private:

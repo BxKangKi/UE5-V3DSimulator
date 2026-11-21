@@ -332,4 +332,6 @@ public:
     TSoftObjectPtr<UInputAction> PauseAction;
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Input")
     TSoftObjectPtr<UInputAction> DebugAction;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Input")
+    TSoftObjectPtr<UInputAction> ChatAction;
 };

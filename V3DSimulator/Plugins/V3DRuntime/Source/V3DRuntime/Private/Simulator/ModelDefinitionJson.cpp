@@ -252,7 +252,6 @@ bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root
     { OutError = TEXT("MaterialMode must be Auto, Opaque, Opaque Two Sided, Translucent, or Translucent Two Sided"); return false; }
     if (Mode == TEXT("Auto")) OutDefinition.MaterialMode = 0;
     else if (Mode == TEXT("Opaque")) OutDefinition.MaterialMode = 5;
-    else if (Mode == TEXT("Masked")) OutDefinition.MaterialMode = 5;
     else if (Mode == TEXT("Opaque Two Sided") || Mode == TEXT("OpaqueTwoSided")) OutDefinition.MaterialMode = 6;
     else if (Mode == TEXT("Translucent")) OutDefinition.MaterialMode = 3;
     else if (Mode == TEXT("Translucent Two Sided") || Mode == TEXT("TranslucentTwoSided")) OutDefinition.MaterialMode = 7;

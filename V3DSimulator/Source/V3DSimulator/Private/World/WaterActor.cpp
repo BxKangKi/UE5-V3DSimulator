@@ -9,6 +9,8 @@
  */
 
 #include "World/WaterActor.h"
+#include "World/PhysicalMaterialProfile.h"
+#include "Materials/Material.h"
 #include "World/WaterExclusionBoxComponent.h"
 #include "World/WaterQuerySubsystem.h"
 #include "World/BuoyancyComponent.h"
@@ -35,86 +37,27 @@ namespace
         return FName(*FString::Printf(TEXT("%s_%d"), Prefix, Index));
     }
 
-    // Apply physically-based pure/ocean water surface optical properties (IOR = 1.3333 -> F0 = 0.0204 -> UE Specular = 0.255)
-    // only to parameters that actually exist on the material graph.
     void ApplyPhysicalWaterSurfaceParameters(UMaterialInstanceDynamic* MID)
     {
-        if (!IsValid(MID))
+        if (!IsValid(MID)) return;
+        const bool bSingleLayer = MID->GetShadingModels().HasShadingModel(MSM_SingleLayerWater);
+        for (const auto& Parameter : V3DPhysicalMaterial::WaterScalars)
         {
-            return;
+            float Current = 0.0f;
+            const FName Name(Parameter.Name);
+            if (!MID->GetScalarParameterValue(Name, Current)) continue;
+            const bool bOpacity = Name == TEXT("Opacity") || Name == TEXT("Water Opacity");
+            // Zero opacity is correct for SingleLayerWater's surface/volume mix, but would
+            // erase an ordinary translucent custom water material entirely.
+            const float Value = bOpacity && !bSingleLayer ? 0.68f : Parameter.Value;
+            if (!FMath::IsNearlyEqual(Current, Value, 1.e-7f)) MID->SetScalarParameterValue(Name, Value);
         }
-
-        TArray<FMaterialParameterInfo> ScalarInfos;
-        TArray<FGuid> ScalarIds;
-        MID->GetAllScalarParameterInfo(ScalarInfos, ScalarIds);
-        auto HasScalar = [&ScalarInfos](const FName Name)
+        for (const auto& Parameter : V3DPhysicalMaterial::WaterVectors)
         {
-            return ScalarInfos.ContainsByPredicate([Name](const FMaterialParameterInfo& Info) { return Info.Name == Name; });
-        };
-
-        TArray<FMaterialParameterInfo> VectorInfos;
-        TArray<FGuid> VectorIds;
-        MID->GetAllVectorParameterInfo(VectorInfos, VectorIds);
-        auto HasVector = [&VectorInfos](const FName Name)
-        {
-            return VectorInfos.ContainsByPredicate([Name](const FMaterialParameterInfo& Info) { return Info.Name == Name; });
-        };
-
-        // Beer-Lambert spectral absorption (cm^-1): shallow water stays transparent to the seabed,
-        // red extinguishes within a few metres, green at mid-depth, and deep water turns dark marine navy.
-        const FLinearColor BeerLambertAbsorption(0.00460f, 0.00140f, 0.00065f, 1.0f);
-        // Low single-scattering albedo keeps deep water dark and realistic instead of bright sky blue.
-        const FLinearColor DeepOceanScattering(0.000018f, 0.000068f, 0.000105f, 1.0f);
-
-        if (HasVector(TEXT("AbsorptionCoefficients")))
-        {
-            MID->SetVectorParameterValue(TEXT("AbsorptionCoefficients"), BeerLambertAbsorption);
-        }
-        if (HasVector(TEXT("Absorption")))
-        {
-            MID->SetVectorParameterValue(TEXT("Absorption"), BeerLambertAbsorption);
-        }
-        if (HasVector(TEXT("ScatteringCoefficients")))
-        {
-            MID->SetVectorParameterValue(TEXT("ScatteringCoefficients"), DeepOceanScattering);
-        }
-        if (HasVector(TEXT("Scattering")))
-        {
-            MID->SetVectorParameterValue(TEXT("Scattering"), DeepOceanScattering);
-        }
-        // Real water has near-zero diffuse albedo; its color comes from volumetric absorption and scattering.
-        if (HasVector(TEXT("Water Albedo")))
-        {
-            MID->SetVectorParameterValue(TEXT("Water Albedo"), FLinearColor(0.0005f, 0.0020f, 0.0040f, 1.0f));
-        }
-        if (HasVector(TEXT("ColorScaleBehindWater")))
-        {
-            MID->SetVectorParameterValue(TEXT("ColorScaleBehindWater"), FLinearColor(0.92f, 0.96f, 1.0f, 1.0f));
-        }
-        // Physical Fresnel specular for water IOR 1.3333 (F0 = 0.0204 -> UE Specular = F0 / 0.08 = 0.255).
-        if (HasScalar(TEXT("Water Specular")))
-        {
-            MID->SetScalarParameterValue(TEXT("Water Specular"), 0.255f);
-        }
-        if (HasScalar(TEXT("Water Fresnel Specular")))
-        {
-            MID->SetScalarParameterValue(TEXT("Water Fresnel Specular"), 0.255f);
-        }
-        if (HasScalar(TEXT("Water Roughness")))
-        {
-            MID->SetScalarParameterValue(TEXT("Water Roughness"), 0.03f);
-        }
-        if (HasScalar(TEXT("Water Fresnel Roughness")))
-        {
-            MID->SetScalarParameterValue(TEXT("Water Fresnel Roughness"), 0.02f);
-        }
-        if (HasScalar(TEXT("Water Fresnel  Exponenth")))
-        {
-            MID->SetScalarParameterValue(TEXT("Water Fresnel  Exponenth"), 5.0f);
-        }
-        if (HasScalar(TEXT("PhaseG")))
-        {
-            MID->SetScalarParameterValue(TEXT("PhaseG"), 0.65f);
+            FLinearColor Current;
+            const FName Name(Parameter.Name);
+            if (MID->GetVectorParameterValue(Name, Current) && !Current.Equals(Parameter.Value, 1.e-8f))
+                MID->SetVectorParameterValue(Name, Parameter.Value);
         }
     }
 
@@ -124,11 +67,12 @@ namespace
         {
             return;
         }
-        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor(0.0015f, 0.016f, 0.042f, 1.0f));
-        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor(0.006f, 0.055f, 0.125f, 1.0f));
-        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor(0.009f, 0.068f, 0.140f, 1.0f));
-        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor(0.80f, 0.92f, 1.0f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor(0.004f, 0.032f, 0.052f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor(0.014f, 0.095f, 0.145f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor(0.020f, 0.115f, 0.165f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor(0.96f, 0.98f, 0.94f, 1.0f));
         PostProcessMID->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
+        PostProcessMID->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.0f);
     }
 
 }
@@ -234,7 +178,7 @@ void AWaterActor::BeginPlay()
     EnsureWaterMaterialInstances();
     ApplyWaterExclusionRenderParameters();
     UMaterialInstanceDynamic *DecalMID = IsValid(DecalMaterial) ? UMaterialInstanceDynamic::Create(DecalMaterial, this) : nullptr;
-    if (DecalMID)
+    if (DecalMID && IsValid(Decal.Get()))
     {
         DecalMID->SetScalarParameterValue(TEXT("WaterLevel"), Level);
         Decal->SetDecalMaterial(DecalMID);
@@ -244,7 +188,7 @@ void AWaterActor::BeginPlay()
     UMaterialInstanceDynamic *PostProcessMID = !bGlobalOcean && IsValid(UnderWaterMaterial)
         ? UMaterialInstanceDynamic::Create(UnderWaterMaterial, this)
         : nullptr;
-    if (PostProcessMID)
+    if (PostProcessMID && IsValid(PostProcess.Get()))
     {
         PostProcess->AddOrUpdateBlendable(PostProcessMID, 1.0f);
         PostProcessMID->SetScalarParameterValue(FName("WaterLevel"), Level);
@@ -360,10 +304,19 @@ void AWaterActor::SetGlobalOceanRenderRadius(const float RadiusCm)
 
 void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
 {
-    if (!OtherActor)
+    if (!IsValid(this) || IsActorBeingDestroyed() || !IsValid(OtherActor) || OtherActor->IsActorBeingDestroyed())
     {
         return;
     }
+
+    const TWeakObjectPtr<AWaterActor> WeakSelf(this);
+    const TWeakObjectPtr<AActor> WeakOther(OtherActor);
+    const auto StillAlive = [WeakSelf, WeakOther]()
+    {
+        const AWaterActor* Self = WeakSelf.Get();
+        const AActor* Other = WeakOther.Get();
+        return Self && Other && !Self->IsActorBeingDestroyed() && !Other->IsActorBeingDestroyed();
+    };
 
     // WaterInteraction and Buoyancy are intentionally independent switches. Generic swimming /
     // splash state sees an exclusion as dry, while UBuoyancyComponent keeps the underlying water
@@ -386,10 +339,17 @@ void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
         }
     }
 
+    // An interface callback may destroy either actor, or remove sibling components.
+    if (!StillAlive()) return;
     TInlineComponentArray<UActorComponent*, 16> Components;
     OtherActor->GetComponents(Components);
-    for (UActorComponent* Component : Components)
+    TArray<TWeakObjectPtr<UActorComponent>, TInlineAllocator<16>> Snapshot;
+    for (UActorComponent* Component : Components) Snapshot.Add(Component);
+    for (const auto& WeakComponent : Snapshot)
     {
+        if (!StillAlive()) return;
+        UActorComponent* Component = WeakComponent.Get();
+        if (!Component || Component->IsBeingDestroyed()) continue;
         if (IWaterInteract* ComponentWaterInteract = Cast<IWaterInteract>(Component))
         {
             // Global-ocean buoyancy is height-driven inside UBuoyancyComponent and must never be
@@ -448,15 +408,22 @@ void AWaterActor::CheckOverlappingWater(AActor *Target)
     // through the common query service. New gameplay code should query UWaterQuerySubsystem directly.
     TArray<AActor*> OverlappingActors;
     Target->GetOverlappingActors(OverlappingActors, AWaterActor::StaticClass());
-    for (AActor* OverlappedActor : OverlappingActors)
+    const TWeakObjectPtr<AActor> WeakTarget(Target);
+    TArray<TWeakObjectPtr<AActor>, TInlineAllocator<16>> Snapshot;
+    for (AActor* Actor : OverlappingActors) Snapshot.Add(Actor);
+    for (const auto& WeakActor : Snapshot)
     {
-        if (AWaterActor* WaterActor = Cast<AWaterActor>(OverlappedActor);
+        Target = WeakTarget.Get();
+        if (!Target || Target->IsActorBeingDestroyed()) return;
+        if (AWaterActor* WaterActor = Cast<AWaterActor>(WeakActor.Get());
             IsValid(WaterActor) && !WaterActor->IsGlobalOcean())
         {
             WaterActor->WaterTrigger(Target, true);
         }
     }
 
+    Target = WeakTarget.Get();
+    if (!Target || Target->IsActorBeingDestroyed()) return;
     if (UWaterQuerySubsystem* WaterQuery = UWaterQuerySubsystem::Get(Target))
     {
         FWaterQueryResult Result;
@@ -535,13 +502,19 @@ void AWaterActor::EnsureWaterMaterialInstances()
     WaterMaterialInstances.SetNum(MaterialCount);
     for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
     {
-        UMaterialInstanceDynamic* ExistingMID = Cast<UMaterialInstanceDynamic>(StaticMesh->GetMaterial(MaterialIndex));
-        UMaterialInstanceDynamic* MID = ExistingMID
-            ? ExistingMID
-            : StaticMesh->CreateDynamicMaterialInstance(MaterialIndex, StaticMesh->GetMaterial(MaterialIndex));
-        if (IsValid(MID) && !ExistingMID)
+        UMaterialInterface* SlotMaterial = StaticMesh->GetMaterial(MaterialIndex);
+        UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(SlotMaterial);
+        if (IsValid(MID) && WaterMaterialInstances[MaterialIndex] == MID) continue;
+        // A mesh asset/BP can share a MID between actors. Own a copy before assigning
+        // actor-specific water/exclusion parameters; never mutate another water body's MID.
+        auto* SourceMID = Cast<UMaterialInstanceDynamic>(SlotMaterial);
+        UMaterialInterface* Parent = SourceMID ? SourceMID->Parent.Get() : SlotMaterial;
+        MID = IsValid(Parent) ? UMaterialInstanceDynamic::Create(Parent, this) : nullptr;
+        if (IsValid(MID))
         {
+            if (SourceMID) MID->CopyParameterOverrides(SourceMID);
             ApplyPhysicalWaterSurfaceParameters(MID);
+            StaticMesh->SetMaterial(MaterialIndex, MID);
         }
         WaterMaterialInstances[MaterialIndex] = MID;
     }
@@ -614,15 +587,7 @@ void AWaterActor::RefreshWaterExclusionRendering(const UObject* WorldContextObje
         return;
     }
 
-    TArray<AWaterActor*> WaterActors;
-    WaterQuery->GetRegisteredWaterActors(WaterActors);
-    for (AWaterActor* WaterActor : WaterActors)
-    {
-        if (IsValid(WaterActor))
-        {
-            WaterActor->ApplyWaterExclusionRenderParameters();
-        }
-    }
+    WaterQuery->RequestExclusionRenderRefresh();
 }
 
 void AWaterActor::UpdateLocalViewWaterEffects(const UObject* WorldContextObject, const FVector& ViewLocation)

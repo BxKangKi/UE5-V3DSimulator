@@ -26,8 +26,43 @@ class USettingControlWidget;
 class UBooleanSettingWidget;
 class UFloatSettingWidget;
 class UEnumSettingWidget;
+class UScrollBox;
+class USettingsKeyMappingBinding;
+
+UENUM(BlueprintType)
+enum class ESettingsTab : uint8
+{
+    Rendering UMETA(DisplayName="Rendering"),
+    Controls UMETA(DisplayName="Controls")
+};
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FSettingsCloseRequested);
+
+/** Per-action delegate adapter for keybinding buttons in the Controls tab. */
+UCLASS(Transient)
+class V3DSIMULATOR_API USettingsKeyMappingBinding : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    void BindButton(USettingsMenuWidget* InOwner, FName InActionId, UButton* InButton);
+    void Unbind();
+
+    UFUNCTION()
+    void HandleClicked();
+
+    FName GetActionId() const { return ActionId; }
+    UButton* GetButton() const { return Button.Get(); }
+
+private:
+    UPROPERTY(Transient)
+    TObjectPtr<USettingsMenuWidget> OwnerWidget;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UButton> Button;
+
+    FName ActionId = NAME_None;
+};
 
 /**
  * Per-control delegate adapter. A Blueprint can keep using ordinary Slider/ComboBoxString/Button
@@ -237,6 +272,19 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings")
     void CloseSettingsFromUI();
 
+    /** Switches between the Rendering and Controls tabs in the native settings layout. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Tabs")
+    void SelectSettingsTab(ESettingsTab Tab);
+
+    UFUNCTION(BlueprintPure, Category="Settings|Tabs")
+    ESettingsTab GetActiveSettingsTab() const { return ActiveTab; }
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Controls")
+    void BeginListeningForKeyMapping(FName ActionId);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Controls")
+    void ResetKeyMappingsFromUI();
+
     /** Returns all setting fields represented by UGameSettings. */
     UFUNCTION(BlueprintPure, Category="Settings")
     TArray<ESettingsField> GetSettingFieldList() const;
@@ -336,12 +384,30 @@ private:
     UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeTitle;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeApply;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeBack;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeRenderingTabButton;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeControlsTabButton;
+    UPROPERTY(Transient) TObjectPtr<UScrollBox> NativeRenderingScroll;
+    UPROPERTY(Transient) TObjectPtr<UScrollBox> NativeControlsScroll;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeKeyMappingsHeader;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeResetKeyMappingsButton;
     UPROPERTY(Transient) TArray<TObjectPtr<UWidget>> NativeControls;
     UPROPERTY(Transient) TArray<TWeakObjectPtr<UTextBlock>> NativeOptionLabels;
     UFUNCTION() UWidget* GenerateNativeOption(FString Option);
+    UFUNCTION() void HandleRenderingTabClicked();
+    UFUNCTION() void HandleControlsTabClicked();
     UPROPERTY(Transient) TArray<TObjectPtr<UTextBlock>> NativeValueLabels;
     UPROPERTY(Transient) TArray<TObjectPtr<UTextBlock>> NativeFieldLabels;
     TArray<ESettingsField> NativeControlFields;
+    UPROPERTY(Transient) TArray<TObjectPtr<UTextBlock>> NativeKeyActionLabels;
+    UPROPERTY(Transient) TArray<TObjectPtr<UButton>> NativeKeyMappingButtons;
+    TArray<FName> NativeKeyActionIds;
+    UPROPERTY(Transient) TArray<TObjectPtr<USettingsKeyMappingBinding>> KeyMappingBindings;
+    ESettingsTab ActiveTab = ESettingsTab::Rendering;
+    FName ListeningKeyActionId = NAME_None;
+    TMap<FName, FName> PendingKeyMappings;
+    void RefreshKeyMappingButtons();
+    void UpdateTabAppearance();
+    FText GetKeyMappingButtonText(FName ActionId) const;
 
     void CollectAssignedWidgetReferences();
     void BindButtonEvents();

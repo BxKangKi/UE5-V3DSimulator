@@ -2234,7 +2234,16 @@ struct FglTFRuntimeMaterial
 	FglTFRuntimeTextureTransform IridescenceThicknessTextureTransform;
 
 	FglTFRuntimeMaterial()
-	{
+    {
+        BaseColorFactor = FLinearColor::White;
+        MetallicFactor = 1.0;
+        RoughnessFactor = 1.0;
+        EmissiveFactor = FLinearColor::Black;
+        SpecularFactor = FLinearColor::White;
+        GlossinessFactor = 1.0;
+        DiffuseFactor = FLinearColor::White;
+        ClearCoatFactor = 0.0;
+        ClearCoatRoughnessFactor = 0.0;
 		bTwoSided = false;
 		bTranslucent = false;
 		AlphaCutoff = 0;

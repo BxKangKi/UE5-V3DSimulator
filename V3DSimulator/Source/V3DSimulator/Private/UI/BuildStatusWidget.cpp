@@ -90,6 +90,7 @@ void UBuildStatusWidget::ApplyNativeStyle()
     Super::ApplyNativeStyle();
     if (!IsUsingNativeLayout()) return;
     if (IsValid(NativeProgressBar)) NativeProgressBar->SetFillColorAndOpacity(AccentColor);
+#if WITH_EDITOR
     if (IsDesignTime())
     {
         if (IsValid(NativeProjectText)) NativeProjectText->SetText(NSLOCTEXT("V3DHUD", "BuildExampleProject", "Example project"));
@@ -99,6 +100,7 @@ void UBuildStatusWidget::ApplyNativeStyle()
         if (IsValid(NativeConfirmButton)) NativeConfirmButton->SetVisibility(ESlateVisibility::Visible);
         return;
     }
+#endif
     UpdateAssignedWidgets();
 }
 

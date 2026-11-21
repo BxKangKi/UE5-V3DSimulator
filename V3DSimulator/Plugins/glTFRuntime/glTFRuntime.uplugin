@@ -15,7 +15,7 @@
   "IsExperimentalVersion": false,
   "Installed": true,
   "EnabledByDefault": true,
-  "EngineVersion": "5.8",
+  "EngineVersion": "5.8.0",
   "Modules": [
     {
       "Name": "glTFRuntime",

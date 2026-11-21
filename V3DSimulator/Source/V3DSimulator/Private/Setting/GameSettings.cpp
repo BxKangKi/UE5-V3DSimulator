@@ -11,6 +11,8 @@
 #include "Setting/GameSettings.h"
 #include "Setting/ShadowDistancePolicy.h"
 #include "Character/MouseLookPolicy.h"
+#include "Character/PlayerCharacterController.h"
+#include "EngineUtils.h"
 #include "System/SafeFileIO.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -61,6 +63,23 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetBoolField(TEXT("bRayTracing"), bRayTracing);
     Json->SetBoolField(TEXT("bHeightFog"), bHeightFog);
     Json->SetBoolField(TEXT("bCloud"), bCloud);
+    Json->SetBoolField(TEXT("bEditorDarkMode"), bEditorDarkMode);
+    if (!KeyMappings.IsEmpty())
+    {
+        TSharedRef<FJsonObject> KeyMapJson = MakeShared<FJsonObject>();
+        TArray<FName> ActionIds;
+        KeyMappings.GetKeys(ActionIds);
+        ActionIds.Sort([](const FName& A, const FName& B) { return A.LexicalLess(B); });
+        for (const FName& ActionId : ActionIds)
+        {
+            const FName KeyName = KeyMappings.FindChecked(ActionId);
+            if (!ActionId.IsNone() && !KeyName.IsNone() && FKey(KeyName).IsValid())
+            {
+                KeyMapJson->SetStringField(ActionId.ToString(), KeyName.ToString());
+            }
+        }
+        Json->SetObjectField(TEXT("KeyMappings"), KeyMapJson);
+    }
     return Json;
 }
 
@@ -78,7 +97,7 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Exposure = Exposure <= -10.5f ? -11.0f : FMath::Clamp(Exposure, -10.0f, 20.0f);
         Json->TryGetNumberField(TEXT("AutoExposureMinEV"), AutoExposureMinEV);
         Json->TryGetNumberField(TEXT("AutoExposureMaxEV"), AutoExposureMaxEV);
-        AutoExposureMinEV = FMath::IsFinite(AutoExposureMinEV) ? FMath::Clamp(AutoExposureMinEV, -10.0f, 10.0f) : -5.0f;
+        AutoExposureMinEV = FMath::IsFinite(AutoExposureMinEV) ? FMath::Clamp(AutoExposureMinEV, -10.0f, 10.0f) : -1.5f;
         AutoExposureMaxEV = FMath::IsFinite(AutoExposureMaxEV) ? FMath::Clamp(AutoExposureMaxEV, AutoExposureMinEV, 20.0f) : FMath::Max(AutoExposureMinEV, 13.0f);
         Json->TryGetNumberField(TEXT("ShadowQuality"), ShadowQuality);
         Json->TryGetNumberField(TEXT("ShadowDistanceMeters"), ShadowDistanceMeters);
@@ -102,6 +121,25 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetBoolField(TEXT("bRayTracing"), bRayTracing);
         Json->TryGetBoolField(TEXT("bHeightFog"), bHeightFog);
         Json->TryGetBoolField(TEXT("bCloud"), bCloud);
+        Json->TryGetBoolField(TEXT("bEditorDarkMode"), bEditorDarkMode);
+        KeyMappings.Reset();
+        const TSharedPtr<FJsonObject>* KeyMapJson = nullptr;
+        if (Json->TryGetObjectField(TEXT("KeyMappings"), KeyMapJson) && KeyMapJson && KeyMapJson->IsValid())
+        {
+            for (const auto& Pair : (*KeyMapJson)->Values)
+            {
+                FString KeyStr;
+                if (Pair.Value.IsValid() && Pair.Value->TryGetString(KeyStr))
+                {
+                    const FName ActionId(*FString(Pair.Key));
+                    const FKey ParsedKey(*KeyStr);
+                    if (!ActionId.IsNone() && ParsedKey.IsValid())
+                    {
+                        KeyMappings.Add(ActionId, ParsedKey.GetFName());
+                    }
+                }
+            }
+        }
         ShadowQuality = FMath::Clamp(ShadowQuality, 0, 3);
         TextureQuality = FMath::Clamp(TextureQuality, 0, 3);
         ViewDistanceQuality = FMath::Clamp(ViewDistanceQuality, 0, 3);
@@ -127,6 +165,33 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
 float UGameSettings::GetClampedMouseSensitivity() const
 {
     return V3DMouseLook::NormalizeSensitivity(MouseSensitivity);
+}
+
+FKey UGameSettings::GetKeyMappingOverride(const FName ActionId) const
+{
+    if (ActionId.IsNone()) return EKeys::Invalid;
+    if (const FName* Found = KeyMappings.Find(ActionId))
+    {
+        const FKey Key(*Found);
+        return Key.IsValid() ? Key : EKeys::Invalid;
+    }
+    return EKeys::Invalid;
+}
+
+void UGameSettings::SetKeyMappingOverride(const FName ActionId, const FKey NewKey)
+{
+    if (ActionId.IsNone()) return;
+    if (!NewKey.IsValid())
+    {
+        KeyMappings.Remove(ActionId);
+        return;
+    }
+    KeyMappings.Add(ActionId, NewKey.GetFName());
+}
+
+void UGameSettings::ResetKeyMappingsToDefaults()
+{
+    KeyMappings.Reset();
 }
 
 int32 UGameSettings::GetClampedMaxTextureResolution() const
@@ -449,9 +514,21 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
                 }
             }
         };
-        SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing"), bUseHardwareRayTracing ? 1 : 0);
+        const bool bLowQualityShading = (ShadingQuality == 0 || ShadowQuality == 0);
+        // Always keep SingleLayerWater active so water stays transparent at every quality preset.
+        SetRenderingOption(TEXT("r.Water.SingleLayer"), 1);
+        SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing"),
+            bUseHardwareRayTracing && !bLowQualityShading ? 1 : 0);
         SetRenderingOption(TEXT("r.RayTracing.Shadows"),
             bUseHardwareRayTracing && ShadowQuality > 0 ? 1 : 0);
+        // Classic clean low-spec 3D game shading on Low quality: disable noisy SSAO, contact shadows,
+        // Lumen GI/reflections, and SSR so characters and terrain have clean smooth diffuse lighting.
+        SetRenderingOption(TEXT("r.AmbientOcclusionLevels"), bLowQualityShading ? 0 : 2);
+        SetRenderingOption(TEXT("r.ContactShadows"), bLowQualityShading ? 0 : 1);
+        SetRenderingOption(TEXT("r.Lumen.DiffuseIndirect.Allow"), bLowQualityShading ? 0 : 1);
+        SetRenderingOption(TEXT("r.Lumen.Reflections.Allow"), bLowQualityShading ? 0 : 1);
+        SetRenderingOption(TEXT("r.SSR.Quality"), bLowQualityShading ? 0 : 2);
+        SetRenderingOption(TEXT("r.BloomQuality"), bLowQualityShading ? 1 : 4);
 
         // Apply after scalability, which otherwise silently scales the user's distance down.
         const float ShadowRange = GetEffectiveShadowDistanceCentimeters();
@@ -476,7 +553,8 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         FPostProcessSettings PPSettings = PostProcess->Settings;
         PPSettings.BloomIntensity = BloomIntensity;
         PPSettings.BloomThreshold = BloomThreshold;
-        PPSettings.AmbientOcclusionIntensity = AmbientOcclusionIntensity;
+        const bool bLowQualityPP = (ShadingQuality == 0 || ShadowQuality == 0);
+        PPSettings.AmbientOcclusionIntensity = bLowQualityPP ? 0.0f : AmbientOcclusionIntensity;
 
         // Exposure=-11 is the explicit Auto sentinel. Auto uses the cheaper Basic metering mode
         // (single downsampled luminance value) with an EV100 adaptation window wide enough for
@@ -502,7 +580,7 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
 
         if (bAutoExposure)
         {
-            const float SafeMinEV = FMath::IsFinite(AutoExposureMinEV) ? FMath::Clamp(AutoExposureMinEV, -10.0f, 10.0f) : -5.0f;
+            const float SafeMinEV = FMath::IsFinite(AutoExposureMinEV) ? FMath::Clamp(AutoExposureMinEV, -10.0f, 10.0f) : -1.5f;
             const float SafeMaxEV = FMath::IsFinite(AutoExposureMaxEV) ? FMath::Clamp(AutoExposureMaxEV, SafeMinEV, 20.0f) : FMath::Max(SafeMinEV, 13.0f);
             PPSettings.AutoExposureMinBrightness = SafeMinEV;
             PPSettings.AutoExposureMaxBrightness = SafeMaxEV;
@@ -523,6 +601,22 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         PPSettings.DynamicGlobalIlluminationMethod = GetDynamicGlobalIlluminationMethod(DynamicGlobalIlluminationMethod);
         PPSettings.ReflectionMethod = GetReflectionMethod(ReflectionMethod);
         PostProcess->Settings = PPSettings;
+    }
+
+    if (GEngine)
+    {
+        for (const FWorldContext& Context : GEngine->GetWorldContexts())
+        {
+            UWorld* World = Context.World();
+            if (!IsValid(World) || !World->IsGameWorld()) continue;
+            for (TActorIterator<APlayerCharacterController> It(World); It; ++It)
+            {
+                if (APlayerCharacterController* PC = *It; IsValid(PC) && PC->IsLocalController())
+                {
+                    PC->ApplyConfiguredInputMappingContexts();
+                }
+            }
+        }
     }
 }
 

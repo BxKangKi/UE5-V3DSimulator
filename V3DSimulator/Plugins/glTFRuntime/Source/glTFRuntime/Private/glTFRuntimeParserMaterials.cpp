@@ -1,6 +1,7 @@
 // Copyright 2020-2023, Roberto De Ioris.
 
 #include "glTFRuntimeParser.h"
+#include "glTFRuntimeImageValidation.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "Engine/Texture2D.h"
 #include "IImageWrapperModule.h"
@@ -17,6 +18,7 @@
 #include "Math/UnrealMathUtility.h"
 #include "Modules/ModuleManager.h"
 #include "TextureResource.h"
+#include "Misc/ScopeExit.h"
 
 
 UMaterialInterface* FglTFRuntimeParser::LoadMaterial_Internal(const int32 Index, const FString& MaterialName, TSharedRef<FJsonObject> JsonMaterialObject, const FglTFRuntimeMaterialsConfig& MaterialsConfig, const bool bUseVertexColors, UMaterialInterface* ForceBaseMaterial)
@@ -104,13 +106,13 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial_Internal(const int32 Index,
 					return;
 				}
 
-				double Values[4];
-				// default alpha
-				Values[3] = 1;
+				if (Fields < 3 || Fields > 4) return;
+				double Values[4] = {0.0, 0.0, 0.0, 1.0};
 
 				for (int32 Index = 0; Index < Fields; Index++)
 				{
-					(*JsonValues)[Index]->TryGetNumber(Values[Index]);
+					if (!(*JsonValues)[Index].IsValid() || !(*JsonValues)[Index]->TryGetNumber(Values[Index])
+						|| !FMath::IsFinite(Values[Index]) || FMath::Abs(Values[Index]) > MAX_flt) return;
 				}
 
 				bHasParam = true;
@@ -385,7 +387,8 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial_Internal(const int32 Index,
 
 UTexture2D* FglTFRuntimeParser::BuildTexture(UObject* Outer, const TArray<FglTFRuntimeMipMap>& Mips, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
 {
-	if (Mips.Num() == 0)
+	if (!ensureMsgf(IsInGameThread(), TEXT("Texture resources must be built on the game thread"))
+		|| IsGarbageCollecting() || !glTFRuntimeImageValidation::ValidateChain(Mips))
 	{
 		return nullptr;
 	}
@@ -502,7 +505,8 @@ UTexture2D* FglTFRuntimeParser::BuildTexture(UObject* Outer, const TArray<FglTFR
 
 UVolumeTexture* FglTFRuntimeParser::BuildVolumeTexture(UObject* Outer, const TArray<FglTFRuntimeMipMap>& Mips, const int32 TileZ, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
 {
-	if (Mips.Num() == 0)
+	if (!ensureMsgf(IsInGameThread(), TEXT("Texture resources must be built on the game thread"))
+		|| IsGarbageCollecting() || !glTFRuntimeImageValidation::ValidateChain(Mips, TileZ))
 	{
 		return nullptr;
 	}
@@ -528,13 +532,15 @@ UVolumeTexture* FglTFRuntimeParser::BuildVolumeTexture(UObject* Outer, const TAr
 		Texture->AddAssetUserData(NewObject<UglTFRuntimeTextureMipDataProviderFactory>());
 	}
 
+	int32 MipDepth = TileZ;
 	for (const FglTFRuntimeMipMap& MipMap : Mips)
 	{
 		FTexture2DMipMap* Mip = new FTexture2DMipMap();
 		PlatformData->Mips.Add(Mip);
 		Mip->SizeX = MipMap.Width;
 		Mip->SizeY = MipMap.Height;
-		Mip->SizeZ = TileZ;
+		Mip->SizeZ = MipDepth;
+		MipDepth = FMath::Max(1, MipDepth / 2);
 
 #if !WITH_EDITOR
 #if !NO_LOGGING
@@ -1049,6 +1055,11 @@ UMaterialInterface* FglTFRuntimeParser::BuildMaterial(const int32 Index, const F
 
 bool FglTFRuntimeParser::LoadImageFromBlob(const TArray64<uint8>& Blob, TSharedRef<FJsonObject> JsonImageObject, TArray64<uint8>& UncompressedBytes, int32& Width, int32& Height, EPixelFormat& PixelFormat, const FglTFRuntimeImagesConfig& ImagesConfig)
 {
+	Width = 0;
+	Height = 0;
+	PixelFormat = PF_Unknown;
+	UncompressedBytes.Reset();
+
 	OnTexturePixels.Broadcast(AsShared(), JsonImageObject, Blob, Width, Height, PixelFormat, UncompressedBytes, ImagesConfig);
 
 	if (UncompressedBytes.Num() == 0)
@@ -1106,6 +1117,15 @@ bool FglTFRuntimeParser::LoadImageFromBlob(const TArray64<uint8>& Blob, TSharedR
 				return false;
 			}
 
+            // Reject decompression bombs and overflowing dimensions before decoding allocates pixels.
+            const EPixelFormat DecodedFormat = ImagesConfig.bForceHDR ? PF_FloatRGBA : PixelFormat;
+            int64 DecodedBytes = 0;
+            if (!glTFRuntimeImageValidation::GetByteSize(ImageWrapper->GetWidth(), ImageWrapper->GetHeight(), DecodedFormat, DecodedBytes))
+            {
+                AddError("LoadImageFromBlob()", "Decoded image exceeds the supported dimensions or memory budget");
+                return false;
+            }
+
 #if ENGINE_MAJOR_VERSION >= 5
 			if (!ImageWrapper->GetRaw(ImagesConfig.bForceHDR ? ERGBFormat::RGBAF : RGBFormat, ImagesConfig.bForceHDR ? 16 : BitDepth, UncompressedBytes))
 #else
@@ -1126,16 +1146,25 @@ bool FglTFRuntimeParser::LoadImageFromBlob(const TArray64<uint8>& Blob, TSharedR
 		}
 	}
 
+    int64 ExpectedBytes = 0;
+    if (!glTFRuntimeImageValidation::GetByteSize(Width, Height, PixelFormat, ExpectedBytes)
+        || UncompressedBytes.Num() != ExpectedBytes)
+    {
+        AddError("LoadImageFromBlob()", "Invalid decoded pixel format, dimensions or byte count");
+        UncompressedBytes.Reset();
+        return false;
+    }
+
 	if (ImagesConfig.bVerticalFlip && GPixelFormats[PixelFormat].BlockSizeX == 1 && GPixelFormats[PixelFormat].BlockSizeY == 1)
 	{
-		TArray<uint8> Flipped;
-		const int64 Pitch = Width * GPixelFormats[PixelFormat].BlockBytes;
+		TArray64<uint8> Flipped;
+		const int64 Pitch = int64(Width) * GPixelFormats[PixelFormat].BlockBytes;
 		Flipped.AddUninitialized(Pitch * Height);
 		for (int32 ImageY = 0; ImageY < Height; ImageY++)
 		{
 			FMemory::Memcpy(Flipped.GetData() + (Pitch * (Height - 1 - ImageY)), UncompressedBytes.GetData() + Pitch * ImageY, Pitch);
 		}
-		UncompressedBytes = Flipped;
+		UncompressedBytes = MoveTemp(Flipped);
 	}
 
 	return true;
@@ -1332,97 +1361,84 @@ bool FglTFRuntimeParser::LoadBlobToMips(const int32 TextureIndex, TSharedRef<FJs
 			return false;
 		}
 
-		OnLoadedTexturePixels.Broadcast(AsShared(), JsonTextureObject, Width, Height, reinterpret_cast<FColor*>(UncompressedBytes.GetData()));
-
-		if (Width > 0 && Height > 0 &&
-			(Width % GPixelFormats[PixelFormat].BlockSizeX) == 0 &&
-			(Height % GPixelFormats[PixelFormat].BlockSizeY) == 0)
-		{
-
-			// limit image size (currently only PF_B8G8R8A8 is supported)
-			if (PixelFormat == EPixelFormat::PF_B8G8R8A8 && (MaterialsConfig.ImagesConfig.MaxWidth > 0 || MaterialsConfig.ImagesConfig.MaxHeight > 0) && GPixelFormats[PixelFormat].BlockSizeX == 1 && GPixelFormats[PixelFormat].BlockSizeY == 1)
-			{
-				const int32 NewWidth = MaterialsConfig.ImagesConfig.MaxWidth > 0 ? MaterialsConfig.ImagesConfig.MaxWidth : Width;
-				const int32 NewHeight = MaterialsConfig.ImagesConfig.MaxHeight > 0 ? MaterialsConfig.ImagesConfig.MaxHeight : Height;
-				TArray64<FColor> ResizedPixels;
-				ResizedPixels.AddUninitialized(NewWidth * NewHeight);
+        // This delegate promises FColor pixels; HDR and compressed data have different strides.
+        if (PixelFormat == PF_B8G8R8A8)
+        {
+            OnLoadedTexturePixels.Broadcast(AsShared(), JsonTextureObject, Width, Height,
+                reinterpret_cast<FColor*>(UncompressedBytes.GetData()));
+            const FIntPoint Size = glTFRuntimeImageValidation::FitWithin(Width, Height,
+                MaterialsConfig.ImagesConfig.MaxWidth, MaterialsConfig.ImagesConfig.MaxHeight);
+            if (Size.X != Width || Size.Y != Height)
+            {
+                TArray64<FColor> ResizedPixels;
+                ResizedPixels.SetNumUninitialized(int64(Size.X) * Size.Y);
+                // TArrayView counts FColor elements, not bytes.
+                const TArrayView<FColor> Colors(reinterpret_cast<FColor*>(UncompressedBytes.GetData()), Width * Height);
 #if ENGINE_MAJOR_VERSION >= 5
-				FImageUtils::ImageResize(Width, Height, TArrayView<FColor>(reinterpret_cast<FColor*>(UncompressedBytes.GetData()), UncompressedBytes.Num()), NewWidth, NewHeight, ResizedPixels, sRGB, false);
+                FImageUtils::ImageResize(Width, Height, Colors, Size.X, Size.Y, ResizedPixels, sRGB, false);
 #else
-				FImageUtils::ImageResize(Width, Height, TArrayView<FColor>(reinterpret_cast<FColor*>(UncompressedBytes.GetData()), UncompressedBytes.Num()), NewWidth, NewHeight, ResizedPixels, sRGB);
+                FImageUtils::ImageResize(Width, Height, Colors, Size.X, Size.Y, ResizedPixels, sRGB);
 #endif
-				Width = NewWidth;
-				Height = NewHeight;
-				UncompressedBytes.Empty(ResizedPixels.Num() * 4);
-				UncompressedBytes.Append(reinterpret_cast<uint8*>(ResizedPixels.GetData()), ResizedPixels.Num() * 4);
-			}
+                Width = Size.X;
+                Height = Size.Y;
+                UncompressedBytes.SetNumUninitialized(ResizedPixels.Num() * sizeof(FColor));
+                FMemory::Memcpy(UncompressedBytes.GetData(), ResizedPixels.GetData(), UncompressedBytes.Num());
+            }
+        }
 
-			int32 NumOfMips = 1;
-
-			TArray64<FColor> UncompressedColors;
-
-			if (MaterialsConfig.bGeneratesMipMaps && GPixelFormats[PixelFormat].BlockSizeX == 1 && GPixelFormats[PixelFormat].BlockSizeY == 1 && FMath::IsPowerOfTwo(Width) && FMath::IsPowerOfTwo(Height))
-			{
-				NumOfMips = FMath::FloorLog2(FMath::Max(Width, Height)) + 1;
-
-				for (int32 MipY = 0; MipY < Height; MipY++)
-				{
-					for (int32 MipX = 0; MipX < Width; MipX++)
-					{
-						int64 MipColorIndex = ((MipY * Width) + MipX) * 4;
-						uint8 MipColorB = UncompressedBytes[MipColorIndex];
-						uint8 MipColorG = UncompressedBytes[MipColorIndex + 1];
-						uint8 MipColorR = UncompressedBytes[MipColorIndex + 2];
-						uint8 MipColorA = UncompressedBytes[MipColorIndex + 3];
-						UncompressedColors.Add(FColor(MipColorR, MipColorG, MipColorB, MipColorA));
-					}
-				}
-			}
-
-			int32 MipWidth = Width;
-			int32 MipHeight = Height;
-
-			for (int32 MipIndex = 0; MipIndex < NumOfMips; MipIndex++)
-			{
-				FglTFRuntimeMipMap MipMap(TextureIndex);
-				MipMap.Width = MipWidth;
-				MipMap.Height = MipHeight;
-				MipMap.PixelFormat = PixelFormat;
-
-				// Resize Image
-				if (MipIndex > 0)
-				{
-					TArray64<FColor> ResizedMipData;
-					ResizedMipData.AddUninitialized(MipWidth * MipHeight);
+        // The FColor resampler cannot generate half-float HDR or compressed mips.
+        const int32 NumOfMips = MaterialsConfig.bGeneratesMipMaps && PixelFormat == PF_B8G8R8A8
+            && FMath::IsPowerOfTwo(Width) && FMath::IsPowerOfTwo(Height)
+            ? FMath::FloorLog2(FMath::Max(Width, Height)) + 1 : 1;
+        Mips.Reserve(NumOfMips);
+        FglTFRuntimeMipMap BaseMip(TextureIndex);
+        BaseMip.Width = Width;
+        BaseMip.Height = Height;
+        BaseMip.PixelFormat = PixelFormat;
+        BaseMip.Pixels = MoveTemp(UncompressedBytes);
+        Mips.Add(MoveTemp(BaseMip));
+        int64 TotalBytes = Mips[0].Pixels.Num();
+        for (int32 MipIndex = 1; MipIndex < NumOfMips; ++MipIndex)
+        {
+            // Downsample the previous level. Each source pixel is visited O(1) times overall,
+            // with no second full-resolution FColor array or per-channel TArray::Add loop.
+            const auto& Previous = Mips.Last();
+            FglTFRuntimeMipMap Next(TextureIndex);
+            Next.Width = FMath::Max(Previous.Width / 2, 1);
+            Next.Height = FMath::Max(Previous.Height / 2, 1);
+            Next.PixelFormat = PixelFormat;
+            const int64 Bytes = int64(Next.Width) * Next.Height * sizeof(FColor);
+            if (Bytes > glTFRuntimeImageValidation::MaxResourceBytes - TotalBytes)
+            {
+                Mips.Reset();
+                AddError("LoadBlobToMips()", "Generated mip chain exceeds the memory budget");
+                return false;
+            }
+            TArray64<FColor> Pixels;
+            Pixels.SetNumUninitialized(int64(Next.Width) * Next.Height);
+            const TArrayView<const FColor> Colors(reinterpret_cast<const FColor*>(Previous.Pixels.GetData()),
+                Previous.Width * Previous.Height);
 #if ENGINE_MAJOR_VERSION >= 5
-					FImageUtils::ImageResize(Width, Height, UncompressedColors, MipWidth, MipHeight, ResizedMipData, sRGB, false);
+            FImageUtils::ImageResize(Previous.Width, Previous.Height, Colors, Next.Width, Next.Height, Pixels, sRGB, false);
 #else
-					FImageUtils::ImageResize(Width, Height, UncompressedColors, MipWidth, MipHeight, ResizedMipData, sRGB);
+            FImageUtils::ImageResize(Previous.Width, Previous.Height, Colors, Next.Width, Next.Height, Pixels, sRGB);
 #endif
-					for (FColor& Color : ResizedMipData)
-					{
-						MipMap.Pixels.Add(Color.B);
-						MipMap.Pixels.Add(Color.G);
-						MipMap.Pixels.Add(Color.R);
-						MipMap.Pixels.Add(Color.A);
-					}
-				}
-				else
-				{
-					MipMap.Pixels = UncompressedBytes;
-				}
-
-				Mips.Add(MipMap);
-
-				MipWidth = FMath::Max(MipWidth / 2, 1);
-				MipHeight = FMath::Max(MipHeight / 2, 1);
-			}
-		}
-	}
+            Next.Pixels.Append(reinterpret_cast<const uint8*>(Pixels.GetData()), Bytes);
+            TotalBytes += Bytes;
+            Mips.Add(MoveTemp(Next));
+        }
+    }
 
 	OnTextureFilterMips.Broadcast(AsShared(), Mips, MaterialsConfig.ImagesConfig);
 
-	return true;
+    // Extension delegates may replace mips; validate their output too.
+    if (!glTFRuntimeImageValidation::ValidateChain(Mips))
+    {
+        AddError("LoadBlobToMips()", "Invalid or oversized mip chain");
+        Mips.Reset();
+        return false;
+    }
+    return true;
 }
 
 UMaterialInterface* FglTFRuntimeParser::LoadMaterial(const int32 Index, const FglTFRuntimeMaterialsConfig& MaterialsConfig, const bool bUseVertexColors, FString& MaterialName, UMaterialInterface* ForceBaseMaterial)
@@ -1510,27 +1526,30 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial(const int32 Index, const Fg
 
 UTextureCube* FglTFRuntimeParser::BuildTextureCube(UObject* Outer, const TArray<FglTFRuntimeMipMap>& MipsXP, const TArray<FglTFRuntimeMipMap>& MipsXN, const TArray<FglTFRuntimeMipMap>& MipsYP, const TArray<FglTFRuntimeMipMap>& MipsYN, const TArray<FglTFRuntimeMipMap>& MipsZP, const TArray<FglTFRuntimeMipMap>& MipsZN, const bool bAutoRotate, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
 {
-	// Every face is addressed with the mip index/size of the X+ face below, so all six of them
-	// must describe the same mip chain (BuildTexture()/BuildTextureArray() do the same check).
-	if (MipsXP.Num() == 0 ||
-		MipsXN.Num() != MipsXP.Num() || MipsYP.Num() != MipsXP.Num() || MipsYN.Num() != MipsXP.Num() ||
-		MipsZP.Num() != MipsXP.Num() || MipsZN.Num() != MipsXP.Num())
-	{
-		UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build TextureCube: the six faces must share the same number of mips"));
-		return nullptr;
-	}
-
-	for (int32 FaceMipIndex = 0; FaceMipIndex < MipsXP.Num(); FaceMipIndex++)
-	{
-		const int64 FaceMipSize = MipsXP[FaceMipIndex].Pixels.Num();
-		if (MipsXN[FaceMipIndex].Pixels.Num() != FaceMipSize || MipsYP[FaceMipIndex].Pixels.Num() != FaceMipSize ||
-			MipsYN[FaceMipIndex].Pixels.Num() != FaceMipSize || MipsZP[FaceMipIndex].Pixels.Num() != FaceMipSize ||
-			MipsZN[FaceMipIndex].Pixels.Num() != FaceMipSize)
-		{
-			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build TextureCube: mismatching face size for mip %d"), FaceMipIndex);
-			return nullptr;
-		}
-	}
+    if (!ensureMsgf(IsInGameThread(), TEXT("Texture resources must be built on the game thread"))
+        || IsGarbageCollecting() || MipsXP.IsEmpty()) return nullptr;
+    const TArray<FglTFRuntimeMipMap>* Faces[] = {&MipsXP, &MipsXN, &MipsYP, &MipsYN, &MipsZP, &MipsZN};
+    int64 TotalBytes = 0;
+    for (const auto* Face : Faces)
+    {
+        if (Face->Num() != MipsXP.Num() || !glTFRuntimeImageValidation::ValidateChain(*Face)) return nullptr;
+        for (int32 Index = 0; Index < Face->Num(); ++Index)
+        {
+            const auto& Mip = (*Face)[Index];
+            const auto& Reference = MipsXP[Index];
+            if (Mip.Width != Mip.Height || Mip.Width != Reference.Width || Mip.Height != Reference.Height
+                || Mip.PixelFormat != Reference.PixelFormat
+                || Mip.Pixels.Num() > glTFRuntimeImageValidation::MaxResourceBytes - TotalBytes) return nullptr;
+            // Pixel rotation of BC blocks corrupts both block contents and allocation bounds.
+            const auto& Info = GPixelFormats[Mip.PixelFormat];
+            if (bAutoRotate && (Info.BlockSizeX != 1 || Info.BlockSizeY != 1))
+            {
+                UE_LOG(LogGLTFRuntime, Error, TEXT("Cubemap auto-rotation requires uncompressed pixels; provide pre-oriented compressed faces"));
+                return nullptr;
+            }
+            TotalBytes += Mip.Pixels.Num();
+        }
+    }
 
 	UTextureCube* Texture = NewObject<UTextureCube>(Outer, NAME_None, RF_Public);
 	FTexturePlatformData* PlatformData = new FTexturePlatformData();
@@ -1653,7 +1672,10 @@ UTextureCube* FglTFRuntimeParser::BuildTextureCube(UObject* Outer, const TArray<
 
 UTexture2DArray* FglTFRuntimeParser::BuildTextureArray(UObject* Outer, const TArray<FglTFRuntimeMipMap>& Mips, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
 {
-	if (Mips.Num() == 0)
+	if (!ensureMsgf(IsInGameThread(), TEXT("Texture resources must be built on the game thread"))
+        || IsGarbageCollecting() || Mips.IsEmpty() || Mips.Num() > 2048
+        || !glTFRuntimeImageValidation::ValidateMip(Mips[0])
+        || Mips[0].Pixels.Num() > glTFRuntimeImageValidation::MaxResourceBytes / Mips.Num())
 	{
 		return nullptr;
 	}
@@ -1761,6 +1783,16 @@ bool FglTFRuntimeDDS::IsDDS(const TArray64<uint8>& Data)
 
 void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipMap>& Mips, const int32 MaxMip, const FglTFRuntimeImagesConfig& ImagesConfig)
 {
+    if (!IsDDS(Data)) return;
+    const int32 OriginalMipCount = Mips.Num();
+    bool Committed = false;
+    ON_SCOPE_EXIT
+    {
+        if (!Committed && Mips.Num() > OriginalMipCount)
+            Mips.RemoveAt(OriginalMipCount, Mips.Num() - OriginalMipCount, EAllowShrinking::No);
+    };
+    int64 TotalBytes = 0;
+
 	constexpr uint32 DDSD_MIPMAPCOUNT = 0x20000;
 	constexpr uint32 DDPF_FOURCC = 0x4;
 	constexpr uint32 DDPF_ALPHAPIXELS = 0x1;
@@ -1778,7 +1810,9 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 	}
 
 	// nothing to load
-	if (NumberOfMips <= 0 || Width == 0 || Height == 0)
+	if (NumberOfMips <= 0 || Width == 0 || Height == 0
+        || Width > glTFRuntimeImageValidation::MaxDimension || Height > glTFRuntimeImageValidation::MaxDimension
+        || NumberOfMips > int32(FMath::FloorLog2(FMath::Max(Width, Height))) + 1)
 	{
 		return;
 	}
@@ -1859,6 +1893,7 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 			if (Ptr32[35] > 0)
 			{
 				// we multiply as we may have a cube here
+				if (Ptr32[35] > uint32(2048 / NumberOfSlices)) return;
 				NumberOfSlices *= Ptr32[35];
 			}
 		}
@@ -1885,14 +1920,15 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 				const int64 MipSize = ((MipWidthAligned * GPixelFormats[PixelFormat].BlockBytes * MipHeightAligned) / (BlockX * BlockY)) * NumberOfSlices;
 
 				const int64 DDSMipSize = (MipWidthAligned * 3 * MipHeightAligned) * NumberOfSlices;
-				if (PixelsOffset + DDSMipSize > Data.Num())
+				if (MipSize <= 0 || MipSize > glTFRuntimeImageValidation::MaxResourceBytes - TotalBytes
+                    || DDSMipSize > Data.Num() - PixelsOffset)
 				{
 					return;
 				}
 				FglTFRuntimeMipMap MipMap(TextureIndex, PixelFormat, MipWidth, MipHeight);
 				MipMap.Pixels.AddUninitialized(MipSize);
 
-				for (int64 PixelIndex = 0; PixelIndex < MipWidthAligned * MipHeightAligned; PixelIndex++)
+				for (int64 PixelIndex = 0; PixelIndex < MipWidthAligned * MipHeightAligned * NumberOfSlices; PixelIndex++)
 				{
 					MipMap.Pixels[PixelIndex * 4] = Data[PixelsOffset + (PixelIndex * 3)];
 					MipMap.Pixels[PixelIndex * 4 + 1] = Data[PixelsOffset + (PixelIndex * 3 + 1)];
@@ -1901,10 +1937,12 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 				}
 
 				Mips.Add(MoveTemp(MipMap));
+                TotalBytes += MipSize;
 				PixelsOffset += DDSMipSize;
 				MipWidth = FMath::Max(MipWidth / 2, 1);
 				MipHeight = FMath::Max(MipHeight / 2, 1);
 			}
+            Committed = true;
 			return;
 		}
 		else if (Ptr32[22] != 32)
@@ -1924,7 +1962,8 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 		const int64 MipWidthAligned = FMath::Max(((MipWidth / BlockX) + ((MipWidth % BlockX) != 0 ? 1 : 0)) * BlockX, BlockX);
 		const int64 MipHeightAligned = FMath::Max(((MipHeight / BlockY) + ((MipHeight % BlockY) != 0 ? 1 : 0)) * BlockY, BlockY);
 		const int64 MipSize = ((MipWidthAligned * GPixelFormats[PixelFormat].BlockBytes * MipHeightAligned) / (BlockX * BlockY)) * NumberOfSlices;
-		if (PixelsOffset + MipSize > Data.Num())
+		if (MipSize <= 0 || MipSize > glTFRuntimeImageValidation::MaxResourceBytes - TotalBytes
+            || MipSize > Data.Num() - PixelsOffset)
 		{
 			return;
 		}
@@ -1933,10 +1972,12 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 		FMemory::Memcpy(MipMap.Pixels.GetData(), Data.GetData() + PixelsOffset, MipSize);
 
 		Mips.Add(MoveTemp(MipMap));
+		TotalBytes += MipSize;
 		PixelsOffset += MipSize;
 		MipWidth = FMath::Max(MipWidth / 2, 1);
 		MipHeight = FMath::Max(MipHeight / 2, 1);
 	}
+    Committed = true;
 }
 
 int32 FglTFRuntimeTextureMipDataProvider::GetMips(const FTextureUpdateContext& Context, int32 StartingMipIndex, const FTextureMipInfoArray& MipInfos, const FTextureUpdateSyncOptions& SyncOptions)
@@ -1944,24 +1985,36 @@ int32 FglTFRuntimeTextureMipDataProvider::GetMips(const FTextureUpdateContext& C
 #if ENGINE_MAJOR_VERSION == 4 && ENGINE_MINOR_VERSION < 26
 	const int32 CurrentFirstLODIdx = Context.CurrentFirstMipIndex;
 #endif
-	for (int32 MipIndex = StartingMipIndex; MipIndex < CurrentFirstLODIdx; MipIndex++)
-	{
+    // The engine owns these destination allocations. Never let BulkData allocate a replacement
+    // or copy an unchecked byte count into a GPU upload buffer.
+    if (StartingMipIndex < 0 || CurrentFirstLODIdx < StartingMipIndex || CurrentFirstLODIdx > MipInfos.Num())
+    {
+        AdvanceTo(ETickState::CleanUp, ETickThread::Async);
+        return StartingMipIndex;
+    }
+    for (int32 MipIndex = StartingMipIndex; MipIndex < CurrentFirstLODIdx; ++MipIndex)
+    {
 #if ENGINE_MAJOR_VERSION >= 5 || ENGINE_MINOR_VERSION >= 27
-		const FTexture2DMipMap& MipMap = *Context.MipsView[MipIndex];
+        if (!Context.MipsView.IsValidIndex(MipIndex) || !Context.MipsView[MipIndex])
+        { AdvanceTo(ETickState::CleanUp, ETickThread::Async); return MipIndex; }
+        const FTexture2DMipMap& MipMap = *Context.MipsView[MipIndex];
 #else
-		// pretty brutal (we are always assuming UTexture2D), but should be safe
-		const FTexture2DMipMap& MipMap = Cast<UTexture2D>(Context.Texture)->PlatformData->Mips[MipIndex];
+        const UTexture2D* Texture = Cast<UTexture2D>(Context.Texture);
+        if (!Texture || !Texture->PlatformData || !Texture->PlatformData->Mips.IsValidIndex(MipIndex))
+        { AdvanceTo(ETickState::CleanUp, ETickThread::Async); return MipIndex; }
+        const FTexture2DMipMap& MipMap = Texture->PlatformData->Mips[MipIndex];
 #endif
-		FByteBulkData* ByteBulkData = const_cast<FByteBulkData*>(&MipMap.BulkData);
-
-		const FTextureMipInfo& MipInfo = MipInfos[MipIndex];
-		void* Dest = MipInfo.DestData;
-
-		if (ByteBulkData->GetBulkDataSize() > 0)
-		{
-			ByteBulkData->GetCopy(&Dest, false);
-		}
-	}
+        FByteBulkData* Bulk = const_cast<FByteBulkData*>(&MipMap.BulkData);
+        const FTextureMipInfo& Info = MipInfos[MipIndex];
+        const int64 Bytes = Bulk->GetBulkDataSize();
+        if (!Info.DestData || Bytes <= 0 || uint64(Bytes) != Info.DataSize)
+        { AdvanceTo(ETickState::CleanUp, ETickThread::Async); return MipIndex; }
+        const void* Source = Bulk->LockReadOnly();
+        if (!Source)
+        { Bulk->Unlock(); AdvanceTo(ETickState::CleanUp, ETickThread::Async); return MipIndex; }
+        FMemory::Memcpy(Info.DestData, Source, SIZE_T(Bytes));
+        Bulk->Unlock();
+    }
 
 	AdvanceTo(ETickState::CleanUp, ETickThread::Async);
 	return CurrentFirstLODIdx;

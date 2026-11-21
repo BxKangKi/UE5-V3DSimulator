@@ -72,5 +72,6 @@ private:
     USoundBase* ResolveSound(const FString& Reference, const FString& DefaultKey, bool bLoop);
     bool ResolveLoop(const FString& Reference, const FString& DefaultKey, TOptional<bool> Override = {}) const;
     void UpdateLoop(TObjectPtr<UAudioComponent>& Component, const FString& Reference,
-        const FString& DefaultKey, float Volume, TOptional<bool> LoopOverride = {});
+        const FString& DefaultKey, float Volume, TOptional<bool> LoopOverride = {},
+        float FadeInSeconds = 0.4f, float FadeOutSeconds = 0.25f);
 };

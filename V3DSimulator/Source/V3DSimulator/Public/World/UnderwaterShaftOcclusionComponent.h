@@ -9,6 +9,7 @@ class AWaterActor;
 class UDirectionalLightComponent;
 class UMaterialInstanceDynamic;
 class USceneCaptureComponent2D;
+class UTexture2D;
 class UTextureRenderTarget2D;
 
 UCLASS()
@@ -29,11 +30,13 @@ private:
     void ReleaseResources();
     void ResetCachedParameters();
     void SetReady(bool bReady);
+    UTexture2D* GetFallbackTexture();
 
     UPROPERTY(Transient) TObjectPtr<UMaterialInstanceDynamic> TargetMaterial;
     UPROPERTY(Transient) TObjectPtr<UDirectionalLightComponent> SunLight;
     UPROPERTY(Transient) TArray<TObjectPtr<USceneCaptureComponent2D>> Captures;
     UPROPERTY(Transient) TArray<TObjectPtr<UTextureRenderTarget2D>> DepthTargets;
+    UPROPERTY(Transient) TObjectPtr<UTexture2D> FallbackTexture;
     TArray<AWaterActor*> CachedWaterActors;
 
     FLinearColor LastWrittenOrigins[2] = { FLinearColor::Transparent, FLinearColor::Transparent };

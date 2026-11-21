@@ -25,11 +25,11 @@ void UWorldEnvironmentSubsystem::Reset()
     ++Generation;
     if (AssetLoad) AssetLoad->CancelHandle();
     AssetLoad.Reset();
-    if (GetWorld()) GetWorld()->GetTimerManager().ClearAllTimersForObject(this);
+    if (UWorld* World = GetWorld()) World->GetTimerManager().ClearAllTimersForObject(this);
     for (auto* Audio : {WaterAudio.Get(), UnderwaterAudio.Get(), MusicAudio.Get()}) if (IsValid(Audio)) Audio->Stop();
     for (auto& Audio : Effects) if (IsValid(Audio)) Audio->Stop();
     for (auto& Audio : FadingMusic) if (IsValid(Audio)) Audio->Stop();
-    UGameplayStatics::DeactivateReverbEffect(this, TEXT("V3DGeometry"));
+    if (GetWorld()) UGameplayStatics::DeactivateReverbEffect(this, TEXT("V3DGeometry"));
     WaterAudio = UnderwaterAudio = MusicAudio = nullptr;
     Effects.Empty(); FadingMusic.Empty(); Defaults.Empty(); LoadedAssets.Empty();
     EventChoices.Empty(); StartedChannels.Empty(); FootstepLoops.Empty(); MusicContext.Reset();
@@ -41,12 +41,14 @@ void UWorldEnvironmentSubsystem::Deinitialize() { Reset(); Super::Deinitialize()
 
 bool UWorldEnvironmentSubsystem::Configure(const TSharedPtr<FJsonObject>& Root, FString& Error)
 {
+    UWorld* World = GetWorld();
+    if (!IsValid(World)) { Error = TEXT("World is unavailable."); return false; }
     FV3DEnvironmentConfig Parsed;
     if (!FV3DEnvironmentConfig::Parse(Root, Parsed, Error)) return false;
-    auto* Events = GetWorld()->GetSubsystem<USoundEventSubsystem>();
+    auto* Events = World->GetSubsystem<USoundEventSubsystem>();
     auto ValidateEvent = [Events, &Error](const FString& Reference)
     {
-        if (Reference.StartsWith(TEXT("event://")) && !Events->HasEvent(FName(Reference.Mid(8))))
+        if (Reference.StartsWith(TEXT("event://")) && (!IsValid(Events) || !Events->HasEvent(FName(Reference.Mid(8)))))
         { Error = TEXT("Unknown audio event: ") + Reference; return false; }
         return true;
     };
@@ -65,7 +67,7 @@ bool UWorldEnvironmentSubsystem::Configure(const TSharedPtr<FJsonObject>& Root, 
     A.OcclusionInterpolationTime = .2f;
     A.bEnableReverbSend = Config.Audio.bGlobalAcoustics;
     RoomReverb = NewObject<UReverbEffect>(this);
-    if (GetWorld()->GetNetMode() != NM_DedicatedServer)
+    if (World->GetNetMode() != NM_DedicatedServer)
     {
         if (auto* Registry = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this))
         {
@@ -114,7 +116,7 @@ bool UWorldEnvironmentSubsystem::Configure(const TSharedPtr<FJsonObject>& Root, 
 #else
     constexpr float Interval = .2f;
 #endif
-    GetWorld()->GetTimerManager().SetTimer(Timer, this, &UWorldEnvironmentSubsystem::Poll, Interval, true);
+    World->GetTimerManager().SetTimer(Timer, this, &UWorldEnvironmentSubsystem::Poll, Interval, true);
     return true;
 }
 
@@ -160,7 +162,10 @@ void UWorldEnvironmentSubsystem::RequestPcm(const FString& Reference)
         while (Self->CachedBytes + Result->Bytes.Num() > Budget && !Self->CacheOrder.IsEmpty())
         {
             const FString Old = Self->CacheOrder[0]; Self->CacheOrder.RemoveAt(0);
-            if (auto* Entry = Self->Pcm.Find(Old)) Self->CachedBytes -= (*Entry)->Bytes.Num();
+            if (auto* Entry = Self->Pcm.Find(Old))
+            {
+                if (Entry->IsValid()) Self->CachedBytes = FMath::Max<int64>(0, Self->CachedBytes - (*Entry)->Bytes.Num());
+            }
             Self->Pcm.Remove(Old);
         }
         Self->CachedBytes += Result->Bytes.Num();
@@ -173,7 +178,9 @@ USoundBase* UWorldEnvironmentSubsystem::ResolveSound(const FString& Reference, c
     if (Reference == TEXT("none")) return nullptr;
     if (Reference.StartsWith(TEXT("event://")))
     {
-        auto* Events = GetWorld()->GetSubsystem<USoundEventSubsystem>();
+        UWorld* World = GetWorld();
+        auto* Events = IsValid(World) ? World->GetSubsystem<USoundEventSubsystem>() : nullptr;
+        if (!IsValid(Events)) return nullptr;
         FString& Selected = EventChoices.FindOrAdd(Reference);
         if (Selected.IsEmpty()) Selected = Events->PickReference(FName(Reference.Mid(8)));
         if (Selected.IsEmpty()) return nullptr;
@@ -199,40 +206,79 @@ bool UWorldEnvironmentSubsystem::ResolveLoop(const FString& Reference, const FSt
 {
     if (Override.IsSet()) return Override.GetValue();
     if (Reference.StartsWith(TEXT("event://")))
-        return GetWorld()->GetSubsystem<USoundEventSubsystem>()->IsLooping(FName(Reference.Mid(8)));
+    {
+        UWorld* World = GetWorld();
+        auto* Events = IsValid(World) ? World->GetSubsystem<USoundEventSubsystem>() : nullptr;
+        return IsValid(Events) && Events->IsLooping(FName(Reference.Mid(8)));
+    }
     if (const auto* Default = Defaults.Find(Key)) return Default->bLoop;
     return Key != TEXT("Footstep");
 }
 
 void UWorldEnvironmentSubsystem::UpdateLoop(TObjectPtr<UAudioComponent>& Audio, const FString& Reference,
-    const FString& Key, float Volume, TOptional<bool> LoopOverride)
+    const FString& Key, float Volume, TOptional<bool> LoopOverride, float FadeInSeconds, float FadeOutSeconds)
 {
     if (IsValid(Audio) && !Audio->IsPlaying()) Audio = nullptr;
+    if (!IsValid(Audio)) Audio = nullptr;
+    const float SafeFadeIn = FMath::IsFinite(FadeInSeconds) ? FMath::Clamp(FadeInSeconds, 0.f, 30.f) : 0.f;
+    const float SafeFadeOut = FMath::IsFinite(FadeOutSeconds) ? FMath::Clamp(FadeOutSeconds, 0.f, 30.f) : 0.f;
     if (Volume <= .001f || Reference == TEXT("none"))
     {
         StartedChannels.Remove(Key); // A later activation may play a non-looping sound once again.
-        if (Audio) { Audio->FadeOut(.25f, 0); FadingMusic.Add(Audio); Audio = nullptr; }
+        if (Audio)
+        {
+            if (SafeFadeOut > KINDA_SMALL_NUMBER)
+            {
+                Audio->FadeOut(SafeFadeOut, 0.f);
+                FadingMusic.Add(Audio);
+            }
+            else
+            {
+                Audio->Stop();
+            }
+            Audio = nullptr;
+        }
         return;
     }
     const bool bLoop = ResolveLoop(Reference, Key, LoopOverride);
     if (!Audio && (bLoop || !StartedChannels.Contains(Key)))
+    {
         if (auto* Sound = ResolveSound(Reference, Key, bLoop))
         {
             Audio = UGameplayStatics::CreateSound2D(this, Sound, Volume, 1, 0, nullptr, false, true);
-            if (Audio)
+            if (IsValid(Audio))
             {
-                StartedChannels.Add(Key); Audio->FadeIn(.4f, Volume);
+                StartedChannels.Add(Key);
+                if (SafeFadeIn > KINDA_SMALL_NUMBER)
+                {
+                    Audio->FadeIn(SafeFadeIn, Volume);
+                }
+                else
+                {
+                    Audio->SetVolumeMultiplier(Volume);
+                    Audio->Play();
+                }
                 if (!bLoop && Cast<USoundWaveProcedural>(Sound)) V3DSoundPlayback::StopOneShot(this, Audio, Sound->Duration, 1.f);
             }
+            else
+            {
+                Audio = nullptr;
+            }
         }
-    if (Audio) Audio->AdjustVolume(.25f, Volume, EAudioFaderCurve::Linear);
+    }
+    else if (Audio)
+    {
+        Audio->AdjustVolume(.25f, Volume, EAudioFaderCurve::Linear);
+    }
 }
 
 void UWorldEnvironmentSubsystem::Poll()
 {
+    UWorld* World = GetWorld();
+    if (!IsValid(World)) return;
     if (const auto* Manager = UGameManagerSubSystem::GetSubSystem(this); Manager && Manager->IsWorldLoading()) return;
-    auto* PC = GetWorld()->GetFirstPlayerController();
-    if (!PC || !PC->GetPawn()) return;
+    auto* PC = World->GetFirstPlayerController();
+    if (!IsValid(PC) || !IsValid(PC->GetPawn())) return;
     const uint64 Token = Generation;
     const FVector Position = PC->GetPawn()->GetActorLocation();
     TSet<FName> NewInside;
@@ -269,8 +315,8 @@ void UWorldEnvironmentSubsystem::Poll()
         OnBiomeChanged.Broadcast(Event.Name, Event.bInside);
         if (Token != Generation) return;
         const FName Command = Event.Command;
-        if (!Command.IsNone() && GetWorld()->GetNetMode() != NM_Client)
-            if (auto* Scripts = GetWorld()->GetSubsystem<USimulationScriptSubsystem>())
+        if (!Command.IsNone() && World->GetNetMode() != NM_Client)
+            if (auto* Scripts = World->GetSubsystem<USimulationScriptSubsystem>())
             {
                 FString Message;
                 if (!Scripts->ExecuteNamed(PC, Command, Message, false))
@@ -278,7 +324,7 @@ void UWorldEnvironmentSubsystem::Poll()
             }
         if (Token != Generation) return;
     }
-    if (GetWorld()->GetNetMode() == NM_DedicatedServer || !bAssetsReady || !PC->PlayerCameraManager) return;
+    if (World->GetNetMode() == NM_DedicatedServer || !bAssetsReady || !IsValid(PC->PlayerCameraManager)) return;
     const FVector Eye = PC->PlayerCameraManager->GetCameraLocation();
     FWaterQueryResult Wet, Near;
     if (auto* Water = UWaterQuerySubsystem::Get(this))
@@ -290,29 +336,47 @@ void UWorldEnvironmentSubsystem::Poll()
     UpdateLoop(UnderwaterAudio, Config.Audio.Underwater, TEXT("Underwater"), Wet.bInWater ? .7f : 0, Config.Audio.UnderwaterLoop);
     if (!Config.Audio.bEnvironmentMusic) DesiredMusic = TEXT("none");
     FadingMusic.RemoveAll([](const auto& C) { return !IsValid(C) || !C->IsPlaying(); });
+    const float CrossfadeDuration = Config.Audio.bBiomeAudioCrossfade
+        ? FMath::Clamp(Config.Audio.BiomeCrossfadeSeconds, 0.f, 30.f)
+        : 0.f;
     if (MusicKey != DesiredMusic || MusicContext != DesiredContext)
     {
         MusicKey = DesiredMusic; MusicContext = DesiredContext; StartedChannels.Remove(TEXT("Music"));
-        if (MusicAudio)
+        if (IsValid(MusicAudio))
         {
-            MusicAudio->FadeOut(.6f, 0); FadingMusic.Add(MusicAudio); MusicAudio = nullptr;
-            if (FadingMusic.Num() > 2) { if (FadingMusic[0]) FadingMusic[0]->Stop(); FadingMusic.RemoveAt(0); }
+            if (CrossfadeDuration > KINDA_SMALL_NUMBER)
+            {
+                MusicAudio->FadeOut(CrossfadeDuration, 0.f);
+                FadingMusic.Add(MusicAudio);
+                while (FadingMusic.Num() > 4)
+                {
+                    if (IsValid(FadingMusic[0])) FadingMusic[0]->Stop();
+                    FadingMusic.RemoveAt(0);
+                }
+            }
+            else
+            {
+                MusicAudio->Stop();
+            }
+            MusicAudio = nullptr;
         }
     }
-    UpdateLoop(MusicAudio, MusicKey, TEXT("Music"), Config.Audio.MusicVolume, MusicLoop);
-    if (MusicAudio) { MusicAudio->SetLowPassFilterEnabled(Wet.bInWater); MusicAudio->SetLowPassFilterFrequency(1200); }
+    UpdateLoop(MusicAudio, MusicKey, TEXT("Music"), Config.Audio.MusicVolume, MusicLoop, CrossfadeDuration, CrossfadeDuration);
+    if (IsValid(MusicAudio)) { MusicAudio->SetLowPassFilterEnabled(Wet.bInWater); MusicAudio->SetLowPassFilterFrequency(1200); }
     if (Config.Audio.bGlobalAcoustics) ProbeRoom(Eye, PC->GetPawn());
 }
 
 void UWorldEnvironmentSubsystem::ProbeRoom(const FVector& Eye, AActor* Pawn)
 {
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || !IsValid(RoomReverb)) return;
     const FVector Directions[] = {FVector(1,0,0),FVector(-1,0,0),FVector(0,1,0),FVector(0,-1,0),FVector(0,0,1),FVector(0,0,-1)};
     float Distances[6]; uint32 HitMask = 0;
     FCollisionQueryParams Params(SCENE_QUERY_STAT(V3DAcoustics), false, Pawn);
     for (int32 I = 0; I < 6; ++I)
     {
         FHitResult Hit;
-        const bool Blocked = GetWorld()->LineTraceSingleByChannel(Hit, Eye, Eye + Directions[I] * Config.Audio.ProbeDistanceCm, ECC_Visibility, Params);
+        const bool Blocked = World->LineTraceSingleByChannel(Hit, Eye, Eye + Directions[I] * Config.Audio.ProbeDistanceCm, ECC_Visibility, Params);
         Distances[I] = Blocked ? Hit.Distance * .01f : Config.Audio.ProbeDistanceCm * .01f;
         if (Blocked) HitMask |= 1u << I;
     }
@@ -329,11 +393,12 @@ void UWorldEnvironmentSubsystem::ProbeRoom(const FVector& Eye, AActor* Pawn)
 
 void UWorldEnvironmentSubsystem::ApplySpatialAudio(UAudioComponent* Audio) const
 {
-    if (Audio && SpatialAttenuation) Audio->AdjustAttenuation(SpatialAttenuation->Attenuation);
+    if (IsValid(Audio) && IsValid(SpatialAttenuation)) Audio->AdjustAttenuation(SpatialAttenuation->Attenuation);
 }
 void UWorldEnvironmentSubsystem::PlayDefaultFootstep(const FVector& Location, UObject* Emitter)
 {
-    if (!GetWorld() || GetWorld()->GetNetMode() == NM_DedicatedServer) return;
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->GetNetMode() == NM_DedicatedServer) return;
     const bool bLoop = ResolveLoop(Config.Audio.DefaultFootstep, TEXT("Footstep"), Config.Audio.DefaultFootstepLoop);
     if (V3DSoundPlayback::RefreshFootstep(FootstepLoops, this, Emitter,
         bLoop ? TEXT("Default") : FString(), Location)) return;
@@ -341,8 +406,13 @@ void UWorldEnvironmentSubsystem::PlayDefaultFootstep(const FVector& Location, UO
     if (Effects.Num() >= 16) return;
     float Volume = .7f, Pitch = 1.f;
     if (Config.Audio.DefaultFootstep.StartsWith(TEXT("event://")))
-        if (const auto* Event = GetWorld()->GetSubsystem<USoundEventSubsystem>()->GetSettings(FName(Config.Audio.DefaultFootstep.Mid(8))))
-        { Volume = Event->Volume; Pitch = FMath::FRandRange(Event->PitchMin, Event->PitchMax); }
+    {
+        if (auto* Events = World->GetSubsystem<USoundEventSubsystem>())
+        {
+            if (const auto* Event = Events->GetSettings(FName(Config.Audio.DefaultFootstep.Mid(8))))
+            { Volume = Event->Volume; Pitch = FMath::FRandRange(Event->PitchMin, Event->PitchMax); }
+        }
+    }
     PlayFootstepSound(ResolveSound(Config.Audio.DefaultFootstep, TEXT("Footstep"), bLoop), Location, Volume, bLoop, Emitter, nullptr, Pitch);
 }
 

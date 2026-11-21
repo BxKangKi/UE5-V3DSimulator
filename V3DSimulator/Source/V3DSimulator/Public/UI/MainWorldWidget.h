@@ -145,8 +145,6 @@ public:
     /** Assign this from a derived WBP Construct event to enable the main Editor button. */
     UFUNCTION(BlueprintCallable, Category="Main World|Widgets")
     void SetEditorButton(UButton* InButton);
-    UFUNCTION(BlueprintCallable, Category="Main World|Editor", meta=(DeprecatedFunction, DeprecationMessage="Use SetEditorButton"))
-    void SetProjectsButton(UButton* InButton) { SetEditorButton(InButton); }
 
     UFUNCTION(BlueprintCallable, Category="Main World|Widgets")
     void SetHostButton(UButton* InButton);

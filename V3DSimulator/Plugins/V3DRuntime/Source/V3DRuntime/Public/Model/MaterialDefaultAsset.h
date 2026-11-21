@@ -10,7 +10,6 @@ UENUM(BlueprintType)
 enum class EV3DMaterialMode : uint8
 {
     Auto = 0,
-    Masked = 1 UMETA(Hidden), // Read old archives/settings as Opaque. No separate UI mode.
     Translucent = 3,
     Opaque = 5,
     OpaqueTwoSided = 6 UMETA(DisplayName="Opaque Two Sided"),
@@ -35,8 +34,6 @@ struct V3DRUNTIME_API FV3DMaterialSoftAssetReferences
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Materials", meta=(DisplayName="MI_Opaque", ToolTip="Single-sided Masked parent, presented as Opaque for dithered culling. Shared by static and dynamic models."))
     TSoftObjectPtr<UMaterialInterface> MI_Opaque;
-    UPROPERTY() // Serialized compatibility only; migrated into MI_Opaque at resolution.
-    TSoftObjectPtr<UMaterialInterface> MI_Masked;
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Materials", meta=(DisplayName="MI_Translucent", ToolTip="Existing single-sided Translucent parent. Shared by static and dynamic models."))
     TSoftObjectPtr<UMaterialInterface> MI_Translucent;
     UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Materials", meta=(DisplayName="MI_Toon", ToolTip="Single-sided Toon parent with Masked or Translucent blending."))

@@ -4,6 +4,7 @@
 #include "Blueprint/UserWidget.h"
 #include "Styling/SlateTypes.h"
 #include "System/ProjectEditorDocument.h"
+#include "UI/HUDStyle.h"
 #include "ProjectEditorWidget.generated.h"
 class SVerticalBox;
 class STextBlock;
@@ -21,6 +22,9 @@ class V3DSIMULATOR_API UProjectEditorWidget : public UUserWidget
 public:
     UProjectEditorWidget(const FObjectInitializer& ObjectInitializer);
     void OpenProject(const FString& ProjectName);
+    void SetDarkMode(bool bInDarkMode);
+    bool IsDarkMode() const { return bDarkMode; }
+    void ToggleDarkMode();
     FSimpleDelegate OnClosed;
     virtual void ReleaseSlateResources(bool bReleaseChildren) override;
     virtual void NativeDestruct() override;
@@ -34,9 +38,14 @@ private:
     UPROPERTY(Transient) FEditableTextBoxStyle EditorInputStyle;
     UPROPERTY(Transient) FComboBoxStyle EditorComboStyle;
     UPROPERTY(Transient) FTableRowStyle EditorRowStyle;
+    UPROPERTY(Transient) FTableViewStyle EditorListStyle;
     UPROPERTY(Transient) FCheckBoxStyle EditorCheckStyle;
     FSlateFontInfo TitleFont;
+    bool bDarkMode = false;
+    V3DHUDStyle::FAuthoringPalette GetThemePalette() const;
+    void ApplyEditorTheme();
     TSharedRef<SWidget> MakeEditorButton(const TCHAR* Label, TFunction<void()> Action);
+    TSharedRef<SWidget> MakeDynamicEditorButton(TFunction<FText()> LabelGetter, TFunction<void()> Action);
     void InvalidatePreview();
     void QueueFormRefresh();
     bool bFormRefreshPending = false;

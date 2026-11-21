@@ -9,6 +9,7 @@
  */
 
 #include "World/WorldEnvManager.h"
+#include "World/PhysicalMaterialProfile.h"
 #include "World/UnderwaterRenderPolicy.h"
 #include "World/UnderwaterShaftOcclusionComponent.h"
 #include "Camera/PlayerCameraManager.h"
@@ -29,6 +30,7 @@
 #include "Engine/StreamableManager.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Engine/GameInstance.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialParameterCollection.h"
@@ -39,8 +41,11 @@
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/GameUpdateSubSystem.h"
 #include "System/MathHelper.h"
+#include "HAL/IConsoleManager.h"
 #include "TimerManager.h"
 #include "World/WorldData.h"
+#include "World/WorldEnvironmentSubsystem.h"
+#include "Weather/WeatherSubsystem.h"
 
 namespace WorldEnvManagerPrivate
 {
@@ -172,7 +177,7 @@ AWorldEnvManager::AWorldEnvManager()
     Sun->SetEnableLightShaftBloom(true);
     Sun->SetBloomScale(0.0001f);
     Sun->SetIntensity(20.0f);
-    Sun->SetLightSourceAngle(0.53f);
+    Sun->SetLightSourceAngle(V3DPhysicalMaterial::CelestialDiameterDegrees);
     Sun->SetTemperature(5700.0f);
     Sun->SetVolumetricScatteringIntensity(2.5f);
     Sun->bCastShadowsOnClouds = true;
@@ -183,17 +188,20 @@ AWorldEnvManager::AWorldEnvManager()
     Moon->SetupAttachment(RootComponent);
     Moon->SetMobility(EComponentMobility::Movable);
     WorldEnvManagerPrivate::ConfigureLightShadows(Moon);
-    // Slot one lets SkyAtmosphere render a separate moon disk without replacing the sun.
+    // Slot one lights the atmosphere/scene. The textured sky disk receives the explicit
+    // direction below, independently of shader light-index conventions.
     Moon->SetAtmosphereSunLight(true);
     Moon->SetAtmosphereSunLightIndex(1);
+    Moon->SetAtmosphereSunDiskColorScale(FLinearColor::Black);
     Moon->SetIntensity(0.005f);
     Moon->SetUseTemperature(true);
-    Moon->SetTemperature(4100.0f);
-    Moon->SetEnableLightShaftOcclusion(true);
-    Moon->SetEnableLightShaftBloom(true);
-    Moon->SetBloomScale(0.0001f);
+    Moon->SetTemperature(6500.0f);
+    Moon->SetEnableLightShaftOcclusion(false);
+    Moon->SetEnableLightShaftBloom(false);
+    Moon->SetBloomScale(0.0f);
+    Moon->SetVolumetricScatteringIntensity(0.10f);
     Moon->bCastShadowsOnClouds = true;
-    Moon->bCastShadowsOnAtmosphere = true;
+    Moon->bCastShadowsOnAtmosphere = false;
     Moon->SetForwardShadingPriority(1);
     Moon->SetRelativeRotation(FRotator(35.0f, 150.0f, 0.0f));
 
@@ -283,6 +291,7 @@ void AWorldEnvManager::PrepareForWorldLoading()
     // must not wait for config.json or the dynamic .dat state to become available.
     SetActorHiddenInGame(false);
     EnsureCoreSkyVisible();
+    EnsureSkyMaterialInstances();
 }
 
 void AWorldEnvManager::EnsureCoreSkyVisible()
@@ -313,6 +322,7 @@ void AWorldEnvManager::EnsureCoreSkyVisible()
     {
         Sun->SetAtmosphereSunLight(true);
         Sun->SetAtmosphereSunLightIndex(0);
+        Sun->SetLightSourceAngle(V3DPhysicalMaterial::CelestialDiameterDegrees);
         if (!bRenderingActive)
         {
             Sun->SetIntensity(20.0f);
@@ -323,6 +333,12 @@ void AWorldEnvManager::EnsureCoreSkyVisible()
     {
         Moon->SetAtmosphereSunLight(true);
         Moon->SetAtmosphereSunLightIndex(1);
+        Moon->SetLightSourceAngle(V3DPhysicalMaterial::CelestialDiameterDegrees);
+        Moon->SetAtmosphereSunDiskColorScale(FLinearColor::Black);
+        Moon->SetEnableLightShaftOcclusion(false);
+        Moon->SetEnableLightShaftBloom(false);
+        Moon->SetBloomScale(0.0f);
+        Moon->SetVolumetricScatteringIntensity(0.10f);
         if (!bRenderingActive)
         {
             Moon->SetIntensity(0.005f);
@@ -408,6 +424,7 @@ void AWorldEnvManager::HandleEnvironmentAssetsReady()
         if (UStaticMesh* LoadedSkybox = Registry->SkyboxMesh.Get())
         {
             Skybox->SetStaticMesh(LoadedSkybox);
+            EnsureSkyMaterialInstances();
         }
     }
 
@@ -501,6 +518,9 @@ void AWorldEnvManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
     }
     OceanPostProcessMaterial = nullptr;
     CloudMaterial = nullptr;
+    SkyMaterialInstances.Reset();
+    LastMoonDiskVisibility = LastSunDiskVisibility = LastStarIntensity = -1.0f;
+    LastMoonDiskDirection = LastSunDiskDirection = FVector::ZeroVector;
     ShaderLibraryMPC = nullptr;
     LastConfiguredShaftMaterial.Reset();
     SubSystem.Reset();
@@ -516,6 +536,9 @@ void AWorldEnvManager::InitializeRendering(UWorldData* InWorldData)
     }
 
     Data = InWorldData;
+    FogTransition.Reset();
+    bFogProfileApplied = false;
+    FogProfilePollSeconds = 0.f;
     bRenderingActive = true;
     LastAppliedWaterSunElevation = -999.0f;
     PrepareForWorldLoading();
@@ -600,7 +623,7 @@ void AWorldEnvManager::RefreshRuntimeSettings()
         Light->SetShadowDistanceFadeoutFraction(0.15f);
     }
 
-    if (Setting->bHeightFog)
+    if (Setting->bHeightFog && IsValid(Data) && Data->Fog.bEnabled)
     {
         if (!IsValid(Fog))
         {
@@ -608,15 +631,17 @@ void AWorldEnvManager::RefreshRuntimeSettings()
             if (IsValid(Fog))
             {
                 AddInstanceComponent(Fog);
-                Fog->SetVolumetricFog(true);
-                Fog->SetVolumetricFogScatteringDistribution(0.25f);
-                Fog->SetVolumetricFogExtinctionScale(1.2f);
+                Fog->SetVolumetricFog(Data->Fog.bVolumetric);
                 Fog->SetupAttachment(GetRootComponent());
-                Fog->SetFogDensity(0.02f);
-                Fog->SetFogHeightFalloff(0.2f);
                 Fog->SetSecondFogDensity(0.0f);
+                UpdateFogProfile(0.f);
                 Fog->RegisterComponent();
             }
+        }
+        else
+        {
+            Fog->SetVolumetricFog(Data->Fog.bVolumetric);
+            UpdateFogProfile(0.f);
         }
     }
     else
@@ -727,6 +752,9 @@ void AWorldEnvManager::DestroyCloudComponent()
 
 void AWorldEnvManager::DestroyFogComponent()
 {
+    FogTransition.Reset();
+    bFogProfileApplied = false;
+    FogProfilePollSeconds = 0.f;
     if (IsValid(Fog))
     {
         RemoveInstanceComponent(Fog);
@@ -780,11 +808,52 @@ void AWorldEnvManager::UnregisterGameUpdate()
     GameUpdateTickHandle = INDEX_NONE;
 }
 
-void AWorldEnvManager::UpdateFromGameUpdate(float /*DeltaSeconds*/)
+void AWorldEnvManager::UpdateFromGameUpdate(float DeltaSeconds)
 {
     // Cloud settings are applied when rendering/settings change, not redundantly every frame.
     UpdateSkyLighting();
+    UpdateFogProfile(DeltaSeconds);
     UpdateUnderwaterLightShafts();
+}
+
+void AWorldEnvManager::UpdateFogProfile(float DeltaSeconds)
+{
+    if (!bRenderingActive || !IsValid(Data) || !IsValid(Fog)) return;
+    const float Delta = FMath::IsFinite(DeltaSeconds) ? FMath::Max(0.f, DeltaSeconds) : 0.f;
+    FogProfilePollSeconds += Delta;
+    V3DFog::FProfile Target = FogTransition.Target;
+    if (!FogTransition.Initialized || FogProfilePollSeconds >= .2f)
+    {
+        FogProfilePollSeconds = 0.f;
+        FName Biome = NAME_None;
+        FName Weather(TEXT("clear"));
+        float Intensity = 1.f;
+        if (UWorld* World = GetWorld())
+            if (const auto* Environment = World->GetSubsystem<UWorldEnvironmentSubsystem>())
+                Biome = Environment->GetActiveBiome();
+        if (UGameInstance* Instance = GetGameInstance())
+            if (const auto* WeatherSystem = Instance->GetSubsystem<UWeatherSubsystem>())
+                if (WeatherSystem->IsWeatherActive())
+                {
+                    Weather = FName(WeatherSystem->GetCurrentWeatherPreset());
+                    Intensity = WeatherSystem->GetCurrentWeatherIntensity();
+                }
+        Target = Data->Fog.Resolve(Biome, Weather, Intensity);
+    }
+    const auto& Profile = FogTransition.Update(Target, Delta, Data->Fog.TransitionSeconds);
+    if (bFogProfileApplied && Profile == LastAppliedFogProfile) return;
+    using namespace V3DFog;
+    Fog->SetFogDensity(Profile[Density]);
+    Fog->SetFogHeightFalloff(Profile[HeightFalloff]);
+    Fog->SetStartDistance(Profile[StartDistanceCm]);
+    Fog->SetFogMaxOpacity(Profile[MaxOpacity]);
+    Fog->SetFogInscatteringColor(FLinearColor(Profile[ColorR], Profile[ColorG], Profile[ColorB]));
+    Fog->SetVolumetricFogScatteringDistribution(Profile[ScatteringDistribution]);
+    Fog->SetVolumetricFogExtinctionScale(Profile[ExtinctionScale]);
+    Fog->SetVolumetricFogDistance(Profile[ViewDistanceCm]);
+    Fog->SetVolumetricFogAlbedo(FLinearColor(Profile[AlbedoR], Profile[AlbedoG], Profile[AlbedoB]).ToFColorSRGB());
+    LastAppliedFogProfile = Profile;
+    bFogProfileApplied = true;
 }
 
 void AWorldEnvManager::UpdateSkyLighting()
@@ -797,28 +866,126 @@ void AWorldEnvManager::UpdateSkyLighting()
     const WorldEnvManagerPrivate::FSkyLightRotations Result =
         WorldEnvManagerPrivate::CalculateLightRotations(Data);
 
+    bool bLowQualityShading = false;
+    if (const UGameManagerSubSystem* GameManager = SubSystem.Get())
+    {
+        if (const UGameSettings* Settings = GameManager->GetGameSettings())
+        {
+            bLowQualityShading = (Settings->ShadingQuality == 0 || Settings->ShadowQuality == 0);
+        }
+    }
+
     float SunElevationSin = 0.5f;
+    float SunDayFactor = 1.0f;
     if (IsValid(Sun))
     {
         Sun->SetWorldRotation(Result.Sun);
         SunElevationSin = FMath::Clamp(static_cast<float>(-Sun->GetForwardVector().Z), -1.0f, 1.0f);
         // Smooth physical sunrise/sunset attenuation and color temperature shift.
-        const float SunDayFactor = FMath::SmoothStep(-0.04f, 0.18f, SunElevationSin);
-        Sun->SetIntensity(20.0f * SunDayFactor);
+        SunDayFactor = FMath::SmoothStep(-0.04f, 0.18f, SunElevationSin);
+        const float MaxSunIntensity = bLowQualityShading ? 12.0f : 20.0f;
+        const float TargetSunIntensity = MaxSunIntensity * SunDayFactor;
+        if (!FMath::IsNearlyEqual(TargetSunIntensity, LastAppliedSunIntensity, 0.01f))
+        {
+            Sun->SetIntensity(TargetSunIntensity);
+            LastAppliedSunIntensity = TargetSunIntensity;
+        }
         const float TempAlpha = FMath::SmoothStep(0.0f, 0.45f, SunElevationSin);
-        Sun->SetTemperature(FMath::Lerp(2600.0f, 5800.0f, TempAlpha));
+        const float TargetSunTemp = FMath::Lerp(2600.0f, 5800.0f, TempAlpha);
+        if (!FMath::IsNearlyEqual(TargetSunTemp, LastAppliedSunTemp, 5.0f))
+        {
+            Sun->SetTemperature(TargetSunTemp);
+            LastAppliedSunTemp = TargetSunTemp;
+        }
     }
 
+    float MoonElevationSin = -1.0f;
     if (IsValid(Moon))
     {
         Moon->SetWorldRotation(Result.Moon);
-        const float MoonElevationSin = FMath::Clamp(static_cast<float>(-Moon->GetForwardVector().Z), -1.0f, 1.0f);
+        MoonElevationSin = FMath::Clamp(static_cast<float>(-Moon->GetForwardVector().Z), -1.0f, 1.0f);
         const float NightFactor = 1.0f - FMath::SmoothStep(-0.04f, 0.12f, SunElevationSin);
         // Subtle realistic moonlight intensity so nights stay naturally dark.
-        Moon->SetIntensity(0.008f * FMath::SmoothStep(0.0f, 0.20f, MoonElevationSin) * NightFactor);
+        const float TargetMoonIntensity = 0.008f * FMath::SmoothStep(0.0f, 0.20f, MoonElevationSin) * NightFactor;
+        if (!FMath::IsNearlyEqual(TargetMoonIntensity, LastAppliedMoonIntensity, 1.0e-4f))
+        {
+            Moon->SetIntensity(TargetMoonIntensity);
+            LastAppliedMoonIntensity = TargetMoonIntensity;
+        }
     }
 
+    if (IsValid(SkyLight))
+    {
+        // Scale ambient hemisphere fill by actual day/night cycle; slightly higher soft fill
+        // on Low quality produces clean, readable classic low-spec 3D game shading without harsh darks.
+        const float DaySkyIntensity = bLowQualityShading ? 0.85f : 0.50f;
+        const float NightSkyIntensity = bLowQualityShading ? 0.08f : 0.04f;
+        const float TargetSkyIntensity = FMath::Lerp(NightSkyIntensity, DaySkyIntensity, SunDayFactor);
+        if (!FMath::IsNearlyEqual(TargetSkyIntensity, LastAppliedSkyLightIntensity, 0.005f))
+        {
+            SkyLight->SetIntensity(TargetSkyIntensity);
+            LastAppliedSkyLightIntensity = TargetSkyIntensity;
+        }
+    }
+
+    UpdateSkyMaterialParameters(SunElevationSin, MoonElevationSin);
     UpdatePhysicalUnderwaterColors(SunElevationSin, false);
+}
+
+void AWorldEnvManager::EnsureSkyMaterialInstances()
+{
+    if (!IsValid(Skybox)) return;
+    SkyMaterialInstances.SetNum(Skybox->GetNumMaterials());
+    for (int32 Index = 0; Index < SkyMaterialInstances.Num(); ++Index)
+    {
+        UMaterialInterface* Source = Skybox->GetMaterial(Index);
+        if (SkyMaterialInstances[Index] == Source && IsValid(Source)) continue;
+        auto* SourceMID = Cast<UMaterialInstanceDynamic>(Source);
+        UMaterialInterface* Parent = SourceMID ? SourceMID->Parent.Get() : Source;
+        auto* MID = IsValid(Parent) ? UMaterialInstanceDynamic::Create(Parent, this) : nullptr;
+        if (!MID) { SkyMaterialInstances[Index] = nullptr; continue; }
+        if (SourceMID) MID->CopyParameterOverrides(SourceMID);
+        MID->SetScalarParameterValue(TEXT("MoonSize"), V3DPhysicalMaterial::MoonRadiusRadians);
+        MID->SetScalarParameterValue(TEXT("SunAngularRadius"), V3DPhysicalMaterial::CelestialRadiusRadians);
+        MID->SetScalarParameterValue(TEXT("MoonIntensity"), V3DPhysicalMaterial::MoonIntensity);
+        MID->SetScalarParameterValue(TEXT("MoonVisibility"), 0.0f);
+        MID->SetScalarParameterValue(TEXT("SunVisibility"), 0.0f);
+        MID->SetScalarParameterValue(TEXT("StarIntensity"), V3DPhysicalMaterial::StarIntensity);
+        Skybox->SetMaterial(Index, MID);
+        SkyMaterialInstances[Index] = MID;
+        LastMoonDiskVisibility = LastSunDiskVisibility = LastStarIntensity = -1.0f;
+        LastMoonDiskDirection = LastSunDiskDirection = FVector::ZeroVector;
+    }
+}
+
+void AWorldEnvManager::UpdateSkyMaterialParameters(const float SunElevationSin, const float MoonElevationSin)
+{
+    const float Night = 1.0f - FMath::SmoothStep(-0.08f, 0.08f, SunElevationSin);
+    const float MoonVisibility = Night * FMath::SmoothStep(-0.015f, 0.06f, MoonElevationSin);
+    const float SunVisibility = FMath::SmoothStep(-0.02f, 0.06f, SunElevationSin);
+    const FVector MoonDirection = IsValid(Moon) ? -Moon->GetForwardVector() : FVector::ZeroVector;
+    const FVector SunDirection = IsValid(Sun) ? -Sun->GetForwardVector() : FVector::ZeroVector;
+    const float Stars = V3DPhysicalMaterial::StarIntensity * Night;
+    const bool MoonChanged = !FMath::IsNearlyEqual(MoonVisibility, LastMoonDiskVisibility, 1.e-4f);
+    const bool SunChanged = !FMath::IsNearlyEqual(SunVisibility, LastSunDiskVisibility, 1.e-4f);
+    const bool MoonMoved = !MoonDirection.Equals(LastMoonDiskDirection, 1.e-6);
+    const bool SunMoved = !SunDirection.Equals(LastSunDiskDirection, 1.e-6);
+    const bool StarsChanged = !FMath::IsNearlyEqual(Stars, LastStarIntensity, 1.e-5f);
+    if (!MoonChanged && !SunChanged && !MoonMoved && !SunMoved && !StarsChanged) return;
+    for (UMaterialInstanceDynamic* MID : SkyMaterialInstances)
+    {
+        if (!IsValid(MID)) continue;
+        if (MoonChanged) MID->SetScalarParameterValue(TEXT("MoonVisibility"), MoonVisibility);
+        if (SunChanged) MID->SetScalarParameterValue(TEXT("SunVisibility"), SunVisibility);
+        if (MoonMoved) MID->SetVectorParameterValue(TEXT("V3DMoonDirection"), FLinearColor(MoonDirection.X, MoonDirection.Y, MoonDirection.Z, 0));
+        if (SunMoved) MID->SetVectorParameterValue(TEXT("V3DSunDirection"), FLinearColor(SunDirection.X, SunDirection.Y, SunDirection.Z, 0));
+        if (StarsChanged) MID->SetScalarParameterValue(TEXT("StarIntensity"), Stars);
+    }
+    LastMoonDiskVisibility = MoonVisibility;
+    LastSunDiskVisibility = SunVisibility;
+    LastMoonDiskDirection = MoonDirection;
+    LastSunDiskDirection = SunDirection;
+    LastStarIntensity = Stars;
 }
 
 void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSin, const bool bForceUpdate)
@@ -840,32 +1007,32 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     const float OneMinusCos = 1.0f - CosAir;
     const float Fresnel = 0.0204f + (1.0f - 0.0204f) * FMath::Pow(OneMinusCos, 5.0f);
     const float SurfaceTrans = 1.0f - Fresnel;
-    const float LightScale = 0.03f + 0.97f * Daylight * SurfaceTrans;
+    const float LightScale = 0.0015f + 0.9985f * Daylight * SurfaceTrans;
 
-    // Darker deep-ocean ambient equilibrium matched to Beer-Lambert water surface optics.
+    // SEUS HRR 3 inspired clear turquoise-teal ambient equilibrium matched to clear shallow water optics.
     const FLinearColor PhysicalFogAmbient(
-        0.0015f * LightScale,
-        0.016f * LightScale,
-        0.042f * LightScale,
+        0.004f * LightScale,
+        0.032f * LightScale,
+        0.052f * LightScale,
         1.0f);
-    // Single-scattering marine in-scatter color (dark ocean navy-teal, never bright sky blue).
+    // Luminous crystalline turquoise-aqua marine in-scatter color.
     const FLinearColor PhysicalFogScatter(
-        0.006f * LightScale,
-        0.055f * LightScale,
-        0.125f * LightScale,
+        0.014f * LightScale,
+        0.095f * LightScale,
+        0.145f * LightScale,
         1.0f);
-    // Waterline meniscus refraction band.
+    // Clean sunlit turquoise waterline meniscus band.
     const FLinearColor PhysicalBandColor(
-        0.009f * LightScale,
-        0.068f * LightScale,
-        0.140f * LightScale,
+        0.020f * LightScale,
+        0.115f * LightScale,
+        0.165f * LightScale,
         1.0f);
-    // Neutral-warm shaft base tint (Beer-Lambert spectral extinction in Underwater.ush supplies depth color).
+    // Warm sunlit-ivory to golden shaft base tint (Beer-Lambert extinction in Underwater.ush shifts with depth).
     const float WarmShift = FMath::SmoothStep(0.0f, 0.35f, SunElevationSin);
     const FLinearColor PhysicalShaftColor(
-        FMath::Lerp(0.95f, 0.80f, WarmShift),
-        FMath::Lerp(0.76f, 0.94f, WarmShift),
-        FMath::Lerp(0.55f, 1.00f, WarmShift),
+        FMath::Lerp(1.00f, 0.96f, WarmShift),
+        FMath::Lerp(0.84f, 0.98f, WarmShift),
+        FMath::Lerp(0.62f, 0.94f, WarmShift),
         1.0f);
 
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Fog Ambient Color"), PhysicalFogAmbient);
@@ -873,6 +1040,7 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Band Color"), PhysicalBandColor);
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("ShaftColor"), PhysicalShaftColor);
     OceanPostProcessMaterial->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
+    OceanPostProcessMaterial->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.0f);
 }
 
 void AWorldEnvManager::UpdateFoliageInteractors()
@@ -968,16 +1136,39 @@ void AWorldEnvManager::UpdateUnderwaterLightShafts()
         IsValid(OceanPostProcessMaterial), IsValid(Camera) ? Camera->GetCameraLocation().Z : 0.0,
         OceanHeight, bUnderwaterScreenShaftsSuppressed);
 
+    int32 EffectiveEffectsQuality = 2;
+    int32 EffectivePostProcessQuality = 2;
+    static const IConsoleVariable* EffectsCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("sg.EffectsQuality"));
+    static const IConsoleVariable* PostCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("sg.PostProcessQuality"));
+    if (EffectsCVar)
+    {
+        EffectiveEffectsQuality = EffectsCVar->GetInt();
+    }
+    if (PostCVar)
+    {
+        EffectivePostProcessQuality = PostCVar->GetInt();
+    }
+    if (UGameManagerSubSystem* GameManager = SubSystem.Get())
+    {
+        if (const UGameSettings* Settings = GameManager->GetGameSettings())
+        {
+            EffectiveEffectsQuality = FMath::Min(EffectiveEffectsQuality, Settings->EffectsQuality);
+            EffectivePostProcessQuality = FMath::Min(EffectivePostProcessQuality, Settings->PostProcessingQuality);
+        }
+    }
+    const bool bShaftsEnabled = bOceanActive
+        && V3DUnderwaterRender::AllowUnderwaterShafts(EffectiveEffectsQuality, EffectivePostProcessQuality);
+
     if (IsValid(UnderwaterShaftOcclusion))
     {
         const bool bShaftConfigChanged = (LastConfiguredShaftMaterial.Get() != OceanPostProcessMaterial.Get())
-            || (bLastShaftOceanActive != bOceanActive)
+            || (bLastShaftOceanActive != bShaftsEnabled)
             || !FMath::IsNearlyEqual(LastShaftOceanHeight, OceanHeight, 0.1f);
         if (bShaftConfigChanged)
         {
-            UnderwaterShaftOcclusion->Configure(OceanPostProcessMaterial, Sun, bOceanActive, OceanHeight);
+            UnderwaterShaftOcclusion->Configure(OceanPostProcessMaterial, Sun, bShaftsEnabled, OceanHeight);
             LastConfiguredShaftMaterial = OceanPostProcessMaterial;
-            bLastShaftOceanActive = bOceanActive;
+            bLastShaftOceanActive = bShaftsEnabled;
             LastShaftOceanHeight = OceanHeight;
         }
     }
