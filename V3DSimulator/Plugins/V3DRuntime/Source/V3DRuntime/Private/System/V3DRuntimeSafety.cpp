@@ -1017,6 +1017,12 @@ bool FV3DRuntimeSafety::IsCircuitOpen(FString* OutReason)
     return V3DRuntimeSafetyPrivate::IsCircuitOpen(OutReason);
 }
 
+void FV3DRuntimeSafety::ResetForStartup()
+{
+    V3DRuntimeSafetyPrivate::FState& State = V3DRuntimeSafetyPrivate::GetState();
+    State.ShuttingDownFlag.Reset();
+}
+
 void FV3DRuntimeSafety::BeginShutdown()
 {
     V3DRuntimeSafetyPrivate::FState& State = V3DRuntimeSafetyPrivate::GetState();

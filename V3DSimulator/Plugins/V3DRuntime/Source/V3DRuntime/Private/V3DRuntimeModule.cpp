@@ -20,6 +20,9 @@ class FV3DRuntimeModule final : public IModuleInterface
     }
     void StartupModule() override
     {
+        FSafeFileIO::ResetForStartup();
+        FV3DRuntimeSafety::ResetForStartup();
+        FV3DStreamingBudget::ResetForStartup();
         const auto Plugin = IPluginManager::Get().FindPlugin(TEXT("V3DRuntime"));
         if (!Plugin) return;
         const FString Directory = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders"));

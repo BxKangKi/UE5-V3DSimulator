@@ -51,6 +51,9 @@ namespace
 void FV3DSimulatorModule::StartupModule()
 {
     FDefaultGameModuleImpl::StartupModule();
+    FSafeFileIO::ResetForStartup();
+    FV3DRuntimeSafety::ResetForStartup();
+    FV3DStreamingBudget::ResetForStartup();
     FV3DRuntimeServices::TextureLimit = [](const UObject* Context) { return UGameSettings::ResolveMaxTextureResolution(Context); };
     FV3DRuntimeServices::TerrainPath = [](const UObject* Context)
     {

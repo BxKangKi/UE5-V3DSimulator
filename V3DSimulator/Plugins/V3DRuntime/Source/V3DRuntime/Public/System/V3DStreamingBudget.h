@@ -24,6 +24,8 @@ public:
         TFunction<void(FPermit)> Start, TFunction<void()> Reject,
         TFunction<bool()> IsStillNeeded = TFunction<bool()>());
     static void Shutdown();
+    /** Clears the shutdown latch on module (re)startup (e.g. Live Coding / Hot Reload). */
+    static void ResetForStartup();
     /** Ask the engine for a throttled, deferred GC after streaming releases strong references. */
     static void NotifyUnloaded();
 

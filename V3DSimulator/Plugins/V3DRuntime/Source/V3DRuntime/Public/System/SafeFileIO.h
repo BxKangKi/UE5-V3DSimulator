@@ -232,6 +232,8 @@ public:
 
     /** Stops accepting new jobs and suppresses callbacks queued after module shutdown begins. */
     static void BeginShutdown();
+    /** Clears the shutdown latch on module (re)startup (e.g. Live Coding / Hot Reload). */
+    static void ResetForStartup();
 
     /** Waits for active disk jobs to drain. Returns false if TimeoutSeconds elapsed. */
     static bool FlushPendingOperations(double TimeoutSeconds);

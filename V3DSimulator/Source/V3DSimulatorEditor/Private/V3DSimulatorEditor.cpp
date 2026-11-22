@@ -2,10 +2,6 @@
 #include "NativeWidgetDesignerLibrary.h"
 #include "HumanoidAnimationBindings.h"
 
-// [TEMPORARY MATERIAL PATCHER - BEGIN] Delete this include + MaterialMigration/ folder once assets are saved.
-#include "MaterialMigration/TemporaryMaterialAssetPatcher.h"
-// [TEMPORARY MATERIAL PATCHER - END]
-
 #include "Containers/Ticker.h"
 #include "Editor.h"
 #include "Engine/Engine.h"
@@ -34,11 +30,6 @@ public:
         // Runs before interactive use and before commandlet cooking, once per schema change.
         if (GEngine) HumanoidAnimationBindings::Upgrade();
         else AnimationBindingHandle = FCoreDelegates::GetOnPostEngineInit().AddStatic(&HumanoidAnimationBindings::Upgrade);
-
-        // [TEMPORARY MATERIAL PATCHER - BEGIN]
-        V3DTempMaterialPatcher::Register();
-        // [TEMPORARY MATERIAL PATCHER - END]
-
         if (IsRunningCommandlet()) return;
         bRegistered = true;
         // Layouts are only generated for assets the user creates, opens, or changes in Class
@@ -61,10 +52,6 @@ public:
 
     virtual void ShutdownModule() override
     {
-        // [TEMPORARY MATERIAL PATCHER - BEGIN]
-        V3DTempMaterialPatcher::Unregister();
-        // [TEMPORARY MATERIAL PATCHER - END]
-
         FCoreDelegates::GetOnPostEngineInit().Remove(AnimationBindingHandle);
         if (!bRegistered) return;
         FKismetEditorUtilities::UnregisterAutoBlueprintNodeCreation(this);
@@ -145,10 +132,6 @@ private:
                 const FScopedTransaction Transaction(LOCTEXT("RefreshHierarchyTransaction", "Refresh Native HUD Hierarchies"));
                 UNativeWidgetDesignerLibrary::RefreshOpenNativeWidgetHierarchies(true);
             })));
-
-        // [TEMPORARY MATERIAL PATCHER - BEGIN]
-        V3DTempMaterialPatcher::RegisterMenuEntry(Section);
-        // [TEMPORARY MATERIAL PATCHER - END]
     }
 
     TWeakObjectPtr<UAssetEditorSubsystem> AssetEditors;

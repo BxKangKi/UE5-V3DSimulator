@@ -127,6 +127,8 @@ public:
 
     /** Stops new work, rejects queued operations, and begins draining active callbacks. */
     static void BeginShutdown();
+    /** Clears the shutdown latch on module (re)startup (e.g. Live Coding / Hot Reload). */
+    static void ResetForStartup();
 
     /** Waits for active native operations and deferred cache releases before module unload. */
     static bool FlushPendingOperations(double TimeoutSeconds);

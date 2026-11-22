@@ -1842,6 +1842,12 @@ void FSafeFileIO::DeleteFilesAsync(
         });
 }
 
+void FSafeFileIO::ResetForStartup()
+{
+    SafeFileIOPrivate::FState& State = SafeFileIOPrivate::GetState();
+    State.ShutdownFlag.Reset();
+}
+
 void FSafeFileIO::BeginShutdown()
 {
     SafeFileIOPrivate::FState& State = SafeFileIOPrivate::GetState();

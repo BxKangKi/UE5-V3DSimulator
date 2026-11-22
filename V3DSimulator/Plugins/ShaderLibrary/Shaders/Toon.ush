@@ -52,6 +52,25 @@ void V3DToonResolveLights(
     OutPrimaryLuma = max(SunLuma, MoonLuma);
 }
 
+// Curvature-adaptive silhouette & crease outline mask for Toon meshes.
+// Produces a crisp anti-aliased outline along curved silhouettes and internal creases
+// while keeping flat surfaces clean at grazing angles.
+float V3DToonComputeOutlineMask(FMaterialPixelParameters Parameters, float3 N)
+{
+    const float3 VRaw = Parameters.CameraVector;
+    const float VLenSq = dot(VRaw, VRaw);
+    if (!isfinite(VLenSq) || VLenSq <= 1.0e-6f) return 0.0f;
+    const float3 V = VRaw * rsqrt(VLenSq);
+    const float NdotV = saturate(abs(dot(N, V)));
+
+    const float dN = length(fwidth(N));
+    const float CurvatureBoost = saturate(dN * 14.0f);
+    const float Threshold = lerp(0.14f, 0.28f, CurvatureBoost);
+    const float AA = max(fwidth(NdotV) * 1.25f, 0.025f);
+    const float Mask = 1.0f - smoothstep(Threshold - AA, Threshold + AA, NdotV);
+    return isfinite(Mask) ? saturate(Mask) : 0.0f;
+}
+
 // Shadow-receiving DefaultLit Toon BaseColor.
 // M_Toon keeps Metallic=0, Specular=0, Roughness=1 so PBR specular sheen stays zero,
 // while outputting cel-banded diffuse albedo to BaseColor lets Unreal Engine's native
@@ -87,7 +106,13 @@ float3 V3DToonComputeBaseColor(
     const float CelCompensation = lerp(1.0f, min(rcp(max(NdotL, 0.35f)), 1.65f), 0.65f * CelActive);
     const float3 BackBase = SafeAlbedo * SafeShadeTint * 0.08f;
     const float3 LitBase = SafeAlbedo * CelCompensation;
-    const float3 Result = lerp(BackBase, LitBase, EffectiveLit);
+    float3 Result = lerp(BackBase, LitBase, EffectiveLit);
+
+    // Dark ink-tinted Toon outline along silhouettes and curved creases.
+    const float OutlineMask = V3DToonComputeOutlineMask(Parameters, N);
+    const float3 OutlineBase = SafeAlbedo * SafeShadeTint * 0.08f;
+    Result = lerp(Result, OutlineBase, OutlineMask);
+
     return saturate(all(isfinite(Result)) ? Result : float3(0.0f, 0.0f, 0.0f));
 }
 
@@ -130,7 +155,12 @@ float3 V3DToonComputeShadowEmissive(
     // Reduce emissive floor on lit-facing surfaces because BaseColor already receives SkyLight indirect diffuse;
     // when a cast shadow blocks direct light on a lit-facing surface, it drops smoothly to match the self-shadow tone.
     const float FloorScale = lerp(0.85f, 0.35f, SelfLit);
-    const float3 ShadowFloor = SafeAlbedo * SafeShadeTint * (AmbientIrradiance * 0.70f + DirectIrradiance * (SafeAmbient * 0.20f)) * FloorScale;
+    float3 ShadowFloor = SafeAlbedo * SafeShadeTint * (AmbientIrradiance * 0.70f + DirectIrradiance * (SafeAmbient * 0.20f)) * FloorScale;
+
+    // Keep silhouette outline dark and crisp even inside cast/self shadows.
+    const float OutlineMask = V3DToonComputeOutlineMask(Parameters, N);
+    ShadowFloor = lerp(ShadowFloor, ShadowFloor * 0.14f, OutlineMask);
+
     const float3 FinalColor = ShadowFloor + SafeEmissive;
     return max(all(isfinite(FinalColor)) ? FinalColor : float3(0.0f, 0.0f, 0.0f), 0.0f);
 }
@@ -197,7 +227,9 @@ float3 V3DToonComputeShading(
     const float3 ShadowColor = SafeAlbedo * SafeShadeTint * (AmbientIrradiance + DirectIrradiance * (SafeAmbient * 0.45f));
     const float3 LitColor = SafeAlbedo * (AmbientIrradiance + DirectIrradiance);
 
-    const float3 FinalColor = lerp(ShadowColor, LitColor, LitMask) + SafeEmissive;
+    const float OutlineMask = V3DToonComputeOutlineMask(Parameters, N);
+    const float3 ShadedColor = lerp(ShadowColor, LitColor, LitMask);
+    const float3 FinalColor = lerp(ShadedColor, ShadowColor * 0.16f, OutlineMask) + SafeEmissive;
     return max(all(isfinite(FinalColor)) ? FinalColor : float3(0.0f, 0.0f, 0.0f), 0.0f);
 }
 

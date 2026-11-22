@@ -180,6 +180,11 @@ void FV3DStreamingBudget::Enqueue(UObject* Owner, TFunction<int64()> EstimateByt
         S.Ticker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick));
 }
 
+void FV3DStreamingBudget::ResetForStartup()
+{
+    V3DStreamingBudgetPrivate::State().bShutdown = false;
+}
+
 void FV3DStreamingBudget::Shutdown()
 {
     check(IsInGameThread());
