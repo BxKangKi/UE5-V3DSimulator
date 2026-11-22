@@ -1012,23 +1012,23 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     const float SurfaceTrans = 1.0f - Fresnel;
     const float LightScale = Daylight * SurfaceTrans;
 
-    // SEUS HRR 3 inspired clear turquoise-teal ambient equilibrium matched to clear shallow water optics.
+    // Natural average clear-blue water ambient equilibrium.
     const FLinearColor PhysicalFogAmbient(
-        0.004f * LightScale,
-        0.032f * LightScale,
-        0.052f * LightScale,
+        0.006f * LightScale,
+        0.028f * LightScale,
+        0.062f * LightScale,
         1.0f);
-    // Luminous crystalline turquoise-aqua marine in-scatter color.
+    // Balanced natural blue marine in-scatter color.
     const FLinearColor PhysicalFogScatter(
-        0.014f * LightScale,
-        0.095f * LightScale,
-        0.145f * LightScale,
+        0.018f * LightScale,
+        0.078f * LightScale,
+        0.155f * LightScale,
         1.0f);
-    // Clean sunlit turquoise waterline meniscus band.
+    // Natural sunlit clear-blue waterline meniscus band.
     const FLinearColor PhysicalBandColor(
-        0.020f * LightScale,
-        0.115f * LightScale,
-        0.165f * LightScale,
+        0.024f * LightScale,
+        0.092f * LightScale,
+        0.175f * LightScale,
         1.0f);
     // Warm sunlit-ivory to golden shaft base tint (Beer-Lambert extinction in Underwater.ush shifts with depth).
     const float WarmShift = FMath::SmoothStep(0.0f, 0.35f, SunElevationSin);

@@ -394,7 +394,7 @@ inline bool validate(const material& m,std::string& error) {
     std::set<std::string> names;
     for(const auto& p:m.scalars)if(!detail::valid_name(p.name)||!std::isfinite(p.value)||!names.insert(p.name).second)return detail::failure(error,"Invalid or duplicate scalar parameter");
     for(const auto& p:m.scalars) {
-        if(p.name=="V3D.Internal.Mode" && p.value!=0 && p.value!=1 && p.value!=3 && p.value!=5)
+        if(p.name=="V3D.Internal.Mode" && p.value!=0 && p.value!=1 && p.value!=3 && p.value!=5 && p.value!=6 && p.value!=7)
             return detail::failure(error,"Invalid material alpha policy");
         if(p.name=="V3D.Internal.Dynamic" && p.value!=0 && p.value!=1)
             return detail::failure(error,"Invalid material dynamic flag");

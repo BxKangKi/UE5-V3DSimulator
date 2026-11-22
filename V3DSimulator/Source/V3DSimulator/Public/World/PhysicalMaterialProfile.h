@@ -9,9 +9,9 @@ namespace V3DPhysicalMaterial
     struct FScalar { const TCHAR* Name; float Value; };
     struct FVectorParameter { const TCHAR* Name; FLinearColor Value; };
 
-    // Realistic ocean/lake/river surface opacity from above water (boosted at grazing angles via Fresnel);
+    // Natural average clear-water surface opacity from above water (boosted at grazing angles via Fresnel);
     // the underside still owns its transparent Snell window and opaque TIR region.
-    constexpr float WaterSurfaceOpacity = 0.42f;
+    constexpr float WaterSurfaceOpacity = 0.36f;
     inline const FScalar WaterScalars[] = {
         {TEXT("Water Opacity"), WaterSurfaceOpacity}, {TEXT("Opacity"), WaterSurfaceOpacity},
         {TEXT("Water Specular"), 0.50f}, {TEXT("Water Fresnel Specular"), 0.50f},
@@ -31,13 +31,13 @@ namespace V3DPhysicalMaterial
         {TEXT("Water Distant Normal Offset"), 2500.0f}, {TEXT("Water Distant Normal Length"), 10000.0f}
     };
     // Native SingleLayerWater coefficients in inverse centimeters (UE world units).
-    // Tuned for natural ocean/lake/river depth attenuation so shallow beds read subtly while deeper water turns rich and opaque.
-    inline const FLinearColor WaterAbsorption(0.0045f, 0.00145f, 0.00095f, 1.0f);
-    inline const FLinearColor WaterScattering(0.000045f, 0.00018f, 0.00024f, 1.0f);
+    // Balanced average natural clear-blue water optics (neither murky dark teal nor overly stylized cyan).
+    inline const FLinearColor WaterAbsorption(0.0028f, 0.00105f, 0.00058f, 1.0f);
+    inline const FLinearColor WaterScattering(0.000035f, 0.00011f, 0.00021f, 1.0f);
     inline const FVectorParameter WaterVectors[] = {
         {TEXT("AbsorptionCoefficients"), WaterAbsorption}, {TEXT("Absorption"), WaterAbsorption},
         {TEXT("ScatteringCoefficients"), WaterScattering}, {TEXT("Scattering"), WaterScattering},
-        {TEXT("Water Albedo"), FLinearColor(0.012f, 0.052f, 0.072f, 1.0f)},
+        {TEXT("Water Albedo"), FLinearColor(0.018f, 0.065f, 0.125f, 1.0f)},
         {TEXT("ColorScaleBehindWater"), FLinearColor::White}
     };
 

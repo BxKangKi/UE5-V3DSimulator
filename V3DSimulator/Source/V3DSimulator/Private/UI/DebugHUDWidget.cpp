@@ -51,19 +51,34 @@ void UDebugHUDWidget::BuildNativeLayout()
     UBorder* Panel = AddPanel(PanelSize, FVector2D::ZeroVector);
     UOverlay* Body = WidgetTree->ConstructWidget<UOverlay>();
     Panel->SetContent(Body);
-    NativeDiagnostics = AddText(Body, FText::GetEmpty());
-    NativeDiagnostics->SetAutoWrapText(true);
-    NativeDiagnostics->SetJustification(ETextJustify::Right);
-    if (UOverlaySlot* DiagnosticsSlot = Cast<UOverlaySlot>(NativeDiagnostics->Slot))
+
+    NativeDiagnosticsBox = WidgetTree->ConstructWidget<UBorder>();
+    NativeDiagnosticsBox->SetVisibility(ESlateVisibility::HitTestInvisible);
+    NativeDiagnosticsBox->SetPadding(FMargin(18.f, 14.f));
+    NativeDiagnosticsBox->SetBrushColor(DiagnosticsBoxColor);
+    if (UOverlaySlot* BoxSlot = Body->AddChildToOverlay(NativeDiagnosticsBox))
     {
-        DiagnosticsSlot->SetHorizontalAlignment(HAlign_Fill);
-        DiagnosticsSlot->SetVerticalAlignment(VAlign_Center);
+        BoxSlot->SetHorizontalAlignment(HAlign_Right);
+        BoxSlot->SetVerticalAlignment(VAlign_Center);
+        BoxSlot->SetPadding(FMargin(24.f));
     }
+
+    NativeDiagnostics = AddText(NativeDiagnosticsBox, FText::GetEmpty());
+    NativeDiagnostics->SetAutoWrapText(false);
+    NativeDiagnostics->SetJustification(ETextJustify::Right);
 }
 
 void UDebugHUDWidget::ApplyNativeStyle()
 {
     Super::ApplyNativeStyle();
+    if (IsValid(NativeDiagnosticsBox))
+    {
+        NativeDiagnosticsBox->SetBrushColor(DiagnosticsBoxColor);
+    }
+    if (IsValid(NativeDiagnostics))
+    {
+        NativeDiagnostics->SetColorAndOpacity(FSlateColor(DiagnosticsTextColor));
+    }
 #if WITH_EDITOR
     if (IsDesignTime() && IsValid(NativeDiagnostics))
         NativeDiagnostics->SetText(NSLOCTEXT("V3DHUD", "DebugPreview", "CPU: Example CPU (10 cores)\nGPU: Example GPU\nMemory: 2048 / 32768 MB\nFPS: 60.0  Average: 60.0\nCharacter: X 0.0  Y 0.0  Z 90.0 cm\nCharacter rotation: Pitch 0.0  Yaw 45.0  Roll 0.0 deg\nCamera: X 0.0  Y 0.0  Z 180.0 cm\nCamera rotation: Pitch -10.0  Yaw 45.0  Roll 0.0 deg\nVelocity: X 3.0  Y 4.0  Z 0.0 m/s\nSpeed: 5.0 m/s\nNetwork: Standalone\nWorld: Ready"));

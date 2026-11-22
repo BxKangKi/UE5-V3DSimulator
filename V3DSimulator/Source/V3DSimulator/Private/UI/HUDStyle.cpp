@@ -11,6 +11,18 @@
 namespace
 {
     constexpr const TCHAR* MainFontAssetPath = TEXT("/Game/Resources/Fonts/FT_Pretendard.FT_Pretendard");
+
+    FSlateBrush MakeOutlinedBoxBrush(const FLinearColor& FillColor, const FLinearColor& OutlineColor,
+        const float CornerRadius = 5.f, const float OutlineWidth = 2.f)
+    {
+        FSlateBrush Brush = FSlateColorBrush(FillColor);
+        Brush.DrawAs = ESlateBrushDrawType::RoundedBox;
+        Brush.OutlineSettings.CornerRadii = FVector4(CornerRadius, CornerRadius, CornerRadius, CornerRadius);
+        Brush.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+        Brush.OutlineSettings.Color = FSlateColor(OutlineColor);
+        Brush.OutlineSettings.Width = OutlineWidth;
+        return Brush;
+    }
 }
 
 UObject* V3DHUDStyle::FindFontForConstructor()
@@ -146,25 +158,44 @@ void V3DHUDStyle::ApplyComboBox(UComboBoxString& Combo, const FAuthoringPalette&
 void V3DHUDStyle::ApplyCheckBox(UCheckBox& CheckBox, const FAuthoringPalette& Palette,
     UObject* FontObject, int32 FontSize, int32 OutlineSize)
 {
+    const bool bDarkPalette = Palette.Background.R < 0.25f;
+    const FLinearColor UncheckedFill = Palette.Input;
+    const FLinearColor UncheckedHover = Palette.Hover;
+    const FLinearColor UncheckedBorder = bDarkPalette
+        ? FLinearColor(0.42f, 0.48f, 0.60f, 1.f)
+        : FLinearColor(0.45f, 0.54f, 0.66f, 1.f);
+
+    const FLinearColor CheckedFill = bDarkPalette
+        ? FLinearColor(0.16f, 0.46f, 0.84f, 1.f)
+        : FLinearColor(0.14f, 0.44f, 0.82f, 1.f);
+    const FLinearColor CheckedHover = bDarkPalette
+        ? FLinearColor(0.24f, 0.56f, 0.94f, 1.f)
+        : FLinearColor(0.22f, 0.53f, 0.92f, 1.f);
+    const FLinearColor CheckedPressed = bDarkPalette
+        ? FLinearColor(0.11f, 0.35f, 0.68f, 1.f)
+        : FLinearColor(0.10f, 0.34f, 0.66f, 1.f);
+    const FLinearColor CheckedBorder = bDarkPalette
+        ? FLinearColor(0.55f, 0.80f, 1.0f, 1.f)
+        : FLinearColor(0.08f, 0.28f, 0.58f, 1.f);
+    const FLinearColor CheckedText(0.98f, 0.99f, 1.0f, 1.f);
+
     FCheckBoxStyle Style = CheckBox.GetWidgetStyle();
     Style.CheckBoxType = ESlateCheckBoxType::ToggleButton;
-    Style.UncheckedImage = FSlateColorBrush(Palette.Panel);
-    Style.UncheckedHoveredImage = FSlateColorBrush(Palette.Hover);
-    Style.UncheckedPressedImage = FSlateColorBrush(Palette.Pressed);
-    Style.CheckedImage = FSlateColorBrush(Palette.Selection);
-    Style.CheckedHoveredImage = FSlateColorBrush(Palette.Hover);
-    Style.CheckedPressedImage = FSlateColorBrush(Palette.Pressed);
-    Style.UndeterminedImage = FSlateColorBrush(Palette.Panel);
-    Style.UndeterminedHoveredImage = FSlateColorBrush(Palette.Hover);
-    Style.UndeterminedPressedImage = FSlateColorBrush(Palette.Pressed);
-    Style.UncheckedImage.DrawAs = Style.UncheckedHoveredImage.DrawAs = Style.UncheckedPressedImage.DrawAs =
-        Style.CheckedImage.DrawAs = Style.CheckedHoveredImage.DrawAs = Style.CheckedPressedImage.DrawAs =
-        Style.UndeterminedImage.DrawAs = Style.UndeterminedHoveredImage.DrawAs = Style.UndeterminedPressedImage.DrawAs =
-        ESlateBrushDrawType::Box;
+    Style.UncheckedImage = MakeOutlinedBoxBrush(UncheckedFill, UncheckedBorder, 6.f, 2.f);
+    Style.UncheckedHoveredImage = MakeOutlinedBoxBrush(UncheckedHover, CheckedBorder, 6.f, 2.f);
+    Style.UncheckedPressedImage = MakeOutlinedBoxBrush(Palette.Pressed, CheckedBorder, 6.f, 2.f);
+    Style.CheckedImage = MakeOutlinedBoxBrush(CheckedFill, CheckedBorder, 6.f, 2.f);
+    Style.CheckedHoveredImage = MakeOutlinedBoxBrush(CheckedHover, CheckedBorder, 6.f, 2.f);
+    Style.CheckedPressedImage = MakeOutlinedBoxBrush(CheckedPressed, CheckedBorder, 6.f, 2.f);
+    Style.UndeterminedImage = MakeOutlinedBoxBrush(Palette.Panel, UncheckedBorder, 6.f, 2.f);
+    Style.UndeterminedHoveredImage = MakeOutlinedBoxBrush(UncheckedHover, CheckedBorder, 6.f, 2.f);
+    Style.UndeterminedPressedImage = MakeOutlinedBoxBrush(Palette.Pressed, CheckedBorder, 6.f, 2.f);
     Style.Padding = FMargin(16.f, 10.f);
-    Style.ForegroundColor = Style.HoveredForeground = Style.PressedForeground =
-        Style.CheckedForeground = Style.CheckedHoveredForeground = Style.CheckedPressedForeground =
-        Style.UndeterminedForeground = FSlateColor(Palette.Text);
+    Style.ForegroundColor = FSlateColor(Palette.Muted);
+    Style.HoveredForeground = FSlateColor(Palette.Text);
+    Style.PressedForeground = FSlateColor(Palette.Text);
+    Style.CheckedForeground = Style.CheckedHoveredForeground = Style.CheckedPressedForeground = FSlateColor(CheckedText);
+    Style.UndeterminedForeground = FSlateColor(Palette.Text);
     V3DWidgetStyle::SetOwnedStyle(CheckBox, Style);
 
     if (UTextBlock* Label = Cast<UTextBlock>(CheckBox.GetContent()))
@@ -172,6 +203,6 @@ void V3DHUDStyle::ApplyCheckBox(UCheckBox& CheckBox, const FAuthoringPalette& Pa
         FSlateFontInfo Font = Label->GetFont();
         ApplyFont(Font, FontObject, FontSize, OutlineSize);
         Label->SetFont(Font);
-        Label->SetColorAndOpacity(FSlateColor(Palette.Text));
+        Label->SetColorAndOpacity(FSlateColor::UseForeground());
     }
 }

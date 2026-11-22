@@ -30,12 +30,12 @@
 // deep water (both character & seafloor) darkens naturally into deep marine navy.
 // SEUS HRR 3 inspired clear ocean optics: crystal-clear shallow water where the seabed is
 // clearly visible, transitioning into luminous turquoise-teal mid-depth and deep clear blue-teal.
-static const float3 UW_WATER_ABSORPTION = float3(0.00095f, 0.00024f, 0.00014f);
-static const float3 UW_WATER_SCATTERING = float3(0.000006f, 0.000032f, 0.000046f);
-static const float3 UW_WATER_EXTINCTION = float3(0.000956f, 0.000272f, 0.000186f);
+static const float3 UW_WATER_ABSORPTION = float3(0.00085f, 0.00028f, 0.00013f);
+static const float3 UW_WATER_SCATTERING = float3(0.000008f, 0.000028f, 0.000052f);
+static const float3 UW_WATER_EXTINCTION = float3(0.000858f, 0.000308f, 0.000182f);
 // Pre-multiplied by log2(e) = 1.44269504f so inner loops use single-instruction exp2().
-static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.00137922f, 0.00039241f, 0.00026834f);
-static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.006276f, 0.117647f, 0.247312f);
+static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.00123783f, 0.00044435f, 0.00026257f);
+static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.009324f, 0.090909f, 0.285714f);
 static const float  UW_WATER_IOR = 1.3333f;
 static const float  UW_WATER_INV_IOR = 0.75001875f;
 static const float  UW_WATER_F0 = 0.0204f; // ((1.3333 - 1) / (1.3333 + 1))^2
@@ -323,7 +323,7 @@ float4 UW_UnderWaterShaftCore(
     const float2 WaveTime2 = float2(0.0f, -Time * 0.05f);
 
     // Physically-based SEUS HRR 3 sunlit aqua-gold shaft scattering albedo.
-    const float3 EffectiveScatterAlbedo = UW_WATER_SCATTER_ALBEDO * 1.85f + float3(0.018f, 0.055f, 0.068f);
+    const float3 EffectiveScatterAlbedo = UW_WATER_SCATTER_ALBEDO * 1.80f + float3(0.020f, 0.048f, 0.082f);
 
     float3 Accumulated = 0.0f;
     float3 PrevTransmittance = float3(1.0f, 1.0f, 1.0f);
@@ -552,7 +552,7 @@ float4 UW_UnderWaterHazeCore(
     const float clampedCamDepth = max(cameraWaterDepth, 0.0f);
     const float downwellingPathCam = clampedCamDepth * invCosWater * 0.75f;
     const float3 directDownwelling = sunTint * (effectiveDaylight * surfaceTrans * 0.85f) * exp2(-UW_WATER_EXTINCTION_LOG2 * downwellingPathCam);
-    const float3 daySkyDownwelling = float3(0.05f, 0.20f, 0.28f) * (0.22f * effectiveDaylight);
+    const float3 daySkyDownwelling = float3(0.06f, 0.16f, 0.30f) * (0.22f * effectiveDaylight);
     const float3 nightSkyDownwelling = moonLightColor * (0.04f * effectiveMoonlight);
     const float3 skyDownwelling = (daySkyDownwelling + nightSkyDownwelling) * exp2(-UW_WATER_EXTINCTION_LOG2 * (clampedCamDepth * 0.85f));
     const float3 inScatterRadiance = (directDownwelling + skyDownwelling) * UW_WATER_SCATTER_ALBEDO;

@@ -6,6 +6,7 @@
 #include "UI/ResponsiveHUDWidget.h"
 #include "DebugHUDWidget.generated.h"
 
+class UBorder;
 class UTextBlock;
 
 /** Low-frequency hardware, pawn motion and active-camera diagnostics; designer preview is world-free. */
@@ -26,7 +27,16 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Debug HUD", meta=(ClampMin="0.1", ClampMax="2.0"))
     float RefreshIntervalSeconds = 0.25f;
 
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Debug HUD")
+    FLinearColor DiagnosticsBoxColor = FLinearColor(0.03f, 0.04f, 0.06f, 0.72f);
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Debug HUD")
+    FLinearColor DiagnosticsTextColor = FLinearColor(0.96f, 0.98f, 1.0f, 1.0f);
+
 private:
+    UPROPERTY(Transient)
+    TObjectPtr<UBorder> NativeDiagnosticsBox;
+
     UPROPERTY(Transient)
     TObjectPtr<UTextBlock> NativeDiagnostics;
 
