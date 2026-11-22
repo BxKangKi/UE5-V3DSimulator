@@ -1,8 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-#ifndef SKYBOX_USH
-#define SKYBOX_USH
+#ifndef SKYBOX_HLSL
+#define SKYBOX_HLSL
 #pragma once
-// /Plugin/ShaderLibrary/Skybox.ush
+// /Plugin/ShaderLibrary/Skybox.hlsl
 
 // Shared by the sun and textured moon: same angular support and edge coverage.
 float V3DSkyDiskMask(float cosAngle, float radius)

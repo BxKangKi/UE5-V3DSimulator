@@ -20,6 +20,9 @@ bool FV3DFogValidationTest::RunTest(const FString&)
     TestEqual(TEXT("Clear default density is reduced"), Config.Global[V3DFog::Density], .0005f);
     TestEqual(TEXT("Rain default density is reduced"), Config.Resolve(NAME_None, TEXT("rain"), 1.f)[V3DFog::Density], .0015f);
     TestEqual(TEXT("Snow default density is reduced"), Config.Resolve(NAME_None, TEXT("snow"), 1.f)[V3DFog::Density], .0025f);
+    TestEqual(TEXT("Default fog inscattering R is realistic"), Config.Global[V3DFog::ColorR], .025f);
+    TestEqual(TEXT("Default fog inscattering G is realistic"), Config.Global[V3DFog::ColorG], .035f);
+    TestEqual(TEXT("Default fog inscattering B is realistic"), Config.Global[V3DFog::ColorB], .048f);
     const auto Good = FSafeFileIO::ParseJsonText(TEXT(R"JSON({"Version":1,"TransitionSeconds":2,
       "Global":{"Density":0.02,"HeightFalloff":0.001,"ScatteringDistribution":-0.9},
       "BiomeProfiles":{"Forest":{"Density":0.06,"Color":[0.2,0.3,0.4]}},

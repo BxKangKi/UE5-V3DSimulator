@@ -847,7 +847,10 @@ void AWorldEnvManager::UpdateFogProfile(float DeltaSeconds)
     Fog->SetFogHeightFalloff(Profile[HeightFalloff]);
     Fog->SetStartDistance(Profile[StartDistanceCm]);
     Fog->SetFogMaxOpacity(Profile[MaxOpacity]);
-    Fog->SetFogInscatteringColor(FLinearColor(Profile[ColorR], Profile[ColorG], Profile[ColorB]));
+    const FLinearColor InscatteringColor(Profile[ColorR], Profile[ColorG], Profile[ColorB]);
+    Fog->SetFogInscatteringColor(InscatteringColor);
+    Fog->SetDirectionalInscatteringColor(FLinearColor(
+        InscatteringColor.R * 0.35f, InscatteringColor.G * 0.35f, InscatteringColor.B * 0.35f));
     Fog->SetVolumetricFogScatteringDistribution(Profile[ScatteringDistribution]);
     Fog->SetVolumetricFogExtinctionScale(Profile[ExtinctionScale]);
     Fog->SetVolumetricFogDistance(Profile[ViewDistanceCm]);
@@ -1007,7 +1010,7 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     const float OneMinusCos = 1.0f - CosAir;
     const float Fresnel = 0.0204f + (1.0f - 0.0204f) * FMath::Pow(OneMinusCos, 5.0f);
     const float SurfaceTrans = 1.0f - Fresnel;
-    const float LightScale = 0.0015f + 0.9985f * Daylight * SurfaceTrans;
+    const float LightScale = Daylight * SurfaceTrans;
 
     // SEUS HRR 3 inspired clear turquoise-teal ambient equilibrium matched to clear shallow water optics.
     const FLinearColor PhysicalFogAmbient(
@@ -1030,9 +1033,9 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     // Warm sunlit-ivory to golden shaft base tint (Beer-Lambert extinction in Underwater.ush shifts with depth).
     const float WarmShift = FMath::SmoothStep(0.0f, 0.35f, SunElevationSin);
     const FLinearColor PhysicalShaftColor(
-        FMath::Lerp(1.00f, 0.96f, WarmShift),
-        FMath::Lerp(0.84f, 0.98f, WarmShift),
-        FMath::Lerp(0.62f, 0.94f, WarmShift),
+        FMath::Lerp(1.00f, 0.96f, WarmShift) * Daylight,
+        FMath::Lerp(0.84f, 0.98f, WarmShift) * Daylight,
+        FMath::Lerp(0.62f, 0.94f, WarmShift) * Daylight,
         1.0f);
 
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Fog Ambient Color"), PhysicalFogAmbient);

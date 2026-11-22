@@ -146,12 +146,16 @@ void UWorldSelectionWidget::BuildNativeLayout()
     auto AddNavigation = [this, Header](const FText& Text, bool bRight)
     {
         UButton* Button = AddButton(Header, Text);
-        UOverlaySlot* Slot = Cast<UOverlaySlot>(Button->GetParent()->Slot);
-        Slot->SetPadding(bRight ? FMargin(0.0f, 0.0f, 32.0f, 0.0f) : FMargin(32.0f, 0.0f, 0.0f, 0.0f));
-        Slot->SetHorizontalAlignment(bRight ? HAlign_Right : HAlign_Left);
-        Slot->SetVerticalAlignment(VAlign_Center);
-        if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(Button->GetContent()->Slot))
-            ContentSlot->SetPadding(FMargin(12.0f));
+        if (UWidget* ParentWidget = Button ? Button->GetParent() : nullptr)
+            if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(ParentWidget->Slot))
+            {
+                OverlaySlot->SetPadding(bRight ? FMargin(0.0f, 0.0f, 32.0f, 0.0f) : FMargin(32.0f, 0.0f, 0.0f, 0.0f));
+                OverlaySlot->SetHorizontalAlignment(bRight ? HAlign_Right : HAlign_Left);
+                OverlaySlot->SetVerticalAlignment(VAlign_Center);
+            }
+        if (UWidget* ContentWidget = Button ? Button->GetContent() : nullptr)
+            if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(ContentWidget->Slot))
+                ContentSlot->SetPadding(FMargin(12.0f));
         if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
         {
             Label->SetMinDesiredWidth(128.0f);

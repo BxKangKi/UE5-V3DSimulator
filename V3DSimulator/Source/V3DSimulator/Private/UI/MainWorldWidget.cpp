@@ -792,6 +792,10 @@ UMultiplayerMenuWidget::UMultiplayerMenuWidget(const FObjectInitializer& ObjectI
     : Super(ObjectInitializer)
 {
     ScreenMode = EMainWorldScreen::Multiplayer;
+    TitleFontSize = 44;
+    BodyFontSize = 24;
+    ButtonHeight = 52.0f;
+    PanelPadding = 28.0f;
 }
 
 void UMainWorldWidget::BuildNativeLayout()
@@ -808,6 +812,7 @@ void UMainWorldWidget::BuildNativeLayout()
     NativeServerAddress = nullptr;
     NativeWorldChoice = nullptr;
     NativeMenuTitle = nullptr;
+    NativeMultiplayerCard = nullptr;
     NativeTitleBounds = nullptr;
     NativeTitleImage = nullptr;
     SetIsFocusable(true);
@@ -818,24 +823,37 @@ void UMainWorldWidget::BuildNativeLayout()
     const bool bMultiplayer = ScreenMode == EMainWorldScreen::Multiplayer;
     if (bMultiplayer)
     {
-        NativeMenuTitle = AddText(Layout, NSLOCTEXT("V3DMenu", "MultiplayerTitle", "Multiplayer"), true);
-        NativeMenuTitle->SetJustification(ETextJustify::Center);
-        UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(NativeMenuTitle->Slot);
-        TitleSlot->SetHorizontalAlignment(HAlign_Center);
-        TitleSlot->SetVerticalAlignment(VAlign_Top);
-
         USizeBox* FormSize = WidgetTree->ConstructWidget<USizeBox>();
-        FormSize->SetMinDesiredWidth(768.0f);
+        FormSize->SetMinDesiredWidth(540.0f);
+        FormSize->SetMaxDesiredWidth(600.0f);
         UOverlaySlot* FormSlot = Layout->AddChildToOverlay(FormSize);
-        FormSlot->SetPadding(FMargin(32.0f, 160.0f, 32.0f, 32.0f));
-        FormSlot->SetHorizontalAlignment(HAlign_Left);
-        FormSlot->SetVerticalAlignment(VAlign_Top);
+        FormSlot->SetPadding(FMargin(24.0f));
+        FormSlot->SetHorizontalAlignment(HAlign_Center);
+        FormSlot->SetVerticalAlignment(VAlign_Center);
+
+        UBorder* Card = WidgetTree->ConstructWidget<UBorder>();
+        NativeMultiplayerCard = Card;
+        Card->SetBrushColor(PanelColor);
+        Card->SetPadding(FMargin(28.0f, 24.0f));
+        FormSize->SetContent(Card);
+
         UVerticalBox* Box = WidgetTree->ConstructWidget<UVerticalBox>();
-        FormSize->SetContent(Box);
+        Card->SetContent(Box);
+
+        NativeMenuTitle = AddText(Box, NSLOCTEXT("V3DMenu", "MultiplayerTitle", "Multiplayer"), true);
+        NativeMenuTitle->SetJustification(ETextJustify::Center);
+        if (UVerticalBoxSlot* TitleBoxSlot = Cast<UVerticalBoxSlot>(NativeMenuTitle->Slot))
+        {
+            TitleBoxSlot->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 16.0f));
+        }
+
         AddText(Box, NSLOCTEXT("V3DMenu", "HostWorldLabel", "World to host"));
+        USizeBox* WorldChoiceSize = WidgetTree->ConstructWidget<USizeBox>();
+        WorldChoiceSize->SetMinDesiredHeight(46.0f);
+        Box->AddChildToVerticalBox(WorldChoiceSize)->SetPadding(FMargin(0.0f, 4.0f, 0.0f, 12.0f));
         NativeWorldChoice = WidgetTree->ConstructWidget<UComboBoxString>();
         NativeWorldChoice->OnGenerateWidgetEvent.BindDynamic(this, &UMainWorldWidget::GenerateNativeWorldChoice);
-        Box->AddChildToVerticalBox(NativeWorldChoice)->SetPadding(FMargin(0.0f, 8.0f));
+        WorldChoiceSize->SetContent(NativeWorldChoice);
 #if WITH_EDITOR
         if (IsDesignTime())
         {
@@ -844,10 +862,14 @@ void UMainWorldWidget::BuildNativeLayout()
         }
 #endif
         AddText(Box, NSLOCTEXT("V3DMenu", "ServerAddressLabel", "Server address"));
+        USizeBox* ServerAddressSize = WidgetTree->ConstructWidget<USizeBox>();
+        ServerAddressSize->SetMinDesiredHeight(46.0f);
+        Box->AddChildToVerticalBox(ServerAddressSize)->SetPadding(FMargin(0.0f, 4.0f, 0.0f, 16.0f));
         NativeServerAddress = WidgetTree->ConstructWidget<UEditableTextBox>();
         NativeServerAddress->SetHintText(NSLOCTEXT("V3DMenu", "ServerAddressHint", "127.0.0.1:7777"));
         NativeServerAddress->SetText(FText::FromString(ServerAddress));
-        Box->AddChildToVerticalBox(NativeServerAddress)->SetPadding(FMargin(0.0f, 8.0f));
+        ServerAddressSize->SetContent(NativeServerAddress);
+
         NativeHost = AddButton(Box, NSLOCTEXT("V3DMenu", "HostWorld", "Host selected world"));
         NativeJoin = AddButton(Box, NSLOCTEXT("V3DMenu", "JoinServer", "Join server"));
         NativeClient = AddButton(Box, NSLOCTEXT("V3DMenu", "ClientWorld", "Open client connection world"));
@@ -934,33 +956,26 @@ void UMainWorldWidget::ApplyNativeStyle()
         NativeTitleBounds->SetWidthOverride(FMath::Clamp(Width, 8.0, Resolution.X * .6));
         NativeTitleBounds->SetHeightOverride(FMath::Clamp(Height, 8.0, Resolution.Y * .25));
     }
+    const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);
+    if (IsValid(NativeMultiplayerCard))
+    {
+        NativeMultiplayerCard->SetBrushColor(Palette.Panel);
+    }
     if (NativeMenuTitle && ScreenMode == EMainWorldScreen::Start)
     {
-        NativeMenuTitle->SetColorAndOpacity(FSlateColor(FLinearColor::Black));
+        NativeMenuTitle->SetColorAndOpacity(FSlateColor(TextColor));
         FSlateFontInfo Font = NativeMenuTitle->GetFont();
-        Font.OutlineSettings.OutlineSize = 0;
+        Font.OutlineSettings.OutlineSize = FontOutlineSize;
         NativeMenuTitle->SetFont(Font);
     }
     if (NativeServerAddress)
     {
-        FEditableTextBoxStyle Style = NativeServerAddress->GetWidgetStyle();
-        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
-        Style.BackgroundImageNormal.TintColor = FSlateColor(ButtonColor);
-        Style.BackgroundImageHovered.TintColor = FSlateColor(ButtonColor * .8f);
-        Style.BackgroundImageFocused.TintColor = FSlateColor(ButtonColor);
-        Style.ForegroundColor = FSlateColor(TextColor);
-        Style.FocusedForegroundColor = FSlateColor(TextColor);
-        V3DWidgetStyle::SetOwnedStyle(*NativeServerAddress, Style);
-        NativeServerAddress->SetForegroundColor(TextColor);
+        V3DHUDStyle::ApplyEditableTextBox(*NativeServerAddress, Palette, FontObject, BodyFontSize, FontOutlineSize);
     }
     if (NativeWorldChoice)
     {
-        FComboBoxStyle Style = NativeWorldChoice->GetWidgetStyle();
-        Style.ComboButtonStyle.ButtonStyle.Normal.TintColor = FSlateColor(ButtonColor);
-        Style.ComboButtonStyle.ButtonStyle.Hovered.TintColor = FSlateColor(HoveredButtonTint);
-        Style.ComboButtonStyle.ButtonStyle.Pressed.TintColor = FSlateColor(ButtonColor * .5f);
-        Style.ComboButtonStyle.DownArrowImage.TintColor = FSlateColor(TextColor);
-        V3DWidgetStyle::SetOwnedStyle(*NativeWorldChoice, Style);
+        V3DHUDStyle::ApplyComboBox(*NativeWorldChoice, Palette, bDarkMode);
         NativeWorldChoice->RefreshOptions();
     }
 }

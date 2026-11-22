@@ -41,7 +41,7 @@ UDebugHUDWidget::UDebugHUDWidget(const FObjectInitializer& ObjectInitializer)
 {
     PanelSize = FVector2D(1920.f, 1080.f);
     BodyFontSize = 15;
-    FontOutlineSize = 1;
+    FontOutlineSize = 0;
     BackgroundColor = FLinearColor::Transparent;
     SetVisibility(ESlateVisibility::HitTestInvisible);
 }

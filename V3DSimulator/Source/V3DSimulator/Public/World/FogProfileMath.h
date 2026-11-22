@@ -17,8 +17,8 @@ namespace V3DFog
     struct FProfile
     {
         std::array<float, FieldCount> Values = {
-            .0005f, .2f, 2000.f, .75f, .55f, .64f, .72f, .25f, .8f,
-            8000.f, .92f, .94f, .96f
+            .0005f, .2f, 2000.f, .75f, .025f, .035f, .048f, .25f, .8f,
+            8000.f, .78f, .82f, .86f
         };
         float& operator[](EField Field) { return Values[Field]; }
         float operator[](EField Field) const { return Values[Field]; }

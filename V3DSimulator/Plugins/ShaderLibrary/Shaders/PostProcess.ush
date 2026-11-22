@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-#ifndef SHADERLIBRARY_POSTPROCESS_USH
-#define SHADERLIBRARY_POSTPROCESS_USH
+#ifndef SHADERLIBRARY_POSTPROCESS_HLSL
+#define SHADERLIBRARY_POSTPROCESS_HLSL
 
 // Entry point used by PP_Weather. Cel shading is not part of this pass.
 float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation, float Time)

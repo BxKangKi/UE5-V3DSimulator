@@ -174,10 +174,11 @@ void UMenuButtonWidget::ApplyNativeStyle()
     NativeRoot->SetMinDesiredHeight(FMath::Clamp(FMath::IsFinite(ButtonMinSize.Y) ? ButtonMinSize.Y : 64.0, 1.0, 16384.0));
     if (IsValid(NativeButton))
     {
-        V3DHUDStyle::ApplyButton(*NativeButton, BackgroundColor);
-        FButtonStyle Style = NativeButton->GetStyle();
-        Style.Hovered.TintColor = FSlateColor(AccentColor);
-        V3DWidgetStyle::SetOwnedStyle(*NativeButton, Style);
+        if (!IsValid(FontObject))
+        {
+            FontObject = V3DHUDStyle::FindFontRuntime();
+        }
+        V3DHUDStyle::ApplyButton(*NativeButton, BackgroundColor, AccentColor);
         if (UButtonSlot* ButtonSlot = Cast<UButtonSlot>(NativeLabel ? NativeLabel->Slot : nullptr))
         {
             ButtonSlot->SetPadding(ContentPadding);

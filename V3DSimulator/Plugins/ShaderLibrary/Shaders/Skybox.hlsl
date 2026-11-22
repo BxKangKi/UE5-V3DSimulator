@@ -1,0 +1,110 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+#ifndef SKYBOX_HLSL
+#define SKYBOX_HLSL
+#pragma once
+// /Plugin/ShaderLibrary/Skybox.hlsl
+
+// Shared by the sun and textured moon: same angular support and edge coverage.
+float V3DSkyDiskMask(float cosAngle, float radius)
+{
+    if (!isfinite(cosAngle) || !isfinite(radius) || !(radius > 0.0f)) return 0.0f;
+    radius = clamp(radius, 0.0001f, 0.2f);
+    cosAngle = clamp(cosAngle, -1.0f, 1.0f);
+    if (cosAngle < cos(radius)) return 0.0f;
+    const float radial = sqrt(max(0.0f, (1.0f - cosAngle) * (1.0f + cosAngle))) / max(sin(radius), 1.0e-4f);
+    return 1.0f - smoothstep(0.94f, 1.0f, radial);
+}
+
+float V3DCelestialCoverage(float3 viewDirection, float3 bodyDirection, float radius, float visibility)
+{
+    const float v2 = dot(viewDirection, viewDirection);
+    const float b2 = dot(bodyDirection, bodyDirection);
+    if (!isfinite(v2) || !isfinite(b2) || !(v2 > 1.0e-8f) || !(b2 > 1.0e-8f)
+        || !isfinite(visibility)) return 0.0f;
+    return V3DSkyDiskMask(dot(viewDirection * rsqrt(v2), bodyDirection * rsqrt(b2)), radius)
+        * clamp(visibility, 0.0f, 1.0f);
+}
+
+float3 V3DMoonRadiance(float3 textureColor, float brightness, float exposure)
+{
+    if (!all(isfinite(textureColor)) || !isfinite(brightness) || !isfinite(exposure)
+        || !(exposure > 0.0f)) return (float3)0;
+    // Apply exposure compensation to the actual texture, before any sky brightness.
+    // Linear texture contrast is retained; the display contribution stays below HDR bloom.
+    return clamp(textureColor, 0.0f, 1.0f) * clamp(brightness, 0.0f, 0.65f) / max(exposure, 1.0e-6f);
+}
+
+float3 V3DComposeMoon(float3 background, float3 moonRadiance, float coverage)
+{
+    const float alpha = isfinite(coverage) ? clamp(coverage, 0.0f, 1.0f) : 0.0f;
+    if (alpha <= 0.0f) return background;
+    if (alpha >= 1.0f) return moonRadiance;
+    // Composite after sky brightness, stars and atmosphere, never add them over the disk.
+    return background * (1.0f - alpha) + moonRadiance * alpha;
+}
+
+float3 MoonUV(float3 viewDir, float3 lightDir, float size, float intensity)
+{
+    // Zero/invalid directions or disk sizes must not poison a full-screen sky pixel with NaN.
+    const float viewLengthSq = dot(viewDir, viewDir);
+    const float lightLengthSq = dot(lightDir, lightDir);
+    if (!isfinite(viewLengthSq) || !isfinite(lightLengthSq)
+        || !(viewLengthSq > 1.0e-8f) || !(lightLengthSq > 1.0e-8f)
+        || !isfinite(size) || !isfinite(intensity)
+        || !(size > 0.0f) || !(intensity > 0.0f)) return (float3)0;
+    const float3 V = viewDir * rsqrt(viewLengthSq);
+    const float3 M = lightDir * rsqrt(lightLengthSq);
+
+    const float cosA = dot(V, M);
+    const float radius = clamp(size, 0.0001f, 0.2f);
+    const float cosR = cos(radius);
+
+    [branch] if (cosA >= cosR)
+    {
+        // Branchless orthonormal basis without pole flipping.
+        const float sign_z = (M.z >= 0.0f) ? 1.0f : -1.0f;
+        const float a = -1.0f / (sign_z + M.z);
+        const float b = M.x * M.y * a;
+
+        const float3 right = float3(1.0f + sign_z * M.x * M.x * a, sign_z * b, -sign_z * M.x);
+        const float3 upDir = float3(b, sign_z + M.y * M.y * a, -M.y);
+
+        // Guard against sin(size) == 0 when size is 0 or PI.
+        const float invS = rcp(max(sin(radius), 1.0e-4f));
+        const float2 diskCoord = float2(dot(V, right), dot(V, upDir)) * invS;
+
+        // The shared angular mask is the sole coverage test. A second UV-radius test can
+        // disagree at small angles after float rounding and clip the moon's edge early.
+        const float edgeAlpha = V3DSkyDiskMask(cosA, radius);
+        const float safeIntensity = clamp(intensity, 0.0f, 1.0f) * edgeAlpha;
+        return float3(clamp(diskCoord * 0.5f + 0.5f, 0.0f, 1.0f), safeIntensity);
+    }
+
+    return (float3)0;
+}
+
+float2 StarUV(float3 ViewDir, float3 MoonDir)
+{
+    const float viewLengthSq = dot(ViewDir, ViewDir);
+    const float moonLengthSq = dot(MoonDir, MoonDir);
+    if (!isfinite(viewLengthSq) || !isfinite(moonLengthSq)
+        || !(viewLengthSq > 1.0e-8f) || !(moonLengthSq > 1.0e-8f)) return (float2)0;
+    const float3 V = ViewDir * rsqrt(viewLengthSq);
+    const float3 M = MoonDir * rsqrt(moonLengthSq);
+
+    const float s = (M.z >= 0.0f) ? 1.0f : -1.0f;
+    const float a = -1.0f / (s + M.z);
+    const float b = M.x * M.y * a;
+    const float3 east = float3(1.0f + s * M.x * M.x * a, s * b, -s * M.x);
+    const float3 north = float3(b, s + M.y * M.y * a, -M.y);
+
+    const float2 localXY = float2(dot(V, east), dot(V, north));
+    const float dist = length(localXY);
+
+    // Clamp dist to 1.0 so floating-point rounding never passes >1.0 into asin() and produces NaN.
+    const float2 uv = (dist > 0.001f) ? (localXY / dist) * asin(min(dist, 1.0f)) : (float2)0;
+
+    return uv * 0.5f + 0.5f;
+}
+
+#endif

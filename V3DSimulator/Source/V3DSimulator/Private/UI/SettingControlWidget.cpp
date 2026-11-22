@@ -22,27 +22,6 @@
 #include "Components/Widget.h"
 #include "Brushes/SlateColorBrush.h"
 
-namespace
-{
-    void ApplySettingRowComboTheme(UComboBoxString* Dropdown, FLinearColor Panel, FLinearColor Accent, FLinearColor Text)
-    {
-        FComboBoxStyle Style = Dropdown->GetWidgetStyle();
-        Style.ComboButtonStyle.ButtonStyle.Normal = FSlateColorBrush(Panel);
-        Style.ComboButtonStyle.ButtonStyle.Hovered = FSlateColorBrush(Accent);
-        Style.ComboButtonStyle.ButtonStyle.Pressed = FSlateColorBrush(
-            FLinearColor(Panel.R * .5f, Panel.G * .5f, Panel.B * .5f, Panel.A));
-        Style.ComboButtonStyle.DownArrowImage.ImageSize = FVector2D(32.f, 32.f);
-        Style.ComboButtonStyle.DownArrowImage.TintColor = FSlateColor(Text);
-        Style.ComboButtonStyle.MenuBorderPadding = FMargin(5.f);
-        Style.MenuRowPadding = FMargin(4.f);
-        V3DWidgetStyle::SetOwnedStyle(*Dropdown, Style);
-        FTableRowStyle Item = Dropdown->GetItemStyle();
-        Item.TextColor = FSlateColor(Text);
-        Item.SelectedTextColor = FSlateColor(Text);
-        V3DWidgetStyle::SetOwnedItemStyle(*Dropdown, Item);
-    }
-}
-
 USettingControlWidget::USettingControlWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
@@ -620,15 +599,19 @@ void USettingControlWidget::ApplyNativeRowStyle()
         Text->SetFont(Font);
         Text->SetColorAndOpacity(FSlateColor(TextColor));
     }
+    if (!IsValid(FontObject))
+    {
+        FontObject = V3DHUDStyle::FindFontRuntime();
+    }
     if (UButton* Button = Cast<UButton>(NativeControl))
     {
-        V3DHUDStyle::ApplyButton(*Button, PanelColor);
-        FButtonStyle Style = Button->GetStyle();
-        Style.Hovered.TintColor = FSlateColor(AccentColor);
-        V3DWidgetStyle::SetOwnedStyle(*Button, Style);
+        V3DHUDStyle::ApplyButton(*Button, PanelColor, AccentColor);
     }
     if (UComboBoxString* Dropdown = Cast<UComboBoxString>(NativeControl))
-        ApplySettingRowComboTheme(Dropdown, PanelColor, AccentColor, TextColor);
+    {
+        const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
+        V3DHUDStyle::ApplyComboBox(*Dropdown, V3DHUDStyle::GetAuthoringPalette(bDarkMode), bDarkMode);
+    }
 }
 
 void UFloatSettingWidget::ApplyNativeRowStyle()
@@ -636,6 +619,10 @@ void UFloatSettingWidget::ApplyNativeRowStyle()
     Super::ApplyNativeRowStyle();
     USlider* Slider = bUseNativeLayout ? Cast<USlider>(NativeControl) : nullptr;
     if (!IsValid(Slider)) return;
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(V3DHUDStyle::IsDarkMode(this));
+    SliderBarColor = Palette.Panel;
+    SliderHoveredBarColor = Palette.Hover;
+    SliderHandleColor = Palette.Selection;
     FSliderStyle Style = Slider->GetWidgetStyle();
     Style.NormalBarImage.TintColor = FSlateColor(SliderBarColor);
     Style.HoveredBarImage.TintColor = FSlateColor(SliderHoveredBarColor);

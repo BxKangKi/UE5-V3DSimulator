@@ -1619,6 +1619,14 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     {
         Material->SetScalarParameterValue(FName(*Override.Key), Override.Value);
     }
+    if (Selection.Family == 2)
+    {
+        // Keep Toon surfaces matte dielectric so indirect lighting never creates a metallic look,
+        // while DefaultLit continues to cast/receive shadows and respond to Directional Light brightness.
+        Material->SetScalarParameterValue(TEXT("metallicFactor"), 0.0f);
+        Material->SetScalarParameterValue(TEXT("specularFactor"), 0.0f);
+        Material->SetScalarParameterValue(TEXT("roughnessFactor"), 1.0f);
+    }
     for (const FGWorldBakedVectorParameter& Parameter : Baked.Vectors)
     {
         Material->SetVectorParameterValue(FName(*Parameter.Name), Parameter.Value);

@@ -1,11 +1,11 @@
-#ifndef NIAGARA_USH
-#define NIAGARA_USH
+#ifndef NIAGARA_HLSL
+#define NIAGARA_HLSL
 
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Niagara.ush
 #pragma once
 
-// /Plugin/ShaderLibrary/Niagara.ush
+// /Plugin/ShaderLibrary/Niagara.hlsl
 
 float2 WorldToUV(float3 POSITION, float4x4 MATRIX_VAR)
 {

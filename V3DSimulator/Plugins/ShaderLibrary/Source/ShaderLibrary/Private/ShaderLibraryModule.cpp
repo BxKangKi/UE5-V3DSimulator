@@ -1,6 +1,8 @@
 #include "ShaderLibraryModule.h"
 
 #include "Interfaces/IPluginManager.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "ShaderCore.h"
 
@@ -32,6 +34,25 @@ void FShaderLibraryModule::StartupModule()
         return;
     }
 
+#if WITH_EDITOR
+    {
+        TArray<FString> HlslFiles;
+        IFileManager::Get().FindFiles(HlslFiles, *FPaths::Combine(ShaderDirectory, TEXT("*.hlsl")), true, false);
+        for (const FString& FileName : HlslFiles)
+        {
+            const FString HlslPath = FPaths::Combine(ShaderDirectory, FileName);
+            const FString UshPath = FPaths::ChangeExtension(HlslPath, TEXT("ush"));
+            TArray<uint8> SrcBytes, DstBytes;
+            if (FFileHelper::LoadFileToArray(SrcBytes, *HlslPath))
+            {
+                if (!FFileHelper::LoadFileToArray(DstBytes, *UshPath) || SrcBytes != DstBytes)
+                {
+                    FFileHelper::SaveArrayToFile(SrcBytes, *UshPath);
+                }
+            }
+        }
+    }
+#endif
     AddShaderSourceDirectoryMapping(TEXT("/Plugin/ShaderLibrary"), ShaderDirectory);
 #if WITH_EDITOR
     // Content packages cannot be loaded during PostConfigInit. Upgrade the existing asset only

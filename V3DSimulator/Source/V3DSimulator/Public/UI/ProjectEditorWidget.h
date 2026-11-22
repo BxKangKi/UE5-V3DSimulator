@@ -22,9 +22,7 @@ class V3DSIMULATOR_API UProjectEditorWidget : public UUserWidget
 public:
     UProjectEditorWidget(const FObjectInitializer& ObjectInitializer);
     void OpenProject(const FString& ProjectName);
-    void SetDarkMode(bool bInDarkMode);
     bool IsDarkMode() const { return bDarkMode; }
-    void ToggleDarkMode();
     FSimpleDelegate OnClosed;
     virtual void ReleaseSlateResources(bool bReleaseChildren) override;
     virtual void NativeDestruct() override;
@@ -45,7 +43,6 @@ private:
     V3DHUDStyle::FAuthoringPalette GetThemePalette() const;
     void ApplyEditorTheme();
     TSharedRef<SWidget> MakeEditorButton(const TCHAR* Label, TFunction<void()> Action);
-    TSharedRef<SWidget> MakeDynamicEditorButton(TFunction<FText()> LabelGetter, TFunction<void()> Action);
     void InvalidatePreview();
     void QueueFormRefresh();
     bool bFormRefreshPending = false;

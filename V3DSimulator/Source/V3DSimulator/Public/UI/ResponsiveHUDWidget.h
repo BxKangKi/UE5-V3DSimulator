@@ -49,28 +49,28 @@ public:
     TObjectPtr<UObject> FontObject;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance", meta=(ClampMin="0", ClampMax="8"))
-    int32 FontOutlineSize = 2;
+    int32 FontOutlineSize = 0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor BackgroundColor = FLinearColor(.830770f, .830770f, .830770f, 1.f);
+    FLinearColor BackgroundColor = FLinearColor(.91f, .93f, .96f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
     FLinearColor PanelColor = FLinearColor::Transparent;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor ButtonColor = FLinearColor(.318547f, .391573f, .462077f, 1.f);
+    FLinearColor ButtonColor = FLinearColor(.64f, .77f, .91f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor HoveredButtonTint = FLinearColor(.8f, .8f, .8f, 1.f);
+    FLinearColor HoveredButtonTint = FLinearColor(.78f, .86f, .96f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor AccentColor = FLinearColor(.318547f, .391573f, .462077f, 1.f);
+    FLinearColor AccentColor = FLinearColor(.50f, .70f, .91f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor TextColor = FLinearColor::White;
+    FLinearColor TextColor = FLinearColor(.018f, .028f, .05f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor MutedTextColor = FLinearColor(.9f, .9f, .9f, 1.f);
+    FLinearColor MutedTextColor = FLinearColor(.15f, .20f, .28f, 1.f);
 
     UFUNCTION(BlueprintPure, Category="HUD|Layout")
     bool IsUsingNativeLayout() const;
@@ -108,6 +108,8 @@ protected:
         FVector2D Anchors = FVector2D(0.5, 0.5), FVector2D Alignment = FVector2D(0.5, 0.5));
     UTextBlock* AddText(UPanelWidget* Parent, const FText& Text, bool bTitle = false);
     UButton* AddButton(UPanelWidget* Parent, const FText& Text);
+
+    UBorder* GetNativeBackground() const { return NativeBackground.Get(); }
 
     UPROPERTY(Transient)
     TObjectPtr<UCanvasPanel> NativeLayout;

@@ -25,7 +25,7 @@ ULoadingHUDWidget::ULoadingHUDWidget(const FObjectInitializer& ObjectInitializer
     BackgroundColor = V3DHUDStyle::LoadingBackground;
     AccentColor = V3DHUDStyle::ProgressFill;
     BodyFontSize = 32;
-    FontOutlineSize = 1;
+    FontOutlineSize = 0;
     SetIsFocusable(true);
 }
 

@@ -2,6 +2,8 @@
 #include "UI/ResponsiveHUDWidget.h"
 #include "UI/HUDStyle.h"
 #include "UI/NativeWidgetTreeNames.h"
+#include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
 
 #include "Blueprint/WidgetTree.h"
 #include "Components/Border.h"
@@ -209,6 +211,37 @@ UButton* UResponsiveHUDWidget::AddButton(UPanelWidget* Parent, const FText& Text
 
 void UResponsiveHUDWidget::ApplyNativeStyle()
 {
+    if (!IsValid(FontObject))
+    {
+        FontObject = V3DHUDStyle::FindFontRuntime();
+    }
+    bool bDarkMode = false;
+    if (const UGameManagerSubSystem* Manager = UGameManagerSubSystem::FindGameManager(this))
+    {
+        if (const UGameSettings* Settings = Manager->GetGameSettings())
+        {
+            bDarkMode = Settings->bEditorDarkMode;
+        }
+    }
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);
+    if (BackgroundColor.A >= 0.99f)
+    {
+        BackgroundColor = Palette.Background;
+    }
+    else if (BackgroundColor.A > 0.01f)
+    {
+        BackgroundColor = Palette.ModalScrim;
+    }
+    if (PanelColor.A > 0.01f)
+    {
+        PanelColor = FLinearColor(Palette.Panel.R, Palette.Panel.G, Palette.Panel.B, PanelColor.A);
+    }
+    ButtonColor = Palette.Button;
+    HoveredButtonTint = Palette.Hover;
+    AccentColor = Palette.Selection;
+    TextColor = Palette.Text;
+    MutedTextColor = Palette.Muted;
+
     const FVector2D Resolution = GetSafeDesignResolution();
     if (NativeReferenceSize)
     {

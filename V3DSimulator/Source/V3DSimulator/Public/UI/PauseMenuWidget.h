@@ -13,6 +13,7 @@
 #include "UI/ResponsiveHUDWidget.h"
 #include "PauseMenuWidget.generated.h"
 
+class UBackgroundBlur;
 class UButton;
 class UTextBlock;
 
@@ -29,7 +30,10 @@ class V3DSIMULATOR_API UPauseMenuWidget : public UResponsiveHUDWidget
 
 public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance")
-    FLinearColor PauseAccentColor = FLinearColor(.1f, .3f, .7f, .3f);
+    FLinearColor PauseAccentColor = FLinearColor(.82f, .87f, .92f, .94f);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance", meta=(ClampMin="0.0", ClampMax="64.0"))
+    float BackdropBlurStrength = 10.0f;
 
     UPauseMenuWidget(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
@@ -75,6 +79,7 @@ private:
     TWeakObjectPtr<UButton> AssignedSettingsButton;
     TWeakObjectPtr<UButton> AssignedExitButton;
 
+    UPROPERTY(Transient) TObjectPtr<UBackgroundBlur> NativeBackgroundBlur;
     UPROPERTY(Transient) TObjectPtr<UBorder> NativePanel;
     UPROPERTY(Transient) TObjectPtr<UBorder> NativePauseAccent;
     UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeTitle;

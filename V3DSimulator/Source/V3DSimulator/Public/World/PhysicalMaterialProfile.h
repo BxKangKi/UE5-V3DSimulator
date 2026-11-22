@@ -26,8 +26,8 @@ namespace V3DPhysicalMaterial
         {TEXT("Critical Angle Dot"), 0.6814166f}, {TEXT("Critical Angle Width"), 0.04f},
         {TEXT("CausticsMaxIntensity"), 1.0f},
         {TEXT("Default Near Water Scale"), 1024.0f}, {TEXT("Default Distant Water Scale"), 3500.0f},
-        {TEXT("Default Near Normal Strength"), 0.16f},
-        {TEXT("Default Distant Normal Strength"), 0.12f}, {TEXT("Default Distant Normal StrengthB"), 0.12f},
+        {TEXT("Default Near Normal Strength"), 0.24f},
+        {TEXT("Default Distant Normal Strength"), 0.16f}, {TEXT("Default Distant Normal StrengthB"), 0.16f},
         {TEXT("Water Distant Normal Offset"), 2500.0f}, {TEXT("Water Distant Normal Length"), 10000.0f}
     };
     // Native SingleLayerWater coefficients in inverse centimeters (UE world units).

@@ -1,8 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-#ifndef UNDERWATER_USH
-#define UNDERWATER_USH
+#ifndef UNDERWATER_HLSL
+#define UNDERWATER_HLSL
 #pragma once
-// /Plugin/ShaderLibrary/Underwater.ush
+// /Plugin/ShaderLibrary/Underwater.hlsl
 
 // Fallback scene-texture & shading-model IDs for Material Function preview / non-PP permutations.
 #ifndef PPI_SceneDepth
@@ -41,17 +41,6 @@ static const float  UW_WATER_INV_IOR = 0.75001875f;
 static const float  UW_WATER_F0 = 0.0204f; // ((1.3333 - 1) / (1.3333 + 1))^2
 static const float  UW_MAX_VALID_DEPTH_CM = 1.0e7f; // 100 km safe finite far-plane ceiling (avoids ConvertFromDeviceZ(0) / 0).
 
-// Unified ViewportUV -> SceneTextureUV helper for legacy callers without FMaterialPixelParameters.
-float2 UW_ToSceneTextureUV(float2 ViewportUV, uint SceneTextureId)
-{
-#if POST_PROCESS_MATERIAL || NEEDS_SCENE_TEXTURES
-    return ClampSceneTextureUV(
-        ViewportUVToSceneTextureUV(saturate(ViewportUV), SceneTextureId), SceneTextureId);
-#else
-    return saturate(ViewportUV);
-#endif
-}
-
 float UW_SceneDepthAtUV(float2 SceneTextureUV)
 {
 #if POST_PROCESS_MATERIAL || NEEDS_SCENE_TEXTURES
@@ -68,16 +57,6 @@ float4 UW_SceneColorAtUV(float2 SceneTextureUV)
 #else
     return float4(0.0f, 0.0f, 0.0f, 1.0f);
 #endif
-}
-
-float UW_SceneDepth(float2 ViewportUV)
-{
-    return UW_SceneDepthAtUV(UW_ToSceneTextureUV(ViewportUV, PPI_SceneDepth));
-}
-
-float4 UW_SceneColor(float2 ViewportUV)
-{
-    return UW_SceneColorAtUV(UW_ToSceneTextureUV(ViewportUV, PPI_PostProcessInput0));
 }
 
 bool UW_ValidSolidDepth(float Depth)
@@ -104,15 +83,6 @@ float UW_ShaftDepthFromUVs(float2 DepthUV, float2 CustomDepthUV, float2 ShadingM
 #endif
 }
 
-float UW_ShaftDepth(float2 ViewportUV)
-{
-    const float2 ClampedUV = saturate(ViewportUV);
-    return UW_ShaftDepthFromUVs(
-        UW_ToSceneTextureUV(ClampedUV, PPI_SceneDepth),
-        UW_ToSceneTextureUV(ClampedUV, PPI_CustomDepth),
-        UW_ToSceneTextureUV(ClampedUV, PPI_ShadingModelID));
-}
-
 float UW_ShaftRayLength(float SolidViewDepth, float ViewCosine, float RayUp, float CameraWaterDepth)
 {
     if (!(SolidViewDepth > 0.0f) || !(ViewCosine > 1.0e-4f) || !(CameraWaterDepth > 0.0f))
@@ -120,15 +90,6 @@ float UW_ShaftRayLength(float SolidViewDepth, float ViewCosine, float RayUp, flo
     float End = min(max(SolidViewDepth - 1.0f, 0.0f) / ViewCosine, 10000.0f);
     if (RayUp > 1.0e-5f) End = min(End, CameraWaterDepth / RayUp);
     return max(End, 0.0f);
-}
-
-float3 UW_ReconstructViewRay(float2 ViewportUV, float3 CameraTS)
-{
-    const float2 ScreenPosition = (ViewportUV * 2.0f - 1.0f) * float2(1.0f, -1.0f);
-    const float4 Probe = mul(float4(ScreenPosition * 1000.0f, 1000.0f, 1.0f), ResolvedView.ScreenToTranslatedWorld);
-    const float3 RayVector = Probe.xyz * rcp(max(abs(Probe.w), 1.0e-6f)) - CameraTS;
-    const float RayLenSq = dot(RayVector, RayVector);
-    return (isfinite(RayLenSq) && RayLenSq > 1.0e-8f) ? (RayVector * rsqrt(RayLenSq)) : ResolvedView.ViewForward;
 }
 
 float3 UW_GetViewRayFromParams(FMaterialPixelParameters Parameters)
@@ -454,89 +415,6 @@ float4 UnderWaterShaftMatrixWithParams(
         ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler, ShadowParams);
 }
 
-// Legacy matrix entry point (for un-migrated callers without FMaterialPixelParameters)
-float4 UnderWaterShaftMatrix(
-    Texture2D ShadowNear, SamplerState ShadowNearSampler,
-    Texture2D ShadowFar, SamplerState ShadowFarSampler,
-    float4x4 ShadowParams)
-{
-    const float3 CameraTS = ResolvedView.TranslatedWorldCameraOrigin;
-    const float2 AlignedUV = saturate(float2(ShadowParams[2].w, ShadowParams[3].w));
-    const float3 Ray = UW_ReconstructViewRay(AlignedUV, CameraTS);
-    const float SolidDepth = UW_ShaftDepth(AlignedUV);
-    return UW_UnderWaterShaftCore(Ray, SolidDepth, AlignedUV * ResolvedView.ViewSizeAndInvSize.xy,
-        ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler, ShadowParams);
-}
-
-// Backward-compatible overloads (float4 and float3 NearOrigin) so legacy / un-migrated
-// Material Functions compile without errors before Editor migration runs.
-float4 UnderWaterShaft(
-    float2 ScreenUV,
-    float WaterLevel,
-    Texture2D ShadowNear, SamplerState ShadowNearSampler,
-    Texture2D ShadowFar, SamplerState ShadowFarSampler,
-    float4 ShadowNearOriginAndReady,
-    float3 ShadowFarOrigin,
-    float3 ShadowRight,
-    float3 ShadowForward)
-{
-    const float4x4 ShadowParams = float4x4(
-        ShadowNearOriginAndReady,
-        float4(ShadowFarOrigin, WaterLevel),
-        float4(ShadowRight, ScreenUV.x),
-        float4(ShadowForward, ScreenUV.y)
-    );
-    return UnderWaterShaftMatrix(ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler, ShadowParams);
-}
-
-float4 UnderWaterShaft(
-    float2 ScreenUV,
-    float WaterLevel,
-    Texture2D ShadowNear, SamplerState ShadowNearSampler,
-    Texture2D ShadowFar, SamplerState ShadowFarSampler,
-    float3 ShadowNearOrigin,
-    float3 ShadowFarOrigin,
-    float3 ShadowRight,
-    float3 ShadowForward)
-{
-    const float Ready = (dot(ShadowForward, ShadowForward) > 1.0e-6f) ? 1.0f : 0.0f;
-    const float4x4 ShadowParams = float4x4(
-        float4(ShadowNearOrigin, Ready),
-        float4(ShadowFarOrigin, WaterLevel),
-        float4(ShadowRight, ScreenUV.x),
-        float4(ShadowForward, ScreenUV.y)
-    );
-    return UnderWaterShaftMatrix(ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler, ShadowParams);
-}
-
-float4 UnderWaterShaftCompact(
-    float2 ScreenUV,
-    float WaterLevel,
-    Texture2D ShadowNear, SamplerState ShadowNearSampler,
-    Texture2D ShadowFar, SamplerState ShadowFarSampler,
-    float4 ShadowNearOriginAndReady,
-    float3 ShadowFarOrigin,
-    float3 ShadowRight,
-    float3 ShadowForward)
-{
-    return UnderWaterShaft(ScreenUV, WaterLevel, ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler,
-        ShadowNearOriginAndReady, ShadowFarOrigin, ShadowRight, ShadowForward);
-}
-
-float4 UnderWaterShaftCompact(
-    float2 ScreenUV,
-    float WaterLevel,
-    Texture2D ShadowNear, SamplerState ShadowNearSampler,
-    Texture2D ShadowFar, SamplerState ShadowFarSampler,
-    float3 ShadowNearOrigin,
-    float3 ShadowFarOrigin,
-    float3 ShadowRight,
-    float3 ShadowForward)
-{
-    return UnderWaterShaft(ScreenUV, WaterLevel, ShadowNear, ShadowNearSampler, ShadowFar, ShadowFarSampler,
-        ShadowNearOrigin, ShadowFarOrigin, ShadowRight, ShadowForward);
-}
-
 // -----------------------------------------------------------------------------
 // Shared core for underwater haze, bilateral blur, and Beer-Lambert attenuation
 // -----------------------------------------------------------------------------
@@ -646,28 +524,36 @@ float4 UW_UnderWaterHazeCore(
     const float sinWaterSq = (1.0f - satSunEl * satSunEl) * (UW_WATER_INV_IOR * UW_WATER_INV_IOR);
     const float invCosWater = rsqrt(max(1.0f - sinWaterSq, 0.15f));
 
-    // Track actual world day/night illumination (sun + moon) so underwater brightness
-    // genuinely darkens at night instead of glowing like daytime.
+    // Track actual directional light energy (sun + moon) and rendered environment brightness
+    // so underwater NEVER glows artificial blue when external lighting is absent or dark.
+    const float3 sunLightColor = max(all(isfinite(ResolvedView.AtmosphereLightIlluminanceOnGroundPostTransmittance[0].rgb))
+        ? ResolvedView.AtmosphereLightIlluminanceOnGroundPostTransmittance[0].rgb : float3(0.0f, 0.0f, 0.0f), 0.0f);
+    const float sunEnergy = dot(sunLightColor, float3(0.2126f, 0.7152f, 0.0722f));
+    const float effectiveDaylight = daylight * saturate(sunEnergy * 0.65f);
+
     const float3 moonDirAir = ResolvedView.AtmosphereLightDirection[1].xyz;
     const float moonLenSq = dot(moonDirAir, moonDirAir);
     const float moonElevation = (isfinite(moonLenSq) && moonLenSq > 1.0e-6f) ? (moonDirAir.z * rsqrt(moonLenSq)) : 0.0f;
-    const float moonlight = smoothstep(-0.04f, 0.22f, moonElevation) * (1.0f - daylight);
-    const float worldLightScale = lerp(0.18f + 0.14f * moonlight, 1.0f, daylight);
+    const float3 moonLightColor = max(all(isfinite(ResolvedView.AtmosphereLightIlluminanceOnGroundPostTransmittance[1].rgb))
+        ? ResolvedView.AtmosphereLightIlluminanceOnGroundPostTransmittance[1].rgb : float3(0.0f, 0.0f, 0.0f), 0.0f);
+    const float moonEnergy = dot(moonLightColor, float3(0.2126f, 0.7152f, 0.0722f));
+    const float effectiveMoonlight = smoothstep(-0.04f, 0.22f, moonElevation) * (1.0f - effectiveDaylight) * saturate(moonEnergy * 8.0f);
 
-    // 1) Downwelling Beer-Lambert attenuation scaled by real world daylight/nighttime brightness.
-    const float sunPathToPixel = pixelWaterDepth * invCosWater * 0.65f;
+    // 1) Pure physical Beer-Lambert attenuation of the already world-lit scene color.
+    // Preserves real environment illumination (sunlight, moonlight, torches, or pitch darkness).
+    const float sunPathToPixel = pixelWaterDepth * invCosWater * 0.55f;
     const float3 surfaceDepthAtten = bValidSolid
-        ? (exp2(-UW_WATER_EXTINCTION_LOG2 * sunPathToPixel) * worldLightScale + float3(0.004f, 0.014f, 0.020f) * daylight)
-        : float3(1.0f, 1.0f, 1.0f);
+        ? exp2(-UW_WATER_EXTINCTION_LOG2 * sunPathToPixel)
+        : float3(effectiveDaylight + effectiveMoonlight * 0.05f, effectiveDaylight + effectiveMoonlight * 0.05f, effectiveDaylight + effectiveMoonlight * 0.05f);
     const float3 attenuatedScene = col.rgb * saturate(surfaceDepthAtten);
 
-    // 2) View-ray Beer-Lambert transmission + world-lit volumetric in-scattering
-    // (luminous SEUS HRR 3 turquoise-teal in daylight; deep dim midnight-indigo at night).
+    // 2) View-ray Beer-Lambert transmission + strictly light-driven volumetric in-scattering.
+    // Zero external light -> zero in-scatter radiance (no self-luminous blue haze under AutoExposure).
     const float clampedCamDepth = max(cameraWaterDepth, 0.0f);
     const float downwellingPathCam = clampedCamDepth * invCosWater * 0.75f;
-    const float3 directDownwelling = sunTint * (daylight * surfaceTrans * 0.95f) * exp2(-UW_WATER_EXTINCTION_LOG2 * downwellingPathCam);
-    const float3 daySkyDownwelling = float3(0.05f, 0.22f, 0.30f) * (0.28f * daylight);
-    const float3 nightSkyDownwelling = float3(0.006f, 0.016f, 0.034f) * ((0.0012f + 0.0040f * moonlight) * (1.0f - daylight));
+    const float3 directDownwelling = sunTint * (effectiveDaylight * surfaceTrans * 0.85f) * exp2(-UW_WATER_EXTINCTION_LOG2 * downwellingPathCam);
+    const float3 daySkyDownwelling = float3(0.05f, 0.20f, 0.28f) * (0.22f * effectiveDaylight);
+    const float3 nightSkyDownwelling = moonLightColor * (0.04f * effectiveMoonlight);
     const float3 skyDownwelling = (daySkyDownwelling + nightSkyDownwelling) * exp2(-UW_WATER_EXTINCTION_LOG2 * (clampedCamDepth * 0.85f));
     const float3 inScatterRadiance = (directDownwelling + skyDownwelling) * UW_WATER_SCATTER_ALBEDO;
 
@@ -692,30 +578,6 @@ float4 UnderWaterHazeWithParams(FMaterialPixelParameters Parameters, float Water
 #endif
     const float3 viewRay = UW_GetViewRayFromParams(Parameters);
     return UW_UnderWaterHazeCore(ColorUV, DepthUV, viewRay, WaterLevel);
-}
-
-// Legacy entry points (for un-migrated callers without FMaterialPixelParameters)
-float4 UnderWaterHaze(float3 ScreenUVAndWaterLevel)
-{
-    const float2 AlignedUV = saturate(ScreenUVAndWaterLevel.xy);
-    const float WaterLevel = ScreenUVAndWaterLevel.z;
-    const float3 cameraPosTS = ResolvedView.TranslatedWorldCameraOrigin;
-    const float3 viewRay = UW_ReconstructViewRay(AlignedUV, cameraPosTS);
-    return UW_UnderWaterHazeCore(
-        UW_ToSceneTextureUV(AlignedUV, PPI_PostProcessInput0),
-        UW_ToSceneTextureUV(AlignedUV, PPI_SceneDepth),
-        viewRay,
-        WaterLevel);
-}
-
-float4 UnderWaterHaze(float2 ScreenUV, float WaterLevel)
-{
-    return UnderWaterHaze(float3(ScreenUV, WaterLevel));
-}
-
-float4 UnderWaterHazeCompact(float2 ScreenUV, float WaterLevel)
-{
-    return UnderWaterHaze(float3(ScreenUV, WaterLevel));
 }
 
 #endif

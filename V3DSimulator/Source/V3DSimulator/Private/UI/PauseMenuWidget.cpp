@@ -12,6 +12,7 @@
 #include "Character/PlayerCharacterController.h"
 #include "Components/Button.h"
 #include "Blueprint/WidgetTree.h"
+#include "Components/BackgroundBlur.h"
 #include "Components/Border.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/Overlay.h"
@@ -224,6 +225,15 @@ void UPauseMenuWidget::ExitFromUI()
 void UPauseMenuWidget::BuildNativeLayout()
 {
     SetIsFocusable(true);
+    if (UBorder* Backdrop = GetNativeBackground())
+    {
+        Backdrop->SetPadding(FMargin(0.0f));
+        NativeBackgroundBlur = WidgetTree->ConstructWidget<UBackgroundBlur>();
+        NativeBackgroundBlur->SetBlurStrength(FMath::Clamp(BackdropBlurStrength, 0.0f, 64.0f));
+        NativeBackgroundBlur->SetApplyAlphaToBlur(true);
+        NativeBackgroundBlur->SetVisibility(ESlateVisibility::HitTestInvisible);
+        Backdrop->SetContent(NativeBackgroundBlur);
+    }
     NativePanel = AddPanel(PanelSize, FVector2D::ZeroVector);
     UOverlay* Layout = WidgetTree->ConstructWidget<UOverlay>();
     NativePanel->SetContent(Layout);
@@ -271,7 +281,13 @@ void UPauseMenuWidget::BuildNativeLayout()
 void UPauseMenuWidget::ApplyNativeStyle()
 {
     Super::ApplyNativeStyle();
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(V3DHUDStyle::IsDarkMode(this));
+    PauseAccentColor = FLinearColor(Palette.Panel.R, Palette.Panel.G, Palette.Panel.B, .94f);
     if (NativePauseAccent) NativePauseAccent->SetBrushColor(PauseAccentColor);
+    if (IsValid(NativeBackgroundBlur))
+    {
+        NativeBackgroundBlur->SetBlurStrength(FMath::Clamp(BackdropBlurStrength, 0.0f, 64.0f));
+    }
 }
 
 void UPauseMenuWidget::BindNativeWidgets()

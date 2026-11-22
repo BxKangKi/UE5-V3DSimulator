@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Components/Button.h"
+#include "Components/CheckBox.h"
 #include "Components/ComboBoxString.h"
 #include "Components/EditableTextBox.h"
 #include "Components/Slider.h"
@@ -43,6 +44,13 @@ namespace V3DWidgetStyle
     inline void SetOwnedStyle(USlider& Widget, const FSliderStyle& Desired)
     {
         FSliderStyle& Owned = const_cast<FSliderStyle&>(Widget.GetWidgetStyle());
+        if (&Owned != &Desired) Owned = Desired;
+        Widget.SetWidgetStyle(Owned);
+    }
+
+    inline void SetOwnedStyle(UCheckBox& Widget, const FCheckBoxStyle& Desired)
+    {
+        FCheckBoxStyle& Owned = const_cast<FCheckBoxStyle&>(Widget.GetWidgetStyle());
         if (&Owned != &Desired) Owned = Desired;
         Widget.SetWidgetStyle(Owned);
     }

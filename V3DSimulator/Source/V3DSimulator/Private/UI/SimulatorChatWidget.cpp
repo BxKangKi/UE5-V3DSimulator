@@ -23,10 +23,10 @@ USimulatorChatWidget::USimulatorChatWidget()
     BackgroundColor = FLinearColor::Transparent;
     PanelSize = FVector2D(740, 300);
     PanelPadding = 16.f;
-    PanelColor = FLinearColor(.082754f, .082754f, .082754f, .94f);
+    PanelColor = FLinearColor(.82f, .87f, .92f, .94f);
     BodyFontSize = 18;
     TitleFontSize = 24;
-    FontOutlineSize = 1;
+    FontOutlineSize = 0;
     SetIsFocusable(true);
 }
 
@@ -65,10 +65,8 @@ void USimulatorChatWidget::ApplyNativeStyle()
     Super::ApplyNativeStyle();
     if (Input)
     {
-        FEditableTextBoxStyle Style = Input->GetWidgetStyle();
-        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
-        Style.SetForegroundColor(FSlateColor(TextColor));
-        V3DWidgetStyle::SetOwnedStyle(*Input, Style);
+        const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(V3DHUDStyle::IsDarkMode(this));
+        V3DHUDStyle::ApplyEditableTextBox(*Input, Palette, FontObject, BodyFontSize, FontOutlineSize);
     }
 }
 void USimulatorChatWidget::NativeConstruct()

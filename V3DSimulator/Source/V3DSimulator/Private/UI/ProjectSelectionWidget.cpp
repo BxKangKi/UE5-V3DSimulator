@@ -616,12 +616,16 @@ void UProjectSelectionWidget::BuildNativeLayout()
     auto AddNavigation = [this, Header](const FText& Text, bool bRight)
     {
         UButton* Button = AddButton(Header, Text);
-        UOverlaySlot* Slot = Cast<UOverlaySlot>(Button->GetParent()->Slot);
-        Slot->SetPadding(bRight ? FMargin(0.0f, 0.0f, 32.0f, 0.0f) : FMargin(32.0f, 0.0f, 0.0f, 0.0f));
-        Slot->SetHorizontalAlignment(bRight ? HAlign_Right : HAlign_Left);
-        Slot->SetVerticalAlignment(VAlign_Center);
-        if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(Button->GetContent()->Slot))
-            ContentSlot->SetPadding(FMargin(12.0f));
+        if (UWidget* ParentWidget = Button ? Button->GetParent() : nullptr)
+            if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(ParentWidget->Slot))
+            {
+                OverlaySlot->SetPadding(bRight ? FMargin(0.0f, 0.0f, 32.0f, 0.0f) : FMargin(32.0f, 0.0f, 0.0f, 0.0f));
+                OverlaySlot->SetHorizontalAlignment(bRight ? HAlign_Right : HAlign_Left);
+                OverlaySlot->SetVerticalAlignment(VAlign_Center);
+            }
+        if (UWidget* ContentWidget = Button ? Button->GetContent() : nullptr)
+            if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(ContentWidget->Slot))
+                ContentSlot->SetPadding(FMargin(12.0f));
         if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
         {
             Label->SetMinDesiredWidth(128.0f);
@@ -636,8 +640,11 @@ void UProjectSelectionWidget::BuildNativeLayout()
     UHorizontalBox* CreateControls = WidgetTree->ConstructWidget<UHorizontalBox>();
     Box->AddChildToVerticalBox(CreateControls)->SetPadding(FMargin(32.0f, 8.0f));
     UTextBlock* TypeLabel = AddText(CreateControls, NSLOCTEXT("V3DMenu", "ProjectTypeLabel", "New project type"));
-    Cast<UHorizontalBoxSlot>(TypeLabel->Slot)->SetVerticalAlignment(VAlign_Center);
-    Cast<UHorizontalBoxSlot>(TypeLabel->Slot)->SetPadding(FMargin(0.0f, 0.0f, 24.0f, 0.0f));
+    if (UHorizontalBoxSlot* TypeLabelSlot = TypeLabel ? Cast<UHorizontalBoxSlot>(TypeLabel->Slot) : nullptr)
+    {
+        TypeLabelSlot->SetVerticalAlignment(VAlign_Center);
+        TypeLabelSlot->SetPadding(FMargin(0.0f, 0.0f, 24.0f, 0.0f));
+    }
     USizeBox* TypeSize = WidgetTree->ConstructWidget<USizeBox>();
     TypeSize->SetMinDesiredWidth(320.0f);
     TypeSize->SetMinDesiredHeight(ButtonHeight);
@@ -664,9 +671,15 @@ void UProjectSelectionWidget::BuildNativeLayout()
     {
         UCheckBox* Check = WidgetTree->ConstructWidget<UCheckBox>();
         Check->SetIsChecked(bChecked);
-        Options->AddChildToHorizontalBox(Check)->SetPadding(FMargin(12, 0));
+        if (UHorizontalBoxSlot* OptionSlot = Options->AddChildToHorizontalBox(Check))
+        {
+            OptionSlot->SetPadding(FMargin(0.f, 0.f, 16.f, 0.f));
+            OptionSlot->SetVerticalAlignment(VAlign_Center);
+        }
         UTextBlock* Text = WidgetTree->ConstructWidget<UTextBlock>();
-        Text->SetText(FText::FromString(Label)); Check->SetContent(Text);
+        Text->SetText(FText::FromString(Label));
+        Text->SetJustification(ETextJustify::Center);
+        Check->SetContent(Text);
         return Check;
     };
     NewProjectAcoustics = AddOption(TEXT("World: geometry acoustics"), false);
@@ -690,27 +703,24 @@ void UProjectSelectionWidget::BuildNativeLayout()
 void UProjectSelectionWidget::ApplyNativeStyle()
 {
     Super::ApplyNativeStyle();
+    const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);
     if (NativeProjectName)
     {
-        FEditableTextBoxStyle Style = NativeProjectName->GetWidgetStyle();
-        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, BodyFontSize, FontOutlineSize);
-        Style.BackgroundImageNormal.TintColor = FSlateColor(ButtonColor);
-        Style.BackgroundImageHovered.TintColor = FSlateColor(ButtonColor * .8f);
-        Style.BackgroundImageFocused.TintColor = FSlateColor(ButtonColor);
-        Style.ForegroundColor = FSlateColor(TextColor);
-        Style.FocusedForegroundColor = FSlateColor(TextColor);
-        V3DWidgetStyle::SetOwnedStyle(*NativeProjectName, Style);
-        NativeProjectName->SetForegroundColor(TextColor);
+        V3DHUDStyle::ApplyEditableTextBox(*NativeProjectName, Palette, FontObject, BodyFontSize, FontOutlineSize);
     }
     if (NativeProjectType)
     {
-        FComboBoxStyle Style = NativeProjectType->GetWidgetStyle();
-        Style.ComboButtonStyle.ButtonStyle.Normal.TintColor = FSlateColor(ButtonColor);
-        Style.ComboButtonStyle.ButtonStyle.Hovered.TintColor = FSlateColor(HoveredButtonTint);
-        Style.ComboButtonStyle.ButtonStyle.Pressed.TintColor = FSlateColor(ButtonColor * .5f);
-        Style.ComboButtonStyle.DownArrowImage.TintColor = FSlateColor(TextColor);
-        V3DWidgetStyle::SetOwnedStyle(*NativeProjectType, Style);
+        V3DHUDStyle::ApplyComboBox(*NativeProjectType, Palette, bDarkMode);
         NativeProjectType->RefreshOptions();
+    }
+    const int32 ToggleFontSize = FMath::Clamp(FMath::RoundToInt(BodyFontSize * 0.72f), 16, 26);
+    for (UCheckBox* Toggle : { NewProjectAcoustics.Get(), NewProjectMusic.Get(), NewProjectExternalAssets.Get() })
+    {
+        if (IsValid(Toggle))
+        {
+            V3DHUDStyle::ApplyCheckBox(*Toggle, Palette, FontObject, ToggleFontSize, FontOutlineSize);
+        }
     }
 }
 

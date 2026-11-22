@@ -31,10 +31,10 @@ UCreatorHUDWidget::UCreatorHUDWidget()
     BackgroundColor = FLinearColor::Transparent;
     PanelSize = FVector2D(1080, 760);
     PanelPadding = 16.f;
-    PanelColor = FLinearColor(.082754f, .082754f, .082754f, .9f);
+    PanelColor = FLinearColor(.82f, .87f, .92f, .92f);
     BodyFontSize = 18;
     TitleFontSize = 30;
-    FontOutlineSize = 1;
+    FontOutlineSize = 0;
     ButtonHeight = 44.f;
 }
 

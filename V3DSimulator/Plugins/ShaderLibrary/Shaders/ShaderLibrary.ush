@@ -1,11 +1,11 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-#ifndef SHADER_LIBRARY_USH
-#define SHADER_LIBRARY_USH
+#ifndef SHADER_LIBRARY_HLSL
+#define SHADER_LIBRARY_HLSL
 #pragma once
 #if POST_PROCESS_MATERIAL
 #include "/Plugin/ShaderLibrary/Underwater.ush"
 #endif
-// /Plugin/ShaderLibrary/ShaderLibrary.ush
+// /Plugin/ShaderLibrary/ShaderLibrary.hlsl
 
 float InvLerp(float a, float b, float v)
 {

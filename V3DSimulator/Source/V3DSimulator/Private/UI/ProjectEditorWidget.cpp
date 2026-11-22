@@ -104,6 +104,16 @@ void UProjectEditorWidget::ApplyEditorTheme()
     V3DHUDStyle::ApplyAuthoringRows(EditorRowStyle, bDarkMode);
     EditorListStyle.BackgroundBrush = FSlateColorBrush(Palette.Input);
     EditorCheckStyle = FCoreStyle::Get().GetWidgetStyle<FCheckBoxStyle>("Checkbox");
+    EditorCheckStyle.UncheckedImage = FSlateColorBrush(Palette.Input);
+    EditorCheckStyle.UncheckedHoveredImage = FSlateColorBrush(Palette.Hover);
+    EditorCheckStyle.UncheckedPressedImage = FSlateColorBrush(Palette.Pressed);
+    EditorCheckStyle.CheckedImage = FSlateColorBrush(Palette.Selection);
+    EditorCheckStyle.CheckedHoveredImage = FSlateColorBrush(Palette.Hover);
+    EditorCheckStyle.CheckedPressedImage = FSlateColorBrush(Palette.Pressed);
+    EditorCheckStyle.UncheckedImage.ImageSize = EditorCheckStyle.UncheckedHoveredImage.ImageSize =
+        EditorCheckStyle.UncheckedPressedImage.ImageSize = EditorCheckStyle.CheckedImage.ImageSize =
+        EditorCheckStyle.CheckedHoveredImage.ImageSize = EditorCheckStyle.CheckedPressedImage.ImageSize =
+        FVector2D(20.f, 20.f);
 
     if (Raw.IsValid())
     {
@@ -115,43 +125,11 @@ void UProjectEditorWidget::ApplyEditorTheme()
     }
 }
 
-void UProjectEditorWidget::SetDarkMode(const bool bInDarkMode)
-{
-    if (bDarkMode == bInDarkMode) return;
-    bDarkMode = bInDarkMode;
-    ApplyEditorTheme();
-    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::FindGameManager(this))
-    {
-        if (UGameSettings* Settings = Manager->GetGameSettings())
-        {
-            if (Settings->bEditorDarkMode != bDarkMode)
-            {
-                Settings->bEditorDarkMode = bDarkMode;
-                Settings->SaveSettingsData();
-            }
-        }
-    }
-    QueueFormRefresh();
-    InvalidateLayoutAndVolatility();
-}
-
-void UProjectEditorWidget::ToggleDarkMode()
-{
-    SetDarkMode(!bDarkMode);
-}
-
 TSharedRef<SWidget> UProjectEditorWidget::MakeEditorButton(const TCHAR* Label, TFunction<void()> Action)
 {
     return SNew(SButton).ButtonStyle(&EditorButtonStyle).ContentPadding(FMargin(14, 9))
         .OnClicked_Lambda([Action = MoveTemp(Action)]() { Action(); return FReply::Handled(); })
         [SNew(STextBlock).TextStyle(&EditorTextStyle).Text(FText::FromString(Label))];
-}
-
-TSharedRef<SWidget> UProjectEditorWidget::MakeDynamicEditorButton(TFunction<FText()> LabelGetter, TFunction<void()> Action)
-{
-    return SNew(SButton).ButtonStyle(&EditorButtonStyle).ContentPadding(FMargin(14, 9))
-        .OnClicked_Lambda([Action = MoveTemp(Action)]() { Action(); return FReply::Handled(); })
-        [SNew(STextBlock).TextStyle(&EditorTextStyle).Text_Lambda([LabelGetter = MoveTemp(LabelGetter)]() { return LabelGetter(); })];
 }
 
 TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
@@ -208,9 +186,6 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         });
         if (!Queued) { bBusy = false; Message = TEXT("Reload queue unavailable."); }
     })];
-    Toolbar->AddSlot()[MakeDynamicEditorButton(
-        [this] { return Text(bDarkMode ? TEXT("Light Mode") : TEXT("Dark Mode")); },
-        [this] { ToggleDarkMode(); })];
     Toolbar->AddSlot()[MakeEditorButton(TEXT("Back"), [this] { RequestBack(); })];
 
     auto Left = SNew(SVerticalBox);

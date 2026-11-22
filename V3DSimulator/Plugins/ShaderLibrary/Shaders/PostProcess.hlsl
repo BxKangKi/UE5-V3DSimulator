@@ -1,0 +1,18 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+#ifndef SHADERLIBRARY_POSTPROCESS_HLSL
+#define SHADERLIBRARY_POSTPROCESS_HLSL
+
+// Entry point used by PP_Weather. Cel shading is not part of this pass.
+float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation, float Time)
+{
+    float2 SceneUV = ClampSceneTextureUV(ViewportUVToSceneTextureUV(saturate(UV), 14), 14);
+    float3 Scene = SceneTextureLookup(SceneUV, 14, false).rgb;
+    float Coverage = saturate(Precipitation);
+    [branch] if (Coverage <= 0.001f) return Scene;
+    // Preserve HDR exposure and highlights while tinting the existing scene.
+    float Luma = dot(max(Scene, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+    float3 Wet = Scene * float3(0.86f, 0.90f, 0.96f);
+    float3 Snow = lerp(Scene, Luma * float3(0.94f, 0.97f, 1.0f), 0.35f);
+    return lerp(Scene, lerp(Wet, Snow, saturate(WeatherMode)), Coverage);
+}
+#endif

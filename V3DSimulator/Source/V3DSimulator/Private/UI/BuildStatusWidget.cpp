@@ -28,7 +28,7 @@ UBuildStatusWidget::UBuildStatusWidget(const FObjectInitializer& ObjectInitializ
     AccentColor = V3DHUDStyle::ProgressFill;
     BodyFontSize = 16;
     ButtonHeight = 44.f;
-    FontOutlineSize = 1;
+    FontOutlineSize = 0;
     SetIsFocusable(true);
 }
 

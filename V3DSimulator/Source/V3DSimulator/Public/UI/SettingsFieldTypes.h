@@ -44,7 +44,8 @@ enum class ESettingsField : uint8
     MouseSensitivity UMETA(DisplayName="Mouse Sensitivity"),
     ShadowDistanceMeters UMETA(DisplayName="Shadow Distance"),
     AutoExposureMinEV UMETA(DisplayName="Auto Exposure Min EV"),
-    AutoExposureMaxEV UMETA(DisplayName="Auto Exposure Max EV")
+    AutoExposureMaxEV UMETA(DisplayName="Auto Exposure Max EV"),
+    DarkMode UMETA(DisplayName="Dark Mode")
 };
 
 UENUM(BlueprintType)

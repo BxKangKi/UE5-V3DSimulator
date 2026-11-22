@@ -274,6 +274,7 @@ private:
     TWeakObjectPtr<UButton> JoinButton;
 
     UPROPERTY(Transient) TObjectPtr<UBorder> NativeMenuPanel;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeMultiplayerCard;
     UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeMenuTitle;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeStart;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeEditor;

@@ -50,19 +50,19 @@ public:
     TObjectPtr<UObject> FontObject;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Style", meta=(ClampMin="0", ClampMax="8"))
-    int32 FontOutlineSize = 1;
+    int32 FontOutlineSize = 0;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Style", meta=(ClampMin="8", ClampMax="96"))
     int32 FontSize = 32;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Style")
-    FLinearColor TextColor = FLinearColor::White;
+    FLinearColor TextColor = FLinearColor(.018f, .028f, .05f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Style")
-    FLinearColor BackgroundColor = FLinearColor(.318547f, .391573f, .462077f, 1.f);
+    FLinearColor BackgroundColor = FLinearColor(.64f, .77f, .91f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Style")
-    FLinearColor AccentColor = FLinearColor(.8f, .8f, .8f, 1.f);
+    FLinearColor AccentColor = FLinearColor(.78f, .86f, .96f, 1.f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Preview")
     FText PreviewLabel = NSLOCTEXT("V3DUI", "ButtonPreview", "Button");

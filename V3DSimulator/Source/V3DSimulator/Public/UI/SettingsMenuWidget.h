@@ -333,6 +333,8 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleCloudFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleDarkModeFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleShadowQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings")
     void CycleShadowDistanceMetersFromUI();
@@ -470,6 +472,7 @@ private:
     bool bPendingRayTracing = true;
     bool bPendingHeightFog = true;
     bool bPendingCloud = true;
+    bool bPendingDarkMode = false;
     int32 PendingShadowQuality = 2;
     int32 PendingShadowDistanceMeters = 2048;
     int32 PendingTextureQuality = 2;

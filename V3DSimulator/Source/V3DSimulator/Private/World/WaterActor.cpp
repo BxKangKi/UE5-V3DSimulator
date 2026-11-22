@@ -67,10 +67,10 @@ namespace
         {
             return;
         }
-        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor(0.004f, 0.032f, 0.052f, 1.0f));
-        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor(0.014f, 0.095f, 0.145f, 1.0f));
-        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor(0.020f, 0.115f, 0.165f, 1.0f));
-        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor(0.96f, 0.98f, 0.94f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor::Black);
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor::Black);
+        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor::Black);
+        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor::Black);
         PostProcessMID->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
         PostProcessMID->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.0f);
     }

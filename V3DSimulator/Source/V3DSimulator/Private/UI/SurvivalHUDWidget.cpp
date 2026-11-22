@@ -13,11 +13,11 @@ USurvivalHUDWidget::USurvivalHUDWidget(const FObjectInitializer& ObjectInitializ
     : Super(ObjectInitializer)
 {
     BackgroundColor = FLinearColor::Transparent;
-    PanelColor = FLinearColor(0.025f, 0.035f, 0.05f, 0.86f);
+    PanelColor = FLinearColor(.82f, .87f, .92f, .88f);
     PanelSize = FVector2D(340.0f, 100.0f);
     PanelPadding = 16.0f;
     BodyFontSize = 22;
-    FontOutlineSize = 1;
+    FontOutlineSize = 0;
     SetVisibility(ESlateVisibility::Collapsed);
 }
 

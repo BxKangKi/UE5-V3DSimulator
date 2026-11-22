@@ -10,6 +10,7 @@
 #include "UI/SettingsMenuWidget.h"
 #include "UI/WidgetStyleSafety.h"
 #include "UI/HUDStyle.h"
+#include "UObject/UObjectIterator.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 #include "UI/SettingControlWidget.h"
@@ -31,31 +32,6 @@
 #include "Setting/ShadowDistancePolicy.h"
 #include "System/GameManagerSubSystem.h"
 #include "InputCoreTypes.h"
-
-namespace
-{
-    void ApplySettingsMenuComboTheme(UComboBoxString* Dropdown, FLinearColor Panel, FLinearColor Accent, FLinearColor Text)
-    {
-        FComboBoxStyle Style = Dropdown->GetWidgetStyle();
-        Style.ComboButtonStyle.ButtonStyle.Normal.TintColor = FSlateColor(Panel);
-        Style.ComboButtonStyle.ButtonStyle.Hovered.TintColor = FSlateColor(Accent);
-        Style.ComboButtonStyle.ButtonStyle.Pressed.TintColor = FSlateColor(Accent);
-        Style.ComboButtonStyle.MenuBorderBrush.TintColor = FSlateColor(Panel);
-        V3DWidgetStyle::SetOwnedStyle(*Dropdown, Style);
-        FTableRowStyle Item = Dropdown->GetItemStyle();
-        Item.EvenRowBackgroundBrush.TintColor = FSlateColor(Panel);
-        Item.OddRowBackgroundBrush.TintColor = FSlateColor(Panel);
-        Item.EvenRowBackgroundHoveredBrush.TintColor = FSlateColor(Accent);
-        Item.OddRowBackgroundHoveredBrush.TintColor = FSlateColor(Accent);
-        Item.ActiveBrush.TintColor = FSlateColor(Accent);
-        Item.ActiveHoveredBrush.TintColor = FSlateColor(Accent);
-        Item.InactiveBrush.TintColor = FSlateColor(Panel);
-        Item.InactiveHoveredBrush.TintColor = FSlateColor(Accent);
-        Item.TextColor = FSlateColor(Text);
-        Item.SelectedTextColor = FSlateColor(Text);
-        V3DWidgetStyle::SetOwnedItemStyle(*Dropdown, Item);
-    }
-}
 
 namespace
 {
@@ -96,6 +72,7 @@ namespace
     {
         static const TArray<ESettingsField> Fields = {
             ESettingsField::MouseSensitivity,
+            ESettingsField::DarkMode,
             ESettingsField::QualityProfile,
             ESettingsField::BloomIntensity,
             ESettingsField::BloomThreshold,
@@ -283,6 +260,7 @@ namespace
         case ESettingsField::RayTracing: return TEXT("RayTracing");
         case ESettingsField::HeightFog: return TEXT("HeightFog");
         case ESettingsField::Cloud: return TEXT("Cloud");
+        case ESettingsField::DarkMode: return TEXT("DarkMode");
         case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
         case ESettingsField::ShadowDistanceMeters: return TEXT("ShadowDistanceMeters");
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
@@ -474,7 +452,7 @@ USettingsMenuWidget::USettingsMenuWidget(const FObjectInitializer& ObjectInitial
     BodyFontSize = 24;
     TitleFontSize = 100;
     ButtonHeight = 64.f;
-    FontOutlineSize = 2;
+    FontOutlineSize = 0;
 }
 
 void USettingsMenuWidget::NativeConstruct()
@@ -869,6 +847,7 @@ ESettingsControlType USettingsMenuWidget::GetSettingControlType(ESettingsField F
     case ESettingsField::RayTracing:
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
+    case ESettingsField::DarkMode:
         return ESettingsControlType::Toggle;
 
     case ESettingsField::MouseSensitivity:
@@ -929,6 +908,7 @@ bool USettingsMenuWidget::GetPendingBooleanSettingValue(ESettingsField Field) co
     case ESettingsField::RayTracing: return bPendingRayTracing;
     case ESettingsField::HeightFog: return bPendingHeightFog;
     case ESettingsField::Cloud: return bPendingCloud;
+    case ESettingsField::DarkMode: return bPendingDarkMode;
     default: return false;
     }
 }
@@ -1051,6 +1031,7 @@ void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
+    case ESettingsField::DarkMode: bPendingDarkMode = !bPendingDarkMode; break;
     default: return;
     }
     ApplyAndSaveSettingsFromUI();
@@ -1225,6 +1206,10 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         break;
+    case ESettingsField::DarkMode:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleDarkModeFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleDarkModeFromUI);
+        break;
     case ESettingsField::ShadowDistanceMeters:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI);
@@ -1337,6 +1322,7 @@ void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Butto
     case ESettingsField::RayTracing: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI); break;
     case ESettingsField::HeightFog: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI); break;
     case ESettingsField::Cloud: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI); break;
+    case ESettingsField::DarkMode: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleDarkModeFromUI); break;
     case ESettingsField::ShadowDistanceMeters: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI); break;
     case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
     case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
@@ -1445,6 +1431,7 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     bPendingRayTracing = Settings->bRayTracing;
     bPendingHeightFog = Settings->bHeightFog;
     bPendingCloud = Settings->bCloud;
+    bPendingDarkMode = Settings->bEditorDarkMode;
     PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
     PendingShadowDistanceMeters = Settings->GetClampedShadowDistanceMeters();
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
@@ -1481,6 +1468,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->bRayTracing = bPendingRayTracing;
     Settings->bHeightFog = bPendingHeightFog;
     Settings->bCloud = bPendingCloud;
+    Settings->bEditorDarkMode = bPendingDarkMode;
     Settings->ShadowQuality = PendingShadowQuality;
     Settings->ShadowDistanceMeters = V3DShadowDistance::Normalize(PendingShadowDistanceMeters);
     Settings->TextureQuality = PendingTextureQuality;
@@ -1562,6 +1550,21 @@ void USettingsMenuWidget::ApplyAndSaveSettingsFromUI()
         SubSystem->UpdateSettings();
     }
 
+    if (IsUsingNativeLayout())
+    {
+        ApplyNativeStyle();
+    }
+    if (UWorld* World = GetWorld())
+    {
+        for (TObjectIterator<UResponsiveHUDWidget> It; It; ++It)
+        {
+            UResponsiveHUDWidget* Widget = *It;
+            if (IsValid(Widget) && Widget != this && Widget->GetWorld() == World)
+            {
+                Widget->RefreshAppearance();
+            }
+        }
+    }
     RefreshSettingsValues();
 }
 
@@ -1642,6 +1645,7 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::RayTracing: return FText::FromString(TEXT("Ray Tracing"));
     case ESettingsField::HeightFog: return FText::FromString(TEXT("Height Fog"));
     case ESettingsField::Cloud: return FText::FromString(TEXT("Cloud"));
+    case ESettingsField::DarkMode: return FText::FromString(TEXT("Dark Mode"));
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
     case ESettingsField::ShadowDistanceMeters: return FText::FromString(TEXT("Shadow Distance"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
@@ -1716,6 +1720,7 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
     case ESettingsField::RayTracing:
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
+    case ESettingsField::DarkMode:
         Options.Add(GetBoolText(false));
         Options.Add(GetBoolText(true));
         break;
@@ -1819,6 +1824,7 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
+    case ESettingsField::DarkMode: bPendingDarkMode = !bPendingDarkMode; break;
     case ESettingsField::ShadowDistanceMeters:
         {
             int32 Step = V3DShadowDistance::Normalize(PendingShadowDistanceMeters) / V3DShadowDistance::Step;
@@ -1898,6 +1904,7 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
     case ESettingsField::RayTracing: return GetBoolText(bPendingRayTracing);
     case ESettingsField::HeightFog: return GetBoolText(bPendingHeightFog);
     case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
+    case ESettingsField::DarkMode: return GetBoolText(bPendingDarkMode);
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
     case ESettingsField::ShadowDistanceMeters: return FText::FromString(FString::Printf(TEXT("%d m"), PendingShadowDistanceMeters));
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
@@ -1978,6 +1985,7 @@ void USettingsMenuWidget::CycleExposureFromUI() { CycleSettingValueFromUI(ESetti
 void USettingsMenuWidget::CycleRayTracingFromUI() { CycleSettingValueFromUI(ESettingsField::RayTracing); }
 void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESettingsField::HeightFog); }
 void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
+void USettingsMenuWidget::CycleDarkModeFromUI() { CycleSettingValueFromUI(ESettingsField::DarkMode); }
 void USettingsMenuWidget::CycleShadowDistanceMetersFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowDistanceMeters); }
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
@@ -2097,9 +2105,9 @@ void USettingsMenuWidget::RefreshKeyMappingButtons()
 
 void USettingsMenuWidget::UpdateTabAppearance()
 {
-    const FLinearColor ActiveColor = AccentColor;
-    const FLinearColor InactiveColor = FLinearColor(
-        ButtonColor.R * 0.65f, ButtonColor.G * 0.65f, ButtonColor.B * 0.65f, ButtonColor.A);
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(V3DHUDStyle::IsDarkMode(this));
+    const FLinearColor ActiveColor = Palette.Selection;
+    const FLinearColor InactiveColor = Palette.Panel;
     if (IsValid(NativeRenderingTabButton))
     {
         V3DHUDStyle::ApplyButton(*NativeRenderingTabButton,
@@ -2142,9 +2150,9 @@ void USettingsMenuWidget::BuildNativeLayout()
         TitleSlot->SetPadding(FMargin(0.f, 8.f));
     }
     NativeBack = AddButton(Header, NSLOCTEXT("V3DUI", "Back", "Back"));
-    if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
+    if (UWidget* BackContent = IsValid(NativeBack) ? NativeBack->GetContent() : nullptr) if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(BackContent->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
     if (USizeBox* Size = Cast<USizeBox>(NativeBack->GetParent())) Size->SetMinDesiredWidth(128.f);
-    if (UOverlaySlot* BackOverlaySlot = Cast<UOverlaySlot>(NativeBack->GetParent()->Slot))
+    if (UWidget* BackParent = IsValid(NativeBack) ? NativeBack->GetParent() : nullptr) if (UOverlaySlot* BackOverlaySlot = Cast<UOverlaySlot>(BackParent->Slot))
     {
         BackOverlaySlot->SetHorizontalAlignment(HAlign_Left);
         BackOverlaySlot->SetVerticalAlignment(VAlign_Center);
@@ -2402,7 +2410,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
     }
     if (NativeBack)
     {
-        if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(NativeBack->GetContent()->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
+        if (UWidget* BackContent = IsValid(NativeBack) ? NativeBack->GetContent() : nullptr) if (UButtonSlot* BackContentSlot = Cast<UButtonSlot>(BackContent->Slot)) BackContentSlot->SetPadding(FMargin(12.f));
         if (UTextBlock* Label = Cast<UTextBlock>(NativeBack->GetContent()))
         {
             FSlateFontInfo Font = Label->GetFont();
@@ -2411,10 +2419,12 @@ void USettingsMenuWidget::ApplyNativeStyle()
         }
     }
     UpdateTabAppearance();
+    const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);
     if (IsValid(NativeKeyMappingsHeader))
     {
         FSlateFontInfo Font = NativeKeyMappingsHeader->GetFont();
-        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), 1);
+        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 4.f / 3.f), FontOutlineSize);
         NativeKeyMappingsHeader->SetFont(Font);
         NativeKeyMappingsHeader->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2422,7 +2432,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
     {
         if (!IsValid(ActionLabel)) continue;
         FSlateFontInfo Font = ActionLabel->GetFont();
-        V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+        V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
         ActionLabel->SetFont(Font);
         ActionLabel->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2432,7 +2442,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
         if (UTextBlock* Label = Cast<UTextBlock>(KeyButton->GetContent()))
         {
             FSlateFontInfo Font = Label->GetFont();
-            V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 0.85f), 1);
+            V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 0.85f), FontOutlineSize);
             Label->SetFont(Font);
         }
     }
@@ -2443,7 +2453,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
         const bool bToggle = GetSettingControlType(NativeControlFields[Index]) == ESettingsControlType::Toggle;
         FSlateFontInfo Font = Label->GetFont();
         V3DHUDStyle::ApplyFont(Font, FontObject,
-            bToggle ? FMath::RoundToInt(BodyFontSize * 4.f / 3.f) : BodyFontSize, 1);
+            bToggle ? FMath::RoundToInt(BodyFontSize * 4.f / 3.f) : BodyFontSize, FontOutlineSize);
         Label->SetFont(Font);
         Label->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2453,7 +2463,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
         UTextBlock* Label = WeakLabel.Get();
         if (!IsValid(Label)) continue;
         FSlateFontInfo Font = Label->GetFont();
-        V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+        V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
         Label->SetFont(Font);
         Label->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2461,7 +2471,7 @@ void USettingsMenuWidget::ApplyNativeStyle()
     {
         if (!IsValid(Value)) continue;
         FSlateFontInfo Font = Value->GetFont();
-        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::Max(8, BodyFontSize / 2), 1);
+        V3DHUDStyle::ApplyFont(Font, FontObject, FMath::Max(8, BodyFontSize / 2), FontOutlineSize);
         Value->SetFont(Font);
         Value->SetColorAndOpacity(FSlateColor(TextColor));
     }
@@ -2473,18 +2483,22 @@ void USettingsMenuWidget::ApplyNativeStyle()
             Style.BarThickness = 24.f;
             Style.NormalThumbImage.ImageSize = FVector2D(16.f, 32.f);
             Style.HoveredThumbImage.ImageSize = FVector2D(16.f, 32.f);
+            Style.NormalBarImage.TintColor = FSlateColor(Palette.Panel);
+            Style.HoveredBarImage.TintColor = FSlateColor(Palette.Hover);
             V3DWidgetStyle::SetOwnedStyle(*Slider, Style);
-            Slider->SetSliderHandleColor(FLinearColor::White);
-            Slider->SetSliderBarColor(FLinearColor(.33f, .33f, .33f, 1.f));
+            Slider->SetSliderHandleColor(Palette.Selection);
+            Slider->SetSliderBarColor(FLinearColor::White);
         }
         else if (UComboBoxString* Dropdown = Cast<UComboBoxString>(Control))
-            ApplySettingsMenuComboTheme(Dropdown, ButtonColor, HoveredButtonTint, TextColor);
+        {
+            V3DHUDStyle::ApplyComboBox(*Dropdown, Palette, bDarkMode);
+        }
         else if (UButton* Button = Cast<UButton>(Control))
         {
             if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
             {
                 FSlateFontInfo Font = Label->GetFont();
-                V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 2.f / 3.f), 1);
+                V3DHUDStyle::ApplyFont(Font, FontObject, FMath::RoundToInt(BodyFontSize * 2.f / 3.f), FontOutlineSize);
                 Label->SetFont(Font);
             }
         }
@@ -2497,7 +2511,7 @@ UWidget* USettingsMenuWidget::GenerateNativeOption(FString Option)
     UTextBlock* Text = NewObject<UTextBlock>(this);
     Text->SetText(FText::FromString(Option));
     FSlateFontInfo Font = Text->GetFont();
-    V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, 1);
+    V3DHUDStyle::ApplyFont(Font, FontObject, BodyFontSize, FontOutlineSize);
     Text->SetFont(Font);
     Text->SetColorAndOpacity(FSlateColor(TextColor));
     NativeOptionLabels.RemoveAll([](const TWeakObjectPtr<UTextBlock>& Item) { return !Item.IsValid(); });
