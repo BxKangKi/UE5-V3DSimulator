@@ -33,7 +33,7 @@ public:
     FLinearColor PauseAccentColor = FLinearColor(.82f, .87f, .92f, .94f);
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Appearance", meta=(ClampMin="0.0", ClampMax="64.0"))
-    float BackdropBlurStrength = 10.0f;
+    float BackdropBlurStrength = 0.0f;
 
     UPauseMenuWidget(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 

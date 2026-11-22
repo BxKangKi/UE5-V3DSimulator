@@ -16,7 +16,7 @@ namespace V3DHUDStyle
     inline const FLinearColor ButtonBackground(.64f, .77f, .91f, 1.f);
     inline const FLinearColor LoadingBackground(.91f, .93f, .96f, 1.f);
     inline const FLinearColor ProgressFill(.50f, .70f, .91f, 1.f);
-    inline const FLinearColor PauseBackground(.20f, .25f, .30f, .62f);
+    inline const FLinearColor PauseBackground(.20f, .20f, .21f, .65f);
     inline const FLinearColor PauseAccent(.82f, .87f, .92f, .94f);
 
     struct FAuthoringPalette

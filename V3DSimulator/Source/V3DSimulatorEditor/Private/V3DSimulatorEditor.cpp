@@ -30,6 +30,7 @@ public:
         // Runs before interactive use and before commandlet cooking, once per schema change.
         if (GEngine) HumanoidAnimationBindings::Upgrade();
         else AnimationBindingHandle = FCoreDelegates::GetOnPostEngineInit().AddStatic(&HumanoidAnimationBindings::Upgrade);
+
         if (IsRunningCommandlet()) return;
         bRegistered = true;
         // Layouts are only generated for assets the user creates, opens, or changes in Class
