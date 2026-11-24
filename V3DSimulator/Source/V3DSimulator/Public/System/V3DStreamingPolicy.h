@@ -6,7 +6,8 @@ class UObject;
 /** Pure geometry shared by stream selection and readiness; sizes are full local dimensions. */
 namespace V3DStreamingPolicy
 {
-    constexpr double MinScreenDiameter = 0.05;
+    // Within MaxRenderDistanceCm, unload only when projected LOD screen ratio drops to <= 1% (0.01).
+    constexpr double MinScreenDiameter = 0.01;
     constexpr int32 RenderDistanceStepMeters = 1024;
     constexpr int32 MinRenderDistanceMeters = 1024;
     constexpr int32 MaxRenderDistanceMeters = 32768;

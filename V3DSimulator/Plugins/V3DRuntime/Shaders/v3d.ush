@@ -81,3 +81,188 @@ float4x3 V3D_SampleTerrain(
 }
 
 #endif // V3D_TERRAIN_HLSL_INCLUDED
+
+// ============================================================================
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+// V3D Octahedral Impostor HLSL library.
+// Mapped to /V3D/v3d.ush by V3DRuntimeModule.
+// Supports both Texture2DArray (Slice 0 = BaseColor+Alpha, Slice 1 = WorldNormal+Roughness)
+// and separate Texture2D atlas fallback.
+#ifndef V3D_IMPOSTOR_HLSL_INCLUDED
+#define V3D_IMPOSTOR_HLSL_INCLUDED
+
+// Encodes a unit direction vector (Z >= 0) into hemi-octahedral UV coordinates in [0, 1]^2.
+float2 V3D_DirToHemiOctahedron(float3 Dir)
+{
+    float LenSq = dot(Dir, Dir);
+    float3 N = LenSq > 1.0e-8 ? Dir * rsqrt(LenSq) : float3(0.0, 0.0, 1.0);
+    N.z = max(N.z, 0.0);
+    float L1 = abs(N.x) + abs(N.y) + N.z;
+    N /= max(L1, 1.0e-6);
+    float2 Oct = float2(N.x + N.y, N.x - N.y);
+    return saturate(Oct * 0.5 + 0.5);
+}
+
+// Decodes hemi-octahedral UV coordinates in [0, 1]^2 back to a unit direction vector (Z >= 0).
+float3 V3D_HemiOctahedronToDir(float2 UV)
+{
+    float2 Oct = UV * 2.0 - 1.0;
+    float2 Temp = float2(Oct.x + Oct.y, Oct.x - Oct.y) * 0.5;
+    float3 Dir = float3(Temp.x, Temp.y, 1.0 - abs(Temp.x) - abs(Temp.y));
+    float LenSq = dot(Dir, Dir);
+    return LenSq > 1.0e-8 ? Dir * rsqrt(LenSq) : float3(0.0, 0.0, 1.0);
+}
+
+// Computes camera-facing billboard offset in INSTANCE LOCAL SPACE (recommended for HISM/ISM & StaticMesh).
+// Automatically preserves per-instance world position, rotation, and scale with zero pivot drift.
+// Feed the returned vector through TransformVector(Local -> World) into WorldPositionOffset.
+// LocalUV: vertex UV0 in [0,1]^2.
+// LocalPosition: vertex local position (UE LocalPosition node).
+// ImpostorCenter: baked ImpostorCenter vector parameter (local bounding-sphere center).
+// LocalViewDir: camera-to-object direction transformed into Local Space (normalize(TransformVector(World->Local, CameraPos - WorldPos))).
+// ImpostorRadius: baked ImpostorRadius scalar parameter (local bounding-sphere radius).
+float3 V3D_ImpostorBillboardLocalWPO(
+    float2 LocalUV,
+    float3 LocalPosition,
+    float3 ImpostorCenter,
+    float3 LocalViewDir,
+    float ImpostorRadius)
+{
+    float LenSq = dot(LocalViewDir, LocalViewDir);
+    float3 Forward = LenSq > 1.0e-6 ? LocalViewDir * rsqrt(LenSq) : float3(1.0, 0.0, 0.0);
+    // Clamp slightly below horizon to match hemi-octahedral capture (Z >= 0) without flipping.
+    Forward.z = max(Forward.z, 0.0);
+    float FwdLenSq = dot(Forward, Forward);
+    Forward = FwdLenSq > 1.0e-6 ? Forward * rsqrt(FwdLenSq) : float3(0.0, 0.0, 1.0);
+
+    float3 LocalUp = abs(Forward.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 Right = normalize(cross(LocalUp, Forward));
+    float3 Up = normalize(cross(Forward, Right));
+
+    float SafeRadius = clamp(ImpostorRadius, 1.0, 100000.0);
+    float2 Centered = (LocalUV - 0.5) * 2.0;
+    float3 TargetLocalPos = ImpostorCenter + (Right * Centered.x - Up * Centered.y) * SafeRadius;
+    return TargetLocalPos - LocalPosition;
+}
+
+// World-space billboard fallback (clamped to prevent HISM component-origin stretch).
+float3 V3D_ImpostorBillboardWPO(
+    float2 LocalUV,
+    float3 ObjectCenterWS,
+    float3 CameraPosWS,
+    float3 CurrentWorldPos,
+    float RadiusWS)
+{
+    float3 ToCam = CameraPosWS - ObjectCenterWS;
+    float DistSq = dot(ToCam, ToCam);
+    float3 Forward = DistSq > 1.0e-6 ? ToCam * rsqrt(DistSq) : float3(1.0, 0.0, 0.0);
+
+    float3 WorldUp = abs(Forward.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 Right = normalize(cross(WorldUp, Forward));
+    float3 Up = normalize(cross(Forward, Right));
+
+    float SafeRadius = clamp(RadiusWS, 1.0, 100000.0);
+    float2 Centered = (LocalUV - 0.5) * 2.0;
+    float3 TargetPosWS = ObjectCenterWS + (Right * Centered.x - Up * Centered.y) * SafeRadius;
+    float3 Offset = TargetPosWS - CurrentWorldPos;
+    float OffsetLenSq = dot(Offset, Offset);
+    float MaxOffset = SafeRadius * 2.5;
+    if (OffsetLenSq > MaxOffset * MaxOffset)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+    return Offset;
+}
+
+// Computes 3-frame barycentric octahedral cell indices and blend weights for smooth view interpolation.
+void V3D_ImpostorOctahedralGrid(
+    float3 LocalViewDir,
+    float GridFrames,
+    out float2 Frame0,
+    out float2 Frame1,
+    out float2 Frame2,
+    out float3 Weights)
+{
+    float SafeFrames = max(floor(GridFrames), 2.0);
+    float2 OctUV = V3D_DirToHemiOctahedron(LocalViewDir);
+    float2 GridPos = OctUV * (SafeFrames - 1.0);
+    float2 BaseCell = floor(GridPos);
+    float2 Frac = GridPos - BaseCell;
+
+    float2 MaxCell = float2(SafeFrames - 1.0, SafeFrames - 1.0);
+    Frame0 = clamp(BaseCell, 0.0, MaxCell);
+    bool bUpperTri = (Frac.x + Frac.y) <= 1.0;
+
+    if (bUpperTri)
+    {
+        Frame1 = clamp(BaseCell + float2(1.0, 0.0), 0.0, MaxCell);
+        Frame2 = clamp(BaseCell + float2(0.0, 1.0), 0.0, MaxCell);
+        Weights = float3(1.0 - Frac.x - Frac.y, Frac.x, Frac.y);
+    }
+    else
+    {
+        Frame1 = clamp(BaseCell + float2(1.0, 0.0), 0.0, MaxCell);
+        Frame2 = clamp(BaseCell + float2(0.0, 1.0), 0.0, MaxCell);
+        Frame0 = clamp(BaseCell + float2(1.0, 1.0), 0.0, MaxCell);
+        Weights = float3(Frac.x + Frac.y - 1.0, 1.0 - Frac.y, 1.0 - Frac.x);
+    }
+    Weights = max(Weights, 0.0);
+    Weights /= max(Weights.x + Weights.y + Weights.z, 1.0e-6);
+}
+
+// Samples a 2-slice Texture2DArray impostor atlas (Slice 0: BaseColor+Alpha, Slice 1: WorldNormal+Roughness).
+// Returns float4x3:
+//   [0] = Linear BaseColor (RGB)
+//   [1] = World/Object-space Normal (RGB, normalized)
+//   [2] = float3(Opacity, Roughness, Metallic)
+//   [3] = float3(0, 0, 0)
+float4x3 V3D_SampleImpostorArray(
+    Texture2DArray ImpostorAtlasArray,
+    SamplerState ImpostorAtlasArraySampler,
+    float2 LocalUV,
+    float3 LocalViewDir,
+    float GridFrames)
+{
+    float SafeFrames = max(floor(GridFrames), 2.0);
+    float InvFrames = 1.0 / SafeFrames;
+
+    float2 F0, F1, F2;
+    float3 W;
+    V3D_ImpostorOctahedralGrid(LocalViewDir, SafeFrames, F0, F1, F2, W);
+
+    float2 CellUV = saturate(LocalUV) * InvFrames;
+    float2 DdxUV = ddx(LocalUV) * InvFrames;
+    float2 DdyUV = ddy(LocalUV) * InvFrames;
+
+    float2 UV0 = F0 * InvFrames + CellUV;
+    float2 UV1 = F1 * InvFrames + CellUV;
+    float2 UV2 = F2 * InvFrames + CellUV;
+
+    float4 C0 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV0, 0.0), DdxUV, DdyUV);
+    float4 C1 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV1, 0.0), DdxUV, DdyUV);
+    float4 C2 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV2, 0.0), DdxUV, DdyUV);
+
+    float4 N0 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV0, 1.0), DdxUV, DdyUV);
+    float4 N1 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV1, 1.0), DdxUV, DdyUV);
+    float4 N2 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV2, 1.0), DdxUV, DdyUV);
+
+    float Alpha = C0.a * W.x + C1.a * W.y + C2.a * W.z;
+    float3 ColorSum = C0.rgb * (C0.a * W.x) + C1.rgb * (C1.a * W.y) + C2.rgb * (C2.a * W.z);
+    float3 BaseColor = Alpha > 1.0e-4 ? (ColorSum / Alpha) : (C0.rgb * W.x + C1.rgb * W.y + C2.rgb * W.z);
+
+    float3 NormalSum = (N0.rgb * 2.0 - 1.0) * (C0.a * W.x)
+        + (N1.rgb * 2.0 - 1.0) * (C1.a * W.y)
+        + (N2.rgb * 2.0 - 1.0) * (C2.a * W.z);
+    float NormalLenSq = dot(NormalSum, NormalSum);
+    float3 NormalOS = NormalLenSq > 1.0e-8 ? NormalSum * rsqrt(NormalLenSq) : float3(0.0, 0.0, 1.0);
+    float Roughness = saturate(N0.a * W.x + N1.a * W.y + N2.a * W.z);
+
+    float4x3 Out;
+    Out[0] = max(BaseColor, 0.0);
+    Out[1] = NormalOS;
+    Out[2] = float3(saturate(Alpha), Roughness, 0.0);
+    Out[3] = float3(0.0, 0.0, 0.0);
+    return Out;
+}
+
+#endif // V3D_IMPOSTOR_HLSL_INCLUDED

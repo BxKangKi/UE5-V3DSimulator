@@ -42,11 +42,16 @@ namespace V3DPhysicalMaterial
     };
 
     constexpr float MoonIntensity = 0.65f; // Texture brightness; visibility is a separate control.
-    // Preserve the authored sun's outer radius acos(1 - .0002), expressed in radians.
-    // Sun and textured moon share one angular radius (about 2.29 degrees in diameter).
-    constexpr float CelestialRadiusRadians = 0.020000334f;
+    // Enlarged default angular radii (in radians) for the sun (~4.8 deg diameter) and moon (~5.5 deg diameter).
+    // Runtime actors and world config.json can override these independently via SunAngularRadius / MoonAngularRadius.
+    constexpr float DefaultSunAngularRadiusRadians = 0.042f;
+    constexpr float DefaultMoonAngularRadiusRadians = 0.048f;
+    constexpr float MinCelestialAngularRadiusRadians = 0.001f;
+    constexpr float MaxCelestialAngularRadiusRadians = 0.35f;
+    constexpr float CelestialRadiusRadians = DefaultSunAngularRadiusRadians;
     constexpr float CelestialDiameterDegrees = CelestialRadiusRadians * (360.f / PI);
-    constexpr float MoonRadiusRadians = CelestialRadiusRadians;
+    constexpr float MoonRadiusRadians = DefaultMoonAngularRadiusRadians;
+    constexpr float MoonDiameterDegrees = MoonRadiusRadians * (360.f / PI);
     constexpr float StarIntensity = 0.035f;
     constexpr float DielectricSpecular = 0.5f; // F0 = 0.04
     constexpr float GlassRoughness = 0.045f;

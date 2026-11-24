@@ -13,6 +13,8 @@
 #include "Model/MaterialDefaultAsset.h"
 #include "System/WorldBakedTexture.h"
 #include "System/V3DTerrain.h"
+#include "System/V3DImpostor.h"
+#include "System/V3DMaterialTextureArray.h"
 #include "System/V3DStreamingBudget.h"
 #include "Misc/App.h"
 #include "Misc/ScopeExit.h"
@@ -403,6 +405,15 @@ namespace WorldBakedModelAssetPrivate
             if (UMaterialInterface* const* Palette = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.TerrainPalette")))
                 if (IsValid(*Palette)) return SingleSided(*Palette);
             return SingleSided(V3DTerrain::ResolveMaterial(Context, Baked.BaseMaterialPath));
+        }
+        if (V3DImpostor::IsImpostorMaterial(Baked))
+        {
+            if (UMaterialInterface* const* Named = Config.MaterialsOverrideByNameMap.Find(Baked.Name))
+                if (IsValid(*Named)) return *Named;
+            if (UMaterialInterface* const* Impostor = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Impostor")))
+                if (IsValid(*Impostor)) return *Impostor;
+            if (UMaterialInterface* Resolved = V3DImpostor::ResolveMaterial(Context, Baked.BaseMaterialPath))
+                return Resolved;
         }
         const bool bTwoSided = v3d::material_is_two_sided(Baked.MaterialType);
         const auto OpaqueFallback = [&Config, bTwoSided]() -> UMaterialInterface*
@@ -809,6 +820,7 @@ struct FWorldBakedMaterialAttachment final
         {
             bInitialized = true;
             Owner->RememberDependencies(Bundle);
+            V3DMaterialTextureArray::PackBundle(Bundle);
             if (MaterialIds.Num() != LODs.Num())
             {
                 Error = TEXT("Prepared RuntimeLOD material layout is inconsistent");
@@ -1718,6 +1730,7 @@ bool UWorldBakedModelAsset::AttachRuntimeMaterials(
             }
         }
     }
+    V3DMaterialTextureArray::PackBundle(Bundle);
     Textures.Reserve(Bundle.Textures.Num());
     for (FGWorldBakedTexture& Baked : Bundle.Textures)
     {

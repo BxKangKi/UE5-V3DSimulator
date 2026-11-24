@@ -11,9 +11,11 @@
 #include "Components/CanvasPanelSlot.h"
 #include "Components/ComboBoxString.h"
 #include "Components/CheckBox.h"
+#include "Components/MultiLineEditableTextBox.h"
 #include "System/ProjectRepository.h"
 #include "System/ProjectWorkspace.h"
 #include "System/SafeFileIO.h"
+#include "System/JsonMetadata.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Overlay.h"
@@ -26,6 +28,7 @@
 #include "Components/PanelWidget.h"
 #include "Components/ScrollBox.h"
 #include "Blueprint/WidgetTree.h"
+#include "Brushes/SlateColorBrush.h"
 #include "GameFramework/PlayerController.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/V3DSimulatorAssetRegistry.h"
@@ -77,6 +80,9 @@ void UProjectSelectionWidget::NativeDestruct()
     if (EditorWidget) { EditorWidget->OnClosed.Unbind(); EditorWidget->RemoveFromParent(); EditorWidget = nullptr; }
     UnbindNavigationButtons();
     if (NativeProjectType) NativeProjectType->OnSelectionChanged.RemoveDynamic(this, &UProjectSelectionWidget::HandleNativeProjectTypeChanged);
+    if (NativeCreateBackButton) NativeCreateBackButton->OnClicked.RemoveDynamic(this, &UProjectSelectionWidget::HandleCreateProjectCancelClicked);
+    if (NativeCreateCancelButton) NativeCreateCancelButton->OnClicked.RemoveDynamic(this, &UProjectSelectionWidget::HandleCreateProjectCancelClicked);
+    if (NativeCreateConfirmButton) NativeCreateConfirmButton->OnClicked.RemoveDynamic(this, &UProjectSelectionWidget::HandleCreateProjectConfirmClicked);
     if (IsValid(BuildStatusWidget))
     {
         BuildStatusWidget->OnConfirmed.RemoveDynamic(
@@ -94,19 +100,10 @@ void UProjectSelectionWidget::NativeDestruct()
         Owner->HandleProjectSelectionWidgetRemoved(this);
     }
     SetCreateProjectMode(false, true);
-    CreateProjectEntryWidget.Reset();
     OwnerMainWidget.Reset();
     BackButton.Reset();
     RefreshButton.Reset();
-    if (bOwnsGeneratedProjectNameTextBox)
-    {
-        if (UEditableTextBox* Generated = NewProjectNameTextBox.Get())
-        {
-            Generated->RemoveFromParent();
-        }
-    }
     NewProjectNameTextBox.Reset();
-    bOwnsGeneratedProjectNameTextBox = false;
     BuildStatusWidget = nullptr;
 
     Super::NativeDestruct();
@@ -117,6 +114,11 @@ FReply UProjectSelectionWidget::NativeOnKeyDown(const FGeometry& InGeometry, con
     if (!InKeyEvent.IsRepeat()
         && (InKeyEvent.GetKey() == EKeys::Escape || InKeyEvent.GetKey() == EKeys::Gamepad_FaceButton_Right))
     {
+        if (bCreateProjectMode && IsValid(NativeCreateProjectScreen))
+        {
+            SetCreateProjectMode(false, true);
+            return FReply::Handled();
+        }
         CloseProjectSelection();
         return FReply::Handled();
     }
@@ -132,16 +134,6 @@ void UProjectSelectionWidget::SetProjectListPanel(UPanelWidget* InPanel)
 {
     if (!AcceptWidgetAssignment(InPanel)) return;
     SetCreateProjectMode(false, true);
-    CreateProjectEntryWidget.Reset();
-    if (bOwnsGeneratedProjectNameTextBox)
-    {
-        if (UEditableTextBox* Generated = NewProjectNameTextBox.Get())
-        {
-            Generated->RemoveFromParent();
-        }
-        NewProjectNameTextBox.Reset();
-        bOwnsGeneratedProjectNameTextBox = false;
-    }
     SetSelectionListPanel(InPanel);
     RefreshProjects();
 }
@@ -181,84 +173,47 @@ void UProjectSelectionWidget::SetRefreshButton(UButton* InButton)
 void UProjectSelectionWidget::SetNewProjectNameTextBox(UEditableTextBox* InTextBox)
 {
     if (!AcceptWidgetAssignment(InTextBox)) return;
-    if (bOwnsGeneratedProjectNameTextBox)
-    {
-        if (UEditableTextBox* Generated = NewProjectNameTextBox.Get(); Generated && Generated != InTextBox)
-        {
-            Generated->RemoveFromParent();
-        }
-    }
     NewProjectNameTextBox = InTextBox;
-    bOwnsGeneratedProjectNameTextBox = false;
-    if (IsValid(InTextBox))
-    {
-        if (UPanelWidget* Panel = GetSelectionListPanel(); IsValid(Panel) && Panel->HasChild(InTextBox))
-        {
-            // Keep even a Blueprint-provided text box at child index 0. This avoids the first-open
-            // bottom placement that occurred when the input was appended after generated buttons.
-            Panel->ShiftChild(0, InTextBox);
-        }
-        InTextBox->SetIsEnabled(bCreateProjectMode);
-        InTextBox->SetVisibility(bCreateProjectMode ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
-    }
-}
-
-UEditableTextBox* UProjectSelectionWidget::EnsureNewProjectNameTextBox()
-{
-    if (UEditableTextBox* Existing = NewProjectNameTextBox.Get())
-    {
-        if (UPanelWidget* Panel = GetSelectionListPanel(); IsValid(Panel) && Panel->HasChild(Existing))
-        {
-            Panel->ShiftChild(0, Existing);
-        }
-        return Existing;
-    }
-
-    UPanelWidget* Panel = GetSelectionListPanel();
-    if (!IsValid(Panel) || !IsValid(WidgetTree))
-    {
-        return nullptr;
-    }
-
-    UEditableTextBox* Generated = WidgetTree->ConstructWidget<UEditableTextBox>(
-        UEditableTextBox::StaticClass(), TEXT("GeneratedNewProjectNameTextBox"));
-    if (!IsValid(Generated))
-    {
-        return nullptr;
-    }
-    Generated->SetHintText(FText::FromString(TEXT("Project name")));
-    Generated->SetIsEnabled(false);
-    Generated->SetVisibility(ESlateVisibility::Collapsed);
-    Panel->AddChild(Generated);
-    NewProjectNameTextBox = Generated;
-    bOwnsGeneratedProjectNameTextBox = true;
-    return Generated;
 }
 
 void UProjectSelectionWidget::SetCreateProjectMode(const bool bEnabled, const bool bClearText)
 {
     bCreateProjectMode = bEnabled;
-
-    if (UEditableTextBox* TextBox = NewProjectNameTextBox.Get())
+    if (IsValid(NativeProjectListScreen))
     {
-        if (bClearText)
+        NativeProjectListScreen->SetVisibility(bCreateProjectMode ? ESlateVisibility::Collapsed : ESlateVisibility::Visible);
+    }
+    if (IsValid(NativeCreateProjectScreen))
+    {
+        NativeCreateProjectScreen->SetVisibility(bCreateProjectMode ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+    }
+    if (bClearText)
+    {
+        if (UEditableTextBox* TextBox = NewProjectNameTextBox.Get())
         {
             TextBox->SetText(FText::GetEmpty());
         }
-        TextBox->SetIsEnabled(bCreateProjectMode);
-        TextBox->SetVisibility(bCreateProjectMode ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        if (IsValid(NativeProjectNotes))
+        {
+            NativeProjectNotes->SetText(FText::GetEmpty());
+        }
+        if (IsValid(NativeCreateErrorText))
+        {
+            NativeCreateErrorText->SetText(FText::GetEmpty());
+            NativeCreateErrorText->SetVisibility(ESlateVisibility::Collapsed);
+        }
     }
-
-    UpdateCreateProjectEntryLabel();
+    UpdateWorldOptionsVisibility();
 }
 
-void UProjectSelectionWidget::UpdateCreateProjectEntryLabel()
+void UProjectSelectionWidget::UpdateWorldOptionsVisibility()
 {
-    if (UMenuButtonWidget* Entry = CreateProjectEntryWidget.Get())
+    if (IsValid(NativeWorldOptionsBox))
     {
-        Entry->ConfigureButton(
-            CreateProjectSelectionKey,
-            bCreateProjectMode ? TEXT("Done") : TEXT("Create Project"));
+        NativeWorldOptionsBox->SetVisibility(
+            NewProjectType == EV3DSimulatorProjectType::World
+                ? ESlateVisibility::Visible
+                : ESlateVisibility::Collapsed);
     }
 }
 
@@ -372,7 +327,6 @@ void UProjectSelectionWidget::UnbindNavigationButtons()
 void UProjectSelectionWidget::RefreshProjects()
 {
     if (IsDesignTime()) return;
-    // Retry the named host on every opening, not only during the first Construct.
     if (!IsValid(GetSelectionListPanel()))
         SetSelectionListPanel(Cast<UPanelWidget>(GetWidgetFromName(TEXT("ProjectListPanel"))));
     if (!IsValid(GetSelectionListPanel()) && IsValid(WidgetTree))
@@ -386,7 +340,6 @@ void UProjectSelectionWidget::RefreshProjects()
         if (Count == 1) SetSelectionListPanel(Candidate);
     }
     SetCreateProjectMode(false, true);
-    CreateProjectEntryWidget.Reset();
     ClearGeneratedSelectionEntries();
 
     if (!IsValid(GetSelectionListPanel()))
@@ -398,22 +351,11 @@ void UProjectSelectionWidget::RefreshProjects()
         return;
     }
 
-    // Allocate the generated input while the panel is still empty. Keeping this collapsed child at
-    // index 0 from the first refresh means its first Visible transition is already above every
-    // generated project button. Previously it was first created only after clicking Create Project,
-    // so AddChild() appended it at the bottom; the next refresh happened to move it to the top.
-    // Pre-creating it here makes the layout deterministic from the very first use.
-    EnsureNewProjectNameTextBox();
-
-    // The create action is generated after the input, so the visible creation layout is always:
-    // [Project Name TextBox] -> [Done/Create Project] -> [Project entries].
     UWidget* CreateEntry = AddGeneratedSelectionEntry(CreateProjectSelectionKey, TEXT("Create Project"));
-    CreateProjectEntryWidget = Cast<UMenuButtonWidget>(CreateEntry);
     if (!IsValid(CreateEntry))
     {
         UE_LOG(LogTemp, Warning, TEXT("ProjectSelectionWidget could not create the project-creation entry."));
     }
-    UpdateCreateProjectEntryLabel();
     FSimulatorFileServices::WriteLogAsync(TEXT("UI"), FString::Printf(
         TEXT("Project list: Host=%s CreateEntry=%s"), *GetNameSafe(GetSelectionListPanel()), *GetNameSafe(CreateEntry)));
 
@@ -443,40 +385,65 @@ void UProjectSelectionWidget::RefreshProjects()
 
 bool UProjectSelectionWidget::CreateNewProject(const FString& ProjectName)
 {
-    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
-    if (!IsValid(Manager) || !Manager->CreateProject(ProjectName, NewProjectType))
+    const FString TrimmedName = ProjectName.TrimStartAndEnd();
+    if (TrimmedName.IsEmpty())
     {
-        SetCreateProjectMode(true, false);
-        if (UMenuButtonWidget* Entry = CreateProjectEntryWidget.Get())
+        if (IsValid(NativeCreateErrorText))
         {
-            const FString Error = IsValid(Manager) ? Manager->GetLastMessage()
-                : TEXT("Project service is unavailable.");
-            Entry->ConfigureButton(CreateProjectSelectionKey,
-                FString::Printf(TEXT("Retry: %s"), *Error));
+            NativeCreateErrorText->SetText(NSLOCTEXT("V3DMenu", "EmptyProjectNameError", "Please enter a project name."));
+            NativeCreateErrorText->SetVisibility(ESlateVisibility::Visible);
         }
         return false;
     }
 
-    if (NewProjectType == EV3DSimulatorProjectType::World)
+    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
+    if (!IsValid(Manager) || !Manager->CreateProject(TrimmedName, NewProjectType))
     {
-        FV3DSimulatorProjectConfig Config;
-        TSharedPtr<FJsonObject> Json;
-        FString Error;
-        if (V3DSimulatorProjectRepository::LoadProject(ProjectName, Config, &Json, Error))
+        const FString Error = IsValid(Manager) ? Manager->GetLastMessage()
+            : TEXT("Project service is unavailable.");
+        if (IsValid(NativeCreateErrorText))
+        {
+            NativeCreateErrorText->SetText(FText::FromString(Error));
+            NativeCreateErrorText->SetVisibility(ESlateVisibility::Visible);
+        }
+        return false;
+    }
+
+    const FString NotesText = IsValid(NativeProjectNotes)
+        ? NativeProjectNotes->GetText().ToString().TrimStartAndEnd()
+        : FString();
+
+    FV3DSimulatorProjectConfig Config;
+    TSharedPtr<FJsonObject> Json;
+    FString LoadError;
+    if (V3DSimulatorProjectRepository::LoadProject(TrimmedName, Config, &Json, LoadError) && Json.IsValid())
+    {
+        bool bModifiedConfig = false;
+        if (!NotesText.IsEmpty())
+        {
+            Json->SetStringField(V3DSimulatorJsonMetadata::Notes, NotesText);
+            bModifiedConfig = true;
+        }
+        if (NewProjectType == EV3DSimulatorProjectType::World)
         {
             Json->SetBoolField(TEXT("bAllowProjectAssets"), NewProjectExternalAssets && NewProjectExternalAssets->IsChecked());
             auto Audio = MakeShared<FJsonObject>();
             Audio->SetBoolField(TEXT("bGlobalAcoustics"), NewProjectAcoustics && NewProjectAcoustics->IsChecked());
             Audio->SetBoolField(TEXT("bEnvironmentMusic"), !NewProjectMusic || NewProjectMusic->IsChecked());
             Json->SetObjectField(TEXT("Audio"), Audio);
-            const auto Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), V3DSimulatorProjectWorkspace::ConfigPath(ProjectName));
+            bModifiedConfig = true;
+        }
+        if (bModifiedConfig)
+        {
+            const auto Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), V3DSimulatorProjectWorkspace::ConfigPath(TrimmedName));
             if (!Saved.IsSuccess()) UE_LOG(LogTemp, Error, TEXT("New project options: %s"), *Saved.Error);
         }
     }
-    // Continue directly to the JSON editor so the remaining settings can be authored before Build.
+
+    // Transition directly to the JSON editor so the user can start working immediately.
     SetCreateProjectMode(false, true);
     RefreshProjects();
-    OpenEditor(ProjectName);
+    OpenEditor(TrimmedName);
     return true;
 }
 
@@ -490,7 +457,6 @@ bool UProjectSelectionWidget::BuildProjectByName(const FString& ProjectName)
     UE_LOG(LogTemp, Error, TEXT("Project build failed because GameManagerSubSystem is unavailable."));
     return false;
 }
-
 
 bool UProjectSelectionWidget::GetProjectConfiguration(
     const FString& ProjectName,
@@ -549,47 +515,11 @@ void UProjectSelectionWidget::OnSelectionEntryActivated(const FString& Selection
 {
     if (SelectionKey == CreateProjectSelectionKey)
     {
-        if (!bCreateProjectMode)
+        SetCreateProjectMode(true, true);
+        if (UEditableTextBox* TextBox = NewProjectNameTextBox.Get())
         {
-            // Rebuild generated entries AFTER the persistent input. Do this before
-            // opening so runtime Slate child order never depends on ShiftChild.
-            RefreshProjects();
-            UEditableTextBox* TextBox = EnsureNewProjectNameTextBox();
-            if (!IsValid(TextBox))
-            {
-                UE_LOG(LogTemp, Warning, TEXT("Create Project could not allocate its project-name input."));
-                return;
-            }
-
-            SetCreateProjectMode(true, false);
-            if (UScrollBox* Scroll = Cast<UScrollBox>(GetSelectionListPanel()))
-            {
-                Scroll->ScrollToStart();
-            }
             TextBox->SetKeyboardFocus();
-            return;
         }
-
-        UEditableTextBox* TextBox = NewProjectNameTextBox.Get();
-        const FString ProjectName = IsValid(TextBox)
-            ? TextBox->GetText().ToString().TrimStartAndEnd()
-            : FString();
-
-        // Done always exits the inline creation UI. An empty name therefore acts like cancel; a
-        // valid name is created before the list is refreshed.
-        SetCreateProjectMode(false, false);
-        if (!ProjectName.IsEmpty())
-        {
-            if (CreateNewProject(ProjectName))
-            {
-                return; // The list was refreshed in-place; ProjectSelection remains visible.
-            }
-
-            UE_LOG(LogTemp, Warning, TEXT("Project creation failed for '%s'."), *ProjectName);
-            return; // Keep the name and the visible error so the user can correct/retry it.
-        }
-
-        SetCreateProjectMode(false, true);
         return;
     }
 
@@ -597,58 +527,147 @@ void UProjectSelectionWidget::OnSelectionEntryActivated(const FString& Selection
     OpenEditor(SelectionKey);
 }
 
+void UProjectSelectionWidget::HandleCreateProjectConfirmClicked()
+{
+    if (IsDesignTime()) return;
+    UEditableTextBox* TextBox = NewProjectNameTextBox.Get();
+    const FString ProjectName = IsValid(TextBox)
+        ? TextBox->GetText().ToString().TrimStartAndEnd()
+        : FString();
+    CreateNewProject(ProjectName);
+}
+
+void UProjectSelectionWidget::HandleCreateProjectCancelClicked()
+{
+    if (IsDesignTime()) return;
+    SetCreateProjectMode(false, true);
+}
 
 void UProjectSelectionWidget::BuildNativeLayout()
 {
     SetIsFocusable(true);
     NativeProjectPanel = AddPanel(PanelSize, FVector2D::ZeroVector);
-    UVerticalBox* Box = WidgetTree->ConstructWidget<UVerticalBox>();
-    NativeProjectPanel->SetContent(Box);
+    UOverlay* ScreenStack = WidgetTree->ConstructWidget<UOverlay>();
+    NativeProjectPanel->SetContent(ScreenStack);
 
-    UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
-    Box->AddChildToVerticalBox(Header);
-    UTextBlock* Title = AddText(Header, NSLOCTEXT("V3DMenu", "EditorTitle", "Editor"), true);
-    Title->SetAutoWrapText(false);
-    Title->SetJustification(ETextJustify::Center);
-    UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(Title->Slot);
-    TitleSlot->SetHorizontalAlignment(HAlign_Center);
-    TitleSlot->SetVerticalAlignment(VAlign_Top);
-    auto AddNavigation = [this, Header](const FText& Text, bool bRight)
+    auto MakeNavigationHeader = [this](UVerticalBox* ParentBox, const FText& HeaderTitle,
+        TObjectPtr<UButton>& OutBack, TObjectPtr<UButton>& OutRightButton, const FText& RightText)
     {
-        UButton* Button = AddButton(Header, Text);
-        if (UWidget* ParentWidget = Button ? Button->GetParent() : nullptr)
-            if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(ParentWidget->Slot))
-            {
-                OverlaySlot->SetPadding(bRight ? FMargin(0.0f, 0.0f, 32.0f, 0.0f) : FMargin(32.0f, 0.0f, 0.0f, 0.0f));
-                OverlaySlot->SetHorizontalAlignment(bRight ? HAlign_Right : HAlign_Left);
-                OverlaySlot->SetVerticalAlignment(VAlign_Center);
-            }
-        if (UWidget* ContentWidget = Button ? Button->GetContent() : nullptr)
-            if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(ContentWidget->Slot))
-                ContentSlot->SetPadding(FMargin(12.0f));
-        if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
+        UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
+        ParentBox->AddChildToVerticalBox(Header);
+        UTextBlock* Title = AddText(Header, HeaderTitle, true);
+        Title->SetAutoWrapText(false);
+        Title->SetJustification(ETextJustify::Center);
+        UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(Title->Slot);
+        TitleSlot->SetHorizontalAlignment(HAlign_Center);
+        TitleSlot->SetVerticalAlignment(VAlign_Top);
+
+        auto AddNavigation = [this, Header](const FText& Text, bool bRight)
         {
-            Label->SetMinDesiredWidth(128.0f);
-            Label->SetAutoWrapText(false);
-        }
-        return Button;
-    };
-    NativeProjectBack = AddNavigation(NSLOCTEXT("V3DMenu", "Back", "Back"), false);
-    NativeProjectRefresh = AddNavigation(NSLOCTEXT("V3DMenu", "Refresh", "Refresh"), true);
+            UButton* Button = AddButton(Header, Text);
+            if (UWidget* ParentWidget = Button ? Button->GetParent() : nullptr)
+                if (UOverlaySlot* OverlaySlot = Cast<UOverlaySlot>(ParentWidget->Slot))
+                {
+                    OverlaySlot->SetPadding(bRight ? FMargin(0.0f, 0.0f, 32.0f, 0.0f) : FMargin(32.0f, 0.0f, 0.0f, 0.0f));
+                    OverlaySlot->SetHorizontalAlignment(bRight ? HAlign_Right : HAlign_Left);
+                    OverlaySlot->SetVerticalAlignment(VAlign_Center);
+                }
+            if (UWidget* ContentWidget = Button ? Button->GetContent() : nullptr)
+                if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(ContentWidget->Slot))
+                    ContentSlot->SetPadding(FMargin(12.0f));
+            if (UTextBlock* Label = Cast<UTextBlock>(Button->GetContent()))
+            {
+                Label->SetMinDesiredWidth(128.0f);
+                Label->SetAutoWrapText(false);
+            }
+            return Button;
+        };
 
-    // Keep project creation controls below the original navigation bar, leaving the list to fill.
-    UHorizontalBox* CreateControls = WidgetTree->ConstructWidget<UHorizontalBox>();
-    Box->AddChildToVerticalBox(CreateControls)->SetPadding(FMargin(32.0f, 8.0f));
-    UTextBlock* TypeLabel = AddText(CreateControls, NSLOCTEXT("V3DMenu", "ProjectTypeLabel", "New project type"));
-    if (UHorizontalBoxSlot* TypeLabelSlot = TypeLabel ? Cast<UHorizontalBoxSlot>(TypeLabel->Slot) : nullptr)
+        OutBack = AddNavigation(NSLOCTEXT("V3DMenu", "Back", "Back"), false);
+        if (!RightText.IsEmpty())
+        {
+            OutRightButton = AddNavigation(RightText, true);
+        }
+    };
+
+    // --- Screen 1: Existing project browser ---
+    NativeProjectListScreen = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("NativeProjectListScreen"));
+    if (UOverlaySlot* ListScreenSlot = ScreenStack->AddChildToOverlay(NativeProjectListScreen))
     {
-        TypeLabelSlot->SetVerticalAlignment(VAlign_Center);
-        TypeLabelSlot->SetPadding(FMargin(0.0f, 0.0f, 24.0f, 0.0f));
+        ListScreenSlot->SetHorizontalAlignment(HAlign_Fill);
+        ListScreenSlot->SetVerticalAlignment(VAlign_Fill);
     }
+    MakeNavigationHeader(
+        NativeProjectListScreen,
+        NSLOCTEXT("V3DMenu", "EditorTitle", "Editor"),
+        NativeProjectBack,
+        NativeProjectRefresh,
+        NSLOCTEXT("V3DMenu", "Refresh", "Refresh"));
+
+    UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("NativeProjectList"));
+    NativeProjectList = Scroll;
+    UVerticalBoxSlot* ListSlot = NativeProjectListScreen->AddChildToVerticalBox(Scroll);
+    ListSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+    ListSlot->SetPadding(FMargin(32.0f, 16.0f, 32.0f, 24.0f));
+#if WITH_EDITOR
+    if (IsDesignTime())
+    {
+        AddButton(Scroll, NSLOCTEXT("V3DMenu", "CreateProject", "Create Project"));
+        AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewProjectOne", "Example Project [World]"));
+        AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewProjectTwo", "Character Library [Character]"));
+    }
+#endif
+
+    // --- Screen 2: Dedicated New Project creation screen ---
+    NativeCreateProjectScreen = WidgetTree->ConstructWidget<UVerticalBox>(UVerticalBox::StaticClass(), TEXT("NativeCreateProjectScreen"));
+    NativeCreateProjectScreen->SetVisibility(ESlateVisibility::Collapsed);
+    if (UOverlaySlot* CreateScreenSlot = ScreenStack->AddChildToOverlay(NativeCreateProjectScreen))
+    {
+        CreateScreenSlot->SetHorizontalAlignment(HAlign_Fill);
+        CreateScreenSlot->SetVerticalAlignment(VAlign_Fill);
+    }
+
+    TObjectPtr<UButton> UnusedRight = nullptr;
+    MakeNavigationHeader(
+        NativeCreateProjectScreen,
+        NSLOCTEXT("V3DMenu", "CreateProjectScreenTitle", "New Project"),
+        NativeCreateBackButton,
+        UnusedRight,
+        FText::GetEmpty());
+
+    UScrollBox* FormScroll = WidgetTree->ConstructWidget<UScrollBox>();
+    UVerticalBoxSlot* FormScrollSlot = NativeCreateProjectScreen->AddChildToVerticalBox(FormScroll);
+    FormScrollSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+    FormScrollSlot->SetPadding(FMargin(32.0f, 16.0f, 32.0f, 32.0f));
+
+    USizeBox* CardContainer = WidgetTree->ConstructWidget<USizeBox>();
+    CardContainer->SetMinDesiredWidth(920.0f);
+    CardContainer->SetMaxDesiredWidth(1120.0f);
+    FormScroll->AddChild(CardContainer);
+
+    NativeCreateProjectCard = WidgetTree->ConstructWidget<UBorder>();
+    NativeCreateProjectCard->SetPadding(FMargin(36.0f, 28.0f));
+    CardContainer->SetContent(NativeCreateProjectCard);
+
+    UVerticalBox* FormBox = WidgetTree->ConstructWidget<UVerticalBox>();
+    NativeCreateProjectCard->SetContent(FormBox);
+
+    // 1. Project Name
+    UTextBlock* NameLabel = AddText(FormBox, NSLOCTEXT("V3DMenu", "ProjectNameLabel", "Project Name"));
+    if (UVerticalBoxSlot* S = Cast<UVerticalBoxSlot>(NameLabel->Slot)) S->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
+    USizeBox* NameSize = WidgetTree->ConstructWidget<USizeBox>();
+    NameSize->SetMinDesiredHeight(ButtonHeight);
+    FormBox->AddChildToVerticalBox(NameSize)->SetPadding(FMargin(0.f, 0.f, 0.f, 20.f));
+    NativeProjectName = WidgetTree->ConstructWidget<UEditableTextBox>();
+    NativeProjectName->SetHintText(NSLOCTEXT("V3DMenu", "ProjectNameHint", "Enter project name..."));
+    NameSize->SetContent(NativeProjectName);
+
+    // 2. Project Type
+    UTextBlock* TypeLabel = AddText(FormBox, NSLOCTEXT("V3DMenu", "ProjectTypeLabel", "Project Type"));
+    if (UVerticalBoxSlot* S = Cast<UVerticalBoxSlot>(TypeLabel->Slot)) S->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
     USizeBox* TypeSize = WidgetTree->ConstructWidget<USizeBox>();
-    TypeSize->SetMinDesiredWidth(320.0f);
     TypeSize->SetMinDesiredHeight(ButtonHeight);
-    CreateControls->AddChildToHorizontalBox(TypeSize);
+    FormBox->AddChildToVerticalBox(TypeSize)->SetPadding(FMargin(0.f, 0.f, 0.f, 20.f));
     NativeProjectType = WidgetTree->ConstructWidget<UComboBoxString>();
     NativeProjectType->OnGenerateWidgetEvent.BindDynamic(this, &UProjectSelectionWidget::GenerateNativeProjectType);
     for (const EV3DSimulatorProjectType Type : { EV3DSimulatorProjectType::World,
@@ -658,15 +677,25 @@ void UProjectSelectionWidget::BuildNativeLayout()
     }
     NativeProjectType->SetSelectedOption(V3DSimulatorProjectTypes::ToString(NewProjectType));
     TypeSize->SetContent(NativeProjectType);
-    NativeProjectName = WidgetTree->ConstructWidget<UEditableTextBox>();
-    NativeProjectName->SetHintText(NSLOCTEXT("V3DMenu", "ProjectNameHint", "Project name"));
-    NativeProjectName->SetVisibility(IsDesignTime() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
-    UHorizontalBoxSlot* NameSlot = CreateControls->AddChildToHorizontalBox(NativeProjectName);
-    NameSlot->SetPadding(FMargin(24.0f, 0.0f, 0.0f, 0.0f));
-    NameSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+
+    // 3. Notes / Memo
+    UTextBlock* NotesLabel = AddText(FormBox, NSLOCTEXT("V3DMenu", "ProjectNotesLabel", "Notes / Memo"));
+    if (UVerticalBoxSlot* S = Cast<UVerticalBoxSlot>(NotesLabel->Slot)) S->SetPadding(FMargin(0.f, 0.f, 0.f, 8.f));
+    USizeBox* NotesSize = WidgetTree->ConstructWidget<USizeBox>();
+    NotesSize->SetMinDesiredHeight(150.0f);
+    FormBox->AddChildToVerticalBox(NotesSize)->SetPadding(FMargin(0.f, 0.f, 0.f, 20.f));
+    NativeProjectNotes = WidgetTree->ConstructWidget<UMultiLineEditableTextBox>();
+    NativeProjectNotes->SetHintText(NSLOCTEXT("V3DMenu", "ProjectNotesHint", "Optional description, goals, or memos..."));
+    NotesSize->SetContent(NativeProjectNotes);
+
+    // 4. World-specific options (shown when ProjectType == World)
+    NativeWorldOptionsBox = WidgetTree->ConstructWidget<UVerticalBox>();
+    FormBox->AddChildToVerticalBox(NativeWorldOptionsBox)->SetPadding(FMargin(0.f, 0.f, 0.f, 20.f));
+    UTextBlock* OptionsLabel = AddText(NativeWorldOptionsBox, NSLOCTEXT("V3DMenu", "WorldOptionsLabel", "World Options"));
+    if (UVerticalBoxSlot* S = Cast<UVerticalBoxSlot>(OptionsLabel->Slot)) S->SetPadding(FMargin(0.f, 0.f, 0.f, 10.f));
 
     UHorizontalBox* Options = WidgetTree->ConstructWidget<UHorizontalBox>();
-    Box->AddChildToVerticalBox(Options)->SetPadding(FMargin(32.0f, 8.0f));
+    NativeWorldOptionsBox->AddChildToVerticalBox(Options);
     auto AddOption = [this, Options](const TCHAR* Label, bool bChecked)
     {
         UCheckBox* Check = WidgetTree->ConstructWidget<UCheckBox>();
@@ -686,18 +715,35 @@ void UProjectSelectionWidget::BuildNativeLayout()
     NewProjectMusic = AddOption(TEXT("Environment music"), true);
     NewProjectExternalAssets = AddOption(TEXT("Use external project assets"), false);
 
-    UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("NativeProjectList"));
-    NativeProjectList = Scroll;
-    UVerticalBoxSlot* ListSlot = Box->AddChildToVerticalBox(Scroll);
-    ListSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-#if WITH_EDITOR
-    if (IsDesignTime())
+    // 5. Validation Error text
+    NativeCreateErrorText = AddText(FormBox, FText::GetEmpty());
+    NativeCreateErrorText->SetVisibility(ESlateVisibility::Collapsed);
+    if (UVerticalBoxSlot* S = Cast<UVerticalBoxSlot>(NativeCreateErrorText->Slot)) S->SetPadding(FMargin(0.f, 0.f, 0.f, 16.f));
+
+    // 6. Action Buttons (Cancel / Create & Open Editor)
+    UHorizontalBox* ActionsRow = WidgetTree->ConstructWidget<UHorizontalBox>();
+    FormBox->AddChildToVerticalBox(ActionsRow)->SetPadding(FMargin(0.f, 8.f, 0.f, 0.f));
+
+    NativeCreateCancelButton = AddButton(ActionsRow, NSLOCTEXT("V3DMenu", "Cancel", "Cancel"));
+    if (UWidget* ParentW = NativeCreateCancelButton ? NativeCreateCancelButton->GetParent() : nullptr)
     {
-        AddButton(Scroll, NSLOCTEXT("V3DMenu", "CreateProject", "Create Project"));
-        AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewProjectOne", "Example Project [World]"));
-        AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewProjectTwo", "Character Library [Character]"));
+        if (UHorizontalBoxSlot* Slot = Cast<UHorizontalBoxSlot>(ParentW->Slot))
+        {
+            Slot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            Slot->SetPadding(FMargin(0.f, 0.f, 16.f, 0.f));
+        }
     }
-#endif
+
+    NativeCreateConfirmButton = AddButton(ActionsRow, NSLOCTEXT("V3DMenu", "CreateAndOpenEditor", "Create & Open Editor"));
+    if (UWidget* ParentW = NativeCreateConfirmButton ? NativeCreateConfirmButton->GetParent() : nullptr)
+    {
+        if (UHorizontalBoxSlot* Slot = Cast<UHorizontalBoxSlot>(ParentW->Slot))
+        {
+            Slot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+        }
+    }
+
+    UpdateWorldOptionsVisibility();
 }
 
 void UProjectSelectionWidget::ApplyNativeStyle()
@@ -705,9 +751,36 @@ void UProjectSelectionWidget::ApplyNativeStyle()
     Super::ApplyNativeStyle();
     const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
     const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);
+    if (IsValid(NativeCreateProjectCard))
+    {
+        NativeCreateProjectCard->SetBrushColor(Palette.Panel);
+    }
     if (NativeProjectName)
     {
         V3DHUDStyle::ApplyEditableTextBox(*NativeProjectName, Palette, FontObject, BodyFontSize, FontOutlineSize);
+    }
+    if (NativeProjectNotes)
+    {
+        FEditableTextBoxStyle Style = NativeProjectNotes->WidgetStyle;
+        V3DHUDStyle::ApplyFont(Style.TextStyle.Font, FontObject, FMath::Clamp(FMath::RoundToInt(BodyFontSize * 0.80f), 16, 28), FontOutlineSize);
+        Style.TextStyle.ColorAndOpacity = FSlateColor(Palette.Text);
+        Style.BackgroundImageNormal = FSlateColorBrush(Palette.Input);
+        Style.BackgroundImageHovered = FSlateColorBrush(Palette.Hover);
+        Style.BackgroundImageFocused = FSlateColorBrush(Palette.Input);
+        Style.BackgroundImageReadOnly = FSlateColorBrush(Palette.Panel);
+        Style.BackgroundImageNormal.DrawAs = Style.BackgroundImageHovered.DrawAs =
+            Style.BackgroundImageFocused.DrawAs = Style.BackgroundImageReadOnly.DrawAs = ESlateBrushDrawType::Box;
+        Style.ForegroundColor = FSlateColor(Palette.Text);
+        Style.FocusedForegroundColor = FSlateColor(Palette.Text);
+        Style.ReadOnlyForegroundColor = FSlateColor(Palette.Muted);
+        Style.Padding = FMargin(12.f, 10.f);
+        NativeProjectNotes->WidgetStyle = Style;
+        NativeProjectNotes->SetTextStyle(Style.TextStyle);
+    }
+    if (NativeCreateErrorText)
+    {
+        NativeCreateErrorText->SetColorAndOpacity(FSlateColor(
+            bDarkMode ? FLinearColor(1.0f, 0.45f, 0.45f, 1.f) : FLinearColor(0.75f, 0.12f, 0.12f, 1.f)));
     }
     if (NativeProjectType)
     {
@@ -731,20 +804,35 @@ void UProjectSelectionWidget::BindNativeWidgets()
     SetBackButton(NativeProjectBack);
     SetRefreshButton(NativeProjectRefresh);
     SetNewProjectNameTextBox(NativeProjectName);
-    if (IsDesignTime())
+    if (!IsDesignTime())
     {
-        if (NativeProjectName) NativeProjectName->SetVisibility(ESlateVisibility::Visible);
-    }
-    else if (NativeProjectType)
-    {
-        NativeProjectType->OnSelectionChanged.AddUniqueDynamic(this, &UProjectSelectionWidget::HandleNativeProjectTypeChanged);
+        if (NativeProjectType)
+        {
+            NativeProjectType->OnSelectionChanged.AddUniqueDynamic(this, &UProjectSelectionWidget::HandleNativeProjectTypeChanged);
+        }
+        if (NativeCreateBackButton)
+        {
+            NativeCreateBackButton->OnClicked.AddUniqueDynamic(this, &UProjectSelectionWidget::HandleCreateProjectCancelClicked);
+        }
+        if (NativeCreateCancelButton)
+        {
+            NativeCreateCancelButton->OnClicked.AddUniqueDynamic(this, &UProjectSelectionWidget::HandleCreateProjectCancelClicked);
+        }
+        if (NativeCreateConfirmButton)
+        {
+            NativeCreateConfirmButton->OnClicked.AddUniqueDynamic(this, &UProjectSelectionWidget::HandleCreateProjectConfirmClicked);
+        }
     }
 }
 
 void UProjectSelectionWidget::HandleNativeProjectTypeChanged(FString SelectedItem, ESelectInfo::Type SelectionType)
 {
     EV3DSimulatorProjectType Type;
-    if (!IsDesignTime() && V3DSimulatorProjectTypes::TryParse(SelectedItem, Type)) NewProjectType = Type;
+    if (!IsDesignTime() && V3DSimulatorProjectTypes::TryParse(SelectedItem, Type))
+    {
+        NewProjectType = Type;
+        UpdateWorldOptionsVisibility();
+    }
 }
 
 UWidget* UProjectSelectionWidget::GenerateNativeProjectType(FString Item)
@@ -758,7 +846,6 @@ UWidget* UProjectSelectionWidget::GenerateNativeProjectType(FString Item)
     return Label;
 }
 
-
 void UProjectSelectionWidget::SetNewProjectType(EV3DSimulatorProjectType ProjectType)
 {
     NewProjectType = ProjectType;
@@ -767,6 +854,7 @@ void UProjectSelectionWidget::SetNewProjectType(EV3DSimulatorProjectType Project
         const FString Option = V3DSimulatorProjectTypes::ToString(ProjectType);
         if (NativeProjectType->GetSelectedOption() != Option) NativeProjectType->SetSelectedOption(Option);
     }
+    UpdateWorldOptionsVisibility();
 }
 
 void UProjectSelectionWidget::OpenEditor(const FString& ProjectName)
@@ -779,6 +867,7 @@ void UProjectSelectionWidget::OpenEditor(const FString& ProjectName)
     SetVisibility(ESlateVisibility::Collapsed);
     EditorWidget->OpenProject(ProjectName);
 }
+
 void UProjectSelectionWidget::HandleEditorClosed()
 {
     EditorWidget = nullptr;

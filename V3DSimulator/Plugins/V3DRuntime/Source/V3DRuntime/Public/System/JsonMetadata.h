@@ -15,5 +15,6 @@ namespace V3DSimulatorJsonMetadata
     inline constexpr TCHAR ModelType[] = TEXT("ModelType");
     inline constexpr TCHAR AllowProjectAssets[] = TEXT("bAllowProjectAssets");
     inline constexpr TCHAR WorldName[] = TEXT("WorldName");
+    inline constexpr TCHAR Notes[] = TEXT("Notes");
     inline constexpr TCHAR SchemaVersion[] = TEXT("1.0.0");
 }

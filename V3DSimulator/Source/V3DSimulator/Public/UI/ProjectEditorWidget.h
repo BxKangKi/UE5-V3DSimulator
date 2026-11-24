@@ -8,10 +8,13 @@
 #include "ProjectEditorWidget.generated.h"
 class SVerticalBox;
 class STextBlock;
+class SEditableTextBox;
 class SMultiLineEditableTextBox;
 class UBuildStatusWidget;
 class UProjectSourceModelBuilder;
 class SV3DModelPreview;
+class FV3DJsonSyntaxHighlighter;
+struct FV3DFileBrowserEntry;
 template<typename ItemType> class SListView;
 
 /** Runtime JSON authoring UI. Preview never changes authored transforms or starts a build. */
@@ -52,6 +55,18 @@ private:
     TSharedPtr<SListView<TSharedPtr<FV3DEditorDocument>>> List;
     TSharedPtr<SVerticalBox> Form;
     TSharedPtr<SMultiLineEditableTextBox> Raw;
+    TSharedPtr<FV3DJsonSyntaxHighlighter> JsonHighlighter;
+
+    // Built-in cross-platform 3D asset file browser modal state
+    bool bShowFileBrowser = false;
+    FString BrowserCurrentDir;
+    FString BrowserFilter;
+    FString BrowserStatus;
+    TArray<TSharedPtr<FV3DFileBrowserEntry>> BrowserEntries;
+    TSet<FString> BrowserSelectedFiles;
+    TSharedPtr<SEditableTextBox> BrowserPathBox;
+    TSharedPtr<SListView<TSharedPtr<FV3DFileBrowserEntry>>> BrowserListView;
+
     bool bBusy = false, bRawDirty = false, bSettingRaw = false, bRebuildingForm = false;
     uint64 RequestGeneration = 0;
     int32 FormRowsRemaining = 1500;
@@ -62,6 +77,14 @@ private:
     void StartPreview();
     void PreviewFinished(UProjectSourceModelBuilder* Builder, bool bSuccess);
     void RefreshFiles();
+    void RefreshProjectDocuments(const FString& PreferredPath = FString(), const FString& CompletionMessage = FString());
+    void OpenFileBrowser();
+    void CloseFileBrowser();
+    void NavigateFileBrowser(const FString& TargetDir);
+    void NavigateFileBrowserUp();
+    void RefreshFileBrowserEntries();
+    void ConfirmFileBrowserImport();
+    void Import3DAssetFiles(TArray<FString> SelectedFiles);
     void RefreshForm();
     void AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
         const TSharedRef<SVerticalBox>& Box, int32 Depth = 0, const FString& Context = FString());

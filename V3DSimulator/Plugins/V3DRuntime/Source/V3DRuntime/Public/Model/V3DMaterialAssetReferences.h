@@ -24,6 +24,7 @@ struct V3DRUNTIME_API FV3DMaterialAssetReferences
     UPROPERTY(Transient) TMap<FString, TObjectPtr<UMaterialInterface>> ReservedMaterials;
     UPROPERTY(Transient) TObjectPtr<UMaterialInterface> Terrain = nullptr;
     UPROPERTY(Transient) TObjectPtr<UMaterialInterface> Foliage = nullptr;
+    UPROPERTY(Transient) TObjectPtr<UMaterialInterface> Impostor = nullptr;
     uint8 MaterialMode = 0;
 
     /** Opaque means BLEND_Masked. 0/1 opaque, 2 translucent, 3 toon; +4 two-sided. */

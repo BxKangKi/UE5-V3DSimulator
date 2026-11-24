@@ -169,6 +169,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     float TimeSpeed;
 
+    /** Angular radius of the sun disk in radians. Configurable in config.json. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Celestial", meta=(ClampMin="0.001", ClampMax="0.35"))
+    float SunAngularRadius = 0.042f;
+
+    /** Angular radius of the moon disk in radians. Configurable in config.json. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Celestial", meta=(ClampMin="0.001", ClampMax="0.35"))
+    float MoonAngularRadius = 0.048f;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Water")
     bool bOcean;
 

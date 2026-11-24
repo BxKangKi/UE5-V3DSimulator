@@ -243,7 +243,8 @@ protected:
 
 private:
     UPROPERTY(Transient) TObjectPtr<USizeBox> NativeTitleBounds;
-    UPROPERTY(Transient) TObjectPtr<UImage> NativeTitleImage;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeTitlePrefix;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeTitleSuffix;
     UFUNCTION()
     void HandleNativeServerAddressChanged(const FText& Text);
 

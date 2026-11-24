@@ -150,6 +150,8 @@ bool V3DSimulatorProjectConfig::Parse(
     Json->TryGetStringField(V3DSimulatorJsonMetadata::Version, OutConfig.Version);
     if (OutConfig.Version != V3DSimulatorJsonMetadata::SchemaVersion) { OutError = TEXT("Unsupported project Version; use the current README schema."); return false; }
 
+    Json->TryGetStringField(V3DSimulatorJsonMetadata::Notes, OutConfig.Notes);
+
     if (OutConfig.ProjectType == EV3DSimulatorProjectType::World)
     {
         Json->TryGetStringField(V3DSimulatorJsonMetadata::WorldName, OutConfig.WorldName);

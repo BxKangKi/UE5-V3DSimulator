@@ -21,8 +21,15 @@ bool FV3DMaxRenderDistanceBoundsTest::RunTest(const FString&)
 
     TestTrue(TEXT("Pivot outside, bound touching range is retained"),
         MeshInRange(Size, Touching, Observer, ScreenDistance, MaxCm));
-    TestTrue(TEXT("Fixture would occupy over 5 percent of the screen"),
+    TestEqual(TEXT("Within render distance, unload threshold is 1 percent LOD screen ratio"),
+        MinScreenDiameter, 0.01);
+    TestTrue(TEXT("Fixture would occupy over 1 percent of the screen"),
         (16.0 / 9.0) * Size.Size() * 0.5 / Outside.GetLocation().Size() > MinScreenDiameter);
+    // A 3m prop at 400m inside a 1024m render distance occupies ~1.3% of screen and must stay loaded.
+    const FVector SmallProp(300.0);
+    const FTransform InsideAt400m(FVector(40000.0, 0, 0));
+    TestTrue(TEXT("Object >1 percent screen ratio inside render distance stays loaded"),
+        MeshInRange(SmallProp, InsideAt400m, Observer, ScreenDistance, MaxCm));
     TestFalse(TEXT("Visible size cannot override maximum distance"),
         MeshInRange(Size, Outside, Observer, ScreenDistance, MaxCm));
     TestFalse(TEXT("Always-loaded cannot override maximum distance"),

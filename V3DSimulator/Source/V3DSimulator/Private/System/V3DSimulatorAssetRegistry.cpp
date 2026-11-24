@@ -2,6 +2,7 @@
 
 #include "System/V3DSimulatorAssetRegistry.h"
 #include "System/V3DTerrain.h"
+#include "System/V3DImpostor.h"
 #include "Materials/MaterialInterface.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "UI/BuildStatusWidget.h"
@@ -31,6 +32,8 @@ void UV3DSimulatorAssetRegistry::EnsureMenuDefaults()
         TerrainMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(V3DTerrain::DefaultMaterialPath));
     if (FoliageMaterial.IsNull())
         FoliageMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/ShaderLibrary/Foliage/M_Foliage.M_Foliage")));
+    if (ImpostorMaterial.IsNull())
+        ImpostorMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(V3DImpostor::DefaultMaterialPath));
     if (ShaderLibraryMPC.IsNull())
         ShaderLibraryMPC = TSoftObjectPtr<UMaterialParameterCollection>(FSoftObjectPath(
             TEXT("/ShaderLibrary/MPC_ShaderLibrary.MPC_ShaderLibrary")));
@@ -94,6 +97,24 @@ UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveFoliageMaterial() const
     }
 
     return FoliageMaterial.LoadSynchronous();
+}
+
+UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveImpostorMaterial() const
+{
+    if (!IsInGameThread() || IsGarbageCollecting() || ImpostorMaterial.IsNull())
+    {
+        return nullptr;
+    }
+
+    if (UMaterialInterface* Existing = ImpostorMaterial.Get())
+    {
+        if (IsValid(Existing))
+        {
+            return Existing;
+        }
+    }
+
+    return ImpostorMaterial.LoadSynchronous();
 }
 
 UPhysicalMaterial* UV3DSimulatorAssetRegistry::ResolveDefaultPhysicalMaterial() const

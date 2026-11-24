@@ -35,6 +35,14 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "System/SourceModelImport.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Text/BaseTextLayoutMarshaller.h"
+#include "Framework/Text/SlateTextRun.h"
+#include "Framework/Text/TextLayout.h"
+#include "HAL/PlatformMisc.h"
+#include "HAL/PlatformProcess.h"
+#include "Misc/Paths.h"
 
 namespace V3DEditorUI
 {
@@ -92,6 +100,273 @@ namespace V3DEditorUI
     }
 }
 
+
+/**
+ * Slate syntax-highlighting marshaller for JSON documents.
+ * Distinguishes keys, string values, numbers, booleans/null, curly braces, square brackets,
+ * and punctuation with dedicated high-contrast palettes for both Dark and Light modes.
+ */
+class FV3DJsonSyntaxHighlighter : public FBaseTextLayoutMarshaller
+{
+public:
+    static TSharedRef<FV3DJsonSyntaxHighlighter> Create(const bool bInDarkMode, const FSlateFontInfo& InFont)
+    {
+        return MakeShareable(new FV3DJsonSyntaxHighlighter(bInDarkMode, InFont));
+    }
+
+    void SetTheme(const bool bInDarkMode, const FSlateFontInfo& InFont)
+    {
+        const FTextBlockStyle Base = FCoreStyle::Get().GetWidgetStyle<FTextBlockStyle>("NormalText");
+        auto MakeStyle = [&Base, &InFont](const FLinearColor& Color)
+        {
+            FTextBlockStyle Style = Base;
+            Style.SetFont(InFont);
+            Style.SetColorAndOpacity(FSlateColor(Color));
+            return Style;
+        };
+
+        if (bInDarkMode)
+        {
+            NormalStyle      = MakeStyle(FLinearColor(0.88f, 0.91f, 0.96f, 1.f));
+            KeyStyle         = MakeStyle(FLinearColor(0.48f, 0.80f, 1.00f, 1.f));
+            StringStyle      = MakeStyle(FLinearColor(0.96f, 0.68f, 0.50f, 1.f));
+            NumberStyle      = MakeStyle(FLinearColor(0.64f, 0.90f, 0.62f, 1.f));
+            KeywordStyle     = MakeStyle(FLinearColor(0.76f, 0.60f, 1.00f, 1.f));
+            BraceStyle       = MakeStyle(FLinearColor(1.00f, 0.84f, 0.35f, 1.f));
+            BracketStyle     = MakeStyle(FLinearColor(0.38f, 0.88f, 0.82f, 1.f));
+            PunctuationStyle = MakeStyle(FLinearColor(0.66f, 0.72f, 0.80f, 1.f));
+        }
+        else
+        {
+            NormalStyle      = MakeStyle(FLinearColor(0.08f, 0.11f, 0.16f, 1.f));
+            KeyStyle         = MakeStyle(FLinearColor(0.05f, 0.28f, 0.62f, 1.f));
+            StringStyle      = MakeStyle(FLinearColor(0.68f, 0.16f, 0.12f, 1.f));
+            NumberStyle      = MakeStyle(FLinearColor(0.05f, 0.45f, 0.22f, 1.f));
+            KeywordStyle     = MakeStyle(FLinearColor(0.48f, 0.12f, 0.64f, 1.f));
+            BraceStyle       = MakeStyle(FLinearColor(0.66f, 0.38f, 0.02f, 1.f));
+            BracketStyle     = MakeStyle(FLinearColor(0.02f, 0.46f, 0.50f, 1.f));
+            PunctuationStyle = MakeStyle(FLinearColor(0.32f, 0.38f, 0.46f, 1.f));
+        }
+        MakeDirty();
+    }
+
+    virtual void SetText(const FString& SourceString, FTextLayout& TargetTextLayout) override
+    {
+        TArray<FTextRange> LineRanges;
+        FTextRange::CalculateLineRangesFromString(SourceString, LineRanges);
+
+        TArray<FTextLayout::FNewLineData> LinesToAdd;
+        LinesToAdd.Reserve(LineRanges.Num());
+
+        for (const FTextRange& LineRange : LineRanges)
+        {
+            TSharedRef<FString> LineText = MakeShared<FString>(
+                SourceString.Mid(LineRange.BeginIndex, LineRange.Len()));
+            TArray<TSharedRef<IRun>> Runs;
+            TokenizeLine(LineText, Runs);
+            if (Runs.IsEmpty())
+            {
+                Runs.Add(FSlateTextRun::Create(FRunInfo(), LineText, NormalStyle, FTextRange(0, LineText->Len())));
+            }
+            LinesToAdd.Add(FTextLayout::FNewLineData(MoveTemp(LineText), MoveTemp(Runs)));
+        }
+
+        TargetTextLayout.AddLines(LinesToAdd);
+    }
+
+    virtual void GetText(FString& TargetString, const FTextLayout& SourceTextLayout) override
+    {
+        SourceTextLayout.GetAsText(TargetString);
+    }
+
+    virtual bool RequiresLiveUpdate() const override
+    {
+        return true;
+    }
+
+private:
+    FV3DJsonSyntaxHighlighter(const bool bInDarkMode, const FSlateFontInfo& InFont)
+    {
+        SetTheme(bInDarkMode, InFont);
+    }
+
+    static bool IsIdentifierChar(const TCHAR Ch)
+    {
+        return FChar::IsAlnum(Ch) || Ch == TEXT('_');
+    }
+
+    void TokenizeLine(const TSharedRef<FString>& LineText, TArray<TSharedRef<IRun>>& OutRuns) const
+    {
+        const FString& Str = *LineText;
+        const int32 Len = Str.Len();
+        OutRuns.Reserve(FMath::Clamp(Len / 4 + 4, 8, 256));
+        int32 Index = 0;
+
+        auto Emit = [&LineText, &OutRuns](const int32 Start, const int32 End, const FTextBlockStyle& Style)
+        {
+            if (End > Start)
+            {
+                OutRuns.Add(FSlateTextRun::Create(FRunInfo(), LineText, Style, FTextRange(Start, End)));
+            }
+        };
+
+        while (Index < Len)
+        {
+            const TCHAR Ch = Str[Index];
+
+            // Whitespace run
+            if (FChar::IsWhitespace(Ch))
+            {
+                const int32 Start = Index;
+                while (Index < Len && FChar::IsWhitespace(Str[Index])) ++Index;
+                Emit(Start, Index, NormalStyle);
+                continue;
+            }
+
+            // String literal (JSON key if followed by ':', otherwise string value)
+            if (Ch == TEXT('"'))
+            {
+                const int32 Start = Index++;
+                bool bEscaped = false;
+                while (Index < Len)
+                {
+                    const TCHAR C = Str[Index++];
+                    if (bEscaped) { bEscaped = false; continue; }
+                    if (C == TEXT('\\')) { bEscaped = true; continue; }
+                    if (C == TEXT('"')) break;
+                }
+                int32 Lookahead = Index;
+                while (Lookahead < Len && FChar::IsWhitespace(Str[Lookahead])) ++Lookahead;
+                const bool bIsKey = (Lookahead < Len && Str[Lookahead] == TEXT(':'));
+                Emit(Start, Index, bIsKey ? KeyStyle : StringStyle);
+                continue;
+            }
+
+            // Curly braces
+            if (Ch == TEXT('{') || Ch == TEXT('}'))
+            {
+                Emit(Index, Index + 1, BraceStyle);
+                ++Index;
+                continue;
+            }
+
+            // Square brackets
+            if (Ch == TEXT('[') || Ch == TEXT(']'))
+            {
+                Emit(Index, Index + 1, BracketStyle);
+                ++Index;
+                continue;
+            }
+
+            // Punctuation
+            if (Ch == TEXT(':') || Ch == TEXT(','))
+            {
+                Emit(Index, Index + 1, PunctuationStyle);
+                ++Index;
+                continue;
+            }
+
+            // Number literal
+            if (FChar::IsDigit(Ch) || (Ch == TEXT('-') && Index + 1 < Len && FChar::IsDigit(Str[Index + 1])))
+            {
+                const int32 Start = Index++;
+                while (Index < Len)
+                {
+                    const TCHAR C = Str[Index];
+                    if (FChar::IsDigit(C) || C == TEXT('.') || C == TEXT('e') || C == TEXT('E')
+                        || ((C == TEXT('+') || C == TEXT('-')) && Index > Start
+                            && (Str[Index - 1] == TEXT('e') || Str[Index - 1] == TEXT('E'))))
+                    {
+                        ++Index;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                Emit(Start, Index, NumberStyle);
+                continue;
+            }
+
+            // Keywords: true, false, null
+            auto MatchKeyword = [&Str, Len, Index](const TCHAR* Keyword, const int32 KeywordLen)
+            {
+                if (Index + KeywordLen > Len) return false;
+                if (FCString::Strncmp(&Str[Index], Keyword, KeywordLen) != 0) return false;
+                return (Index + KeywordLen == Len) || !IsIdentifierChar(Str[Index + KeywordLen]);
+            };
+            if (MatchKeyword(TEXT("true"), 4))
+            {
+                Emit(Index, Index + 4, KeywordStyle);
+                Index += 4;
+                continue;
+            }
+            if (MatchKeyword(TEXT("false"), 5))
+            {
+                Emit(Index, Index + 5, KeywordStyle);
+                Index += 5;
+                continue;
+            }
+            if (MatchKeyword(TEXT("null"), 4))
+            {
+                Emit(Index, Index + 4, KeywordStyle);
+                Index += 4;
+                continue;
+            }
+
+            // Fallback character
+            Emit(Index, Index + 1, NormalStyle);
+            ++Index;
+        }
+    }
+
+    FTextBlockStyle NormalStyle;
+    FTextBlockStyle KeyStyle;
+    FTextBlockStyle StringStyle;
+    FTextBlockStyle NumberStyle;
+    FTextBlockStyle KeywordStyle;
+    FTextBlockStyle BraceStyle;
+    FTextBlockStyle BracketStyle;
+    FTextBlockStyle PunctuationStyle;
+};
+
+struct FV3DFileBrowserEntry
+{
+    FString DisplayName;
+    FString FullPath;
+    int64 FileSizeBytes = 0;
+    bool bIsDirectory = false;
+};
+
+namespace V3DFileBrowserUtils
+{
+    FString GetUserHomeDir()
+    {
+#if PLATFORM_WINDOWS
+        FString Home = FPlatformMisc::GetEnvironmentVariable(TEXT("USERPROFILE"));
+#else
+        FString Home = FPlatformMisc::GetEnvironmentVariable(TEXT("HOME"));
+#endif
+        Home.TrimStartAndEndInline();
+        if (!Home.IsEmpty() && IFileManager::Get().DirectoryExists(*Home))
+        {
+            FPaths::NormalizeDirectoryName(Home);
+            return Home;
+        }
+        FString Fallback = FPlatformProcess::UserDir();
+        FPaths::NormalizeDirectoryName(Fallback);
+        return Fallback;
+    }
+
+    FString FormatFileSize(const int64 Bytes)
+    {
+        if (Bytes < 0) return TEXT("");
+        if (Bytes < 1024) return FString::Printf(TEXT("%lld B"), Bytes);
+        if (Bytes < 1024ll * 1024ll) return FString::Printf(TEXT("%.1f KB"), Bytes / 1024.0);
+        return FString::Printf(TEXT("%.2f MB"), Bytes / (1024.0 * 1024.0));
+    }
+}
+
 UProjectEditorWidget::UProjectEditorWidget(const FObjectInitializer& ObjectInitializer)
     : Super(ObjectInitializer)
 {
@@ -128,12 +403,17 @@ void UProjectEditorWidget::ApplyEditorTheme()
     EditorButtonStyle.NormalForeground = EditorButtonStyle.HoveredForeground =
         EditorButtonStyle.PressedForeground = FSlateColor(Palette.Text);
 
+    const FLinearColor FocusOutlineColor = bDarkMode
+        ? FLinearColor(0.35f, 0.56f, 0.85f, 1.f)
+        : FLinearColor(0.24f, 0.48f, 0.80f, 1.f);
     EditorInputStyle = FCoreStyle::Get().GetWidgetStyle<FEditableTextBoxStyle>("NormalEditableTextBox");
     EditorInputStyle.TextStyle = EditorTextStyle;
     EditorInputStyle.BackgroundImageNormal = FSlateColorBrush(Palette.Input);
     EditorInputStyle.BackgroundImageHovered = FSlateColorBrush(Palette.Input);
-    EditorInputStyle.BackgroundImageFocused = FSlateColorBrush(Palette.Hover);
+    EditorInputStyle.BackgroundImageFocused = V3DEditorUI::MakeOutlinedBrush(Palette.Input, FocusOutlineColor, 4.f, 1.5f);
     EditorInputStyle.BackgroundImageReadOnly = FSlateColorBrush(Palette.Background);
+    EditorInputStyle.BackgroundImageNormal.DrawAs = EditorInputStyle.BackgroundImageHovered.DrawAs =
+        EditorInputStyle.BackgroundImageReadOnly.DrawAs = ESlateBrushDrawType::Box;
     EditorInputStyle.ForegroundColor = EditorInputStyle.FocusedForegroundColor = FSlateColor(Palette.Text);
     EditorInputStyle.Padding = FMargin(10, 7);
 
@@ -181,13 +461,27 @@ void UProjectEditorWidget::ApplyEditorTheme()
     EditorCheckStyle.CheckedForeground = EditorCheckStyle.CheckedHoveredForeground =
         EditorCheckStyle.CheckedPressedForeground = FSlateColor(CheckedText);
 
+    if (!JsonHighlighter.IsValid())
+    {
+        JsonHighlighter = FV3DJsonSyntaxHighlighter::Create(bDarkMode, EditorTextStyle.Font);
+    }
+    else
+    {
+        JsonHighlighter->SetTheme(bDarkMode, EditorTextStyle.Font);
+    }
     if (Raw.IsValid())
     {
         Raw->SetTextStyle(&EditorTextStyle);
+        TGuardValue<bool> Guard(bSettingRaw, true);
+        Raw->SetText(V3DEditorUI::Text(RawDraft));
     }
     if (List.IsValid())
     {
         List->RequestListRefresh();
+    }
+    if (BrowserListView.IsValid())
+    {
+        BrowserListView->RequestListRefresh();
     }
 }
 
@@ -252,6 +546,8 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         });
         if (!Queued) { bBusy = false; Message = TEXT("Reload queue unavailable."); }
     })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Refresh"), [this] { RefreshProjectDocuments(); })];
+    Toolbar->AddSlot()[MakeEditorButton(TEXT("Import 3D Asset"), [this] { OpenFileBrowser(); })];
     Toolbar->AddSlot()[MakeEditorButton(TEXT("Back"), [this] { RequestBack(); })];
 
     auto Left = SNew(SVerticalBox);
@@ -277,7 +573,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().Panel); }).Padding(8)
         [SNew(SBox).HeightOverride(240)[SAssignNew(Preview, SV3DModelPreview)]]];
     Right->AddSlot().AutoHeight().Padding(0,8)[SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text(Text(TEXT("JSON / advanced edit · Apply JSON to update fields")))];
-    Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).Style(&EditorInputStyle).Font(EditorTextStyle.Font).AutoWrapText(false)
+    Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).Style(&EditorInputStyle).Font(EditorTextStyle.Font).Marshaller(JsonHighlighter).AutoWrapText(false)
         .OnTextChanged_Lambda([this](const FText& Value)
         { if (!bSettingRaw) { bRawDirty = true; RawDraft = Value.ToString(); } })];
     auto Body = SNew(SSplitter)
@@ -303,8 +599,128 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
     Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Save"), [this] { bConfirmBack = false; SaveAll(false, true); })];
     Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Discard"), [this] { bConfirmBack = false; Close(); })];
     Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Cancel"), [this] { bConfirmBack = false; })];
+    auto QuickBar = SNew(SWrapBox).UseAllottedSize(true).InnerSlotPadding(FVector2D(8, 6));
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Up (..)"), [this] { NavigateFileBrowserUp(); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Home"), [this] { NavigateFileBrowser(V3DFileBrowserUtils::GetUserHomeDir()); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Desktop"), [this] { NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Desktop"))); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Documents"), [this] { NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Documents"))); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Downloads"), [this] { NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Downloads"))); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Project"), [this] { NavigateFileBrowser(V3DSimulatorProjectWorkspace::ProjectRoot(Project)); })];
+
+    auto BrowserModal = SNew(SBorder)
+        .Visibility_Lambda([this] { return bShowFileBrowser ? EVisibility::Visible : EVisibility::Collapsed; })
+        .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+        .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().ModalScrim); })
+        .HAlign(HAlign_Center).VAlign(VAlign_Center)
+        [SNew(SBox).WidthOverride(940.f).HeightOverride(660.f)
+            [SNew(SBorder).Padding(24).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+                .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().Background); })
+                [SNew(SVerticalBox)
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 12)
+                        [SNew(SHorizontalBox)
+                            + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+                                [SNew(STextBlock).TextStyle(&EditorTextStyle).Font(TitleFont)
+                                    .Text(Text(TEXT("Import 3D Assets (.glb, .gltf, .fbx, .obj, .stl)")))]
+                            + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                                [MakeEditorButton(TEXT("Close"), [this] { CloseFileBrowser(); })]]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)[QuickBar]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
+                        [SNew(SHorizontalBox)
+                            + SHorizontalBox::Slot().FillWidth(1).Padding(0, 0, 8, 0)
+                                [SAssignNew(BrowserPathBox, SEditableTextBox)
+                                    .Style(&EditorInputStyle)
+                                    .HintText(Text(TEXT("Directory path...")))
+                                    .OnTextCommitted_Lambda([this](const FText& NewPath, ETextCommit::Type CommitType)
+                                    {
+                                        if (CommitType == ETextCommit::OnEnter)
+                                        {
+                                            NavigateFileBrowser(NewPath.ToString().TrimStartAndEnd());
+                                        }
+                                    })]
+                            + SHorizontalBox::Slot().AutoWidth()
+                                [MakeEditorButton(TEXT("Go"), [this]
+                                {
+                                    if (BrowserPathBox.IsValid())
+                                    {
+                                        NavigateFileBrowser(BrowserPathBox->GetText().ToString().TrimStartAndEnd());
+                                    }
+                                })]]
+                    + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10)
+                        [SNew(SEditableTextBox)
+                            .Style(&EditorInputStyle)
+                            .HintText(Text(TEXT("Filter folders / 3D assets in this directory...")))
+                            .OnTextChanged_Lambda([this](const FText& Val)
+                            {
+                                BrowserFilter = Val.ToString();
+                                RefreshFileBrowserEntries();
+                            })]
+                    + SVerticalBox::Slot().FillHeight(1).Padding(0, 0, 0, 12)
+                        [SNew(SBorder).Padding(4).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
+                            .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().Panel); })
+                            [SAssignNew(BrowserListView, SListView<TSharedPtr<FV3DFileBrowserEntry>>)
+                                .ListViewStyle(&EditorListStyle)
+                                .ListItemsSource(&BrowserEntries)
+                                .SelectionMode(ESelectionMode::None)
+                                .OnGenerateRow_Lambda([this](TSharedPtr<FV3DFileBrowserEntry> Entry, const TSharedRef<STableViewBase>& Owner)
+                                {
+                                    return SNew(STableRow<TSharedPtr<FV3DFileBrowserEntry>>, Owner).Style(&EditorRowStyle)
+                                        [SNew(SButton)
+                                            .ButtonStyle(&EditorButtonStyle)
+                                            .ContentPadding(FMargin(10, 6))
+                                            .OnClicked_Lambda([this, Entry]()
+                                            {
+                                                if (!Entry.IsValid()) return FReply::Handled();
+                                                if (Entry->bIsDirectory)
+                                                {
+                                                    NavigateFileBrowser(Entry->FullPath);
+                                                }
+                                                else
+                                                {
+                                                    if (BrowserSelectedFiles.Contains(Entry->FullPath))
+                                                        BrowserSelectedFiles.Remove(Entry->FullPath);
+                                                    else
+                                                        BrowserSelectedFiles.Add(Entry->FullPath);
+                                                    if (BrowserListView.IsValid()) BrowserListView->RequestListRefresh();
+                                                }
+                                                return FReply::Handled();
+                                            })
+                                            [SNew(SHorizontalBox)
+                                                + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+                                                    [SNew(STextBlock).TextStyle(&EditorTextStyle)
+                                                        .Text_Lambda([this, Entry]
+                                                        {
+                                                            if (!Entry.IsValid()) return FText::GetEmpty();
+                                                            if (Entry->bIsDirectory)
+                                                            {
+                                                                return Text(TEXT("[DIR]  ") + Entry->DisplayName);
+                                                            }
+                                                            const bool bSelected = BrowserSelectedFiles.Contains(Entry->FullPath);
+                                                            return Text((bSelected ? TEXT("[✓]  ") : TEXT("[ ]  ")) + Entry->DisplayName);
+                                                        })]
+                                                + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(12, 0, 0, 0)
+                                                    [SNew(STextBlock).TextStyle(&EditorTextStyle)
+                                                        .ColorAndOpacity_Lambda([this] { return FSlateColor(GetThemePalette().Muted); })
+                                                        .Text(Entry.IsValid() && !Entry->bIsDirectory
+                                                            ? Text(V3DFileBrowserUtils::FormatFileSize(Entry->FileSizeBytes))
+                                                            : FText::GetEmpty())]]];
+                                })]]
+                    + SVerticalBox::Slot().AutoHeight()
+                        [SNew(SHorizontalBox)
+                            + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+                                [SNew(STextBlock).TextStyle(&EditorTextStyle)
+                                    .Text_Lambda([this]
+                                    {
+                                        if (!BrowserStatus.IsEmpty()) return Text(BrowserStatus);
+                                        return Text(FString::Printf(TEXT("%d file(s) selected"), BrowserSelectedFiles.Num()));
+                                    })]
+                            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 8, 0)
+                                [MakeEditorButton(TEXT("Cancel"), [this] { CloseFileBrowser(); })]
+                            + SHorizontalBox::Slot().AutoWidth()
+                                [MakeEditorButton(TEXT("Import Selected"), [this] { ConfirmFileBrowserImport(); })]]]]];
+
     return SNew(SOverlay)
-        + SOverlay::Slot()[SNew(SBox).IsEnabled_Lambda([this] { return !bConfirmBack; })[Root]]
+        + SOverlay::Slot()[SNew(SBox).IsEnabled_Lambda([this] { return !bConfirmBack && !bShowFileBrowser; })[Root]]
+        + SOverlay::Slot()[BrowserModal]
         + SOverlay::Slot()[SNew(SBorder)
             .Visibility_Lambda([this] { return bConfirmBack ? EVisibility::Visible : EVisibility::Collapsed; })
             .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
@@ -354,6 +770,303 @@ void UProjectEditorWidget::RefreshFiles()
     VisibleDocuments.Reset();
     for (const auto& Doc : Documents) if (Doc.IsValid() && (Filter.IsEmpty() || Doc->Label.Contains(Filter))) VisibleDocuments.Add(Doc);
     if (List) List->RequestListRefresh();
+}
+
+void UProjectEditorWidget::RefreshProjectDocuments(const FString& PreferredPath, const FString& CompletionMessage)
+{
+    if (bBusy || BuildStatus || Project.IsEmpty()) return;
+    if (!ApplyRaw()) return;
+
+    const FString TargetSelection = !PreferredPath.IsEmpty()
+        ? FSafeFileIO::NormalizeFilePath(PreferredPath)
+        : (Current.IsValid() ? Current->Path : FString());
+
+    bBusy = true;
+    Message = TEXT("Refreshing project files...");
+    const FString ProjectName = Project;
+    const uint64 Token = ++RequestGeneration;
+    const TWeakObjectPtr<UProjectEditorWidget> Weak(this);
+    const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, ProjectName, TargetSelection, CompletionMessage]
+    {
+        TArray<TSharedPtr<FV3DEditorDocument>> Found;
+        FString Error;
+        const bool bSuccess = V3DProjectEditor::Discover(ProjectName, Found, Error);
+        FSafeFileIO::DispatchTrackedGameThread([Weak, Token, Found = MoveTemp(Found), Error, bSuccess, TargetSelection, CompletionMessage]() mutable
+        {
+            auto* Self = Weak.Get();
+            if (!Self || Self->RequestGeneration != Token) return;
+            Self->bBusy = false;
+            if (!bSuccess)
+            {
+                Self->Message = Error.IsEmpty() ? TEXT("Refresh failed.") : Error;
+                return;
+            }
+
+            // Preserve any unsaved in-memory edits while adopting newly discovered/updated files on disk.
+            TMap<FString, TSharedPtr<FV3DEditorDocument>> DirtyByPath;
+            for (const auto& Existing : Self->Documents)
+            {
+                if (Existing.IsValid() && Existing->bDirty)
+                {
+                    DirtyByPath.Add(Existing->Path.ToLower(), Existing);
+                }
+            }
+            bool bPreservedDirty = false;
+            for (int32 Index = 0; Index < Found.Num(); ++Index)
+            {
+                if (!Found[Index].IsValid()) continue;
+                if (const auto* DirtyDoc = DirtyByPath.Find(Found[Index]->Path.ToLower()))
+                {
+                    Found[Index] = *DirtyDoc;
+                    bPreservedDirty = true;
+                }
+            }
+
+            Self->InvalidatePreview();
+            Self->Documents = MoveTemp(Found);
+            Self->RefreshFiles();
+
+            TSharedPtr<FV3DEditorDocument> NextSelection;
+            if (!TargetSelection.IsEmpty())
+            {
+                for (const auto& Doc : Self->Documents)
+                {
+                    if (Doc.IsValid() && Doc->Path.Equals(TargetSelection, ESearchCase::IgnoreCase))
+                    {
+                        NextSelection = Doc;
+                        break;
+                    }
+                }
+            }
+            if (!NextSelection.IsValid() && !Self->Documents.IsEmpty())
+            {
+                NextSelection = Self->Documents[0];
+            }
+
+            Self->Current = NextSelection;
+            Self->bRawDirty = false;
+            Self->RefreshForm();
+            if (Self->List && Self->Current)
+            {
+                Self->List->SetSelection(Self->Current, ESelectInfo::Direct);
+            }
+            if (!CompletionMessage.IsEmpty())
+            {
+                Self->Message = CompletionMessage;
+            }
+            else
+            {
+                Self->Message = bPreservedDirty
+                    ? TEXT("Project refreshed (unsaved edits preserved).")
+                    : TEXT("Project files refreshed.");
+            }
+        });
+    });
+    if (!Queued)
+    {
+        bBusy = false;
+        Message = TEXT("Editor refresh queue is unavailable.");
+    }
+}
+
+void UProjectEditorWidget::OpenFileBrowser()
+{
+    if (bBusy || BuildStatus || Project.IsEmpty()) return;
+    if (!ApplyRaw()) return;
+
+    BrowserSelectedFiles.Reset();
+    BrowserFilter.Reset();
+    BrowserStatus.Reset();
+    bShowFileBrowser = true;
+
+    FString StartDir = BrowserCurrentDir;
+    if (StartDir.IsEmpty() || !IFileManager::Get().DirectoryExists(*StartDir))
+    {
+        StartDir = V3DFileBrowserUtils::GetUserHomeDir();
+    }
+    NavigateFileBrowser(StartDir);
+}
+
+void UProjectEditorWidget::CloseFileBrowser()
+{
+    bShowFileBrowser = false;
+    BrowserSelectedFiles.Reset();
+    BrowserStatus.Reset();
+}
+
+void UProjectEditorWidget::NavigateFileBrowser(const FString& TargetDir)
+{
+    FString Normalized = TargetDir;
+    Normalized.TrimStartAndEndInline();
+    FPaths::NormalizeDirectoryName(Normalized);
+    if (Normalized.IsEmpty() || !IFileManager::Get().DirectoryExists(*Normalized))
+    {
+        BrowserStatus = TEXT("Directory does not exist: ") + TargetDir;
+        return;
+    }
+    BrowserCurrentDir = Normalized;
+    BrowserStatus.Reset();
+    if (BrowserPathBox.IsValid())
+    {
+        BrowserPathBox->SetText(FText::FromString(BrowserCurrentDir));
+    }
+    RefreshFileBrowserEntries();
+}
+
+void UProjectEditorWidget::NavigateFileBrowserUp()
+{
+    if (BrowserCurrentDir.IsEmpty())
+    {
+        NavigateFileBrowser(V3DFileBrowserUtils::GetUserHomeDir());
+        return;
+    }
+    FString Parent = FPaths::GetPath(BrowserCurrentDir);
+    FPaths::NormalizeDirectoryName(Parent);
+#if !PLATFORM_WINDOWS
+    if (Parent.IsEmpty())
+    {
+        Parent = TEXT("/");
+    }
+#endif
+    if (!Parent.IsEmpty() && IFileManager::Get().DirectoryExists(*Parent))
+    {
+        NavigateFileBrowser(Parent);
+    }
+}
+
+void UProjectEditorWidget::RefreshFileBrowserEntries()
+{
+    BrowserEntries.Reset();
+    if (BrowserCurrentDir.IsEmpty() || !IFileManager::Get().DirectoryExists(*BrowserCurrentDir))
+    {
+        if (BrowserListView.IsValid()) BrowserListView->RequestListRefresh();
+        return;
+    }
+
+    IFileManager& Files = IFileManager::Get();
+    const FString SearchWildcard = FPaths::Combine(BrowserCurrentDir, TEXT("*"));
+
+    TArray<FString> SubDirs;
+    Files.FindFiles(SubDirs, *SearchWildcard, false, true);
+    SubDirs.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::IgnoreCase) < 0; });
+
+    for (const FString& DirName : SubDirs)
+    {
+        if (DirName.StartsWith(TEXT("."))) continue;
+        if (!BrowserFilter.IsEmpty() && !DirName.Contains(BrowserFilter, ESearchCase::IgnoreCase)) continue;
+        auto Entry = MakeShared<FV3DFileBrowserEntry>();
+        Entry->DisplayName = DirName;
+        Entry->FullPath = FPaths::Combine(BrowserCurrentDir, DirName);
+        Entry->bIsDirectory = true;
+        BrowserEntries.Add(MoveTemp(Entry));
+    }
+
+    TArray<FString> FoundFiles;
+    Files.FindFiles(FoundFiles, *SearchWildcard, true, false);
+    FoundFiles.Sort([](const FString& A, const FString& B) { return A.Compare(B, ESearchCase::IgnoreCase) < 0; });
+
+    for (const FString& FileName : FoundFiles)
+    {
+        if (FileName.StartsWith(TEXT("."))) continue;
+        const FString FullPath = FPaths::Combine(BrowserCurrentDir, FileName);
+        if (!V3DSourceModelImport::IsModelSource(FullPath)) continue;
+        if (!BrowserFilter.IsEmpty() && !FileName.Contains(BrowserFilter, ESearchCase::IgnoreCase)) continue;
+        auto Entry = MakeShared<FV3DFileBrowserEntry>();
+        Entry->DisplayName = FileName;
+        Entry->FullPath = FullPath;
+        Entry->FileSizeBytes = Files.FileSize(*FullPath);
+        Entry->bIsDirectory = false;
+        BrowserEntries.Add(MoveTemp(Entry));
+    }
+
+    if (BrowserListView.IsValid())
+    {
+        BrowserListView->RequestListRefresh();
+    }
+}
+
+void UProjectEditorWidget::ConfirmFileBrowserImport()
+{
+    if (BrowserSelectedFiles.IsEmpty())
+    {
+        BrowserStatus = TEXT("Select one or more 3D asset files first.");
+        return;
+    }
+    TArray<FString> Selected = BrowserSelectedFiles.Array();
+    CloseFileBrowser();
+    Import3DAssetFiles(MoveTemp(Selected));
+}
+
+void UProjectEditorWidget::Import3DAssetFiles(TArray<FString> SelectedFiles)
+{
+    if (bBusy || BuildStatus || Project.IsEmpty() || SelectedFiles.IsEmpty()) return;
+
+    bBusy = true;
+    Message = TEXT("Importing 3D asset(s)...");
+    const FString ProjectName = Project;
+    const uint64 Token = ++RequestGeneration;
+    const TWeakObjectPtr<UProjectEditorWidget> Weak(this);
+    const bool Queued = FSafeFileIO::RunTrackedWorker([Weak, Token, ProjectName, SelectedFiles = MoveTemp(SelectedFiles)]
+    {
+        const FString ResourcesDir = V3DSimulatorProjectWorkspace::ProjectResourcesRoot(ProjectName);
+        IFileManager& Files = IFileManager::Get();
+        Files.MakeDirectory(*ResourcesDir, true);
+
+        int32 ImportedCount = 0;
+        FString LastImportedJsonPath;
+        TArray<FString> Skipped;
+
+        for (const FString& SourceFile : SelectedFiles)
+        {
+            if (!Files.FileExists(*SourceFile) || !V3DSourceModelImport::IsModelSource(SourceFile))
+            {
+                Skipped.Add(FPaths::GetCleanFilename(SourceFile));
+                continue;
+            }
+
+            const FString BaseName = FPaths::GetBaseFilename(SourceFile);
+            const FString Ext = FPaths::GetExtension(SourceFile, true);
+            FString DestPath = FPaths::Combine(ResourcesDir, BaseName + Ext);
+            int32 Suffix = 1;
+            while (Files.FileExists(*DestPath) && Suffix < 10000)
+            {
+                DestPath = FPaths::Combine(ResourcesDir, FString::Printf(TEXT("%s_%d%s"), *BaseName, Suffix++, *Ext));
+            }
+
+            if (Files.Copy(*DestPath, *SourceFile, false, true) == COPY_OK)
+            {
+                ++ImportedCount;
+                LastImportedJsonPath = FPaths::ChangeExtension(DestPath, TEXT("json"));
+            }
+            else
+            {
+                Skipped.Add(FPaths::GetCleanFilename(SourceFile));
+            }
+        }
+
+        FSafeFileIO::DispatchTrackedGameThread([Weak, Token, ImportedCount, LastImportedJsonPath, Skipped = MoveTemp(Skipped)]
+        {
+            auto* Self = Weak.Get();
+            if (!Self || Self->RequestGeneration != Token) return;
+            Self->bBusy = false;
+            if (ImportedCount > 0)
+            {
+                const FString DoneMsg = Skipped.IsEmpty()
+                    ? FString::Printf(TEXT("Imported %d 3D asset(s) into resources/."), ImportedCount)
+                    : FString::Printf(TEXT("Imported %d 3D asset(s); skipped %d unsupported/failed file(s)."), ImportedCount, Skipped.Num());
+                Self->RefreshProjectDocuments(LastImportedJsonPath, DoneMsg);
+            }
+            else
+            {
+                Self->Message = TEXT("No supported 3D assets were imported (.glb, .gltf, .fbx, .obj, .stl).");
+            }
+        });
+    });
+    if (!Queued)
+    {
+        bBusy = false;
+        Message = TEXT("Import queue is unavailable.");
+    }
 }
 void UProjectEditorWidget::Remember()
 {
@@ -857,7 +1570,7 @@ FReply UProjectEditorWidget::NativeOnKeyDown(const FGeometry& Geometry, const FK
 {
     if (Event.GetKey() == EKeys::Escape)
     {
-        if (bConfirmBack) bConfirmBack = false; else RequestBack();
+        if (bShowFileBrowser) CloseFileBrowser(); else if (bConfirmBack) bConfirmBack = false; else RequestBack();
         return FReply::Handled();
     }
     return Super::NativeOnKeyDown(Geometry, Event);
@@ -885,7 +1598,7 @@ void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
 {
     Super::ReleaseSlateResources(bReleaseChildren);
     bFormRefreshPending = false;
-    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset();
+    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset();
 }
 
 void UProjectEditorWidget::StartPreview()

@@ -355,6 +355,12 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
             *Registry->FoliageMaterial.ToSoftObjectPath().ToString()));
         NewCache->References.Foliage = nullptr;
     }
+    NewCache->References.Impostor = bRuntimeAssetsPreloaded
+        ? Registry->ImpostorMaterial.Get() : Registry->ResolveImpostorMaterial();
+    if (!Registry->ImpostorMaterial.IsNull() && !IsValid(NewCache->References.Impostor))
+    {
+        NewCache->References.Impostor = nullptr;
+    }
     bMaterialDefaultAssetResolved = true;
 
     for (const FString& Failure : Failures)
@@ -1017,6 +1023,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         const FV3DMaterialSoftAssetReferences& Materials = Registry->V3DMaterials;
         TArray<FSoftObjectPath> MaterialPaths; Materials.GetPreloadPaths(MaterialPaths);
         for (const auto& Path : MaterialPaths) AddPath(Path);
+        AddPath(Registry->ImpostorMaterial.ToSoftObjectPath());
 
     }
 

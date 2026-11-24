@@ -194,6 +194,7 @@ AWorldEnvManager::AWorldEnvManager()
     Moon->SetAtmosphereSunLightIndex(1);
     Moon->SetAtmosphereSunDiskColorScale(FLinearColor::Black);
     Moon->SetIntensity(0.005f);
+    Moon->SetLightSourceAngle(V3DPhysicalMaterial::MoonDiameterDegrees);
     Moon->SetUseTemperature(true);
     Moon->SetTemperature(6500.0f);
     Moon->SetEnableLightShaftOcclusion(false);
@@ -322,7 +323,7 @@ void AWorldEnvManager::EnsureCoreSkyVisible()
     {
         Sun->SetAtmosphereSunLight(true);
         Sun->SetAtmosphereSunLightIndex(0);
-        Sun->SetLightSourceAngle(V3DPhysicalMaterial::CelestialDiameterDegrees);
+        Sun->SetLightSourceAngle(GetEffectiveSunAngularRadius() * (360.f / PI));
         if (!bRenderingActive)
         {
             Sun->SetIntensity(20.0f);
@@ -333,7 +334,7 @@ void AWorldEnvManager::EnsureCoreSkyVisible()
     {
         Moon->SetAtmosphereSunLight(true);
         Moon->SetAtmosphereSunLightIndex(1);
-        Moon->SetLightSourceAngle(V3DPhysicalMaterial::CelestialDiameterDegrees);
+        Moon->SetLightSourceAngle(GetEffectiveMoonAngularRadius() * (360.f / PI));
         Moon->SetAtmosphereSunDiskColorScale(FLinearColor::Black);
         Moon->SetEnableLightShaftOcclusion(false);
         Moon->SetEnableLightShaftBloom(false);
@@ -539,6 +540,12 @@ void AWorldEnvManager::InitializeRendering(UWorldData* InWorldData)
     FogTransition.Reset();
     bFogProfileApplied = false;
     FogProfilePollSeconds = 0.f;
+    LastFogSunElevationSin = -999.0f;
+    LastFogMoonElevationSin = -999.0f;
+    LastFogSunElevationSin = -999.0f;
+    LastFogMoonElevationSin = -999.0f;
+    LastAppliedSunRadius = -1.0f;
+    LastAppliedMoonRadius = -1.0f;
     bRenderingActive = true;
     LastAppliedWaterSunElevation = -999.0f;
     PrepareForWorldLoading();
@@ -546,6 +553,7 @@ void AWorldEnvManager::InitializeRendering(UWorldData* InWorldData)
     ApplyCloudSettings();
     RefreshShaderLibraryParameters();
     RegisterGameUpdate();
+    ApplyCelestialSizes();
     UpdateSkyLighting();
     UpdateFoliageInteractors();
     UpdateUnderwaterLightShafts();
@@ -841,21 +849,31 @@ void AWorldEnvManager::UpdateFogProfile(float DeltaSeconds)
         Target = Data->Fog.Resolve(Biome, Weather, Intensity);
     }
     const auto& Profile = FogTransition.Update(Target, Delta, Data->Fog.TransitionSeconds);
-    if (bFogProfileApplied && Profile == LastAppliedFogProfile) return;
+    const bool bLightingChanged = !FMath::IsNearlyEqual(CurrentSunElevationSin, LastFogSunElevationSin, 0.002f)
+        || !FMath::IsNearlyEqual(CurrentMoonElevationSin, LastFogMoonElevationSin, 0.002f);
+    if (bFogProfileApplied && Profile == LastAppliedFogProfile && !bLightingChanged) return;
     using namespace V3DFog;
     Fog->SetFogDensity(Profile[Density]);
     Fog->SetFogHeightFalloff(Profile[HeightFalloff]);
     Fog->SetStartDistance(Profile[StartDistanceCm]);
     Fog->SetFogMaxOpacity(Profile[MaxOpacity]);
-    const FLinearColor InscatteringColor(Profile[ColorR], Profile[ColorG], Profile[ColorB]);
+    const FDayNightLighting DayNight = EvaluateDayNightLighting(CurrentSunElevationSin, CurrentMoonElevationSin);
+    const FLinearColor InscatteringColor(
+        Profile[ColorR] * DayNight.InscatteringScale[0],
+        Profile[ColorG] * DayNight.InscatteringScale[1],
+        Profile[ColorB] * DayNight.InscatteringScale[2]);
     Fog->SetFogInscatteringColor(InscatteringColor);
     Fog->SetDirectionalInscatteringColor(FLinearColor(
-        InscatteringColor.R * 0.35f, InscatteringColor.G * 0.35f, InscatteringColor.B * 0.35f));
+        Profile[ColorR] * DayNight.DirectionalScale[0],
+        Profile[ColorG] * DayNight.DirectionalScale[1],
+        Profile[ColorB] * DayNight.DirectionalScale[2]));
     Fog->SetVolumetricFogScatteringDistribution(Profile[ScatteringDistribution]);
     Fog->SetVolumetricFogExtinctionScale(Profile[ExtinctionScale]);
     Fog->SetVolumetricFogDistance(Profile[ViewDistanceCm]);
     Fog->SetVolumetricFogAlbedo(FLinearColor(Profile[AlbedoR], Profile[AlbedoG], Profile[AlbedoB]).ToFColorSRGB());
     LastAppliedFogProfile = Profile;
+    LastFogSunElevationSin = CurrentSunElevationSin;
+    LastFogMoonElevationSin = CurrentMoonElevationSin;
     bFogProfileApplied = true;
 }
 
@@ -931,6 +949,8 @@ void AWorldEnvManager::UpdateSkyLighting()
         }
     }
 
+    CurrentSunElevationSin = SunElevationSin;
+    CurrentMoonElevationSin = MoonElevationSin;
     UpdateSkyMaterialParameters(SunElevationSin, MoonElevationSin);
     UpdatePhysicalUnderwaterColors(SunElevationSin, false);
 }
@@ -948,8 +968,8 @@ void AWorldEnvManager::EnsureSkyMaterialInstances()
         auto* MID = IsValid(Parent) ? UMaterialInstanceDynamic::Create(Parent, this) : nullptr;
         if (!MID) { SkyMaterialInstances[Index] = nullptr; continue; }
         if (SourceMID) MID->CopyParameterOverrides(SourceMID);
-        MID->SetScalarParameterValue(TEXT("MoonSize"), V3DPhysicalMaterial::MoonRadiusRadians);
-        MID->SetScalarParameterValue(TEXT("SunAngularRadius"), V3DPhysicalMaterial::CelestialRadiusRadians);
+        MID->SetScalarParameterValue(TEXT("MoonSize"), GetEffectiveMoonAngularRadius());
+        MID->SetScalarParameterValue(TEXT("SunAngularRadius"), GetEffectiveSunAngularRadius());
         MID->SetScalarParameterValue(TEXT("MoonIntensity"), V3DPhysicalMaterial::MoonIntensity);
         MID->SetScalarParameterValue(TEXT("MoonVisibility"), 0.0f);
         MID->SetScalarParameterValue(TEXT("SunVisibility"), 0.0f);
@@ -961,8 +981,57 @@ void AWorldEnvManager::EnsureSkyMaterialInstances()
     }
 }
 
+float AWorldEnvManager::GetEffectiveSunAngularRadius() const
+{
+    const float Base = (IsValid(Data) && FMath::IsFinite(Data->SunAngularRadius))
+        ? Data->SunAngularRadius
+        : (FMath::IsFinite(SunAngularRadius) ? SunAngularRadius : V3DPhysicalMaterial::DefaultSunAngularRadiusRadians);
+    const float Scale = FMath::IsFinite(SunSizeScale) ? FMath::Clamp(SunSizeScale, 0.1f, 5.0f) : 1.0f;
+    return FMath::Clamp(Base * Scale,
+        V3DPhysicalMaterial::MinCelestialAngularRadiusRadians,
+        V3DPhysicalMaterial::MaxCelestialAngularRadiusRadians);
+}
+
+float AWorldEnvManager::GetEffectiveMoonAngularRadius() const
+{
+    const float Base = (IsValid(Data) && FMath::IsFinite(Data->MoonAngularRadius))
+        ? Data->MoonAngularRadius
+        : (FMath::IsFinite(MoonAngularRadius) ? MoonAngularRadius : V3DPhysicalMaterial::DefaultMoonAngularRadiusRadians);
+    const float Scale = FMath::IsFinite(MoonSizeScale) ? FMath::Clamp(MoonSizeScale, 0.1f, 5.0f) : 1.0f;
+    return FMath::Clamp(Base * Scale,
+        V3DPhysicalMaterial::MinCelestialAngularRadiusRadians,
+        V3DPhysicalMaterial::MaxCelestialAngularRadiusRadians);
+}
+
+void AWorldEnvManager::ApplyCelestialSizes()
+{
+    const float SunRadius = GetEffectiveSunAngularRadius();
+    const float MoonRadius = GetEffectiveMoonAngularRadius();
+    const bool bSunRadiusChanged = !FMath::IsNearlyEqual(SunRadius, LastAppliedSunRadius, 1.e-5f);
+    const bool bMoonRadiusChanged = !FMath::IsNearlyEqual(MoonRadius, LastAppliedMoonRadius, 1.e-5f);
+    if (!bSunRadiusChanged && !bMoonRadiusChanged) return;
+
+    if (bSunRadiusChanged && IsValid(Sun))
+    {
+        Sun->SetLightSourceAngle(SunRadius * (360.f / PI));
+    }
+    if (bMoonRadiusChanged && IsValid(Moon))
+    {
+        Moon->SetLightSourceAngle(MoonRadius * (360.f / PI));
+    }
+    for (UMaterialInstanceDynamic* MID : SkyMaterialInstances)
+    {
+        if (!IsValid(MID)) continue;
+        if (bSunRadiusChanged) MID->SetScalarParameterValue(TEXT("SunAngularRadius"), SunRadius);
+        if (bMoonRadiusChanged) MID->SetScalarParameterValue(TEXT("MoonSize"), MoonRadius);
+    }
+    LastAppliedSunRadius = SunRadius;
+    LastAppliedMoonRadius = MoonRadius;
+}
+
 void AWorldEnvManager::UpdateSkyMaterialParameters(const float SunElevationSin, const float MoonElevationSin)
 {
+    ApplyCelestialSizes();
     const float Night = 1.0f - FMath::SmoothStep(-0.08f, 0.08f, SunElevationSin);
     const float MoonVisibility = Night * FMath::SmoothStep(-0.015f, 0.06f, MoonElevationSin);
     const float SunVisibility = FMath::SmoothStep(-0.02f, 0.06f, SunElevationSin);

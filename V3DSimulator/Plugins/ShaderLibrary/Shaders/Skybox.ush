@@ -8,7 +8,7 @@
 float V3DSkyDiskMask(float cosAngle, float radius)
 {
     if (!isfinite(cosAngle) || !isfinite(radius) || !(radius > 0.0f)) return 0.0f;
-    radius = clamp(radius, 0.0001f, 0.2f);
+    radius = clamp(radius, 0.0001f, 0.35f);
     cosAngle = clamp(cosAngle, -1.0f, 1.0f);
     if (cosAngle < cos(radius)) return 0.0f;
     const float radial = sqrt(max(0.0f, (1.0f - cosAngle) * (1.0f + cosAngle))) / max(sin(radius), 1.0e-4f);
@@ -56,7 +56,7 @@ float3 MoonUV(float3 viewDir, float3 lightDir, float size, float intensity)
     const float3 M = lightDir * rsqrt(lightLengthSq);
 
     const float cosA = dot(V, M);
-    const float radius = clamp(size, 0.0001f, 0.2f);
+    const float radius = clamp(size, 0.0001f, 0.35f);
     const float cosR = cos(radius);
 
     [branch] if (cosA >= cosR)

@@ -8,6 +8,7 @@
  */
 
 #include "World/WorldData.h"
+#include "World/PhysicalMaterialProfile.h"
 #include "System/MacroLibrary.h"
 #include "System/JsonMetadata.h"
 #include "System/ProjectConfig.h"
@@ -188,6 +189,8 @@ UWorldData::UWorldData()
     // almost black and was easily mistaken for a missing WorldEnvManager during the first Play.
     WorldTime = OneDayTime * 0.5f;
     TimeSpeed = 60.0f;
+    SunAngularRadius = V3DPhysicalMaterial::DefaultSunAngularRadiusRadians;
+    MoonAngularRadius = V3DPhysicalMaterial::DefaultMoonAngularRadiusRadians;
     bOcean = false;
     OceanHeightCm = 0.0;
     bAllowProjectAssets = false;
@@ -210,6 +213,20 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(ONE_YEAR_DAYS, Data->OneYearDays);
         Json->TryGetNumberField(ONE_DAY_TIME, Data->OneDayTime);
         Json->TryGetNumberField(TIME_SPEED, Data->TimeSpeed);
+        double LoadedSunRadius = Data->SunAngularRadius;
+        if (Json->TryGetNumberField(TEXT("SunAngularRadius"), LoadedSunRadius) && FMath::IsFinite(LoadedSunRadius))
+        {
+            Data->SunAngularRadius = FMath::Clamp(static_cast<float>(LoadedSunRadius),
+                V3DPhysicalMaterial::MinCelestialAngularRadiusRadians,
+                V3DPhysicalMaterial::MaxCelestialAngularRadiusRadians);
+        }
+        double LoadedMoonRadius = Data->MoonAngularRadius;
+        if (Json->TryGetNumberField(TEXT("MoonAngularRadius"), LoadedMoonRadius) && FMath::IsFinite(LoadedMoonRadius))
+        {
+            Data->MoonAngularRadius = FMath::Clamp(static_cast<float>(LoadedMoonRadius),
+                V3DPhysicalMaterial::MinCelestialAngularRadiusRadians,
+                V3DPhysicalMaterial::MaxCelestialAngularRadiusRadians);
+        }
         Json->TryGetBoolField(OCEAN, Data->bOcean);
         double LoadedOceanHeight = Data->OceanHeightCm;
         if (Json->TryGetNumberField(TEXT("OceanHeightCm"), LoadedOceanHeight) && FMath::IsFinite(LoadedOceanHeight))

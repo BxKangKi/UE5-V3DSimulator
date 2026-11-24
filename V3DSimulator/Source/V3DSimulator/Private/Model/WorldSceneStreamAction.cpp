@@ -12,6 +12,7 @@
 #include "System/WorldSurfaceSubsystem.h"
 #include "Model/WorldSceneStreamingSubsystem.h"
 #include "System/V3DStreamingPolicy.h"
+#include "System/V3DImpostor.h"
 #include "System/V3DStreamingBudget.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
@@ -1137,8 +1138,9 @@ void UWorldSceneStreamAction::RefreshRenderRangeSnapshot()
     CurrentMaxRenderDistanceCm = V3DStreamingPolicy::GetMaxRenderDistanceCm(OwnerActor.Get());
     if (IsValid(MeshActor) && IsValid(MeshActor->GetMeshComponent()) && IsValid(MeshActor->GetMeshComponent()->GetStaticMesh()))
     {
-        const double End = FMath::Min(CurrentMaxRenderDistanceCm, FMath::Max(2000.0, double(PlanningWorldRadius)));
-        MeshActor->SetInstanceCullDistances(FMath::FloorToInt(End * 0.85), FMath::FloorToInt(End));
+        // Disable HISM cluster-level hardware distance culling (0, 0): streaming residency is
+        // governed strictly by MaxRenderDistanceCm and the 1% LOD screen-ratio unload rule.
+        MeshActor->SetInstanceCullDistances(0, 0);
     }
 }
 
@@ -1284,8 +1286,9 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
     {
         ISMC->SetRenderCustomDepth(true);
         ISMC->SetCustomDepthStencilValue(1);
-        const double End = FMath::Min(CurrentMaxRenderDistanceCm, FMath::Max(2000.0, double(PlanningWorldRadius)));
-        MeshActor->SetInstanceCullDistances(FMath::FloorToInt(End * 0.85), FMath::FloorToInt(End));
+        // Disable HISM cluster-level hardware distance culling (0, 0): streaming residency is
+        // governed strictly by MaxRenderDistanceCm and the 1% LOD screen-ratio unload rule.
+        MeshActor->SetInstanceCullDistances(0, 0);
     }
 
     ConfigureGeneratedMeshCollision(
@@ -1307,11 +1310,16 @@ void UWorldSceneStreamAction::SetStaticMesh(UStaticMesh *StaticMesh)
     }
 }
 
-FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N)
+FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N, bool bLastIsImpostor = false)
 {
     if (N <= 1) return 1.0f;
-    // LOD0 -> 1.0, LOD1 -> 0.35, LOD2 -> 0.1225, LOD3 -> 0.042875.
-    return i <= 0 ? 1.0f : FMath::Pow(0.35f, static_cast<float>(i));
+    if (i <= 0) return 1.0f;
+    // Keep baked impostors strictly for distant silhouettes (~6% screen height), never up close.
+    if (bLastIsImpostor && i == N - 1)
+    {
+        return FMath::Min(0.06f, FMath::Pow(0.35f, static_cast<float>(i)));
+    }
+    return FMath::Max(0.015f, FMath::Pow(0.35f, static_cast<float>(i)));
 }
 
 void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
@@ -1396,10 +1404,12 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
         return;
     }
 
+    const bool bLastIsImpostor = Count > 1
+        && V3DImpostor::IsImpostorMeshName(MeshSourceAsset->GetMeshName(LocalIndices.Last()));
     TMap<int32, float> LODScreenSize;
     for (int32 Index = 0; Index < Count; ++Index)
     {
-        LODScreenSize.Add(Index, CalculateLODScreenSize(Index, Count));
+        LODScreenSize.Add(Index, CalculateLODScreenSize(Index, Count, bLastIsImpostor));
     }
 
     const bool bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;

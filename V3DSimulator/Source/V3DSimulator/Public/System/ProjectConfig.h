@@ -30,6 +30,7 @@ struct V3DSIMULATOR_API FV3DSimulatorProjectConfig
     UPROPERTY(BlueprintReadOnly, Category="Project") FString Version;
     UPROPERTY(BlueprintReadOnly, Category="Project") EV3DSimulatorProjectType ProjectType = EV3DSimulatorProjectType::World;
     UPROPERTY(BlueprintReadOnly, Category="Project") FString WorldName;
+    UPROPERTY(BlueprintReadOnly, Category="Project") FString Notes;
     /** World-only: mounts built Prefab/Character/Dynamic packs from top-level Resources/<Project>.v3d files. */
     UPROPERTY(BlueprintReadOnly, Category="Project") bool bAllowProjectAssets = false;
 

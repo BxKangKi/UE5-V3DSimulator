@@ -72,6 +72,9 @@ namespace V3DHUDStyle
     /** Runtime-safe font lookup matching the main menu font (FT_Pretendard). */
     V3DSIMULATOR_API UObject* FindFontRuntime();
     V3DSIMULATOR_API void ApplyFont(FSlateFontInfo& Font, UObject* FontObject, int32 Size, int32 OutlineSize = 0);
+    /** Applies Pretendard with explicit Bold/Regular typeface selection (with faux-bold fallback if single-weight). */
+    V3DSIMULATOR_API void ApplyFontWithWeight(FSlateFontInfo& Font, UObject* FontObject, int32 Size, bool bBold,
+        const FLinearColor& FauxBoldColor = FLinearColor::Transparent);
     V3DSIMULATOR_API void ApplyButton(UButton& Button, const FLinearColor& Color,
         const FLinearColor& HoverTint = FLinearColor(.78f, .86f, .96f, 1.f));
     V3DSIMULATOR_API void ApplyEditableTextBox(UEditableTextBox& TextBox, const FAuthoringPalette& Palette,

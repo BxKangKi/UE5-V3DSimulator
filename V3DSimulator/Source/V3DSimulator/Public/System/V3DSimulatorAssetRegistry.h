@@ -133,6 +133,9 @@ public:
     /** Synchronously resolves FoliageMaterial on the game thread. */
     UMaterialInterface* ResolveFoliageMaterial() const;
 
+    /** Synchronously resolves ImpostorMaterial on the game thread. */
+    UMaterialInterface* ResolveImpostorMaterial() const;
+
     /** Loaded once by the world surface subsystem; the registry retains only the soft path. */
     UPhysicalMaterial* ResolveDefaultPhysicalMaterial() const;
 
@@ -224,9 +227,13 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> PlacementGridMaterial;
 
-    /** MI_Opaque (Masked) / MI_Translucent / MI_Toon, their TwoSided versions, and reserved names. Dynamic models share these parents and set MID FadeDistance=50. */
+    /** Texture2DArray-based V3D parent materials (V3D_MaterialArray: 0=BaseColor, 1=Normal, 2=ORM, 3=Emissive): MI_Opaque (Masked) / MI_Translucent / MI_Toon, their TwoSided versions, and reserved names. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     FV3DMaterialSoftAssetReferences V3DMaterials;
+
+    /** Base material used by baked V3D octahedral impostor LODs (ImpostorAtlasArray + /V3D/v3d.ush). */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UMaterialInterface> ImpostorMaterial;
 
     /** Base material used by baked V3D terrain palettes (Texture2DArray + vertex-color layer weights). */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")

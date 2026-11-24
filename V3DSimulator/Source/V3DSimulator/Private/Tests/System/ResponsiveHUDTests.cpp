@@ -360,10 +360,16 @@ bool FV3DMainWorldTitleBoundsTest::RunTest(const FString&)
     TestEqual(TEXT("Default logo width respects the menu width limit"), Bounds->GetWidthOverride(), 1152.f);
     TestEqual(TEXT("Default logo height"), Bounds->GetHeightOverride(), 140.f);
     const UScaleBox* Scale = Cast<UScaleBox>(Bounds->GetContent());
-    if (TestNotNull(TEXT("Logo retains the configured title sizing"), Scale))
+    if (TestNotNull(TEXT("Title retains the configured sizing"), Scale))
     {
-        TestEqual(TEXT("Logo fills its title bounds"), Scale->GetStretch(), EStretch::Fill);
-        TestNotNull(TEXT("Original title image is retained"), Cast<UImage>(Scale->GetContent()));
+        TestEqual(TEXT("Title scales down cleanly within bounds"), Scale->GetStretch(), EStretch::ScaleToFit);
+        const UTextBlock* Prefix = Cast<UTextBlock>(HUD->GetWidgetFromName(TEXT("MainWorldTitlePrefix")));
+        const UTextBlock* Suffix = Cast<UTextBlock>(HUD->GetWidgetFromName(TEXT("MainWorldTitleSuffix")));
+        if (TestNotNull(TEXT("Title prefix V3D exists"), Prefix) && TestNotNull(TEXT("Title suffix Simulator exists"), Suffix))
+        {
+            TestEqual(TEXT("Title prefix text"), Prefix->GetText().ToString(), FString(TEXT("V3D")));
+            TestEqual(TEXT("Title suffix text"), Suffix->GetText().ToString(), FString(TEXT("Simulator")));
+        }
     }
     const UOverlaySlot* Slot = Cast<UOverlaySlot>(Bounds->Slot);
     if (TestNotNull(TEXT("Logo is anchored within the menu overlay"), Slot))

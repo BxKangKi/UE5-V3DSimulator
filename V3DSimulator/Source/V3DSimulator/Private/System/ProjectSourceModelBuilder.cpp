@@ -11,6 +11,7 @@
 #include "Format/v3d.h"
 #include "Model/V3DModelAnimation.h"
 #include "System/V3DTerrain.h"
+#include "System/V3DImpostor.h"
 
 #include "Containers/Ticker.h"
 #include "Animation/Skeleton.h"
@@ -1025,7 +1026,19 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
             Definition.bBuildTerrainFlipNormalGreen))
         || !BakedData.IsSane(&Error)
         || !BuildMetadata(Metadata, Error)
-        || !Metadata.IsSane(&Error)
+        || (Definition.ModelType == EModelDefinitionType::Static
+            && !V3DImpostor::Bake(BakedData, Metadata, Error, this))
+        || !BakedData.IsSane(&Error)
+        || !Metadata.IsSane(&Error))
+    {
+        Complete(false, Error.IsEmpty()
+            ? TEXT("decoded model validation failed") : Error);
+        return;
+    }
+    Metadata.SourceMeshCount = BakedData.Meshes.Num();
+    Metadata.SourceMaterialCount = BakedData.Materials.Num();
+    Metadata.SourceTextureCount = BakedData.Textures.Num();
+    if (!Metadata.IsSane(&Error)
         || Metadata.SourceMeshCount != BakedData.Meshes.Num()
         || Metadata.SourceMaterialCount != BakedData.Materials.Num()
         || Metadata.SourceTextureCount != BakedData.Textures.Num())

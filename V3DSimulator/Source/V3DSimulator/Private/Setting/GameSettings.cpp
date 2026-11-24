@@ -289,13 +289,14 @@ float UGameSettings::GetEffectiveStreamingDistanceMultiplier() const
 
 float UGameSettings::GetEffectiveObjectStreamingRadiusMeters() const
 {
+    const float RenderMeters = static_cast<float>(GetClampedMaxRenderDistanceMeters());
     switch (FMath::Clamp(ViewDistanceQuality, 0, 3))
     {
-    case 0: return 256.0f;
-    case 1: return 384.0f;
-    case 3: return 768.0f;
+    case 0: return FMath::Max(256.0f, RenderMeters);
+    case 1: return FMath::Max(384.0f, RenderMeters);
+    case 3: return FMath::Max(768.0f, RenderMeters);
     case 2:
-    default: return 512.0f;
+    default: return FMath::Max(512.0f, RenderMeters);
     }
 }
 

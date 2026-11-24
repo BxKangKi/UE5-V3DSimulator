@@ -172,11 +172,6 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 
 		TArray<FStaticMeshBuildVertex> StaticMeshBuildVertices;
 		StaticMeshBuildVertices.AddUninitialized(NumVerticesToBuildPerLOD);
-#if WITH_EDITOR
-		// One byte per vertex keeps mixed color/weight meshes correct in MeshDescription too.
-		TArray<uint8> VertexColorsAreSRGB;
-		VertexColorsAreSRGB.Init(1, NumVerticesToBuildPerLOD);
-#endif
 
 		FBox BoundingBox;
 		BoundingBox.Init();
@@ -263,9 +258,6 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 				ParallelFor(Primitive.Positions.Num(), [&](const int32 VertexIndex)
 					{
 						FStaticMeshBuildVertex& StaticMeshVertex = StaticMeshBuildVertices[VertexBaseIndex + VertexIndex];
-#if WITH_EDITOR
-						VertexColorsAreSRGB[VertexBaseIndex + VertexIndex] = Primitive.bVertexColorsSRGB ? 1 : 0;
-#endif
 
 #if ENGINE_MAJOR_VERSION > 4
 						StaticMeshVertex.Position = FVector3f(GetSafeValue(Primitive.Positions, VertexIndex, FVector::ZeroVector, bMissingIgnore));
@@ -307,7 +299,7 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 
 						if (bHasVertexColors)
 						{
-							StaticMeshVertex.Color = FLinearColor(GetSafeValue(Primitive.Colors, VertexIndex, WhiteColor, bMissingIgnore)).ToFColor(Primitive.bVertexColorsSRGB);
+							StaticMeshVertex.Color = FLinearColor(GetSafeValue(Primitive.Colors, VertexIndex, WhiteColor, bMissingIgnore)).ToFColor(true);
 						}
 
 						if (bApplyAdditionalTransforms)
@@ -340,9 +332,6 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 						LODIndices[VertexInstanceBaseIndex + VertexInstanceSectionIndex] = VertexBaseIndex + VertexInstanceSectionIndex;
 
 						FStaticMeshBuildVertex& StaticMeshVertex = StaticMeshBuildVertices[VertexBaseIndex + VertexInstanceSectionIndex];
-#if WITH_EDITOR
-						VertexColorsAreSRGB[VertexBaseIndex + VertexInstanceSectionIndex] = Primitive.bVertexColorsSRGB ? 1 : 0;
-#endif
 
 #if ENGINE_MAJOR_VERSION > 4
 						StaticMeshVertex.Position = FVector3f(GetSafeValue(Primitive.Positions, VertexIndex, FVector::ZeroVector, bMissingIgnore));
@@ -384,7 +373,7 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 
 						if (bHasVertexColors)
 						{
-							StaticMeshVertex.Color = FLinearColor(GetSafeValue(Primitive.Colors, VertexIndex, WhiteColor, bMissingIgnore)).ToFColor(Primitive.bVertexColorsSRGB);
+							StaticMeshVertex.Color = FLinearColor(GetSafeValue(Primitive.Colors, VertexIndex, WhiteColor, bMissingIgnore)).ToFColor(true);
 						}
 
 						if (bApplyAdditionalTransforms)
@@ -868,15 +857,9 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMesh_Internal(TSharedRef<FglTFRuntime
 
 						if (bHasVertexColors)
 						{
-							VertexInstanceColors[VertexInstanceID0] = VertexColorsAreSRGB[VertexIndex0]
-								? FLinearColor(StaticMeshBuildVertices[VertexIndex0].Color)
-								: StaticMeshBuildVertices[VertexIndex0].Color.ReinterpretAsLinear();
-							VertexInstanceColors[VertexInstanceID1] = VertexColorsAreSRGB[VertexIndex1]
-								? FLinearColor(StaticMeshBuildVertices[VertexIndex1].Color)
-								: StaticMeshBuildVertices[VertexIndex1].Color.ReinterpretAsLinear();
-							VertexInstanceColors[VertexInstanceID2] = VertexColorsAreSRGB[VertexIndex2]
-								? FLinearColor(StaticMeshBuildVertices[VertexIndex2].Color)
-								: StaticMeshBuildVertices[VertexIndex2].Color.ReinterpretAsLinear();
+							VertexInstanceColors[VertexInstanceID0] = FLinearColor(StaticMeshBuildVertices[VertexIndex0].Color);
+							VertexInstanceColors[VertexInstanceID1] = FLinearColor(StaticMeshBuildVertices[VertexIndex1].Color);
+							VertexInstanceColors[VertexInstanceID2] = FLinearColor(StaticMeshBuildVertices[VertexIndex2].Color);
 						}
 
 						// safe approach given that the section array is built in order
@@ -1656,25 +1639,9 @@ UStaticMesh* FglTFRuntimeParser::LoadStaticMeshFromRuntimeLODs(const TArray<FglT
 
 void FglTFRuntimeParser::LoadStaticMeshFromRuntimeLODsAsync(const TArray<FglTFRuntimeMeshLOD>& RuntimeLODs, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
 {
-	// Blueprint/legacy callers retain ownership; only this compatibility entry makes a copy.
-	TArray<FglTFRuntimeMeshLOD> OwnedRuntimeLODs(RuntimeLODs);
-	LoadStaticMeshFromRuntimeLODsAsyncMove(MoveTemp(OwnedRuntimeLODs), AsyncCallback, StaticMeshConfig);
-}
-
-void FglTFRuntimeParser::LoadStaticMeshFromRuntimeLODsAsyncMove(TArray<FglTFRuntimeMeshLOD>&& RuntimeLODs, const FglTFRuntimeStaticMeshAsync& AsyncCallback, const FglTFRuntimeStaticMeshConfig& StaticMeshConfig)
-{
-	// Empty geometry otherwise reaches resource initialization and divides by zero LOD count.
-	if (RuntimeLODs.IsEmpty() || RuntimeLODs.ContainsByPredicate([](const FglTFRuntimeMeshLOD& LOD) { return LOD.Primitives.IsEmpty(); }))
-	{
-		AddError("LoadStaticMeshFromRuntimeLODsAsyncMove()", "No geometry in RuntimeLODs");
-		RuntimeLODs.Empty();
-		AsyncCallback.ExecuteIfBound(nullptr);
-		return;
-	}
 	TSharedRef<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe> StaticMeshContext = MakeShared<FglTFRuntimeStaticMeshContext, ESPMode::ThreadSafe>(AsShared(), -1, StaticMeshConfig);
 
-	// The worker owns every LOD until its GameThread finalizer/callback has returned.
-	Async(EAsyncExecution::Thread, [this, StaticMeshContext, RuntimeLODs = MoveTemp(RuntimeLODs), AsyncCallback]()
+	Async(EAsyncExecution::Thread, [this, StaticMeshContext, StaticMeshConfig, RuntimeLODs, AsyncCallback]()
 		{
 			for (const FglTFRuntimeMeshLOD& RuntimeLOD : RuntimeLODs)
 			{

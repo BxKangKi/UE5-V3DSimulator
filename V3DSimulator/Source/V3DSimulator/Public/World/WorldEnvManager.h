@@ -74,6 +74,26 @@ public:
     UFUNCTION(BlueprintCallable, Category="World|Rendering")
     void RefreshRuntimeSettings();
 
+    /** Default angular radius of the sun disk in radians (editable in Details / Blueprint). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Celestial", meta=(ClampMin="0.001", ClampMax="0.35", UIMin="0.005", UIMax="0.2"))
+    float SunAngularRadius = 0.042f;
+
+    /** Default angular radius of the moon disk in radians (editable in Details / Blueprint). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Celestial", meta=(ClampMin="0.001", ClampMax="0.35", UIMin="0.005", UIMax="0.2"))
+    float MoonAngularRadius = 0.048f;
+
+    /** Multiplier applied to the effective sun angular radius for quick runtime/editor tuning. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Celestial", meta=(ClampMin="0.1", ClampMax="5.0", UIMin="0.25", UIMax="3.0"))
+    float SunSizeScale = 1.0f;
+
+    /** Multiplier applied to the effective moon angular radius for quick runtime/editor tuning. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Celestial", meta=(ClampMin="0.1", ClampMax="5.0", UIMin="0.25", UIMax="3.0"))
+    float MoonSizeScale = 1.0f;
+
+    /** Re-applies sun and moon angular size parameters to directional lights and sky materials. */
+    UFUNCTION(BlueprintCallable, Category="World|Celestial")
+    void ApplyCelestialSizes();
+
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -153,6 +173,15 @@ private:
     FVector LastMoonDiskDirection = FVector::ZeroVector;
     FVector LastSunDiskDirection = FVector::ZeroVector;
     float LastStarIntensity = -1.0f;
+    float LastAppliedSunRadius = -1.0f;
+    float LastAppliedMoonRadius = -1.0f;
+    float CurrentSunElevationSin = 0.5f;
+    float CurrentMoonElevationSin = -1.0f;
+    float LastFogSunElevationSin = -999.0f;
+    float LastFogMoonElevationSin = -999.0f;
+
+    float GetEffectiveSunAngularRadius() const;
+    float GetEffectiveMoonAngularRadius() const;
 
     UPROPERTY(Transient)
     TArray<TObjectPtr<UMaterialInstanceDynamic>> SkyMaterialInstances;

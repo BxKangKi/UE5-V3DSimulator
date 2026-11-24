@@ -49,6 +49,69 @@ void V3DHUDStyle::ApplyFont(FSlateFontInfo& Font, UObject* FontObject, int32 Siz
     Font.OutlineSettings.OutlineColor = FLinearColor::Transparent;
 }
 
+void V3DHUDStyle::ApplyFontWithWeight(FSlateFontInfo& Font, UObject* FontObject, int32 Size, bool bBold,
+    const FLinearColor& FauxBoldColor)
+{
+    const int32 ClampedSize = FMath::Clamp(Size, 8, 144);
+    Font.Size = ClampedSize;
+    Font.OutlineSettings.OutlineSize = 0;
+    Font.OutlineSettings.OutlineColor = FLinearColor::Transparent;
+
+    if (!FontObject)
+    {
+        Font.TypefaceFontName = bBold ? TEXT("Bold") : TEXT("Regular");
+        return;
+    }
+
+    Font.FontObject = FontObject;
+    FName SelectedTypeface = TEXT("Default");
+    bool bMatchedExplicitBold = false;
+
+    if (const UFont* FontAsset = Cast<UFont>(FontObject))
+    {
+        if (const FCompositeFont* Composite = FontAsset->GetCompositeFont())
+        {
+            for (const FTypefaceEntry& Entry : Composite->DefaultTypeface.Fonts)
+            {
+                const FString NameStr = Entry.Name.ToString();
+                if (bBold)
+                {
+                    if (NameStr.Equals(TEXT("Bold"), ESearchCase::IgnoreCase))
+                    {
+                        SelectedTypeface = Entry.Name;
+                        bMatchedExplicitBold = true;
+                        break;
+                    }
+                    if (!bMatchedExplicitBold && NameStr.Contains(TEXT("Bold"), ESearchCase::IgnoreCase))
+                    {
+                        SelectedTypeface = Entry.Name;
+                        bMatchedExplicitBold = true;
+                    }
+                }
+                else
+                {
+                    if (NameStr.Equals(TEXT("Regular"), ESearchCase::IgnoreCase)
+                        || NameStr.Equals(TEXT("Normal"), ESearchCase::IgnoreCase))
+                    {
+                        SelectedTypeface = Entry.Name;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Font.TypefaceFontName = SelectedTypeface;
+    // If FT_Pretendard is single-weight without a separate Bold typeface entry, apply a crisp
+    // same-color outline so "V3D" remains visually bold next to regular "Simulator".
+    if (bBold && !bMatchedExplicitBold && FauxBoldColor.A > 0.01f)
+    {
+        Font.OutlineSettings.OutlineSize = FMath::Clamp(FMath::RoundToInt(ClampedSize * 0.022f), 1, 3);
+        Font.OutlineSettings.OutlineColor = FauxBoldColor;
+        Font.OutlineSettings.bSeparateFillAlpha = false;
+    }
+}
+
 void V3DHUDStyle::ApplyButton(UButton& Button, const FLinearColor& Color, const FLinearColor& HoverTint)
 {
     FButtonStyle Style = Button.GetStyle();

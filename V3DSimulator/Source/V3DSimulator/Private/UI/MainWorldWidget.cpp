@@ -19,6 +19,8 @@
 #include "Components/ComboBoxString.h"
 #include "Components/EditableTextBox.h"
 #include "Components/Image.h"
+#include "Components/HorizontalBox.h"
+#include "Components/HorizontalBoxSlot.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 #include "Components/SizeBox.h"
@@ -814,7 +816,8 @@ void UMainWorldWidget::BuildNativeLayout()
     NativeMenuTitle = nullptr;
     NativeMultiplayerCard = nullptr;
     NativeTitleBounds = nullptr;
-    NativeTitleImage = nullptr;
+    NativeTitlePrefix = nullptr;
+    NativeTitleSuffix = nullptr;
     SetIsFocusable(true);
 
     NativeMenuPanel = AddPanel(PanelSize, FVector2D::ZeroVector);
@@ -877,32 +880,40 @@ void UMainWorldWidget::BuildNativeLayout()
     }
     else
     {
-        // Preserve the original title texture and the two edge-aligned button groups.
-        UWidget* Title = nullptr;
-        if (UTexture2D* Texture = LoadObject<UTexture2D>(nullptr, TEXT("/Game/Resources/Textures/T_Title.T_Title")))
+        // Render the title using Pretendard typography: bold "V3D" seamlessly joined with regular "Simulator"
+        // (no space), supporting both light and dark themes automatically.
+        NativeTitleBounds = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), TEXT("MainWorldTitleBounds"));
+        UScaleBox* TitleScale = WidgetTree->ConstructWidget<UScaleBox>();
+        TitleScale->SetStretch(EStretch::ScaleToFit);
+        TitleScale->SetStretchDirection(EStretchDirection::DownOnly);
+        NativeTitleBounds->SetContent(TitleScale);
+
+        UHorizontalBox* TitleRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), TEXT("MainWorldTitleRow"));
+        TitleRow->SetVisibility(ESlateVisibility::HitTestInvisible);
+        TitleScale->SetContent(TitleRow);
+
+        NativeTitlePrefix = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("MainWorldTitlePrefix"));
+        NativeTitlePrefix->SetText(FText::FromString(TEXT("V3D")));
+        NativeTitlePrefix->SetAutoWrapText(false);
+        NativeTitlePrefix->SetVisibility(ESlateVisibility::HitTestInvisible);
+        if (UHorizontalBoxSlot* PrefixSlot = TitleRow->AddChildToHorizontalBox(NativeTitlePrefix))
         {
-            // The texture's native resolution is only an aspect-ratio hint, never the
-            // viewport allocation. SizeBox owns the logo bounds; ScaleBox preserves its shape.
-            NativeTitleBounds = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), TEXT("MainWorldTitleBounds"));
-            UScaleBox* LogoScale = WidgetTree->ConstructWidget<UScaleBox>();
-            LogoScale->SetStretch(EStretch::Fill);
-            //LogoScale->SetStretchDirection(EStretchDirection::DownOnly);
-            NativeTitleBounds->SetContent(LogoScale);
-            NativeTitleImage = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), TEXT("MainWorldTitleImage"));
-            NativeTitleImage->SetBrushFromTexture(Texture, false);
-            NativeTitleImage->SetDesiredSizeOverride(FVector2D(Texture->GetSizeX(), Texture->GetSizeY()));
-            NativeTitleImage->SetVisibility(ESlateVisibility::HitTestInvisible);
-            LogoScale->SetContent(NativeTitleImage);
-            Layout->AddChildToOverlay(NativeTitleBounds);
-            Title = NativeTitleBounds;
+            PrefixSlot->SetPadding(FMargin(0.0f));
+            PrefixSlot->SetVerticalAlignment(VAlign_Bottom);
         }
-        else
+
+        NativeTitleSuffix = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass(), TEXT("MainWorldTitleSuffix"));
+        NativeTitleSuffix->SetText(FText::FromString(TEXT("Simulator")));
+        NativeTitleSuffix->SetAutoWrapText(false);
+        NativeTitleSuffix->SetVisibility(ESlateVisibility::HitTestInvisible);
+        if (UHorizontalBoxSlot* SuffixSlot = TitleRow->AddChildToHorizontalBox(NativeTitleSuffix))
         {
-            NativeMenuTitle = AddText(Layout, NSLOCTEXT("V3DMenu", "AppTitle", "V3DSimulator"), true);
-            NativeMenuTitle->SetJustification(ETextJustify::Right);
-            Title = NativeMenuTitle;
+            SuffixSlot->SetPadding(FMargin(0.0f));
+            SuffixSlot->SetVerticalAlignment(VAlign_Bottom);
         }
-        UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(Title->Slot);
+
+        Layout->AddChildToOverlay(NativeTitleBounds);
+        UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(NativeTitleBounds->Slot);
         TitleSlot->SetPadding(FMargin(0.0f, 128.0f, 32.0f, 0.0f));
         TitleSlot->SetHorizontalAlignment(HAlign_Right);
         TitleSlot->SetVerticalAlignment(VAlign_Top);
@@ -962,12 +973,18 @@ void UMainWorldWidget::ApplyNativeStyle()
     {
         NativeMultiplayerCard->SetBrushColor(Palette.Panel);
     }
-    if (NativeMenuTitle && ScreenMode == EMainWorldScreen::Start)
+    if (NativeTitlePrefix && NativeTitleSuffix && ScreenMode == EMainWorldScreen::Start)
     {
-        NativeMenuTitle->SetColorAndOpacity(FSlateColor(TextColor));
-        FSlateFontInfo Font = NativeMenuTitle->GetFont();
-        Font.OutlineSettings.OutlineSize = FontOutlineSize;
-        NativeMenuTitle->SetFont(Font);
+        const FLinearColor TitleColor = Palette.Text;
+        NativeTitlePrefix->SetColorAndOpacity(FSlateColor(TitleColor));
+        NativeTitleSuffix->SetColorAndOpacity(FSlateColor(TitleColor));
+        FSlateFontInfo PrefixFont = NativeTitlePrefix->GetFont();
+        V3DHUDStyle::ApplyFontWithWeight(PrefixFont, FontObject, TitleFontSize, true, TitleColor);
+        NativeTitlePrefix->SetFont(PrefixFont);
+
+        FSlateFontInfo SuffixFont = NativeTitleSuffix->GetFont();
+        V3DHUDStyle::ApplyFontWithWeight(SuffixFont, FontObject, TitleFontSize, false);
+        NativeTitleSuffix->SetFont(SuffixFont);
     }
     if (NativeServerAddress)
     {

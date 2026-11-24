@@ -8,8 +8,10 @@
 #include "UI/SelectionWidgetBase.h"
 #include "ProjectSelectionWidget.generated.h"
 
+class UBorder;
 class UButton;
 class UEditableTextBox;
+class UMultiLineEditableTextBox;
 class UPanelWidget;
 class UMenuButtonWidget;
 class UMainWorldWidget;
@@ -17,13 +19,15 @@ class UBuildStatusWidget;
 class UComboBoxString;
 class UCheckBox;
 class UProjectEditorWidget;
+class UTextBlock;
+class UVerticalBox;
 
 /**
- * Project browser shown directly over the current start menu.
+ * Project browser and dedicated New Project creation screen shown over the start menu.
  *
  * The complete layout and entry lifecycle are implemented in C++ and previewed in Blueprint children.
- * Native code discovers valid Projects/<Project> folders,
- * populates the assigned panel, and starts the project-specific resources/ -> .v3d/.v3d build pipeline.
+ * Native code discovers valid Projects/<Project> folders, provides a dedicated project creation screen
+ * (name, project type, notes/memo, and world options), and opens the JSON editor immediately after creation.
  */
 UCLASS(Blueprintable, BlueprintType)
 class V3DSIMULATOR_API UProjectSelectionWidget : public USelectionWidgetBase
@@ -52,7 +56,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Projects|Widgets")
     void SetRefreshButton(UButton* InButton);
 
-    /** Text box used by the first generated "Create Project" entry. */
+    /** Text box used for the new project name input. */
     UFUNCTION(BlueprintCallable, Category="Projects|Widgets")
     void SetNewProjectNameTextBox(UEditableTextBox* InTextBox);
 
@@ -67,7 +71,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Projects")
     void RefreshProjects();
 
-    /** Creates Projects/<Name>/config.json with the currently selected ProjectType, then refreshes the list. */
+    /** Creates Projects/<Name>/config.json with the selected ProjectType, notes, and options, then opens the Editor. */
     UFUNCTION(BlueprintCallable, Category="Projects")
     bool CreateNewProject(const FString& ProjectName);
 
@@ -109,17 +113,20 @@ private:
     void HandleNativeProjectTypeChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
     UFUNCTION()
     UWidget* GenerateNativeProjectType(FString Item);
+    UFUNCTION()
+    void HandleCreateProjectConfirmClicked();
+    UFUNCTION()
+    void HandleCreateProjectCancelClicked();
 
     void OpenEditor(const FString& ProjectName);
     void HandleEditorClosed();
     UPROPERTY(Transient) TObjectPtr<UProjectEditorWidget> EditorWidget;
     void BindNavigationButtons();
     void UnbindNavigationButtons();
-    UEditableTextBox* EnsureNewProjectNameTextBox();
     UBuildStatusWidget* EnsureBuildStatusWidget();
     void ShowBuildStatus(const FString& ProjectName);
     void SetCreateProjectMode(bool bEnabled, bool bClearText = false);
-    void UpdateCreateProjectEntryLabel();
+    void UpdateWorldOptionsVisibility();
 
     UFUNCTION()
     void HandleBuildStatusConfirmed();
@@ -128,8 +135,6 @@ private:
     TWeakObjectPtr<UButton> BackButton;
     TWeakObjectPtr<UButton> RefreshButton;
     TWeakObjectPtr<UEditableTextBox> NewProjectNameTextBox;
-    TWeakObjectPtr<UMenuButtonWidget> CreateProjectEntryWidget;
-    bool bOwnsGeneratedProjectNameTextBox = false;
     bool bCreateProjectMode = false;
     EV3DSimulatorProjectType NewProjectType = EV3DSimulatorProjectType::World;
 
@@ -139,11 +144,20 @@ private:
     bool bGeneratedBuildStatusWidget = false;
 
     UPROPERTY(Transient) TObjectPtr<UBorder> NativeProjectPanel;
+    UPROPERTY(Transient) TObjectPtr<UVerticalBox> NativeProjectListScreen;
+    UPROPERTY(Transient) TObjectPtr<UVerticalBox> NativeCreateProjectScreen;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeCreateProjectCard;
     UPROPERTY(Transient) TObjectPtr<UPanelWidget> NativeProjectList;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeProjectBack;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeProjectRefresh;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeCreateBackButton;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeCreateConfirmButton;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeCreateCancelButton;
     UPROPERTY(Transient) TObjectPtr<UEditableTextBox> NativeProjectName;
     UPROPERTY(Transient) TObjectPtr<UComboBoxString> NativeProjectType;
+    UPROPERTY(Transient) TObjectPtr<UMultiLineEditableTextBox> NativeProjectNotes;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeCreateErrorText;
+    UPROPERTY(Transient) TObjectPtr<UVerticalBox> NativeWorldOptionsBox;
     UPROPERTY(Transient) TObjectPtr<UCheckBox> NewProjectAcoustics;
     UPROPERTY(Transient) TObjectPtr<UCheckBox> NewProjectMusic;
     UPROPERTY(Transient) TObjectPtr<UCheckBox> NewProjectExternalAssets;
