@@ -599,16 +599,17 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
     Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Save"), [this] { bConfirmBack = false; SaveAll(false, true); })];
     Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Discard"), [this] { bConfirmBack = false; Close(); })];
     Choices->AddSlot().AutoWidth().Padding(6)[MakeEditorButton(TEXT("Cancel"), [this] { bConfirmBack = false; })];
+    const TWeakObjectPtr<UProjectEditorWidget> WeakSelf(this);
     auto QuickBar = SNew(SWrapBox).UseAllottedSize(true).InnerSlotPadding(FVector2D(8, 6));
-    QuickBar->AddSlot()[MakeEditorButton(TEXT("Up (..)"), [this] { NavigateFileBrowserUp(); })];
-    QuickBar->AddSlot()[MakeEditorButton(TEXT("Home"), [this] { NavigateFileBrowser(V3DFileBrowserUtils::GetUserHomeDir()); })];
-    QuickBar->AddSlot()[MakeEditorButton(TEXT("Desktop"), [this] { NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Desktop"))); })];
-    QuickBar->AddSlot()[MakeEditorButton(TEXT("Documents"), [this] { NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Documents"))); })];
-    QuickBar->AddSlot()[MakeEditorButton(TEXT("Downloads"), [this] { NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Downloads"))); })];
-    QuickBar->AddSlot()[MakeEditorButton(TEXT("Project"), [this] { NavigateFileBrowser(V3DSimulatorProjectWorkspace::ProjectRoot(Project)); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Up (..)"), [WeakSelf] { if (auto* S = WeakSelf.Get()) S->NavigateFileBrowserUp(); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Home"), [WeakSelf] { if (auto* S = WeakSelf.Get()) S->NavigateFileBrowser(V3DFileBrowserUtils::GetUserHomeDir()); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Desktop"), [WeakSelf] { if (auto* S = WeakSelf.Get()) S->NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Desktop"))); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Documents"), [WeakSelf] { if (auto* S = WeakSelf.Get()) S->NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Documents"))); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Downloads"), [WeakSelf] { if (auto* S = WeakSelf.Get()) S->NavigateFileBrowser(FPaths::Combine(V3DFileBrowserUtils::GetUserHomeDir(), TEXT("Downloads"))); })];
+    QuickBar->AddSlot()[MakeEditorButton(TEXT("Project"), [WeakSelf] { if (auto* S = WeakSelf.Get()) S->NavigateFileBrowser(V3DSimulatorProjectWorkspace::ProjectRoot(S->Project)); })];
 
     auto BrowserModal = SNew(SBorder)
-        .Visibility_Lambda([this] { return bShowFileBrowser ? EVisibility::Visible : EVisibility::Collapsed; })
+        .Visibility_Lambda([WeakSelf] { auto* S = WeakSelf.Get(); return (S && S->bShowFileBrowser) ? EVisibility::Visible : EVisibility::Collapsed; })
         .BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
         .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().ModalScrim); })
         .HAlign(HAlign_Center).VAlign(VAlign_Center)
@@ -1583,7 +1584,8 @@ void UProjectEditorWidget::Close()
 void UProjectEditorWidget::NativeDestruct()
 {
     ++RequestGeneration;
-    bBusy = false; bFormRefreshPending = false;
+    bBusy = false; bFormRefreshPending = false; bShowFileBrowser = false;
+    BrowserEntries.Reset(); BrowserSelectedFiles.Reset();
     InvalidatePreview();
     if (IsValid(BuildStatus))
     {

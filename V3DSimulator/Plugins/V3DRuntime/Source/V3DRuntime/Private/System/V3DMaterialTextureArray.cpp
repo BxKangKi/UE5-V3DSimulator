@@ -91,9 +91,10 @@ namespace V3DMaterialArrayPrivate
     }
 
     void BuildLinearArrayMips(const int32 BaseSize, const int32 NumLayers, const TArray<uint8>& TopBytes,
-        TArray<FGWorldBakedTextureMip>& OutMips)
+        TArray<FGWorldBakedTextureMip>& OutMips, const bool bAllowParallel = true)
     {
         OutMips.Reset();
+        OutMips.Reserve(12);
         FGWorldBakedTextureMip Top;
         Top.SizeX = BaseSize;
         Top.SizeY = BaseSize;
@@ -115,7 +116,7 @@ namespace V3DMaterialArrayPrivate
             const int64 PrevStride = static_cast<int64>(Prev.SizeX) * Prev.SizeY * 4;
             const int64 NextStride = static_cast<int64>(NextSize) * NextSize * 4;
 
-            ParallelFor(NumLayers, [&](const int32 Layer)
+            const auto ProcessLayer = [&](const int32 Layer)
             {
                 const uint8* SrcL = Prev.Bytes.GetData() + Layer * PrevStride;
                 uint8* DstL = Next.Bytes.GetData() + Layer * NextStride;
@@ -138,7 +139,15 @@ namespace V3DMaterialArrayPrivate
                         for (int32 C = 0; C < 4; ++C) OutP[C] = static_cast<uint8>((Sum[C] + 2) >> 2);
                     }
                 }
-            });
+            };
+            if (bAllowParallel && NextSize >= 128)
+            {
+                ParallelFor(NumLayers, ProcessLayer);
+            }
+            else
+            {
+                for (int32 Layer = 0; Layer < NumLayers; ++Layer) ProcessLayer(Layer);
+            }
             OutMips.Add(MoveTemp(Next));
             Cur = NextSize;
         }
@@ -312,11 +321,11 @@ bool V3DMaterialTextureArray::PackMaterials(
     return true;
 }
 
-void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
+bool V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle, TFunctionRef<bool()> ShouldCancel)
 {
     if (Bundle.Materials.IsEmpty())
     {
-        return;
+        return !ShouldCancel();
     }
 
     TMap<int32, const FGWorldBakedTexture*> TextureById;
@@ -331,10 +340,12 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
         : 1024;
 
     TArray<FGWorldBakedTexture> PackedArrays;
+    PackedArrays.Reserve(Bundle.Materials.Num());
     TSet<int32> ReplacedTextureIds;
 
     for (FGWorldBakedMaterial& Mat : Bundle.Materials)
     {
+        if (ShouldCancel()) return false;
         if (V3DTerrain::IsPaletteMaterial(Mat) || V3DImpostor::IsImpostorMaterial(Mat))
         {
             continue;
@@ -369,7 +380,7 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
         int32 MaxDim = 0;
         for (const FGWorldBakedTexture* Candidate : { BaseColorTex, NormalTex, ORMTex, EmissiveTex })
         {
-            if (Candidate)
+            if (Candidate && Candidate->SizeX > 0 && Candidate->SizeY > 0)
             {
                 MaxDim = FMath::Max(MaxDim, FMath::Max(Candidate->SizeX, Candidate->SizeY));
             }
@@ -378,9 +389,13 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
             ? V3DMaterialArrayPrivate::RoundDownPowerOfTwo(MaxDim, 1, CapRes)
             : 1;
         const int64 SliceBytes = static_cast<int64>(TargetSize) * TargetSize * 4;
+        if (SliceBytes <= 0 || SliceBytes * SliceCount > 128ll * 1024ll * 1024ll)
+        {
+            continue;
+        }
 
         TArray<uint8> Combined;
-        Combined.SetNumZeroed(SliceBytes * SliceCount);
+        Combined.SetNumUninitialized(SliceBytes * SliceCount);
 
         const FGWorldBakedTexture* SliceSources[SliceCount] = { BaseColorTex, NormalTex, ORMTex, EmissiveTex };
         const bool SliceSRGB[SliceCount] = { true, false, false, true };
@@ -390,18 +405,22 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
             FLinearColor::White,
             FLinearColor::Black
         };
-        ParallelFor(SliceCount, [&](const int32 SliceIdx)
+        // Avoid nested ParallelFor oversubscription on background streaming workers so GT/RT stay smooth.
+        for (int32 SliceIdx = 0; SliceIdx < SliceCount; ++SliceIdx)
         {
+            if (ShouldCancel()) return false;
             V3DMaterialArrayPrivate::SampleSourceSlice(
                 SliceSources[SliceIdx],
                 TargetSize,
                 SliceSRGB[SliceIdx],
                 SliceDefaults[SliceIdx],
                 Combined.GetData() + SliceBytes * SliceIdx);
-        });
+        }
+
+        if (ShouldCancel()) return false;
 
         // Deterministic runtime-only TextureId in upper positive range so it never collides with archive TextureIds.
-        const int32 RuntimeArrayTexId = 0x40000000 | (Mat.MaterialId & 0x3FFFFFFF);
+        const int32 RuntimeArrayTexId = static_cast<int32>(0x40000000u | (static_cast<uint32>(Mat.MaterialId) & 0x3FFFFFFFu));
         FGWorldBakedTexture ArrayTex;
         ArrayTex.TextureId = RuntimeArrayTexId;
         ArrayTex.Name = Mat.Name + TEXT("_RuntimeMaterialArray");
@@ -415,7 +434,8 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
         ArrayTex.Filter = static_cast<uint8>(TF_Trilinear);
         ArrayTex.LODGroup = static_cast<uint8>(TEXTUREGROUP_World);
         ArrayTex.bSRGB = false;
-        V3DMaterialArrayPrivate::BuildLinearArrayMips(TargetSize, SliceCount, Combined, ArrayTex.Mips);
+        V3DMaterialArrayPrivate::BuildLinearArrayMips(TargetSize, SliceCount, Combined, ArrayTex.Mips, false);
+        Combined.Empty();
 
         PackedArrays.Add(MoveTemp(ArrayTex));
 
@@ -435,11 +455,9 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
 
     if (PackedArrays.IsEmpty())
     {
-        return;
+        return !ShouldCancel();
     }
 
-    // Drop separate Texture2D payloads that are no longer referenced by any material in this bundle
-    // so Unreal never allocates or uploads redundant Texture2D GPU resources.
     TSet<int32> StillReferenced;
     for (const FGWorldBakedMaterial& Mat : Bundle.Materials)
     {
@@ -453,4 +471,5 @@ void V3DMaterialTextureArray::PackBundle(FGWorldBakedAssetBundle& Bundle)
         return ReplacedTextureIds.Contains(Tex.TextureId) && !StillReferenced.Contains(Tex.TextureId);
     });
     Bundle.Textures.Append(MoveTemp(PackedArrays));
+    return !ShouldCancel();
 }

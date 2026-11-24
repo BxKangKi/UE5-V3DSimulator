@@ -86,6 +86,8 @@ public:
     void MovementInput(const float X, const float Y);
     UFUNCTION(BlueprintCallable)
     void ClearTransientInputState();
+    /** Clears latched movement/jump/sprint inputs without zeroing physical velocity (used for Pause/UI). */
+    void ClearTransientInputStatePreservingVelocity();
     UFUNCTION(BlueprintCallable)
     void CameraInput(const float X, const float Y, const float Sensitive);
     UFUNCTION(BlueprintCallable)

@@ -441,7 +441,7 @@ private:
     int32 CountConfiguredInputMappingContexts() const;
 
     void UpdateFromGameUpdate(float DeltaSeconds);
-    void StopGameplayMotionForUI();
+    void StopGameplayMotionForUI(bool bStopVelocity = false);
 
     /** Applies ignore-move/look exactly once so repeated loading/UI callbacks cannot stack controller locks. */
     void SetGameplayInputSuppressed(bool bSuppress);

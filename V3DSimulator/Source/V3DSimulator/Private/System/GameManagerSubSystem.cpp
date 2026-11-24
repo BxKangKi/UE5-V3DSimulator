@@ -397,6 +397,11 @@ void UGameManagerSubSystem::TogglePause()
     {
         return;
     }
+    if (UWorld* World = GetWorld(); IsValid(World) && World->GetNetMode() != NM_Standalone)
+    {
+        SetGamePaused(false);
+        return;
+    }
     SetGamePaused(!bIsGamePaused);
 }
 
@@ -406,8 +411,18 @@ void UGameManagerSubSystem::SetGamePaused(bool bPaused)
     {
         return;
     }
+    UWorld* World = GetWorld();
+    if (bPaused && IsValid(World) && World->GetNetMode() != NM_Standalone)
+    {
+        bIsGamePaused = false;
+        if (UGameplayStatics::IsGamePaused(World))
+        {
+            UGameplayStatics::SetGamePaused(World, false);
+        }
+        return;
+    }
     bIsGamePaused = bPaused;
-    if (UWorld* World = GetWorld())
+    if (IsValid(World))
     {
         UGameplayStatics::SetGamePaused(World, bIsGamePaused);
     }

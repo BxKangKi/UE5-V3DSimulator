@@ -1343,12 +1343,23 @@ void ACharacterController::MovementInput(const float X, const float Y)
     // movement component's normal braking, while flying intentionally eases out over time.
 }
 
-void ACharacterController::ClearTransientInputState()
+void ACharacterController::ClearTransientInputStatePreservingVelocity()
 {
     RawMoveInput = FVector::ZeroVector;
-    CharacterStateBit &= ~(STATE_JUMPING | STATE_SPRINT | STATE_CROUCH);
+    CharacterStateBit &= ~(STATE_JUMPING | STATE_SPRINT);
 
     StopJumping();
+
+    if (IsValid(Movement))
+    {
+        Movement->ConsumeInputVector();
+    }
+}
+
+void ACharacterController::ClearTransientInputState()
+{
+    ClearTransientInputStatePreservingVelocity();
+    CharacterStateBit &= ~STATE_CROUCH;
     UnCrouch();
 
     if (IsValid(Component.Get()))

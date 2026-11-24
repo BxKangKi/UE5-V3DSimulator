@@ -147,12 +147,12 @@ void APlayerCharacterController::OpenSimulationChat()
 {
     auto* Manager = UGameManagerSubSystem::GetSubSystem(this);
     if (!bEnableSimulationChat || !IsLocalController() || !Manager || Manager->IsWorldLoading()
-        || Manager->GetGamePaused() || !GetPawn() || bMenuWorldTravelPending) return;
+        || Manager->GetGamePaused() || bUIInputMode || !GetPawn() || bMenuWorldTravelPending) return;
     if (!IsValid(SimulationChat)) SimulationChat = CreateWidget<USimulatorChatWidget>(this, USimulatorChatWidget::StaticClass());
     if (!SimulationChat) return;
     if (!SimulationChat->IsInViewport()) SimulationChat->AddToViewport(1000);
     RefreshSurvivalHUD();
-    ClearLatchedMovementInput();
+    StopGameplayMotionForUI(false);
     UWidgetBlueprintLibrary::SetInputMode_UIOnlyEx(this, SimulationChat, EMouseLockMode::DoNotLock, true);
     bShowMouseCursor = true;
     SimulationChat->FocusInput();
@@ -420,7 +420,7 @@ void APlayerCharacterController::BeginPlay()
                 return;
             }
 
-            if (IsValid(SubSystem) && SubSystem->GetGamePaused())
+            if (bUIInputMode || (IsValid(SubSystem) && SubSystem->GetGamePaused()))
             {
                 return;
             }
@@ -530,7 +530,7 @@ void APlayerCharacterController::BeginPlayingState()
             SubSystem = UGameManagerSubSystem::GetSubSystem(this);
         }
 
-        if (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()))
+        if (!bUIInputMode && (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused())))
         {
             ApplyGameInputMode();
         }
@@ -578,7 +578,7 @@ void APlayerCharacterController::OnPossess(APawn* InPawn)
                     SubSystem->ApplyPendingInitialPlayerControlRotation(this);
                 }
 
-                if (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()))
+                if (!bUIInputMode && (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused())))
                 {
                     ApplyGameInputMode();
                 }
@@ -846,7 +846,7 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
     bShowMouseCursor = true;
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
-    StopGameplayMotionForUI();
+    StopGameplayMotionForUI(false);
     SetGameplayInputSuppressed(true);
 }
 
@@ -868,13 +868,14 @@ void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocu
     bShowMouseCursor = true;
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
-    StopGameplayMotionForUI();
+    StopGameplayMotionForUI(true);
     SetGameplayInputSuppressed(true);
 }
 
-void APlayerCharacterController::StopGameplayMotionForUI()
+void APlayerCharacterController::StopGameplayMotionForUI(const bool bStopVelocity)
 {
-    // UI/mouse-cursor mode must stop active gameplay input immediately.
+    // UI/mouse-cursor mode must stop active gameplay input immediately without resetting
+    // physical momentum unless an explicit full stop (e.g. world loading) is requested.
     // Enhanced Input may not emit Completed events while focus is on a widget, so clear
     // the controlled pawn explicitly instead of waiting for key release callbacks.
 
@@ -886,7 +887,14 @@ void APlayerCharacterController::StopGameplayMotionForUI()
 
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
-        CharacterCtrl->ClearTransientInputState();
+        if (bStopVelocity)
+        {
+            CharacterCtrl->ClearTransientInputState();
+        }
+        else
+        {
+            CharacterCtrl->ClearTransientInputStatePreservingVelocity();
+        }
     }
 }
 
@@ -1006,7 +1014,7 @@ void APlayerCharacterController::RestorePauseMenuAfterRejectedTravel()
     }
 
     ApplyUIInputMode(Menu);
-    bPrevGamePaused = true;
+    bPrevGamePaused = IsValid(SubSystem) ? SubSystem->GetGamePaused() : false;
 }
 
 void APlayerCharacterController::ArmMenuWorldTravelWatchdog()
@@ -1950,7 +1958,7 @@ void APlayerCharacterController::OpenPauseMenu()
     PauseMenuWidget->ResetExitRequestState();
     SubSystem->SetGamePaused(true);
     ApplyUIInputMode(PauseMenuWidget.Get());
-    bPrevGamePaused = true;
+    bPrevGamePaused = IsValid(SubSystem) ? SubSystem->GetGamePaused() : false;
 }
 
 void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
@@ -2035,7 +2043,7 @@ void APlayerCharacterController::ShowSettingsMenuFromPause()
     SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
     SubSystem->SetGamePaused(true);
     ApplyUIInputMode(SettingsMenuWidget.Get());
-    bPrevGamePaused = true;
+    bPrevGamePaused = IsValid(SubSystem) ? SubSystem->GetGamePaused() : false;
 }
 
 void APlayerCharacterController::ReturnToPauseMenuFromSettings()
@@ -2066,7 +2074,7 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
         PauseMenuWidget->ResetExitRequestState();
     }
     ApplyUIInputMode(PauseMenuWidget.Get());
-    bPrevGamePaused = true;
+    bPrevGamePaused = IsValid(SubSystem) ? SubSystem->GetGamePaused() : false;
 }
 
 void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()

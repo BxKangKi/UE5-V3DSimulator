@@ -1080,14 +1080,14 @@ bool FV3DTerrainWeightsTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Interior one-hot green"),Mesh.Primitives[1].Colors[1].Equals(FVector4f(0,1,0,0)));
     TestEqual(TEXT("Shared palette"),Mesh.Primitives[1].MaterialId,2);
     TestEqual(TEXT("Explicit runtime data-color marker"),Mesh.Primitives[1].MaterialName,FString(TEXT("V3D.TerrainPalette")));
-    // The patched glTFRuntime primitive option is essential: RGB and alpha are all weights.
-    FglTFRuntimePrimitive RuntimePrimitive;
-    TestTrue(TEXT("Ordinary glTF keeps its legacy transfer"),RuntimePrimitive.bVertexColorsSRGB);
-    RuntimePrimitive.bVertexColorsSRGB=false;
-    const FColor WeightBytes=FLinearColor(.25f,.25f,.25f,.25f).ToFColor(RuntimePrimitive.bVertexColorsSRGB);
-    TestEqual(TEXT("RGB and alpha receive the same linear quantization"),WeightBytes.R,WeightBytes.A);
-    const FLinearColor DescriptionWeights=WeightBytes.ReinterpretAsLinear();
-    TestTrue(TEXT("Editor mesh-description weights remain linear"),FMath::IsNearlyEqual(DescriptionWeights.R,DescriptionWeights.A));
+    // Stock glTFRuntime encodes RGB with sRGB via ToFColor(true). Pre-compensating linear
+    // terrain weight bytes via FLinearColor(LinearBytes) recovers identical linear quantization.
+    const FColor LinearBytes = FLinearColor(.25f, .25f, .25f, .25f).ToFColor(false);
+    const FLinearColor Compensated(LinearBytes);
+    const FColor WeightBytes = Compensated.ToFColor(true);
+    TestEqual(TEXT("RGB and alpha receive the same linear quantization"), WeightBytes.R, WeightBytes.A);
+    const FLinearColor DescriptionWeights = WeightBytes.ReinterpretAsLinear();
+    TestTrue(TEXT("Editor mesh-description weights remain linear"), FMath::IsNearlyEqual(DescriptionWeights.R, DescriptionWeights.A));
     TestFalse(TEXT("Five layers rejected"),V3DTerrain::Private::PaintWeights(Model,{0,1,2,3,4},5,Error));
     FGWorldBakedModel Invalid = Before;
     Invalid.Meshes.Add(Before.Meshes[0]);

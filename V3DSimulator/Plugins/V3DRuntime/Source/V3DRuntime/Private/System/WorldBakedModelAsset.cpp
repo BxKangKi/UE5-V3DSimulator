@@ -713,9 +713,24 @@ namespace WorldBakedModelAssetPrivate
                 }
 
                 // Colors in the public V3D terrain contract are linear weights, including alpha.
-                Primitive.bVertexColorsSRGB = Baked.MaterialName != TEXT("V3D.TerrainPalette");
+                // Stock glTFRuntime encodes Primitive.Colors via FLinearColor::ToFColor(true)
+                // (sRGB on RGB, linear on A). Quantize terrain weights linearly and pre-decode
+                // through FLinearColor(FColor) so stock glTFRuntime recovers the exact linear bytes.
+                const bool bLinearTerrainWeights = Baked.MaterialName == TEXT("V3D.TerrainPalette");
                 Primitive.Colors.Reserve(Baked.Colors.Num());
-                for (const FVector4f& Value : Baked.Colors) Primitive.Colors.Add(FVector4(Value));
+                for (const FVector4f& Value : Baked.Colors)
+                {
+                    if (bLinearTerrainWeights)
+                    {
+                        const FColor LinearBytes = FLinearColor(Value.X, Value.Y, Value.Z, Value.W).ToFColor(false);
+                        const FLinearColor Compensated(LinearBytes);
+                        Primitive.Colors.Add(FVector4(Compensated.R, Compensated.G, Compensated.B, Compensated.A));
+                    }
+                    else
+                    {
+                        Primitive.Colors.Add(FVector4(Value));
+                    }
+                }
                 Baked.Colors.Empty();
 
                 Primitive.MorphTargets.Reserve(Baked.MorphTargets.Num());
@@ -820,7 +835,6 @@ struct FWorldBakedMaterialAttachment final
         {
             bInitialized = true;
             Owner->RememberDependencies(Bundle);
-            V3DMaterialTextureArray::PackBundle(Bundle);
             if (MaterialIds.Num() != LODs.Num())
             {
                 Error = TEXT("Prepared RuntimeLOD material layout is inconsistent");
@@ -1944,7 +1958,8 @@ void UWorldBakedMeshFinalizeRequest::BeginStatic(
     // representation before InitResources; changing the flag after completion is too late.
     FglTFRuntimeStaticMeshAsync NativeCallback;
     NativeCallback.BindDynamic(this, &UWorldBakedMeshFinalizeRequest::HandleStaticMeshFinalized);
-    Builder->LoadStaticMeshFromRuntimeLODsAsyncMove(MoveTemp(LODs), NativeCallback, Config);
+    Builder->LoadStaticMeshFromRuntimeLODsAsync(LODs, NativeCallback, Config);
+    LODs.Empty();
 }
 
 void UWorldBakedMeshFinalizeRequest::BeginSkeletal(
@@ -1968,7 +1983,8 @@ void UWorldBakedMeshFinalizeRequest::BeginSkeletal(
     }
     FglTFRuntimeSkeletalMeshAsync NativeCallback;
     NativeCallback.BindDynamic(this, &UWorldBakedMeshFinalizeRequest::HandleSkeletalMeshFinalized);
-    Builder->LoadSkeletalMeshFromRuntimeLODsAsyncMove(MoveTemp(LODs), INDEX_NONE, NativeCallback, Config);
+    Builder->LoadSkeletalMeshFromRuntimeLODsAsync(LODs, INDEX_NONE, NativeCallback, Config);
+    LODs.Empty();
 }
 
 void UWorldBakedMeshFinalizeRequest::HandleStaticMeshFinalized(UStaticMesh* StaticMesh)
@@ -2483,13 +2499,19 @@ void UWorldBakedModelAsset::LoadStaticMeshLODsAdmitted(
                 TArray<FglTFRuntimeMeshLOD> LODs;
                 TArray<TArray<int32>> MaterialIds;
                 FString Error;
+                const auto IsCancelled = [Cancellation]()
+                {
+                    return FSafeFileIO::IsShuttingDown()
+                        || (Cancellation.IsValid() && Cancellation->GetValue() != 0);
+                };
                 const bool bRead = LocalReader->ReadMeshBundle(
                     LocalUUID, *LocalManifest, MeshIndices, INDEX_NONE,
                     !Config.MaterialsConfig.bSkipLoad, Bundle, Error,
                     &CachedTextureIds, &CachedMaterialIds, TextureResolution, false,
-                    [Cancellation]() { return FSafeFileIO::IsShuttingDown()
-                        || (Cancellation.IsValid() && Cancellation->GetValue() != 0); });
-                const bool bPrepared = bRead
+                    IsCancelled);
+                const bool bPacked = bRead && (Config.MaterialsConfig.bSkipLoad
+                    || V3DMaterialTextureArray::PackBundle(Bundle, IsCancelled));
+                const bool bPrepared = bPacked
                     && WorldBakedModelAssetPrivate::BuildRuntimeLODsDetached(
                         Bundle, INDEX_NONE, !Config.MaterialsConfig.bSkipLoad,
                         LODs, MaterialIds, Error);
@@ -2793,7 +2815,9 @@ void UWorldBakedModelAsset::LoadSkeletalMeshAdmitted(
                     !Config.MaterialsConfig.bSkipLoad, Bundle, Error,
                     &CachedTextureIds, &CachedMaterialIds, TextureResolution, false,
                     IsCancelled);
-                const bool bPrepared = bRead && !IsCancelled()
+                const bool bPacked = bRead && !IsCancelled() && (Config.MaterialsConfig.bSkipLoad
+                    || V3DMaterialTextureArray::PackBundle(Bundle, IsCancelled));
+                const bool bPrepared = bPacked && !IsCancelled()
                     && WorldBakedModelAssetPrivate::BuildRuntimeLODsDetached(
                         Bundle, SkinIndex, !Config.MaterialsConfig.bSkipLoad,
                         LODs, MaterialIds, Error);

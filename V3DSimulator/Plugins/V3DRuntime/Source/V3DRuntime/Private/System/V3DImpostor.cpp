@@ -490,6 +490,11 @@ UMaterialInterface* V3DImpostor::ResolveMaterial(
     {
         return Cached;
     }
+    if (CachedDefault.IsStale())
+    {
+        CachedDefault.Reset();
+        bProbedDefault = false;
+    }
     if (!bProbedDefault)
     {
         bProbedDefault = true;

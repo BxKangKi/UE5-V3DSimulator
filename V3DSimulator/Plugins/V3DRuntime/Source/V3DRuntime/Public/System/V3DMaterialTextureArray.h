@@ -37,7 +37,7 @@ namespace V3DMaterialTextureArray
      * in memory for Unreal rendering, while keeping the .v3d archive format itself portable
      * with separate textures intact.
      */
-    V3DRUNTIME_API void PackBundle(FGWorldBakedAssetBundle& Bundle);
+    V3DRUNTIME_API bool PackBundle(FGWorldBakedAssetBundle& Bundle, TFunctionRef<bool()> ShouldCancel = []() { return false; });
 
     /** Optional build-time packer (if a caller explicitly wants pre-packed arrays in an archive). */
     V3DRUNTIME_API bool PackMaterials(
