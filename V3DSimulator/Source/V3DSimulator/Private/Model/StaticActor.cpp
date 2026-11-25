@@ -35,6 +35,11 @@
 #include "System/StreamingMovementGateSubsystem.h"
 #include "System/WorldArchive.h"
 #include "System/WorldBakedModelAsset.h"
+#include "HAL/PlatformFileManager.h"
+#include "Misc/Compression.h"
+#include "System/V3DTerrain.h"
+#include "System/WorldArchiveCodec.h"
+#include "System/WorldSurfaceSubsystem.h"
 #include "System/V3DRuntimeSafety.h"
 #include "System/V3DSimulatorGameInstance.h"
 #include "System/V3DSimulatorAssetRegistry.h"
@@ -44,6 +49,117 @@
 
 namespace StaticActorPrivate
 {
+    TArray<FString> ExtractTerrainLayerNamesFromArchive(
+        const FString& ArchivePath,
+        const FGWorldModelManifest& Manifest)
+    {
+        TArray<FString> LayerNames;
+        if (ArchivePath.IsEmpty() || Manifest.MaterialRanges.IsEmpty()) return LayerNames;
+
+        IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+        TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*ArchivePath));
+        if (!Handle) return LayerNames;
+
+        TMap<int32, FString> NamesById;
+        TArray<FString> FallbackTerrainNames;
+        TMap<int32, int32> PaletteSourceByLayer;
+        bool bHasPalette = false;
+
+        for (const TPair<int32, FGWorldArchiveRange>& Pair : Manifest.MaterialRanges)
+        {
+            const FGWorldArchiveRange& Range = Pair.Value;
+            if (Range.StoredSize == 0 || Range.UncompressedSize == 0
+                || Range.StoredSize > 16ull * 1024ull * 1024ull
+                || Range.UncompressedSize > 16ull * 1024ull * 1024ull)
+            {
+                continue;
+            }
+            if (!Handle->Seek(static_cast<int64>(Range.Offset))) continue;
+            TArray<uint8> Stored;
+            Stored.SetNumUninitialized(static_cast<int32>(Range.StoredSize));
+            if (!Handle->Read(Stored.GetData(), static_cast<int64>(Range.StoredSize))) continue;
+
+            TArray<uint8> Payload;
+            if (Range.Codec == 0)
+            {
+                Payload = MoveTemp(Stored);
+            }
+            else if (Range.Codec == 1)
+            {
+                Payload.SetNumUninitialized(static_cast<int32>(Range.UncompressedSize));
+                if (!FCompression::UncompressMemory(NAME_Zlib,
+                    Payload.GetData(), Payload.Num(),
+                    Stored.GetData(), Stored.Num()))
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                continue;
+            }
+
+            FGWorldBakedMaterial Mat;
+            FString Err;
+            if (!WorldArchiveCodec::DeserializeMaterial(Payload, Mat, Err)) continue;
+
+            NamesById.Add(Mat.MaterialId, Mat.Name);
+            if (V3DTerrain::IsTerrainName(Mat.Name))
+            {
+                FallbackTerrainNames.AddUnique(Mat.Name);
+            }
+            if (V3DTerrain::IsPaletteMaterial(Mat)
+                || Mat.Name.Equals(TEXT("V3D.TerrainPalette"), ESearchCase::IgnoreCase))
+            {
+                bHasPalette = true;
+                for (const FGWorldBakedScalarParameter& Scalar : Mat.Scalars)
+                {
+                    if (Scalar.Name.StartsWith(TEXT("V3D_SourceMaterial")))
+                    {
+                        const FString Suffix = Scalar.Name.Mid(18);
+                        if (Suffix.IsNumeric())
+                        {
+                            const int32 LayerIdx = FCString::Atoi(*Suffix);
+                            if (LayerIdx >= 0 && LayerIdx < 4)
+                            {
+                                PaletteSourceByLayer.Add(LayerIdx, FMath::RoundToInt(Scalar.Value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!bHasPalette && FallbackTerrainNames.IsEmpty()) return LayerNames;
+
+        if (!PaletteSourceByLayer.IsEmpty())
+        {
+            LayerNames.SetNum(4);
+            int32 HighestValid = -1;
+            for (int32 LayerIdx = 0; LayerIdx < 4; ++LayerIdx)
+            {
+                if (const int32* SrcId = PaletteSourceByLayer.Find(LayerIdx))
+                {
+                    if (const FString* SrcName = NamesById.Find(*SrcId))
+                    {
+                        LayerNames[LayerIdx] = *SrcName;
+                        HighestValid = LayerIdx;
+                    }
+                }
+            }
+            if (HighestValid >= 0)
+            {
+                LayerNames.SetNum(HighestValid + 1);
+                return LayerNames;
+            }
+            LayerNames.Reset();
+        }
+
+        FallbackTerrainNames.Sort();
+        if (FallbackTerrainNames.Num() > 4) FallbackTerrainNames.SetNum(4);
+        return FallbackTerrainNames;
+    }
+
     struct FStaticPreparedGroup
     {
         FInstancedMeshGroupInitData Data;
@@ -568,6 +684,12 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
 
                 if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
                 const bool bSuccess = Results[0] && Results[1];
+                TArray<FString> TerrainLayerNames;
+                if (bSuccess && Reader.IsValid())
+                {
+                    TerrainLayerNames = StaticActorPrivate::ExtractTerrainLayerNamesFromArchive(
+                        Reader->GetArchivePath(), Manifest);
+                }
                 FString Error;
                 if (!bSuccess)
                 {
@@ -587,6 +709,7 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
                         bSuccess,
                         Metadata = MoveTemp(Metadata),
                         Manifest = MoveTemp(Manifest),
+                        TerrainLayerNames = MoveTemp(TerrainLayerNames),
                         Error = MoveTemp(Error)]() mutable
                     {
                         if (AStaticActor* StrongThis = WeakThis.Get())
@@ -600,6 +723,13 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
                                 MoveTemp(Metadata),
                                 MoveTemp(Manifest),
                                 MoveTemp(Error));
+                            if (bSuccess && !TerrainLayerNames.IsEmpty() && IsValid(StrongThis->GetBakedAsset()))
+                            {
+                                if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(StrongThis))
+                                {
+                                    Surfaces->RegisterTerrainLayers(StrongThis->GetBakedAsset(), TerrainLayerNames);
+                                }
+                            }
                         }
                     });
             });

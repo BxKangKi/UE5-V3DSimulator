@@ -40,6 +40,8 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "System/SourceModelImport.h"
+#include "System/V3DTerrain.h"
+#include "Model/V3DMaterialAssetReferences.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Text/BaseTextLayoutMarshaller.h"
 #include "Framework/Text/SlateTextRun.h"
@@ -572,10 +574,22 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
             InvalidatePreview(); Current = Doc; bRawDirty = false; RefreshForm();
         })];
     auto Right = SNew(SVerticalBox);
-    Right->AddSlot().AutoHeight().Padding(0,0,0,8)[MakeEditorButton(TEXT("Preview model (read only)"), [this] { StartPreview(); })];
+    TWeakObjectPtr<UProjectEditorWidget> WeakPreviewSelf(this);
+    Right->AddSlot().AutoHeight().Padding(0,0,0,6)
+    [
+        SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().FillWidth(1).Padding(0,0,6,0)[MakeEditorButton(TEXT("Preview model + overlays"), [WeakPreviewSelf] { if (auto* Self = WeakPreviewSelf.Get()) Self->StartPreview(); })]
+        + SHorizontalBox::Slot().AutoWidth()[MakeEditorButton(TEXT("Reset View"), [WeakPreviewSelf] { if (auto* Self = WeakPreviewSelf.Get(); Self && Self->Preview) Self->Preview->ResetCamera(); })]
+    ];
     Right->AddSlot().AutoHeight()[SNew(SBorder).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
         .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().Panel); }).Padding(8)
-        [SNew(SBox).HeightOverride(240)[SAssignNew(Preview, SV3DModelPreview)]]];
+        [SNew(SBox).HeightOverride(320)[SAssignNew(Preview, SV3DModelPreview)]]];
+    Right->AddSlot().AutoHeight().Padding(2,4,2,4)
+    [
+        SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true)
+        .ColorAndOpacity_Lambda([this] { return FSlateColor(GetThemePalette().Muted); })
+        .Text(Text(TEXT("LMB: Orbit · RMB: Pan · Wheel: Zoom · Double-Click: Reset  |  Green: Collider · Gold: Light · Orange/Pink: Hand/Grip · Red: Muzzle")))
+    ];
     Right->AddSlot().AutoHeight().Padding(0,8)[SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text(Text(TEXT("JSON / advanced edit · Apply JSON to update fields")))];
     Right->AddSlot().FillHeight(1)[SAssignNew(Raw, SMultiLineEditableTextBox).Style(&EditorInputStyle).Font(EditorTextStyle.Font).Marshaller(JsonHighlighter).AutoWrapText(false)
         .OnTextChanged_Lambda([this](const FText& Value)
@@ -1090,7 +1104,16 @@ void UProjectEditorWidget::Remember()
 void UProjectEditorWidget::Changed()
 {
     if (Current) Current->bDirty = true;
-    bRawDirty = false; InvalidatePreview(); QueueFormRefresh();
+    bRawDirty = false;
+    if (Preview && Current)
+    {
+        if (PreviewDocument != Current->Path)
+        {
+            InvalidatePreview();
+        }
+        Preview->SetOverlaysFromJson(Current->Json);
+    }
+    QueueFormRefresh();
 }
 
 void UProjectEditorWidget::QueueFormRefresh()
@@ -1114,7 +1137,7 @@ void UProjectEditorWidget::InvalidatePreview()
         PreviewBuilder->Cancel();
         PreviewBuilder = nullptr;
     }
-    if (Preview) Preview->ClearModel();
+    if (Preview) { Preview->ClearModel(); Preview->ClearOverlays(); }
 }
 
 bool UProjectEditorWidget::ApplyRaw()
@@ -1520,6 +1543,679 @@ void UProjectEditorWidget::AddNodeSettingsSection(const TSharedRef<SVerticalBox>
     ];
 }
 
+struct FV3DMaterialEntry
+{
+    FString KeyName;
+    FString TextureName;
+    FString DisplayLabel;
+    FString SearchText;
+    bool bIsTerrainLayer = false;
+    bool bIsFoliageDefault = false;
+};
+
+namespace V3DMaterialDiscovery
+{
+    static void RegisterMaterialName(
+        const FString& RawName,
+        const FString& TextureHint,
+        TMap<FString, TSharedPtr<FV3DMaterialEntry>>& OutMap)
+    {
+        const FString Trimmed = RawName.TrimStartAndEnd();
+        if (Trimmed.IsEmpty()) return;
+        if (Trimmed.Equals(TEXT("V3D.TerrainPalette"), ESearchCase::IgnoreCase)
+            || Trimmed.Equals(TEXT("V3D.Impostor"), ESearchCase::IgnoreCase))
+        {
+            return;
+        }
+
+        const FString Normalized = FV3DMaterialAssetReferences::NormalizeMaterialName(Trimmed);
+
+        // Reserved foliage materials are treated as a single default material entry ("foliage").
+        if (Normalized == TEXT("foliage") || Normalized.EndsWith(TEXT(".foliage")))
+        {
+            const FString DedupKey = TEXT("foliage");
+            if (!OutMap.Contains(DedupKey))
+            {
+                auto Entry = MakeShared<FV3DMaterialEntry>();
+                Entry->KeyName = TEXT("foliage");
+                Entry->DisplayLabel = TEXT("foliage  [Foliage (Default)]");
+                Entry->SearchText = TEXT("foliage default");
+                Entry->bIsFoliageDefault = true;
+                OutMap.Add(DedupKey, MoveTemp(Entry));
+            }
+            return;
+        }
+
+        // Reserved terrain materials (*.terrain) are listed individually per terrain texture/layer.
+        if (V3DTerrain::IsTerrainName(Trimmed))
+        {
+            const FString DedupKey = Trimmed.ToLower();
+            TSharedPtr<FV3DMaterialEntry>* Existing = OutMap.Find(DedupKey);
+            if (Existing && Existing->IsValid())
+            {
+                if ((*Existing)->TextureName.IsEmpty() && !TextureHint.IsEmpty())
+                {
+                    (*Existing)->TextureName = TextureHint;
+                    (*Existing)->DisplayLabel = FString::Printf(TEXT("%s  [Terrain Texture: %s]"), *Trimmed, *TextureHint);
+                    (*Existing)->SearchText = Trimmed + TEXT(" ") + TextureHint + TEXT(" terrain texture");
+                }
+                return;
+            }
+
+            auto Entry = MakeShared<FV3DMaterialEntry>();
+            Entry->KeyName = Trimmed;
+            Entry->TextureName = TextureHint;
+            Entry->bIsTerrainLayer = true;
+            Entry->DisplayLabel = TextureHint.IsEmpty()
+                ? (Trimmed + TEXT("  [Terrain Texture]"))
+                : FString::Printf(TEXT("%s  [Terrain Texture: %s]"), *Trimmed, *TextureHint);
+            Entry->SearchText = Trimmed + TEXT(" ") + TextureHint + TEXT(" terrain texture");
+            OutMap.Add(DedupKey, MoveTemp(Entry));
+            return;
+        }
+
+        // Regular material
+        const FString DedupKey = Trimmed.ToLower();
+        if (!OutMap.Contains(DedupKey))
+        {
+            auto Entry = MakeShared<FV3DMaterialEntry>();
+            Entry->KeyName = Trimmed;
+            Entry->TextureName = TextureHint;
+            Entry->DisplayLabel = Trimmed;
+            Entry->SearchText = Trimmed + (TextureHint.IsEmpty() ? FString() : (TEXT(" ") + TextureHint));
+            OutMap.Add(DedupKey, MoveTemp(Entry));
+        }
+    }
+
+    static FString ResolveBaseColorTextureName(
+        const TSharedPtr<FJsonObject>& MatObj,
+        const TArray<TSharedPtr<FJsonValue>>* TexturesArr,
+        const TArray<TSharedPtr<FJsonValue>>* ImagesArr)
+    {
+        if (!MatObj.IsValid() || !TexturesArr || !ImagesArr) return FString();
+        const TSharedPtr<FJsonObject>* PbrObj = nullptr;
+        if (!MatObj->TryGetObjectField(TEXT("pbrMetallicRoughness"), PbrObj) || !PbrObj || !PbrObj->IsValid()) return FString();
+        const TSharedPtr<FJsonObject>* BaseTexObj = nullptr;
+        if (!(*PbrObj)->TryGetObjectField(TEXT("baseColorTexture"), BaseTexObj) || !BaseTexObj || !BaseTexObj->IsValid()) return FString();
+
+        double TexIdxNum = -1.0;
+        if (!(*BaseTexObj)->TryGetNumberField(TEXT("index"), TexIdxNum)) return FString();
+        const int32 TexIdx = FMath::FloorToInt(TexIdxNum);
+        if (!TexturesArr->IsValidIndex(TexIdx) || !(*TexturesArr)[TexIdx].IsValid() || (*TexturesArr)[TexIdx]->Type != EJson::Object) return FString();
+
+        const TSharedPtr<FJsonObject> TexObj = (*TexturesArr)[TexIdx]->AsObject();
+        double SrcIdxNum = -1.0;
+        if (!TexObj.IsValid() || !TexObj->TryGetNumberField(TEXT("source"), SrcIdxNum)) return FString();
+        const int32 ImgIdx = FMath::FloorToInt(SrcIdxNum);
+        if (!ImagesArr->IsValidIndex(ImgIdx) || !(*ImagesArr)[ImgIdx].IsValid() || (*ImagesArr)[ImgIdx]->Type != EJson::Object) return FString();
+
+        const TSharedPtr<FJsonObject> ImgObj = (*ImagesArr)[ImgIdx]->AsObject();
+        if (!ImgObj.IsValid()) return FString();
+
+        FString ImgName;
+        if (ImgObj->TryGetStringField(TEXT("name"), ImgName) && !ImgName.TrimStartAndEnd().IsEmpty())
+        {
+            return ImgName.TrimStartAndEnd();
+        }
+        FString ImgUri;
+        if (ImgObj->TryGetStringField(TEXT("uri"), ImgUri) && !ImgUri.StartsWith(TEXT("data:"), ESearchCase::IgnoreCase))
+        {
+            return FPaths::GetBaseFilename(ImgUri);
+        }
+        return FString();
+    }
+
+    static void ExtractMaterialsFromGltfJsonText(
+        const FString& JsonText,
+        TMap<FString, TSharedPtr<FV3DMaterialEntry>>& OutMap)
+    {
+        TSharedPtr<FJsonObject> Root;
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+        if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid()) return;
+
+        const TArray<TSharedPtr<FJsonValue>>* MaterialsArr = nullptr;
+        if (!Root->TryGetArrayField(TEXT("materials"), MaterialsArr) || !MaterialsArr) return;
+
+        const TArray<TSharedPtr<FJsonValue>>* TexturesArr = nullptr;
+        Root->TryGetArrayField(TEXT("textures"), TexturesArr);
+        const TArray<TSharedPtr<FJsonValue>>* ImagesArr = nullptr;
+        Root->TryGetArrayField(TEXT("images"), ImagesArr);
+
+        for (const TSharedPtr<FJsonValue>& Val : *MaterialsArr)
+        {
+            if (!Val.IsValid() || Val->Type != EJson::Object) continue;
+            const TSharedPtr<FJsonObject> MatObj = Val->AsObject();
+            if (!MatObj.IsValid()) continue;
+            FString MatName;
+            if (!MatObj->TryGetStringField(TEXT("name"), MatName)) continue;
+            const FString TexName = ResolveBaseColorTextureName(MatObj, TexturesArr, ImagesArr);
+            RegisterMaterialName(MatName, TexName, OutMap);
+        }
+    }
+
+    static void CollectMaterialsFromSourceFile(
+        const FString& SourcePath,
+        TMap<FString, TSharedPtr<FV3DMaterialEntry>>& OutMap)
+    {
+        if (SourcePath.IsEmpty() || !FPaths::FileExists(SourcePath)) return;
+        const FString Ext = FPaths::GetExtension(SourcePath).ToLower();
+
+        if (Ext == TEXT("glb"))
+        {
+            TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*SourcePath));
+            if (Reader && Reader->TotalSize() >= 20)
+            {
+                uint32 Magic = 0, Version = 0, TotalLength = 0;
+                uint32 ChunkLen = 0, ChunkType = 0;
+                *Reader << Magic << Version << TotalLength << ChunkLen << ChunkType;
+                constexpr uint32 GlbMagic = 0x46546C67u;
+                constexpr uint32 JsonChunkType = 0x4E4F534Au;
+                constexpr uint32 MaxJsonChunkBytes = 32u * 1024u * 1024u;
+                if (Magic == GlbMagic && ChunkType == JsonChunkType && ChunkLen > 0 && ChunkLen <= MaxJsonChunkBytes
+                    && static_cast<int64>(20 + ChunkLen) <= Reader->TotalSize())
+                {
+                    TArray<uint8> JsonBytes;
+                    JsonBytes.SetNumUninitialized(static_cast<int32>(ChunkLen));
+                    Reader->Serialize(JsonBytes.GetData(), ChunkLen);
+                    FUTF8ToTCHAR Conv(reinterpret_cast<const ANSICHAR*>(JsonBytes.GetData()), JsonBytes.Num());
+                    ExtractMaterialsFromGltfJsonText(FString(Conv.Length(), Conv.Get()), OutMap);
+                }
+            }
+        }
+        else if (Ext == TEXT("gltf"))
+        {
+            const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
+            if (FileSize > 0 && FileSize <= 32ll * 1024 * 1024)
+            {
+                FString JsonText;
+                if (FFileHelper::LoadFileToString(JsonText, *SourcePath))
+                {
+                    ExtractMaterialsFromGltfJsonText(JsonText, OutMap);
+                }
+            }
+        }
+        else if (Ext == TEXT("obj"))
+        {
+            const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
+            if (FileSize > 0 && FileSize <= 64ll * 1024 * 1024)
+            {
+                TArray<FString> Lines;
+                if (FFileHelper::LoadFileToStringArray(Lines, *SourcePath))
+                {
+                    for (const FString& Line : Lines)
+                    {
+                        if (Line.StartsWith(TEXT("usemtl ")))
+                        {
+                            RegisterMaterialName(Line.Mid(7), FString(), OutMap);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static FString FindMappedSurface(const TSharedPtr<FJsonObject>& SoundsJson, const FString& MaterialKey)
+    {
+        if (!SoundsJson.IsValid()) return FString();
+        const TArray<TSharedPtr<FJsonValue>>* Mappings = nullptr;
+        if (!SoundsJson->TryGetArrayField(TEXT("MaterialPhysicalMappings"), Mappings) || !Mappings) return FString();
+        for (const TSharedPtr<FJsonValue>& EntryVal : *Mappings)
+        {
+            if (!EntryVal.IsValid() || EntryVal->Type != EJson::Object) continue;
+            const TSharedPtr<FJsonObject> Obj = EntryVal->AsObject();
+            FString MatStr, SurfStr;
+            if (Obj.IsValid() && Obj->TryGetStringField(TEXT("Material"), MatStr)
+                && MatStr.Equals(MaterialKey, ESearchCase::IgnoreCase))
+            {
+                Obj->TryGetStringField(TEXT("PhysicalMaterial"), SurfStr);
+                return SurfStr;
+            }
+        }
+        return FString();
+    }
+
+    static bool SetOrRemoveMaterialMapping(
+        const TSharedPtr<FJsonObject>& SoundsJson,
+        const FString& MaterialKey,
+        const FString& SurfaceName,
+        const bool bRemove)
+    {
+        if (!SoundsJson.IsValid() || MaterialKey.IsEmpty()) return false;
+        TArray<TSharedPtr<FJsonValue>> Updated;
+        const TArray<TSharedPtr<FJsonValue>>* Existing = nullptr;
+        if (SoundsJson->TryGetArrayField(TEXT("MaterialPhysicalMappings"), Existing) && Existing)
+        {
+            Updated = *Existing;
+        }
+
+        bool bFound = false;
+        for (int32 Idx = Updated.Num() - 1; Idx >= 0; --Idx)
+        {
+            if (!Updated[Idx].IsValid() || Updated[Idx]->Type != EJson::Object) continue;
+            const TSharedPtr<FJsonObject> Obj = Updated[Idx]->AsObject();
+            FString MatStr;
+            if (Obj.IsValid() && Obj->TryGetStringField(TEXT("Material"), MatStr)
+                && MatStr.Equals(MaterialKey, ESearchCase::IgnoreCase))
+            {
+                bFound = true;
+                if (bRemove)
+                {
+                    Updated.RemoveAt(Idx);
+                }
+                else
+                {
+                    Obj->SetStringField(TEXT("PhysicalMaterial"), SurfaceName);
+                }
+            }
+        }
+
+        if (!bRemove && !bFound)
+        {
+            auto NewEntry = MakeShared<FJsonObject>();
+            NewEntry->SetStringField(TEXT("Material"), MaterialKey);
+            NewEntry->SetStringField(TEXT("PhysicalMaterial"), SurfaceName.IsEmpty() ? TEXT("SurfaceName") : SurfaceName);
+            Updated.Add(MakeShared<FJsonValueObject>(NewEntry));
+        }
+
+        SoundsJson->SetArrayField(TEXT("MaterialPhysicalMappings"), Updated);
+        return true;
+    }
+}
+
+TSharedPtr<FV3DEditorDocument> UProjectEditorWidget::FindSoundsDocument() const
+{
+    for (const TSharedPtr<FV3DEditorDocument>& Doc : Documents)
+    {
+        if (Doc.IsValid() && Doc->Path.EndsWith(TEXT("scripts/sounds.json"), ESearchCase::IgnoreCase))
+        {
+            return Doc;
+        }
+    }
+    return nullptr;
+}
+
+void UProjectEditorWidget::EnsureMaterialsLoaded(const bool bProjectWide, const FString& SourcePath)
+{
+    const FString ScopeKey = bProjectWide
+        ? FString::Printf(TEXT("PROJECT:%s:%d"), *Project, Documents.Num())
+        : (TEXT("MODEL:") + SourcePath);
+    if (CachedMaterialsScopeKey == ScopeKey)
+    {
+        return;
+    }
+    CachedMaterialsScopeKey = ScopeKey;
+    CachedMaterials.Reset();
+
+    TMap<FString, TSharedPtr<FV3DMaterialEntry>> Collected;
+    if (bProjectWide)
+    {
+        for (const TSharedPtr<FV3DEditorDocument>& Doc : Documents)
+        {
+            if (!Doc.IsValid() || Doc->SourcePath.IsEmpty()) continue;
+            V3DMaterialDiscovery::CollectMaterialsFromSourceFile(Doc->SourcePath, Collected);
+        }
+    }
+    else
+    {
+        V3DMaterialDiscovery::CollectMaterialsFromSourceFile(SourcePath, Collected);
+    }
+
+    Collected.GenerateValueArray(CachedMaterials);
+    CachedMaterials.Sort([](const TSharedPtr<FV3DMaterialEntry>& A, const TSharedPtr<FV3DMaterialEntry>& B)
+    {
+        if (A->bIsTerrainLayer != B->bIsTerrainLayer) return A->bIsTerrainLayer;
+        if (A->bIsFoliageDefault != B->bIsFoliageDefault) return A->bIsFoliageDefault;
+        return A->KeyName.Compare(B->KeyName, ESearchCase::IgnoreCase) < 0;
+    });
+}
+
+void UProjectEditorWidget::RebuildMaterialSearchResults(const bool bProjectWide)
+{
+    using namespace V3DEditorUI;
+    if (!MaterialSearchResultsBox.IsValid() || !Current || !Current->Json) return;
+
+    MaterialSearchResultsBox->ClearChildren();
+    const V3DHUDStyle::FAuthoringPalette Palette = GetThemePalette();
+    const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush("WhiteBrush");
+
+    const TSharedPtr<FV3DEditorDocument> SoundsDoc = bProjectWide ? Current : FindSoundsDocument();
+    const TSharedPtr<FJsonObject> SoundsJson = SoundsDoc.IsValid() ? SoundsDoc->Json : nullptr;
+
+    const FString Query = MaterialSearchQuery.TrimStartAndEnd();
+    TArray<TSharedPtr<FV3DMaterialEntry>> Matches;
+    Matches.Reserve(CachedMaterials.Num());
+    for (const TSharedPtr<FV3DMaterialEntry>& Entry : CachedMaterials)
+    {
+        if (!Entry.IsValid()) continue;
+        if (Query.IsEmpty() || Entry->SearchText.Contains(Query, ESearchCase::IgnoreCase)
+            || Entry->KeyName.Contains(Query, ESearchCase::IgnoreCase))
+        {
+            Matches.Add(Entry);
+        }
+    }
+
+    const int32 TotalCount = CachedMaterials.Num();
+    const int32 MatchCount = Matches.Num();
+    const int32 ShowLimit = FMath::Min(MatchCount, 60);
+
+    MaterialSearchResultsBox->AddSlot().AutoHeight().Padding(2, 2, 2, 6)
+    [
+        SNew(STextBlock)
+        .TextStyle(&EditorTextStyle)
+        .ColorAndOpacity(FSlateColor(Palette.Muted))
+        .Text(Text(TotalCount > 0
+            ? FString::Printf(TEXT("Materials found: %d / %d (Terrain: per texture, Foliage: default)"), MatchCount, TotalCount)
+            : TEXT("No embedded materials found in scanned 3D models.")))
+    ];
+
+    TWeakObjectPtr<UProjectEditorWidget> WeakSelf(this);
+    for (int32 Idx = 0; Idx < ShowLimit; ++Idx)
+    {
+        const TSharedPtr<FV3DMaterialEntry>& Entry = Matches[Idx];
+        const FString MatKey = Entry->KeyName;
+        const FString MappedSurface = V3DMaterialDiscovery::FindMappedSurface(SoundsJson, MatKey);
+        const bool bMapped = !MappedSurface.IsEmpty();
+
+        const FString RowLabel = bMapped
+            ? FString::Printf(TEXT("%s  [-> %s]"), *Entry->DisplayLabel, *MappedSurface)
+            : Entry->DisplayLabel;
+
+        MaterialSearchResultsBox->AddSlot().AutoHeight().Padding(0, 0, 0, 4)
+        [
+            SNew(SBorder)
+            .BorderImage(WhiteBrush)
+            .BorderBackgroundColor(CardBorderColor(bDarkMode, !bMapped))
+            .Padding(1.f)
+            [
+                SNew(SBorder)
+                .BorderImage(WhiteBrush)
+                .BorderBackgroundColor(CardFillColor(Palette, bDarkMode, Idx, !bMapped))
+                .Padding(FMargin(8.f, 4.f))
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .TextStyle(&EditorTextStyle)
+                        .ColorAndOpacity(FSlateColor(bMapped ? Palette.Text : Palette.Muted))
+                        .Text(Text(RowLabel))
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        MakeEditorButton(
+                            bMapped ? TEXT("Remove") : (bProjectWide ? TEXT("+ Map") : TEXT("+ Map in sounds.json")),
+                            [WeakSelf, MatKey, bMapped, bProjectWide]
+                            {
+                                UProjectEditorWidget* Self = WeakSelf.Get();
+                                if (!Self || Self->bBusy || !Self->Current) return;
+                                if (Self->bRawDirty) { Self->Message = TEXT("Apply JSON first."); return; }
+                                TSharedPtr<FV3DEditorDocument> TargetDoc = bProjectWide ? Self->Current : Self->FindSoundsDocument();
+                                if (!TargetDoc.IsValid() || !TargetDoc->Json.IsValid())
+                                {
+                                    Self->Message = TEXT("scripts/sounds.json was not found in this project.");
+                                    return;
+                                }
+                                if (TargetDoc == Self->Current)
+                                {
+                                    Self->Remember();
+                                }
+                                const FString SurfaceToAssign = Self->MaterialTargetSurface.TrimStartAndEnd().IsEmpty()
+                                    ? TEXT("SurfaceName") : Self->MaterialTargetSurface.TrimStartAndEnd();
+                                V3DMaterialDiscovery::SetOrRemoveMaterialMapping(TargetDoc->Json, MatKey, SurfaceToAssign, bMapped);
+                                TargetDoc->bDirty = true;
+                                Self->Message = bMapped
+                                    ? (TEXT("Removed material mapping: ") + MatKey)
+                                    : FString::Printf(TEXT("Mapped '%s' -> '%s' in scripts/sounds.json"), *MatKey, *SurfaceToAssign);
+                                if (TargetDoc == Self->Current)
+                                {
+                                    Self->Changed();
+                                }
+                                else
+                                {
+                                    Self->RebuildMaterialSearchResults(bProjectWide);
+                                }
+                            })
+                    ]
+                ]
+            ]
+        ];
+    }
+
+    if (MatchCount > ShowLimit)
+    {
+        MaterialSearchResultsBox->AddSlot().AutoHeight().Padding(2, 4, 2, 2)
+        [
+            SNew(STextBlock)
+            .TextStyle(&EditorTextStyle)
+            .ColorAndOpacity(FSlateColor(Palette.Muted))
+            .Text(Text(FString::Printf(TEXT("... %d more matches. Refine search to narrow results."), MatchCount - ShowLimit)))
+        ];
+    }
+}
+
+void UProjectEditorWidget::AddMaterialSearchSection(const TSharedRef<SVerticalBox>& Box)
+{
+    using namespace V3DEditorUI;
+    if (!Current || !Current->Json) return;
+
+    const bool bIsSoundsScript = Current->Path.EndsWith(TEXT("scripts/sounds.json"), ESearchCase::IgnoreCase);
+    bool bIsModelDoc = false;
+    if (!bIsSoundsScript && !Current->SourcePath.IsEmpty())
+    {
+        FString AssetType;
+        Current->Json->TryGetStringField(TEXT("AssetType"), AssetType);
+        const FString Ext = FPaths::GetExtension(Current->SourcePath).ToLower();
+        const bool bModelExt = Ext == TEXT("glb") || Ext == TEXT("gltf") || Ext == TEXT("obj");
+        bIsModelDoc = bModelExt && (AssetType.IsEmpty() || AssetType == TEXT("Model"));
+    }
+
+    if (!bIsSoundsScript && !bIsModelDoc) return;
+
+    EnsureMaterialsLoaded(bIsSoundsScript, Current->SourcePath);
+
+    // Collect available PhysicalMaterials surface names from scripts/sounds.json for target selection
+    TSharedPtr<FV3DEditorDocument> SoundsDoc = bIsSoundsScript ? Current : FindSoundsDocument();
+    CachedSurfaceOptions.Reset();
+    if (SoundsDoc.IsValid() && SoundsDoc->Json.IsValid())
+    {
+        const TSharedPtr<FJsonObject>* PhysMap = nullptr;
+        if (SoundsDoc->Json->TryGetObjectField(TEXT("PhysicalMaterials"), PhysMap) && PhysMap && PhysMap->IsValid())
+        {
+            TArray<FString> SortedSurfaces;
+            for (const auto& Pair : (*PhysMap)->Values)
+            {
+                SortedSurfaces.Add(FString(Pair.Key));
+            }
+            SortedSurfaces.Sort();
+            for (const FString& SurfName : SortedSurfaces)
+            {
+                CachedSurfaceOptions.Add(MakeShared<FString>(SurfName));
+            }
+        }
+    }
+    if (MaterialTargetSurface.IsEmpty() && !CachedSurfaceOptions.IsEmpty())
+    {
+        MaterialTargetSurface = *CachedSurfaceOptions[0];
+    }
+    else if (MaterialTargetSurface.IsEmpty())
+    {
+        MaterialTargetSurface = TEXT("SurfaceName");
+    }
+
+    const V3DHUDStyle::FAuthoringPalette Palette = GetThemePalette();
+    const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush("WhiteBrush");
+    TWeakObjectPtr<UProjectEditorWidget> WeakSelf(this);
+
+    auto MatSearchBox = SNew(SEditableTextBox)
+        .Style(&EditorInputStyle)
+        .Text(Text(MaterialSearchQuery))
+        .HintText(Text(TEXT("Search material or terrain texture name...")))
+        .OnTextChanged_Lambda([WeakSelf, bIsSoundsScript](const FText& NewText)
+        {
+            if (UProjectEditorWidget* Self = WeakSelf.Get())
+            {
+                Self->MaterialSearchQuery = NewText.ToString();
+                Self->RebuildMaterialSearchResults(bIsSoundsScript);
+            }
+        });
+
+    auto SurfaceInput = SNew(SEditableTextBox)
+        .Style(&EditorInputStyle)
+        .Text(Text(MaterialTargetSurface))
+        .HintText(Text(TEXT("Target PhysicalMaterial...")))
+        .OnTextChanged_Lambda([WeakSelf](const FText& NewText)
+        {
+            if (UProjectEditorWidget* Self = WeakSelf.Get())
+            {
+                Self->MaterialTargetSurface = NewText.ToString();
+            }
+        });
+
+    MaterialSearchResultsBox = SNew(SVerticalBox);
+    RebuildMaterialSearchResults(bIsSoundsScript);
+
+    auto SurfaceRow = SNew(SHorizontalBox)
+        + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+        [
+            SNew(STextBlock)
+            .TextStyle(&EditorTextStyle)
+            .ColorAndOpacity(FSlateColor(Palette.Muted))
+            .Text(Text(TEXT("Target Surface:")))
+        ]
+        + SHorizontalBox::Slot().FillWidth(1).Padding(0, 0, 6, 0)[SurfaceInput];
+
+    if (!CachedSurfaceOptions.IsEmpty())
+    {
+        TSharedPtr<FString> SelectedOpt = CachedSurfaceOptions[0];
+        for (const TSharedPtr<FString>& Opt : CachedSurfaceOptions)
+        {
+            if (Opt.IsValid() && Opt->Equals(MaterialTargetSurface, ESearchCase::IgnoreCase))
+            {
+                SelectedOpt = Opt;
+                break;
+            }
+        }
+        SurfaceRow->AddSlot().AutoWidth().VAlign(VAlign_Center)
+        [
+            SNew(SComboBox<TSharedPtr<FString>>)
+            .ComboBoxStyle(&EditorComboStyle)
+            .OptionsSource(&CachedSurfaceOptions)
+            .InitiallySelectedItem(SelectedOpt)
+            .OnGenerateWidget_Lambda([this](TSharedPtr<FString> Opt)
+            {
+                return SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(Opt.IsValid() ? *Opt : FString()));
+            })
+            .OnSelectionChanged_Lambda([WeakSelf, SurfaceInput](TSharedPtr<FString> Opt, ESelectInfo::Type)
+            {
+                if (UProjectEditorWidget* Self = WeakSelf.Get(); Self && Opt.IsValid())
+                {
+                    Self->MaterialTargetSurface = *Opt;
+                    SurfaceInput->SetText(Text(*Opt));
+                }
+            })
+            [
+                SNew(STextBlock).TextStyle(&EditorTextStyle)
+                .Text_Lambda([WeakSelf]()
+                {
+                    if (const UProjectEditorWidget* Self = WeakSelf.Get())
+                    {
+                        return Text(Self->MaterialTargetSurface);
+                    }
+                    return FText::GetEmpty();
+                })
+            ]
+        ];
+    }
+
+    auto SectionBody = SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+        [
+            SNew(STextBlock)
+            .TextStyle(&EditorTextStyle)
+            .ColorAndOpacity(FSlateColor(Palette.Text))
+            .Text(Text(bIsSoundsScript
+                ? TEXT("Material Search (MaterialPhysicalMappings — Terrain: per texture, Foliage: default)")
+                : TEXT("Model Materials (Terrain: per texture, Foliage: default)")))
+        ]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)[SurfaceRow]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1).Padding(0, 0, 6, 0)[MatSearchBox]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 6, 0)
+            [
+                MakeEditorButton(TEXT("+ Map Custom"), [WeakSelf, bIsSoundsScript]
+                {
+                    UProjectEditorWidget* Self = WeakSelf.Get();
+                    if (!Self || Self->bBusy || !Self->Current) return;
+                    if (Self->bRawDirty) { Self->Message = TEXT("Apply JSON first."); return; }
+                    FString CustomMat = Self->MaterialSearchQuery.TrimStartAndEnd();
+                    if (CustomMat.IsEmpty())
+                    {
+                        Self->Message = TEXT("Enter a material name to map.");
+                        return;
+                    }
+                    const FString NormCustom = FV3DMaterialAssetReferences::NormalizeMaterialName(CustomMat);
+                    if (NormCustom == TEXT("foliage") || NormCustom.EndsWith(TEXT(".foliage")))
+                    {
+                        CustomMat = TEXT("foliage");
+                    }
+                    TSharedPtr<FV3DEditorDocument> TargetDoc = bIsSoundsScript ? Self->Current : Self->FindSoundsDocument();
+                    if (!TargetDoc.IsValid() || !TargetDoc->Json.IsValid())
+                    {
+                        Self->Message = TEXT("scripts/sounds.json was not found in this project.");
+                        return;
+                    }
+                    if (TargetDoc == Self->Current) Self->Remember();
+                    const FString SurfaceToAssign = Self->MaterialTargetSurface.TrimStartAndEnd().IsEmpty()
+                        ? TEXT("SurfaceName") : Self->MaterialTargetSurface.TrimStartAndEnd();
+                    V3DMaterialDiscovery::SetOrRemoveMaterialMapping(TargetDoc->Json, CustomMat, SurfaceToAssign, false);
+                    TargetDoc->bDirty = true;
+                    Self->Message = FString::Printf(TEXT("Mapped '%s' -> '%s' in scripts/sounds.json"), *CustomMat, *SurfaceToAssign);
+                    if (TargetDoc == Self->Current) Self->Changed();
+                    else Self->RebuildMaterialSearchResults(bIsSoundsScript);
+                })
+            ]
+            + SHorizontalBox::Slot().AutoWidth()
+            [
+                MakeEditorButton(TEXT("Rescan"), [WeakSelf, bIsSoundsScript]
+                {
+                    if (UProjectEditorWidget* Self = WeakSelf.Get())
+                    {
+                        Self->CachedMaterialsScopeKey.Reset();
+                        if (Self->Current) Self->EnsureMaterialsLoaded(bIsSoundsScript, Self->Current->SourcePath);
+                        Self->RebuildMaterialSearchResults(bIsSoundsScript);
+                    }
+                })
+            ]
+        ]
+        + SVerticalBox::Slot().AutoHeight()
+        [
+            SNew(SBox).MaxDesiredHeight(180.f)
+            [
+                SNew(SScrollBox)
+                + SScrollBox::Slot()[MaterialSearchResultsBox.ToSharedRef()]
+            ]
+        ];
+
+    Box->AddSlot().AutoHeight().Padding(0, 0, 0, 10)
+    [
+        SNew(SBorder)
+        .BorderImage(WhiteBrush)
+        .BorderBackgroundColor(CardBorderColor(bDarkMode, false))
+        .Padding(1.f)
+        [
+            SNew(SBorder)
+            .BorderImage(WhiteBrush)
+            .BorderBackgroundColor(CardFillColor(Palette, bDarkMode, 1, false))
+            .Padding(FMargin(10.f, 8.f))
+            [
+                SectionBody
+            ]
+        ]
+    ];
+}
+
 void UProjectEditorWidget::RefreshForm()
 {
     using namespace V3DEditorUI;
@@ -1538,7 +2234,9 @@ void UProjectEditorWidget::RefreshForm()
     if (!Current->SourcePath.IsEmpty() && !Current->Json->HasField(TEXT("AssetType")))
         Form->AddSlot().AutoHeight().Padding(0, 0, 0, 8)[MakeEditorButton(TEXT("Add AssetType"), [this]
         { Remember(); Current->Json->SetStringField(TEXT("AssetType"), FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase) ? TEXT("Sound") : TEXT("Model")); Changed(); })];
+    if (Preview) Preview->SetOverlaysFromJson(Current->Json);
     AddNodeSettingsSection(Form.ToSharedRef());
+    AddMaterialSearchSection(Form.ToSharedRef());
     AddObject(Current->Json, V3DProjectEditor::Suggestions(*Current), Form.ToSharedRef());
 }
 
@@ -1812,7 +2510,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
         {
             const EJson ExpectedType = Value->Type;
             const bool IsString = ExpectedType == EJson::String;
-            PairCardBody->AddSlot().AutoHeight()[SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Value)))
+            auto InputWidget = SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Value)))
                 .OnTextCommitted_Lambda([this, Object, Key, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
                 {
                     if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) { Message = TEXT("Apply pending JSON before editing fields."); return; }
@@ -1829,7 +2527,46 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                     if (!Found || !Found->IsValid() || (*Found)->Type != ExpectedType)
                     { Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
                     Remember(); Object->SetField(Key, *Found); Changed();
-                })];
+                });
+
+            if (ExpectedType == EJson::Number)
+            {
+                double StepSize = 1.0;
+                if (Key == TEXT("ScaleX") || Key == TEXT("ScaleY") || Key == TEXT("ScaleZ")) StepSize = 0.1;
+                else if (Key == TEXT("Intensity")) StepSize = 100.0;
+                else if (Key == TEXT("AttenuationRadius") || Key == TEXT("RadiusCm") || Key == TEXT("Range")) StepSize = 50.0;
+                else if (Key == TEXT("X") || Key == TEXT("Y") || Key == TEXT("Z")
+                    || Key == TEXT("DX") || Key == TEXT("DY") || Key == TEXT("DZ")
+                    || Key == TEXT("Pitch") || Key == TEXT("Yaw") || Key == TEXT("Roll")
+                    || Key == TEXT("SourceRadius") || Key == TEXT("SoftSourceRadius") || Key == TEXT("Length")) StepSize = 5.0;
+
+                TWeakObjectPtr<UProjectEditorWidget> WeakNudgeSelf(this);
+                auto MakeNudge = [WeakNudgeSelf, Object, Key](const double Delta)
+                {
+                    return [WeakNudgeSelf, Object, Key, Delta]
+                    {
+                        UProjectEditorWidget* Self = WeakNudgeSelf.Get();
+                        if (!Self || Self->bBusy || Self->bRawDirty || Self->bRebuildingForm || Self->bFormRefreshPending) return;
+                        double CurVal = 0.0;
+                        if (!Object->TryGetNumberField(Key, CurVal) || !FMath::IsFinite(CurVal)) return;
+                        Self->Remember();
+                        Object->SetNumberField(Key, FMath::RoundToDouble((CurVal + Delta) * 1000.0) / 1000.0);
+                        Self->Changed();
+                    };
+                };
+
+                PairCardBody->AddSlot().AutoHeight()
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 4, 0)[MakeEditorButton(TEXT("-"), MakeNudge(-StepSize))]
+                    + SHorizontalBox::Slot().FillWidth(1)[InputWidget]
+                    + SHorizontalBox::Slot().AutoWidth().Padding(4, 0, 0, 0)[MakeEditorButton(TEXT("+"), MakeNudge(StepSize))]
+                ];
+            }
+            else
+            {
+                PairCardBody->AddSlot().AutoHeight()[InputWidget];
+            }
         }
 
         Box->AddSlot().AutoHeight().Padding(0, 0, 0, 8)
@@ -2002,7 +2739,7 @@ void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
 {
     Super::ReleaseSlateResources(bReleaseChildren);
     bFormRefreshPending = false;
-    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset(); NodeSearchResultsBox.Reset();
+    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset(); NodeSearchResultsBox.Reset(); MaterialSearchResultsBox.Reset();
 }
 
 void UProjectEditorWidget::StartPreview()
@@ -2035,7 +2772,8 @@ void UProjectEditorWidget::PreviewFinished(UProjectSourceModelBuilder* Builder, 
     {
         const auto Model = Builder->TakeBuildModel();
         Preview->SetModel(Model);
-        Message = TEXT("Read-only wireframe (up to 3000 edges). Drag to orbit; scroll to zoom. No positions are changed.");
+        Preview->SetOverlaysFromJson(Current->Json);
+        Message = TEXT("Live preview ready (wireframe + Collider/Light/Transform/Hand overlays). LMB: Orbit, RMB: Pan, Wheel: Zoom.");
     }
     else if (!bSuccess && IsValid(Builder)) Message = Builder->GetError();
     PreviewBuilder = nullptr;

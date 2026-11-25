@@ -15,6 +15,7 @@ class UProjectSourceModelBuilder;
 class SV3DModelPreview;
 class FV3DJsonSyntaxHighlighter;
 struct FV3DFileBrowserEntry;
+struct FV3DMaterialEntry;
 template<typename ItemType> class SListView;
 
 /** Runtime JSON authoring UI. Preview never changes authored transforms or starts a build. */
@@ -73,6 +74,14 @@ private:
     TArray<FString> CachedModelNodeNames;
     TSharedPtr<SVerticalBox> NodeSearchResultsBox;
 
+    // Material search (Terrain: per texture layer, Foliage: default)
+    FString MaterialSearchQuery;
+    FString MaterialTargetSurface;
+    FString CachedMaterialsScopeKey;
+    TArray<TSharedPtr<FV3DMaterialEntry>> CachedMaterials;
+    TArray<TSharedPtr<FString>> CachedSurfaceOptions;
+    TSharedPtr<SVerticalBox> MaterialSearchResultsBox;
+
     bool bBusy = false, bRawDirty = false, bSettingRaw = false, bRebuildingForm = false;
     uint64 RequestGeneration = 0;
     int32 FormRowsRemaining = 1500;
@@ -95,6 +104,10 @@ private:
     void EnsureModelNodeNamesLoaded(const FString& SourcePath);
     void RebuildNodeSearchResults();
     void AddNodeSettingsSection(const TSharedRef<SVerticalBox>& Box);
+    TSharedPtr<FV3DEditorDocument> FindSoundsDocument() const;
+    void EnsureMaterialsLoaded(bool bProjectWide, const FString& SourcePath);
+    void RebuildMaterialSearchResults(bool bProjectWide);
+    void AddMaterialSearchSection(const TSharedRef<SVerticalBox>& Box);
     void AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
         const TSharedRef<SVerticalBox>& Box, int32 Depth = 0, const FString& Context = FString());
     void Remember();
