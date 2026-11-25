@@ -14,6 +14,9 @@
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
+#include "Components/BorderSlot.h"
+#include "Components/SizeBox.h"
+#include "UI/HUDStyle.h"
 
 namespace
 {
@@ -131,8 +134,14 @@ void UWorldSelectionWidget::BuildNativeLayout()
 {
     SetIsFocusable(true);
     NativeWorldPanel = AddPanel(PanelSize, FVector2D::ZeroVector);
+    UOverlay* PanelRoot = WidgetTree->ConstructWidget<UOverlay>();
+    NativeWorldPanel->SetContent(PanelRoot);
     UVerticalBox* Box = WidgetTree->ConstructWidget<UVerticalBox>();
-    NativeWorldPanel->SetContent(Box);
+    if (UOverlaySlot* BoxSlot = PanelRoot->AddChildToOverlay(Box))
+    {
+        BoxSlot->SetHorizontalAlignment(HAlign_Fill);
+        BoxSlot->SetVerticalAlignment(VAlign_Fill);
+    }
 
     UOverlay* Header = WidgetTree->ConstructWidget<UOverlay>();
     Box->AddChildToVerticalBox(Header);
@@ -168,7 +177,7 @@ void UWorldSelectionWidget::BuildNativeLayout()
 
     UScrollBox* Scroll = WidgetTree->ConstructWidget<UScrollBox>(UScrollBox::StaticClass(), TEXT("NativeWorldList"));
     NativeWorldList = Scroll;
-    NativeWorldEmpty = AddText(Scroll, NSLOCTEXT("V3DMenu", "NoWorlds", "No built worlds found. Build a world project in Editor, then refresh this list."));
+    NativeWorldEmpty = AddText(Scroll, NSLOCTEXT("V3DMenu", "NoWorlds", "No built worlds found in V3Ds/Worlds. Build a World project in Editor, then refresh this list."));
     NativeWorldEmpty->SetVisibility(IsDesignTime() ? ESlateVisibility::Collapsed : ESlateVisibility::HitTestInvisible);
     UVerticalBoxSlot* ListSlot = Box->AddChildToVerticalBox(Scroll);
     ListSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
@@ -179,11 +188,80 @@ void UWorldSelectionWidget::BuildNativeLayout()
         AddButton(Scroll, NSLOCTEXT("V3DMenu", "PreviewWorldTwo", "City Simulation"));
     }
 #endif
+
+    // Modal warning overlay for invalid / non-World .v3d archives
+    NativeWarningOverlay = WidgetTree->ConstructWidget<UBorder>();
+    NativeWarningOverlay->SetBrushColor(FLinearColor(0.0f, 0.0f, 0.0f, 0.65f));
+    NativeWarningOverlay->SetVisibility(ESlateVisibility::Collapsed);
+    if (UOverlaySlot* WarnOverlaySlot = PanelRoot->AddChildToOverlay(NativeWarningOverlay))
+    {
+        WarnOverlaySlot->SetHorizontalAlignment(HAlign_Fill);
+        WarnOverlaySlot->SetVerticalAlignment(VAlign_Fill);
+    }
+
+    USizeBox* WarnCardSize = WidgetTree->ConstructWidget<USizeBox>();
+    WarnCardSize->SetWidthOverride(780.0f);
+    NativeWarningOverlay->SetContent(WarnCardSize);
+    if (UBorderSlot* OverlayContentSlot = Cast<UBorderSlot>(WarnCardSize->Slot))
+    {
+        OverlayContentSlot->SetHorizontalAlignment(HAlign_Center);
+        OverlayContentSlot->SetVerticalAlignment(VAlign_Center);
+    }
+
+    NativeWarningCard = WidgetTree->ConstructWidget<UBorder>();
+    NativeWarningCard->SetPadding(FMargin(36.0f, 28.0f));
+    WarnCardSize->SetContent(NativeWarningCard);
+
+    UVerticalBox* WarnBox = WidgetTree->ConstructWidget<UVerticalBox>();
+    NativeWarningCard->SetContent(WarnBox);
+
+    NativeWarningTitle = AddText(WarnBox, FText::FromString(TEXT("Warning")), true);
+    NativeWarningTitle->SetAutoWrapText(true);
+    if (UVerticalBoxSlot* TitleWarnSlot = Cast<UVerticalBoxSlot>(NativeWarningTitle->Slot))
+    {
+        TitleWarnSlot->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 16.0f));
+    }
+
+    NativeWarningMessage = AddText(WarnBox, FText::GetEmpty(), false);
+    NativeWarningMessage->SetAutoWrapText(true);
+    if (UVerticalBoxSlot* MsgWarnSlot = Cast<UVerticalBoxSlot>(NativeWarningMessage->Slot))
+    {
+        MsgWarnSlot->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 24.0f));
+    }
+
+    NativeWarningOkButton = AddButton(WarnBox, FText::FromString(TEXT("OK")));
+    if (UWidget* OkParent = NativeWarningOkButton ? NativeWarningOkButton->GetParent() : nullptr)
+    {
+        if (UVerticalBoxSlot* OkSlot = Cast<UVerticalBoxSlot>(OkParent->Slot))
+        {
+            OkSlot->SetHorizontalAlignment(HAlign_Right);
+        }
+    }
 }
 
 void UWorldSelectionWidget::ApplyNativeStyle()
 {
     Super::ApplyNativeStyle();
+    const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
+    const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);
+    if (IsValid(NativeWarningCard))
+    {
+        NativeWarningCard->SetBrushColor(Palette.Panel);
+    }
+    if (IsValid(NativeWarningTitle))
+    {
+        FSlateFontInfo WarnTitleFont = NativeWarningTitle->GetFont();
+        V3DHUDStyle::ApplyFontWithWeight(WarnTitleFont, FontObject, 38, true, FLinearColor(0.95f, 0.35f, 0.28f, 1.0f));
+        NativeWarningTitle->SetFont(WarnTitleFont);
+        NativeWarningTitle->SetColorAndOpacity(FSlateColor(FLinearColor(0.95f, 0.35f, 0.28f, 1.0f)));
+    }
+    if (IsValid(NativeWarningMessage))
+    {
+        FSlateFontInfo WarnMsgFont = NativeWarningMessage->GetFont();
+        V3DHUDStyle::ApplyFontWithWeight(WarnMsgFont, FontObject, 24, false, Palette.Text);
+        NativeWarningMessage->SetFont(WarnMsgFont);
+        NativeWarningMessage->SetColorAndOpacity(FSlateColor(Palette.Text));
+    }
 }
 
 void UWorldSelectionWidget::BindNativeWidgets()
@@ -192,4 +270,35 @@ void UWorldSelectionWidget::BindNativeWidgets()
     SetSelectionListPanel(NativeWorldList);
     SetBackButton(NativeWorldBack);
     SetRefreshButton(NativeWorldRefresh);
+    if (!IsDesignTime() && IsValid(NativeWarningOkButton))
+    {
+        NativeWarningOkButton->OnClicked.RemoveDynamic(this, &UWorldSelectionWidget::HideWarningDialog);
+        NativeWarningOkButton->OnClicked.AddDynamic(this, &UWorldSelectionWidget::HideWarningDialog);
+    }
+}
+
+void UWorldSelectionWidget::ShowWarningDialog(const FString& InTitle, const FString& InMessage)
+{
+    SetIsEnabled(true);
+    if (IsValid(NativeWarningTitle))
+    {
+        NativeWarningTitle->SetText(FText::FromString(InTitle));
+    }
+    if (IsValid(NativeWarningMessage))
+    {
+        NativeWarningMessage->SetText(FText::FromString(InMessage));
+    }
+    if (IsValid(NativeWarningOverlay))
+    {
+        NativeWarningOverlay->SetVisibility(ESlateVisibility::Visible);
+    }
+}
+
+void UWorldSelectionWidget::HideWarningDialog()
+{
+    if (IsValid(NativeWarningOverlay))
+    {
+        NativeWarningOverlay->SetVisibility(ESlateVisibility::Collapsed);
+    }
+    SetIsEnabled(true);
 }

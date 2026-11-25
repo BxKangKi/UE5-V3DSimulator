@@ -24,6 +24,7 @@
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 #include "Components/SizeBox.h"
+#include "Components/SizeBoxSlot.h"
 #include "Components/ScaleBox.h"
 #include "Components/TextBlock.h"
 #include "Components/UniformGridPanel.h"
@@ -61,7 +62,7 @@ UMainWorldWidget::UMainWorldWidget(const FObjectInitializer& ObjectInitializer)
     PanelPadding = 0.0f;
     ButtonHeight = 96.0f;
     BodyFontSize = 48;
-    TitleFontSize = 100;
+    TitleFontSize = 128;
     SetIsFocusable(true);
 }
 
@@ -887,6 +888,11 @@ void UMainWorldWidget::BuildNativeLayout()
         TitleScale->SetStretch(EStretch::ScaleToFit);
         TitleScale->SetStretchDirection(EStretchDirection::DownOnly);
         NativeTitleBounds->SetContent(TitleScale);
+        if (USizeBoxSlot* TitleScaleSlot = Cast<USizeBoxSlot>(TitleScale->Slot))
+        {
+            TitleScaleSlot->SetHorizontalAlignment(HAlign_Right);
+            TitleScaleSlot->SetVerticalAlignment(VAlign_Center);
+        }
 
         UHorizontalBox* TitleRow = WidgetTree->ConstructWidget<UHorizontalBox>(UHorizontalBox::StaticClass(), TEXT("MainWorldTitleRow"));
         TitleRow->SetVisibility(ESlateVisibility::HitTestInvisible);
@@ -914,7 +920,7 @@ void UMainWorldWidget::BuildNativeLayout()
 
         Layout->AddChildToOverlay(NativeTitleBounds);
         UOverlaySlot* TitleSlot = Cast<UOverlaySlot>(NativeTitleBounds->Slot);
-        TitleSlot->SetPadding(FMargin(0.0f, 128.0f, 32.0f, 0.0f));
+        TitleSlot->SetPadding(FMargin(0.0f, 112.0f, 12.0f, 0.0f));
         TitleSlot->SetHorizontalAlignment(HAlign_Right);
         TitleSlot->SetVerticalAlignment(VAlign_Top);
 
@@ -964,8 +970,8 @@ void UMainWorldWidget::ApplyNativeStyle()
         const FVector2D Resolution = GetSafeDesignResolution();
         const double Width = FMath::IsFinite(TitleImageSize.X) ? TitleImageSize.X : 800.0;
         const double Height = FMath::IsFinite(TitleImageSize.Y) ? TitleImageSize.Y : 100.0;
-        NativeTitleBounds->SetWidthOverride(FMath::Clamp(Width, 8.0, Resolution.X * .6));
-        NativeTitleBounds->SetHeightOverride(FMath::Clamp(Height, 8.0, Resolution.Y * .25));
+        NativeTitleBounds->SetWidthOverride(FMath::Clamp(Width, 8.0, Resolution.X * .75));
+        NativeTitleBounds->SetHeightOverride(FMath::Clamp(Height, 8.0, Resolution.Y * .30));
     }
     const bool bDarkMode = V3DHUDStyle::IsDarkMode(this);
     const V3DHUDStyle::FAuthoringPalette Palette = V3DHUDStyle::GetAuthoringPalette(bDarkMode);

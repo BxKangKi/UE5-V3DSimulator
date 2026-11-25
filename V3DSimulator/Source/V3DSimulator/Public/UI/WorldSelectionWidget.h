@@ -41,6 +41,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Main World|World Selection")
     void ClearWorldButtons();
 
+    /** Displays an English modal warning popup and cancels world loading. */
+    UFUNCTION(BlueprintCallable, Category="Main World|World Selection")
+    void ShowWarningDialog(const FString& InTitle, const FString& InMessage);
+
+    UFUNCTION(BlueprintCallable, Category="Main World|World Selection")
+    void HideWarningDialog();
+
 protected:
     virtual void BuildNativeLayout() override;
     virtual void ApplyNativeStyle() override;
@@ -53,4 +60,9 @@ private:
     UPROPERTY(Transient) TObjectPtr<UButton> NativeWorldBack;
     UPROPERTY(Transient) TObjectPtr<UButton> NativeWorldRefresh;
     UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeWorldEmpty;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeWarningOverlay;
+    UPROPERTY(Transient) TObjectPtr<UBorder> NativeWarningCard;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeWarningTitle;
+    UPROPERTY(Transient) TObjectPtr<UTextBlock> NativeWarningMessage;
+    UPROPERTY(Transient) TObjectPtr<UButton> NativeWarningOkButton;
 };

@@ -46,7 +46,7 @@ public:
 
     /** Fixed reference-space bounds: the logo never inherits the full-screen Overlay size. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="HUD|Title", meta=(DesignerRebuild))
-    FVector2D TitleImageSize = FVector2D(1200.0, 140.0);
+    FVector2D TitleImageSize = FVector2D(1440.0, 180.0);
 
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;

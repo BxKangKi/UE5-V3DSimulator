@@ -757,7 +757,52 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
     if (!TryResolveWorldFolderKey(WorldFolderName, ResolvedFolderName))
     {
         UE_LOG(LogTemp, Warning, TEXT("MainGameMode cannot open single-player world. Unknown world folder key: %s"), *WorldFolderName);
+        if (IsValid(WorldSelectionWidget)) WorldSelectionWidget->SetIsEnabled(true);
         return;
+    }
+
+    // Validate that the selected .v3d archive under V3Ds/Worlds is actually a World-type project.
+    {
+        const FString ArchivePath = FPaths::Combine(V3DSimulatorPaths::WorldsRoot(), ResolvedFolderName + TEXT(".v3d"));
+        FString ReadError;
+        const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader = FGWorldArchiveReader::Open(ArchivePath, ReadError);
+        FString ConfigText;
+        FV3DSimulatorProjectConfig ProjectConfig;
+        FString ConfigError;
+        bool bValidWorld = false;
+        FString DetectedType = TEXT("Unknown");
+
+        if (Reader.IsValid() && Reader->ReadWorldConfig(ConfigText, ReadError))
+        {
+            const FSafeJsonLoadResult ParsedConfig = FSafeFileIO::ParseJsonText(ConfigText, ArchivePath + TEXT("#config.json"));
+            if (ParsedConfig.IsSuccess() && ParsedConfig.JsonObject.IsValid())
+            {
+                FString RawType;
+                if (ParsedConfig.JsonObject->TryGetStringField(TEXT("ProjectType"), RawType) && !RawType.IsEmpty())
+                {
+                    DetectedType = RawType;
+                }
+                if (V3DSimulatorProjectConfig::Parse(ParsedConfig.JsonObject, ResolvedFolderName, ProjectConfig, ConfigError)
+                    && ProjectConfig.ProjectType == EV3DSimulatorProjectType::World)
+                {
+                    bValidWorld = true;
+                }
+            }
+        }
+
+        if (!bValidWorld)
+        {
+            const FString WarningTitle = TEXT("Cannot Load World");
+            const FString WarningMessage = FString::Printf(
+                TEXT("The selected file '%s.v3d' is not a World project (Detected ProjectType: %s).\n\nOnly World-type .v3d archives placed under V3Ds/Worlds can be loaded in Singleplay. Loading has been cancelled."),
+                *ResolvedFolderName, *DetectedType);
+            UE_LOG(LogTemp, Warning, TEXT("[WorldSelection] %s"), *WarningMessage);
+            if (IsValid(WorldSelectionWidget))
+            {
+                WorldSelectionWidget->ShowWarningDialog(WarningTitle, WarningMessage);
+            }
+            return;
+        }
     }
 
     TSoftObjectPtr<UWorld> SelectedGameplayWorld;
@@ -1175,22 +1220,20 @@ void AMainGameMode::BuildLevelFolderNameMap()
         }
         const FSafeJsonLoadResult Config = FSafeFileIO::ParseJsonText(
             ConfigText, ArchivePath + TEXT("#config.json"));
+        FString DisplayName = SafeKey;
         FV3DSimulatorProjectConfig ProjectConfig;
         FString ProjectConfigError;
-        if (!Config.IsSuccess() || !Config.JsonObject.IsValid()
-            || !V3DSimulatorProjectConfig::Parse(
-                Config.JsonObject, SafeKey, ProjectConfig, ProjectConfigError)
-            || ProjectConfig.ProjectType != EV3DSimulatorProjectType::World)
+        if (Config.IsSuccess() && Config.JsonObject.IsValid()
+            && V3DSimulatorProjectConfig::Parse(
+                Config.JsonObject, SafeKey, ProjectConfig, ProjectConfigError))
         {
-            UE_LOG(LogTemp, Error,
-                TEXT("[WorldSelection] Ignoring .v3d without a canonical World project config: %s (%s)"),
-                *ArchivePath, *ProjectConfigError);
-            continue;
+            const FString Candidate = ProjectConfig.WorldName.IsEmpty()
+                ? ProjectConfig.Name : ProjectConfig.WorldName;
+            if (!Candidate.TrimStartAndEnd().IsEmpty())
+            {
+                DisplayName = Candidate.TrimStartAndEnd();
+            }
         }
-        FString DisplayName = ProjectConfig.WorldName.IsEmpty()
-            ? ProjectConfig.Name : ProjectConfig.WorldName;
-        DisplayName.TrimStartAndEndInline();
-        if (DisplayName.IsEmpty()) continue;
         FolderNameMap.Add(SafeKey, MoveTemp(DisplayName));
     }
 }
