@@ -23,37 +23,47 @@ public:
     UDynamicPointLightComponent();
 
     UMaterialInterface *GetLightDecal() const { return LightDecal.Get(); }
-    void SetLightDecal(UMaterialInterface *InDecal) { LightDecal = InDecal; }
+    void SetLightDecal(UMaterialInterface *InDecal);
 
     bool IsLightDecalFallbackEnabled() const { return bEnableLightDecalFallback; }
+    void SetLightDecalFallbackEnabled(bool bEnable);
+
     float GetCullingDistance() const { return CullingDistance; }
+    void SetCullingDistance(float InDistance);
+
     float GetDecalTransitionDistance() const { return DecalTransitionDistance; }
+    void SetDecalTransitionDistance(float InDistance);
+
     float GetMaxLightDecalSize() const { return MaxLightDecalSize; }
     float GetMaxLightDecalOpacity() const { return MaxLightDecalOpacity; }
 
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+    virtual void OnRegister() override;
+    virtual void OnUnregister() override;
 
 private:
+    void NotifySubsystemRefresh();
+
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> LightDecal;
 
-    /** Disabled by default because large fallback decals can wash out glTF materials. */
+    /** Enables lightweight decal fallback when the dynamic point light is distance-culled. */
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal")
-    bool bEnableLightDecalFallback = false;
+    bool bEnableLightDecalFallback = true;
 
-    /** Disables the light when the camera is farther than this distance. */
+    /** Disables the dynamic point light when the camera is farther than this distance. */
     UPROPERTY(EditAnywhere, Category = "Optimization", meta = (UIMin = "0.0", ClampMin = "0.0"))
     float CullingDistance = 10000.0f;
 
-    /** Decal fallback is used only when bEnableLightDecalFallback is true and this value is greater than CullingDistance. */
+    /** Distance up to which the fallback decal remains visible after the point light culls. */
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal", meta = (UIMin = "0.0", ClampMin = "0.0"))
-    float DecalTransitionDistance = 0.0f;
+    float DecalTransitionDistance = 25000.0f;
 
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal", meta = (UIMin = "1.0", ClampMin = "1.0"))
     float MaxLightDecalSize = 2500.0f;
 
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal", meta = (UIMin = "0.0", ClampMin = "0.0", ClampMax = "1.0"))
-    float MaxLightDecalOpacity = 0.22f;
+    float MaxLightDecalOpacity = 0.35f;
 };

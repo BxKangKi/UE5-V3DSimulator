@@ -52,7 +52,31 @@ void V3DNativeWidgetTree::BindBlueprintWidgets(UUserWidget* Owner)
     // Initialize() originally assigned variables and event targets to the generated class's
     // cloned template tree. Replacing that tree must move those references to the controls that
     // are actually displayed. This runs once per new native tree, never during ordinary styling.
-    if (!Owner->IsDesignTime()) UBlueprintGeneratedClass::UnbindDynamicDelegates(Owner->GetClass(), Owner);
+    if (!Owner->IsDesignTime())
+    {
+#if WITH_EDITOR
+        UBlueprintGeneratedClass::UnbindDynamicDelegates(Owner->GetClass(), Owner);
+#else
+        // UBlueprintGeneratedClass::UnbindDynamicDelegates is editor-only; unbind dynamic
+        // delegates from any previously bound widget properties before rebinding the new tree.
+        for (TFieldIterator<FObjectPropertyBase> OldIt(Owner->GetClass()); OldIt; ++OldIt)
+        {
+            FObjectPropertyBase* ObjProp = *OldIt;
+            if (!ObjProp->PropertyClass || !ObjProp->PropertyClass->IsChildOf(UWidget::StaticClass())) continue;
+            if (UWidget* OldWidget = Cast<UWidget>(ObjProp->GetObjectPropertyValue_InContainer(Owner)); IsValid(OldWidget))
+            {
+                for (TFieldIterator<FMulticastDelegateProperty> DelIt(OldWidget->GetClass()); DelIt; ++DelIt)
+                {
+                    void* ValuePtr = DelIt->ContainerPtrToValuePtr<void>(OldWidget);
+                    if (const FMulticastScriptDelegate* Delegate = DelIt->GetMulticastDelegate(ValuePtr))
+                    {
+                        const_cast<FMulticastScriptDelegate*>(Delegate)->RemoveAll(Owner);
+                    }
+                }
+            }
+        }
+#endif
+    }
     TArray<UWidget*> Widgets;
     Owner->WidgetTree->GetAllWidgets(Widgets);
     TMap<FName, UWidget*> WidgetsByName;

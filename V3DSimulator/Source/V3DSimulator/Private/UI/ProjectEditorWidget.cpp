@@ -596,7 +596,7 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
         { if (!bSettingRaw) { bRawDirty = true; RawDraft = Value.ToString(); } })];
     auto Body = SNew(SSplitter)
         + SSplitter::Slot().Value(.2f)[Left]
-        + SSplitter::Slot().Value(.45f)[SNew(SScrollBox) + SScrollBox::Slot().Padding(8, 0)[SAssignNew(Form, SVerticalBox)]]
+        + SSplitter::Slot().Value(.45f)[SAssignNew(FormScrollBox, SScrollBox) + SScrollBox::Slot().Padding(8, 0)[SAssignNew(Form, SVerticalBox)]]
         + SSplitter::Slot().Value(.35f)[Right];
     auto Root = SNew(SBorder).Padding(32).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
         .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().Background); })
@@ -2301,6 +2301,7 @@ void UProjectEditorWidget::RefreshForm()
     using namespace V3DEditorUI;
     bFormRefreshPending = false;
     if (!Form || !Raw || !Current) return;
+    const float SavedScrollOffset = FormScrollBox.IsValid() ? FormScrollBox->GetScrollOffset() : 0.0f;
     TGuardValue<bool> RebuildGuard(bRebuildingForm, true);
     Form->ClearChildren(); FormRowsRemaining = 1500;
     bSettingRaw = true;
@@ -2317,11 +2318,15 @@ void UProjectEditorWidget::RefreshForm()
     if (Preview) Preview->SetOverlaysFromJson(Current->Json);
     AddNodeSettingsSection(Form.ToSharedRef());
     AddMaterialSearchSection(Form.ToSharedRef());
-    AddObject(Current->Json, V3DProjectEditor::Suggestions(*Current), Form.ToSharedRef());
+    AddObject(Current->Json, V3DProjectEditor::Suggestions(*Current), Form.ToSharedRef(), 0, FString(), Current->Path);
+    if (FormScrollBox.IsValid() && SavedScrollOffset > 0.0f)
+    {
+        FormScrollBox->SetScrollOffset(SavedScrollOffset);
+    }
 }
 
 void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
-    const TSharedRef<SVerticalBox>& Box, int32 Depth, const FString& Context)
+    const TSharedRef<SVerticalBox>& Box, int32 Depth, const FString& Context, const FString& PathPrefix)
 {
     using namespace V3DEditorUI;
     if (!Object || Depth > 16) return;
@@ -2396,13 +2401,25 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
         ];
         PairCardBody->AddSlot().AutoHeight().Padding(0, 0, 0, 6)[HeaderRow];
 
+        const FString SectionPath = PathPrefix.IsEmpty() ? Key : (PathPrefix + TEXT("/") + Key);
+        TWeakObjectPtr<UProjectEditorWidget> WeakExpandSelf(this);
+
         if (Value->Type == EJson::Object)
         {
             auto Nested = SNew(SVerticalBox);
             const auto HintObject = Hint && (*Hint).IsValid() && (*Hint)->Type == EJson::Object ? (*Hint)->AsObject() : V3DProjectEditor::EntryTemplate(Context);
-            AddObject(Value->AsObject(), HintObject, Nested, Depth + 1, Key);
-            const bool bExpandObj = (Key == TEXT("MeshData") && !Value->AsObject()->Values.IsEmpty()) || Context == TEXT("MeshData");
+            AddObject(Value->AsObject(), HintObject, Nested, Depth + 1, Key, SectionPath);
+            const bool bDefaultExpandObj = (Key == TEXT("MeshData") && !Value->AsObject()->Values.IsEmpty()) || Context == TEXT("MeshData");
+            const bool* SavedExpand = ExpandedSectionStates.Find(SectionPath);
+            const bool bExpandObj = SavedExpand ? *SavedExpand : bDefaultExpandObj;
             PairCardBody->AddSlot().AutoHeight().Padding(4, 2, 0, 0)[SNew(SExpandableArea).InitiallyCollapsed(!bExpandObj)
+                .OnAreaExpansionChanged_Lambda([WeakExpandSelf, SectionPath](bool bIsExpanded)
+                {
+                    if (UProjectEditorWidget* Self = WeakExpandSelf.Get())
+                    {
+                        Self->ExpandedSectionStates.Add(SectionPath, bIsExpanded);
+                    }
+                })
                 .BorderImage(WhiteBrush)
                 .BorderBackgroundColor(Palette.Panel)
                 .BodyBorderImage(WhiteBrush)
@@ -2431,11 +2448,12 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                     if (Values.IsValidIndex(I)) Values.RemoveAt(I);
                     Object->SetArrayField(Key, Values); Changed();
                 })];
-                if (Entry->Type == EJson::Object) AddObject(Entry->AsObject(), V3DProjectEditor::EntryTemplate(Key), ItemBody, Depth + 1, Key);
+                if (Entry->Type == EJson::Object) AddObject(Entry->AsObject(), V3DProjectEditor::EntryTemplate(Key), ItemBody, Depth + 1, Key, FString::Printf(TEXT("%s[%d]"), *SectionPath, I));
                 else ItemBody->AddSlot().AutoHeight()[SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Entry)))
                     .OnTextCommitted_Lambda([this, Object, Key, I, Entry](const FText& T, ETextCommit::Type)
                     {
                         if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) return;
+                        if (T.ToString() == ValueText(Entry)) return;
                         TSharedPtr<FJsonValue> Updated;
                         if (Entry->Type == EJson::String) Updated = MakeShared<FJsonValueString>(T.ToString());
                         else
@@ -2481,7 +2499,16 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                 else Values.Add(MakeShared<FJsonValueObject>(V3DProjectEditor::EntryTemplate(Key)));
                 Object->SetArrayField(Key, Values); Changed();
             })];
-            PairCardBody->AddSlot().AutoHeight().Padding(4, 2, 0, 0)[SNew(SExpandableArea).InitiallyCollapsed(true)
+            const bool* SavedArrExpand = ExpandedSectionStates.Find(SectionPath);
+            const bool bExpandArr = SavedArrExpand ? *SavedArrExpand : false;
+            PairCardBody->AddSlot().AutoHeight().Padding(4, 2, 0, 0)[SNew(SExpandableArea).InitiallyCollapsed(!bExpandArr)
+                .OnAreaExpansionChanged_Lambda([WeakExpandSelf, SectionPath](bool bIsExpanded)
+                {
+                    if (UProjectEditorWidget* Self = WeakExpandSelf.Get())
+                    {
+                        Self->ExpandedSectionStates.Add(SectionPath, bIsExpanded);
+                    }
+                })
                 .BorderImage(WhiteBrush)
                 .BorderBackgroundColor(Palette.Panel)
                 .BodyBorderImage(WhiteBrush)
@@ -2647,6 +2674,14 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                     const auto* Found = Parsed.JsonObject->Values.Find(TEXT("v"));
                     if (!Found || !Found->IsValid() || (*Found)->Type != ExpectedType)
                     { Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
+                    if (ExpectedType == EJson::Number)
+                    {
+                        double ExistingNum = 0.0;
+                        if (Object->TryGetNumberField(Key, ExistingNum) && FMath::IsNearlyEqual(ExistingNum, (*Found)->AsNumber(), 1e-6))
+                        {
+                            return;
+                        }
+                    }
                     Remember(); Object->SetField(Key, *Found); Changed();
                 });
 
@@ -2860,7 +2895,7 @@ void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
 {
     Super::ReleaseSlateResources(bReleaseChildren);
     bFormRefreshPending = false;
-    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset(); NodeSearchResultsBox.Reset(); MaterialSearchResultsBox.Reset();
+    List.Reset(); FormScrollBox.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset(); NodeSearchResultsBox.Reset(); MaterialSearchResultsBox.Reset();
 }
 
 void UProjectEditorWidget::StartPreview()

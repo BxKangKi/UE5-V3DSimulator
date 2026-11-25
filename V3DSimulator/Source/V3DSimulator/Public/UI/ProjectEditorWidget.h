@@ -7,6 +7,7 @@
 #include "UI/HUDStyle.h"
 #include "ProjectEditorWidget.generated.h"
 class SVerticalBox;
+class SScrollBox;
 class STextBlock;
 class SEditableTextBox;
 class SMultiLineEditableTextBox;
@@ -54,7 +55,9 @@ private:
     TArray<TSharedPtr<FV3DEditorDocument>> Documents, VisibleDocuments;
     TSharedPtr<FV3DEditorDocument> Current;
     TSharedPtr<SListView<TSharedPtr<FV3DEditorDocument>>> List;
+    TSharedPtr<SScrollBox> FormScrollBox;
     TSharedPtr<SVerticalBox> Form;
+    TMap<FString, bool> ExpandedSectionStates;
     TSharedPtr<SMultiLineEditableTextBox> Raw;
     TSharedPtr<FV3DJsonSyntaxHighlighter> JsonHighlighter;
 
@@ -109,7 +112,8 @@ private:
     void RebuildMaterialSearchResults(bool bProjectWide);
     void AddMaterialSearchSection(const TSharedRef<SVerticalBox>& Box);
     void AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
-        const TSharedRef<SVerticalBox>& Box, int32 Depth = 0, const FString& Context = FString());
+        const TSharedRef<SVerticalBox>& Box, int32 Depth = 0, const FString& Context = FString(),
+        const FString& PathPrefix = FString());
     void Remember();
     void Changed();
     bool ApplyRaw();

@@ -17,30 +17,73 @@ UDynamicPointLightComponent::UDynamicPointLightComponent()
     PrimaryComponentTick.bCanEverTick = false; // Disable ticking to remove scheduling overhead.
 }
 
-void UDynamicPointLightComponent::BeginPlay()
+void UDynamicPointLightComponent::NotifySubsystemRefresh()
 {
-    Super::BeginPlay();
-
-    // Register this component with the world subsystem.
-    if (UWorld *World = GetWorld())
+    if (UWorld* World = GetWorld(); IsValid(World) && World->IsGameWorld())
     {
-        if (auto *Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())
+        if (UDynamicLightSubsystem* Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())
         {
             Subsystem->RegisterLight(this);
         }
     }
 }
 
-void UDynamicPointLightComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void UDynamicPointLightComponent::SetLightDecal(UMaterialInterface* InDecal)
 {
-    // Unregister this component when it is destroyed.
-    if (UWorld *World = GetWorld())
+    LightDecal = InDecal;
+    NotifySubsystemRefresh();
+}
+
+void UDynamicPointLightComponent::SetLightDecalFallbackEnabled(const bool bEnable)
+{
+    bEnableLightDecalFallback = bEnable;
+    NotifySubsystemRefresh();
+}
+
+void UDynamicPointLightComponent::SetCullingDistance(const float InDistance)
+{
+    CullingDistance = FMath::Max(0.0f, InDistance);
+    NotifySubsystemRefresh();
+}
+
+void UDynamicPointLightComponent::SetDecalTransitionDistance(const float InDistance)
+{
+    DecalTransitionDistance = FMath::Max(0.0f, InDistance);
+    NotifySubsystemRefresh();
+}
+
+void UDynamicPointLightComponent::OnRegister()
+{
+    Super::OnRegister();
+    NotifySubsystemRefresh();
+}
+
+void UDynamicPointLightComponent::OnUnregister()
+{
+    if (UWorld* World = GetWorld(); IsValid(World) && World->IsGameWorld())
     {
-        if (auto *Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())
+        if (UDynamicLightSubsystem* Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())
         {
             Subsystem->UnregisterLight(this);
         }
     }
+    Super::OnUnregister();
+}
 
+void UDynamicPointLightComponent::BeginPlay()
+{
+    Super::BeginPlay();
+    NotifySubsystemRefresh();
+}
+
+void UDynamicPointLightComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UWorld* World = GetWorld())
+    {
+        if (UDynamicLightSubsystem* Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())
+        {
+            Subsystem->UnregisterLight(this);
+        }
+    }
     Super::EndPlay(EndPlayReason);
 }

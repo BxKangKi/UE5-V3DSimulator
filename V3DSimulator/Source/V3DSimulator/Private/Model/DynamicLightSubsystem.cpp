@@ -11,8 +11,11 @@
 #include "Model/DynamicLightSubsystem.h"
 #include "Model/DynamicPointLightComponent.h"
 #include "Engine/World.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Subsystems/SubsystemCollection.h"
 #include "System/GameUpdateSubSystem.h"
+#include "System/V3DSimulatorAssetRegistry.h"
+#include "System/V3DSimulatorGameInstance.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
@@ -36,6 +39,71 @@ namespace
         }
         Decal->UnregisterComponent();
         Decal->DestroyComponent();
+    }
+
+    FLinearColor ComputeEffectiveDecalColor(const UDynamicPointLightComponent* LightComp)
+    {
+        if (!IsValid(LightComp))
+        {
+            return FLinearColor(1.0f, 1.0f, 1.0f, 0.0f);
+        }
+
+        FLinearColor Color = LightComp->GetLightColor();
+        if (LightComp->bUseTemperature)
+        {
+            Color *= FLinearColor::MakeFromColorTemperature(LightComp->Temperature);
+        }
+
+        // Normalize intensity across light units so 1000 Lumens / ~80 Candelas / ~10 Unitless
+        // produces a visible fallback decal instead of vanishing near 0.01 opacity.
+        float NormalizedIntensity = 0.0f;
+        const float RawIntensity = FMath::Max(0.0f, LightComp->Intensity);
+        if (RawIntensity > KINDA_SMALL_NUMBER)
+        {
+            switch (LightComp->IntensityUnits)
+            {
+            case ELightUnits::Lumens:
+                NormalizedIntensity = RawIntensity / 2500.0f;
+                break;
+            case ELightUnits::Candelas:
+                NormalizedIntensity = RawIntensity / 200.0f;
+                break;
+            case ELightUnits::EV:
+                NormalizedIntensity = FMath::Pow(2.0f, FMath::Clamp(RawIntensity, -4.0f, 12.0f)) / 64.0f;
+                break;
+            case ELightUnits::Unitless:
+            default:
+                NormalizedIntensity = RawIntensity / 16.0f;
+                break;
+            }
+            Color.A = FMath::Clamp(NormalizedIntensity * LightComp->GetMaxLightDecalOpacity(),
+                FMath::Min(0.06f, LightComp->GetMaxLightDecalOpacity()),
+                LightComp->GetMaxLightDecalOpacity());
+        }
+        else
+        {
+            Color.A = 0.0f;
+        }
+        return Color;
+    }
+
+    UMaterialInterface* ResolveDecalMaterialForLight(
+        const UObject* WorldContext,
+        UDynamicPointLightComponent* InLight)
+    {
+        if (IsValid(InLight) && IsValid(InLight->GetLightDecal()))
+        {
+            return InLight->GetLightDecal();
+        }
+        if (UV3DSimulatorAssetRegistry* Registry =
+            UV3DSimulatorGameInstance::GetAssetRegistryFromContext(WorldContext))
+        {
+            if (!Registry->StaticDecalLightMaterial.IsNull())
+            {
+                return Registry->StaticDecalLightMaterial.LoadSynchronous();
+            }
+        }
+        return nullptr;
     }
 }
 
@@ -66,24 +134,39 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
 
     CompactManagedLights();
 
-    // Component re-registration must not create duplicate work or duplicate fallback decals.
-    if (ManagedLights.ContainsByPredicate([InLight](const FLightOptimizationData& Data)
-        {
-            return Data.LightComponent.Get() == InLight;
-        }))
+    UMaterialInterface* ResolvedMaterial = ResolveDecalMaterialForLight(this, InLight);
+    const float CullingDist = FMath::Max(0.0f, InLight->GetCullingDistance());
+    const float DecalDist = FMath::Max(0.0f, InLight->GetDecalTransitionDistance());
+    const bool bCanUseDecalFallback = InLight->IsLightDecalFallbackEnabled()
+        && IsValid(ResolvedMaterial)
+        && DecalDist > CullingDist;
+
+    // Refresh existing entry if re-registered after SetLightDecal / distance updates.
+    for (FLightOptimizationData& Existing : ManagedLights)
     {
-        return;
+        if (Existing.LightComponent.Get() == InLight)
+        {
+            Existing.Position = InLight->GetComponentLocation();
+            Existing.CullingDistanceSq = FMath::Square(CullingDist);
+            Existing.DecalTransitionDistanceSq = bCanUseDecalFallback ? FMath::Square(DecalDist) : 0.0f;
+            Existing.TargetDecalMaterial = bCanUseDecalFallback ? ResolvedMaterial : nullptr;
+            if (!bCanUseDecalFallback)
+            {
+                DestroyManagedDecal(Existing.DecalComponent.Get());
+                Existing.DecalComponent.Reset();
+                Existing.bCurrentDecalVisibility = false;
+                Existing.bTargetDecalVisibility = false;
+            }
+            return;
+        }
     }
 
     FLightOptimizationData NewData;
     NewData.Position = InLight->GetComponentLocation();
-    NewData.CullingDistanceSq = FMath::Square(InLight->GetCullingDistance());
-    const bool bCanUseDecalFallback = InLight->IsLightDecalFallbackEnabled()
-        && IsValid(InLight->GetLightDecal())
-        && InLight->GetDecalTransitionDistance() > InLight->GetCullingDistance();
-    NewData.DecalTransitionDistanceSq = bCanUseDecalFallback ? FMath::Square(InLight->GetDecalTransitionDistance()) : 0.0f;
+    NewData.CullingDistanceSq = FMath::Square(CullingDist);
+    NewData.DecalTransitionDistanceSq = bCanUseDecalFallback ? FMath::Square(DecalDist) : 0.0f;
     NewData.LightComponent = InLight;
-    NewData.TargetDecalMaterial = bCanUseDecalFallback ? InLight->GetLightDecal() : nullptr;
+    NewData.TargetDecalMaterial = bCanUseDecalFallback ? ResolvedMaterial : nullptr;
 
     // Apply the initial state.
     NewData.bCurrentLightVisibility = InLight->IsVisible();
@@ -251,6 +334,7 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
 
                 if (IsValid(DecalComp))
                 {
+                    DecalComp->SetWorldLocationAndRotation(Data.Position, FRotator(-90.0f, 0.0f, 0.0f));
                     DecalComp->SetVisibility(true);
                 }
             }
@@ -259,6 +343,17 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
                 if (UDecalComponent *DecalComp = Data.DecalComponent.Get())
                 {
                     DecalComp->SetVisibility(false);
+                }
+            }
+        }
+        else if (Data.bCurrentDecalVisibility)
+        {
+            // Keep visible decal synced with moving dynamic lights.
+            if (UDecalComponent* DecalComp = Data.DecalComponent.Get(); IsValid(DecalComp))
+            {
+                if (!DecalComp->GetComponentLocation().Equals(Data.Position, 1.0f))
+                {
+                    DecalComp->SetWorldLocationAndRotation(Data.Position, FRotator(-90.0f, 0.0f, 0.0f));
                 }
             }
         }
@@ -286,17 +381,36 @@ UDecalComponent *UDynamicLightSubsystem::CreateDecalComponent(UDynamicPointLight
     }
 
     Owner->AddInstanceComponent(NewDecal);
-    // Attach the decal to the light owner root and match its location.
+    NewDecal->SetMobility(EComponentMobility::Movable);
     NewDecal->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
     NewDecal->SetWorldLocationAndRotation(LightComp->GetComponentLocation(), FRotator(-90.0f, 0.0f, 0.0f)); // Default downward projection.
+
     // Clamp fallback decals so they cannot cover the whole scene with a white wash.
     const float LightRadius = FMath::Clamp(LightComp->AttenuationRadius, 1.0f, LightComp->GetMaxLightDecalSize());
     NewDecal->DecalSize = FVector(LightRadius, LightRadius, LightRadius);
-    FLinearColor Color = LightComp->GetColorTemperature();
-    Color.A = FMath::Clamp(LightComp->Intensity * 0.00001f, 0.0f, LightComp->GetMaxLightDecalOpacity());
-    NewDecal->SetDecalColor(Color);
-    NewDecal->SetDecalMaterial(Material);
+
+    // Prevent UE's default FadeScreenSize (0.01) from culling distant fallback decals!
+    NewDecal->FadeScreenSize = 0.0f;
+    NewDecal->SetFadeOut(0.0f, 0.0f, false);
     NewDecal->bDestroyOwnerAfterFade = false;
+
+    const FLinearColor Color = ComputeEffectiveDecalColor(LightComp);
+    NewDecal->SetDecalColor(Color);
+
+    if (UMaterialInstanceDynamic* DecalMID = UMaterialInstanceDynamic::Create(Material, NewDecal))
+    {
+        DecalMID->SetVectorParameterValue(TEXT("Color"), Color);
+        DecalMID->SetVectorParameterValue(TEXT("LightColor"), Color);
+        DecalMID->SetVectorParameterValue(TEXT("BaseColor"), Color);
+        DecalMID->SetScalarParameterValue(TEXT("Opacity"), Color.A);
+        DecalMID->SetScalarParameterValue(TEXT("Intensity"), Color.A);
+        NewDecal->SetDecalMaterial(DecalMID);
+    }
+    else
+    {
+        NewDecal->SetDecalMaterial(Material);
+    }
+
     NewDecal->RegisterComponent();
     return NewDecal;
 }
