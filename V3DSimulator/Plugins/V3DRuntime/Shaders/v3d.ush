@@ -265,4 +265,91 @@ float4x3 V3D_SampleImpostorArray(
     return Out;
 }
 
+#if VERTEXSHADER
+// Full Vertex-Shader entry point for UE5 Custom node (WorldPositionOffset).
+// Handles StaticMesh, ISM/HISM per-instance transforms, rotation/scale, and LWC automatically.
+float3 V3D_ImpostorWPO_VS(
+    FMaterialVertexParameters Parameters,
+    float3 ImpostorCenter,
+    float ImpostorRadius)
+{
+    float2 LocalUV = float2(0.5, 0.5);
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 0
+    LocalUV = Parameters.TexCoords[0].xy;
+#endif
+    float3 LocalPos = Parameters.PreSkinnedPosition;
+
+    // Basis vectors of this instance in world space (works identically for StaticMesh, ISM, and HISM).
+    float3 AxisX = TransformLocalVectorToWorld(Parameters, float3(1.0, 0.0, 0.0));
+    float3 AxisY = TransformLocalVectorToWorld(Parameters, float3(0.0, 1.0, 0.0));
+    float3 AxisZ = TransformLocalVectorToWorld(Parameters, float3(0.0, 0.0, 1.0));
+
+    // Derive this instance's ImpostorCenter in Translated World Space (pure float3, LWC-safe).
+    float3 DeltaLocal = ImpostorCenter - LocalPos;
+    float3 DeltaWS = AxisX * DeltaLocal.x + AxisY * DeltaLocal.y + AxisZ * DeltaLocal.z;
+    float3 CenterTWS = Parameters.WorldPosition + DeltaWS;
+
+    float3 ViewDirWS = ResolvedView.TranslatedWorldCameraOrigin - CenterTWS;
+    float3 LocalViewDir = float3(
+        dot(ViewDirWS, AxisX) / max(dot(AxisX, AxisX), 1.0e-8),
+        dot(ViewDirWS, AxisY) / max(dot(AxisY, AxisY), 1.0e-8),
+        dot(ViewDirWS, AxisZ) / max(dot(AxisZ, AxisZ), 1.0e-8));
+
+    float3 LocalOffset = V3D_ImpostorBillboardLocalWPO(
+        LocalUV,
+        LocalPos,
+        ImpostorCenter,
+        LocalViewDir,
+        ImpostorRadius);
+
+    return AxisX * LocalOffset.x + AxisY * LocalOffset.y + AxisZ * LocalOffset.z;
+}
+#endif // VERTEXSHADER
+
+#if PIXELSHADER
+// Computes normalized camera-to-instance direction in Instance Local Space for Pixel Shader.
+float3 V3D_ImpostorLocalViewDir_PS(FMaterialPixelParameters Parameters)
+{
+    float3 AxisX = TransformLocalVectorToWorld(Parameters, float3(1.0, 0.0, 0.0));
+    float3 AxisY = TransformLocalVectorToWorld(Parameters, float3(0.0, 1.0, 0.0));
+    float3 AxisZ = TransformLocalVectorToWorld(Parameters, float3(0.0, 0.0, 1.0));
+    float3 V = Parameters.CameraVector;
+    float3 LocalViewDir = float3(
+        dot(V, AxisX) / max(dot(AxisX, AxisX), 1.0e-8),
+        dot(V, AxisY) / max(dot(AxisY, AxisY), 1.0e-8),
+        dot(V, AxisZ) / max(dot(AxisZ, AxisZ), 1.0e-8));
+    float LenSq = dot(LocalViewDir, LocalViewDir);
+    return LenSq > 1.0e-8 ? LocalViewDir * rsqrt(LenSq) : float3(1.0, 0.0, 0.0);
+}
+
+// Full Pixel-Shader entry point for UE5 Custom node.
+// Samples ImpostorAtlasArray using UV0 and instance-local view direction, returning:
+//   [0] = Linear BaseColor (RGB)
+//   [1] = World-Space Normal (RGB, normalized)
+//   [2] = float3(Opacity, Roughness, Metallic)
+//   [3] = float3(0, 0, 0)
+float4x3 V3D_SampleImpostorArray_PS(
+    FMaterialPixelParameters Parameters,
+    Texture2DArray ImpostorAtlasArray,
+    SamplerState ImpostorAtlasArraySampler,
+    float GridFrames)
+{
+    float2 LocalUV = float2(0.5, 0.5);
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+    LocalUV = Parameters.TexCoords[0].xy;
+#endif
+    float3 LocalViewDir = V3D_ImpostorLocalViewDir_PS(Parameters);
+    float4x3 Sampled = V3D_SampleImpostorArray(
+        ImpostorAtlasArray,
+        ImpostorAtlasArraySampler,
+        LocalUV,
+        LocalViewDir,
+        GridFrames);
+    float3 NormalWS = TransformLocalVectorToWorld(Parameters, Sampled[1]);
+    float NLenSq = dot(NormalWS, NormalWS);
+    Sampled[1] = NLenSq > 1.0e-8 ? NormalWS * rsqrt(NLenSq) : float3(0.0, 0.0, 1.0);
+    return Sampled;
+}
+#endif // PIXELSHADER
+
 #endif // V3D_IMPOSTOR_HLSL_INCLUDED
