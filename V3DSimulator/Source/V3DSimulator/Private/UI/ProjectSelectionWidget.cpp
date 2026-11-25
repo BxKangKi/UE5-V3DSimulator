@@ -727,19 +727,19 @@ void UProjectSelectionWidget::BuildNativeLayout()
     NativeCreateCancelButton = AddButton(ActionsRow, NSLOCTEXT("V3DMenu", "Cancel", "Cancel"));
     if (UWidget* ParentW = NativeCreateCancelButton ? NativeCreateCancelButton->GetParent() : nullptr)
     {
-        if (UHorizontalBoxSlot* Slot = Cast<UHorizontalBoxSlot>(ParentW->Slot))
+        if (UHorizontalBoxSlot* HBoxSlot = Cast<UHorizontalBoxSlot>(ParentW->Slot))
         {
-            Slot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-            Slot->SetPadding(FMargin(0.f, 0.f, 16.f, 0.f));
+            HBoxSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            HBoxSlot->SetPadding(FMargin(0.f, 0.f, 16.f, 0.f));
         }
     }
 
     NativeCreateConfirmButton = AddButton(ActionsRow, NSLOCTEXT("V3DMenu", "CreateAndOpenEditor", "Create & Open Editor"));
     if (UWidget* ParentW = NativeCreateConfirmButton ? NativeCreateConfirmButton->GetParent() : nullptr)
     {
-        if (UHorizontalBoxSlot* Slot = Cast<UHorizontalBoxSlot>(ParentW->Slot))
+        if (UHorizontalBoxSlot* HBoxSlot = Cast<UHorizontalBoxSlot>(ParentW->Slot))
         {
-            Slot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+            HBoxSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
         }
     }
 
