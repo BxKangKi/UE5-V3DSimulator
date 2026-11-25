@@ -3451,11 +3451,11 @@ void UGameManagerSubSystem::RefreshBuiltModelLists()
         {
             continue;
         }
-        if (Definition.EntityType == EModelEntityType::Vehicle)
+        if (Definition.IsVehicle())
         {
             VehicleReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
         }
-        else if (Definition.ItemType == EModelItemType::Weapon)
+        else if (Definition.IsWeapon())
         {
             WeaponReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
         }
@@ -4621,7 +4621,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
     if (!Database || !Database->FindUUIDForReference(ModelReference, UUID)
         || !Database->ResolveLoadable(UUID, Definition, RuntimeReference)
         || Definition.ModelType != EModelDefinitionType::Dynamic
-        || Definition.EntityType != EModelEntityType::Vehicle)
+        || !Definition.IsVehicle())
     {
         LastSaveMessage = TEXT("The built vehicle model reference is invalid.");
         return;
@@ -5212,7 +5212,7 @@ void UGameManagerSubSystem::StartNextProjectBuildModel()
             this,
             &UGameManagerSubSystem::HandleProjectBuildModelFinished);
 
-        if (Definition.ModelType == EModelDefinitionType::Character)
+        if (Definition.IsHumanoid())
         {
             USkeleton* CharacterSkeleton = nullptr;
             USkeletalMesh* CharacterSkeletalMesh = nullptr;

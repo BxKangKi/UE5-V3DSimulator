@@ -392,6 +392,57 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
         }
     }
 
+    // 2b. Vehicle / Train WheelMeshNames visualization (bogie axle chord + wheel markers)
+    {
+        const TSharedPtr<FJsonObject>* TuningObj = nullptr;
+        const bool bHasTune = (Json->TryGetObjectField(TEXT("TrainTuning"), TuningObj) && TuningObj && TuningObj->IsValid())
+            || (Json->TryGetObjectField(TEXT("VehicleTuning"), TuningObj) && TuningObj && TuningObj->IsValid());
+        if (bHasTune)
+        {
+            const TArray<TSharedPtr<FJsonValue>>* WheelArr = nullptr;
+            if ((*TuningObj)->TryGetArrayField(TEXT("WheelMeshNames"), WheelArr) && WheelArr)
+            {
+                const FLinearColor WheelColor(0.15f, 0.88f, 1.0f, 0.95f);
+                const FLinearColor AxleColor(1.0f, 0.78f, 0.15f, 0.90f);
+                TArray<FVector> WheelPositions;
+                for (const TSharedPtr<FJsonValue>& WVal : *WheelArr)
+                {
+                    if (!WVal.IsValid() || WVal->Type != EJson::String) continue;
+                    const FString WName = WVal->AsString().TrimStartAndEnd();
+                    if (const FTransform* WXform = NodeWorldTransforms.Find(WName))
+                    {
+                        const FVector WPos = WXform->GetLocation();
+                        WheelPositions.Add(WPos);
+                        AddSphereLines(FVector::ZeroVector, FMath::Max(12.f, GizmoScale * 0.6f), *WXform, WheelColor, 2.0f, Bounds, 14);
+                        AddCrossMarker(WPos, FMath::Max(6.f, GizmoScale * 0.4f), AxleColor, Bounds);
+                        OverlayLabels.Add({WPos, TEXT("Wheel: ") + WName, WheelColor});
+                    }
+                }
+                if (WheelPositions.Num() >= 2)
+                {
+                    double MinX = DBL_MAX, MaxX = -DBL_MAX;
+                    for (const FVector& P : WheelPositions) { MinX = FMath::Min(MinX, P.X); MaxX = FMath::Max(MaxX, P.X); }
+                    const double MidX = 0.5 * (MinX + MaxX);
+                    FVector FrontSum = FVector::ZeroVector, RearSum = FVector::ZeroVector;
+                    int32 FC = 0, RC = 0;
+                    for (const FVector& P : WheelPositions)
+                    {
+                        if (P.X >= MidX) { FrontSum += P; ++FC; }
+                        else { RearSum += P; ++RC; }
+                    }
+                    if (FC > 0 && RC > 0)
+                    {
+                        const FVector FrontPivot = FrontSum / static_cast<double>(FC);
+                        const FVector RearPivot = RearSum / static_cast<double>(RC);
+                        OverlayLines.Add({RearPivot, FrontPivot, AxleColor, 2.4f});
+                        OverlayLabels.Add({FrontPivot, TEXT("Front Bogie"), AxleColor});
+                        OverlayLabels.Add({RearPivot, TEXT("Rear Bogie"), AxleColor});
+                    }
+                }
+            }
+        }
+    }
+
     // 3. Item HoldTransform, RightHandIK, LeftHandIK
     const TSharedPtr<FJsonObject>* HoldObj = nullptr;
     if (Json->TryGetObjectField(TEXT("HoldTransform"), HoldObj) && HoldObj && HoldObj->IsValid())

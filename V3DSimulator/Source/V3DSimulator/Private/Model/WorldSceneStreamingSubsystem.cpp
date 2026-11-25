@@ -260,7 +260,7 @@ void UWorldSceneStreamingSubsystem::StartWorldStreaming(
             Record.bHasGravityField = ResolvedDefinition.GravityField.bEnabled;
             SceneRecords.Add(MoveTemp(Record));
         }
-        else if (ResolvedDefinition.ModelType == EModelDefinitionType::Character)
+        else if (ResolvedDefinition.IsHumanoid())
         {
             FWorldCharacterStreamRecord Record;
             Record.UUID = Definition.UUID;

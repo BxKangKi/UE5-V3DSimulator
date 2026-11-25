@@ -563,11 +563,13 @@ struct model_record {
     std::uint8_t asset_type = 0;
      // 0 model.
     std::uint8_t model_type = 1;
-     // 1 static, 2 dynamic, 3 character.
-    std::uint8_t entity_type = 0;
-     // 0 none, 1 vehicle, 2 prop, 3 animal.
+     // 1 static, 2 dynamic.
+    std::uint8_t dynamic_type = 0;
+     // 0 none, 1 humanoid, 2 vehicle, 3 prop, 4 creature, 5 item.
     std::uint8_t item_type = 0;
-     // 0 none, 1 weapon, 2 tool, 3 misc.
+     // 0 none, 1 weapon, 2 tool, 3 misc (when dynamic_type == 5).
+    std::uint8_t vehicle_type = 0;
+     // 0 none, 1 car, 2 train (when dynamic_type == 2).
     std::string name, display_name;
     gravity_field gravity;
     model_summary summary;
@@ -1038,9 +1040,12 @@ inline bool valid_gravity(const gravity_field& g) {
 }
 inline bool valid_model(const model_record& m,std::uint64_t end) {
     const std::string prefix="models/"+guid_digits(m.uuid)+"/";
-    const bool subtype=(m.model_type==2 && !(m.entity_type && m.item_type))
-        || ((m.model_type==1 || m.model_type==3) && !m.entity_type && !m.item_type);
-    return valid_guid(m.uuid)&&m.asset_type==0&&m.model_type>=1&&m.model_type<=3&&m.entity_type<=3&&m.item_type<=3&&subtype
+    const bool subtype = (m.model_type == 1 && !m.dynamic_type && !m.item_type && !m.vehicle_type)
+        || (m.model_type == 2 && m.dynamic_type <= 5
+            && (m.dynamic_type == 5 ? (m.item_type <= 3 && !m.vehicle_type)
+                : (m.dynamic_type == 2 ? (m.vehicle_type <= 2 && !m.item_type)
+                    : (!m.item_type && !m.vehicle_type))));
+    return valid_guid(m.uuid)&&m.asset_type==0&&m.model_type>=1&&m.model_type<=2&&m.dynamic_type<=5&&m.item_type<=3&&m.vehicle_type<=2&&subtype
         &&!m.name.empty()&&!m.display_name.empty()&&m.name.size()<=4096&&m.display_name.size()<=4096
         && valid_gravity(m.gravity)&&valid_summary(m.summary)
         &&m.definition_range.name==prefix+"definition.dat"&&m.metadata_range.name==prefix+"metadata.dat"&&m.manifest_range.name==prefix+"manifest.dat"
@@ -1057,8 +1062,9 @@ inline void write_model(detail::writer& w,const model_record& m) {
     write_guid(w,m.uuid);
     w.u8(m.asset_type);
     w.u8(m.model_type);
-    w.u8(m.entity_type);
+    w.u8(m.dynamic_type);
     w.u8(m.item_type);
+    w.u8(m.vehicle_type);
     w.string(m.name,4096);
     w.string(m.display_name,4096);
     w.u8(m.gravity.enabled);
@@ -1076,8 +1082,9 @@ inline bool read_model(detail::reader& r,model_record& m) {
     m.uuid=read_guid(r);
     m.asset_type=r.u8();
     m.model_type=r.u8();
-    m.entity_type=r.u8();
+    m.dynamic_type=r.u8();
     m.item_type=r.u8();
+    m.vehicle_type=r.u8();
     m.name=r.string(4096);
     m.display_name=r.string(4096);
     const auto enabled=r.u8();

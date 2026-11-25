@@ -237,31 +237,49 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
             Merge(TEXT("Model"));
             Doc.Json->TryGetStringField(TEXT("ModelType"), Subtype);
             Result->SetStringField(TEXT("ModelType"), Subtype.IsEmpty() ? TEXT("Static") : Subtype);
-            if (Subtype == TEXT("Character"))
-            {
-                auto Bones = MakeShared<FJsonObject>();
-                for (const auto& Key : CharacterBoneSchema::GetRequiredKeys()) Bones->SetStringField(Key.ToString(), Key.ToString());
-                Result->SetObjectField(TEXT("Bones"), Bones);
-                Merge(TEXT("CharacterInteraction"));
-            }
-            else
+            if (Subtype.IsEmpty() || Subtype == TEXT("Static"))
             {
                 Merge(TEXT("Gravity"));
-                if (Subtype.IsEmpty() || Subtype == TEXT("Static"))
-                {
-                    Merge(TEXT("StaticInteraction"));
-                }
+                Merge(TEXT("StaticInteraction"));
             }
-            if (Subtype == TEXT("Dynamic"))
+            else if (Subtype == TEXT("Dynamic"))
             {
-                Merge(TEXT("Dynamic"));
-                FString Entity, Item;
-                Doc.Json->TryGetStringField(TEXT("EntityType"), Entity); Doc.Json->TryGetStringField(TEXT("ItemType"), Item);
-                if (Item.IsEmpty()) Result->SetStringField(TEXT("EntityType"), Entity.IsEmpty() ? TEXT("Prop") : Entity);
-                if (Entity.IsEmpty()) Result->SetStringField(TEXT("ItemType"), Item.IsEmpty() ? TEXT("Misc") : Item);
-                if (Entity == TEXT("Vehicle")) Merge(TEXT("Vehicle"));
-                if (!Item.IsEmpty()) Merge(TEXT("Item"));
-                if (Item == TEXT("Weapon")) Merge(TEXT("Weapon"));
+                FString DynamicType, ItemType, VehicleType;
+                Doc.Json->TryGetStringField(TEXT("DynamicType"), DynamicType);
+                Doc.Json->TryGetStringField(TEXT("ItemType"), ItemType);
+                Doc.Json->TryGetStringField(TEXT("VehicleType"), VehicleType);
+                Result->SetStringField(TEXT("DynamicType"), DynamicType.IsEmpty() ? TEXT("Prop") : DynamicType);
+
+                if (DynamicType == TEXT("Humanoid"))
+                {
+                    auto Bones = MakeShared<FJsonObject>();
+                    for (const auto& Key : CharacterBoneSchema::GetRequiredKeys()) Bones->SetStringField(Key.ToString(), Key.ToString());
+                    Result->SetObjectField(TEXT("Bones"), Bones);
+                    Merge(TEXT("CharacterInteraction"));
+                }
+                else
+                {
+                    Merge(TEXT("Dynamic"));
+                    Merge(TEXT("Gravity"));
+                    if (DynamicType == TEXT("Vehicle"))
+                    {
+                        Result->SetStringField(TEXT("VehicleType"), VehicleType.IsEmpty() ? TEXT("Car") : VehicleType);
+                        if (VehicleType == TEXT("Train"))
+                        {
+                            Merge(TEXT("Train"));
+                        }
+                        else
+                        {
+                            Merge(TEXT("Vehicle"));
+                        }
+                    }
+                    else if (DynamicType == TEXT("Item"))
+                    {
+                        Result->SetStringField(TEXT("ItemType"), ItemType.IsEmpty() ? TEXT("Misc") : ItemType);
+                        Merge(TEXT("Item"));
+                        if (ItemType == TEXT("Weapon")) Merge(TEXT("Weapon"));
+                    }
+                }
             }
         }
     }

@@ -9,6 +9,8 @@
 
 #include "Model/InstancedMeshActor.h"
 #include "System/WorldSurfaceSubsystem.h"
+#include "Simulator/NodeTokenLibrary.h"
+#include "World/RailTrackSubsystem.h"
 #include "System/V3DStreamingBudget.h"
 
 #include "Components/InstancedStaticMeshComponent.h"
@@ -238,12 +240,18 @@ bool AInstancedMeshActor::AddNodeInstances(TConstArrayView<FWorldPreparedInstanc
             return false;
         }
         FChunkPage& Page = ChunkPages.FindChecked(PageName);
+        URailTrackSubsystem* RailTracks = URailTrackSubsystem::Get(this);
         for (int32 Index = 0; Index < Indices.Num(); ++Index)
         {
             const FName Name = Rows[Offset + Index]->NodeName;
             Page.Nodes.Add(Name);
             InstanceSlots.Add(Name, FInstanceSlot{PageName, Indices[Index]});
             LoadedNodes->Add(Name); OutAdded.Add(Name);
+            if (RailTracks && USimulatorNodeTokenLibrary::HasEffectiveToken(Name.ToString(), FName(TEXT("RAIL"))))
+            {
+                const FTransform WorldInstTransform = Rows[Offset + Index]->LocalTransform * GetActorTransform();
+                RailTracks->RegisterRailMeshInstance(this, Name, MeshComponent->GetStaticMesh(), WorldInstTransform);
+            }
         }
         DirtyPages.Add(PageName);
         Offset += Transforms.Num();
@@ -397,6 +405,10 @@ void AInstancedMeshActor::ReleaseRuntimeResources()
         return;
     }
     bRuntimeResourcesReleased = true;
+    if (URailTrackSubsystem* RailTracks = URailTrackSubsystem::Get(this))
+    {
+        RailTracks->UnregisterRailsForActor(this);
+    }
 
     TArray<FName> DynamicNodes;
     DynamicComponentMap.GetKeys(DynamicNodes);

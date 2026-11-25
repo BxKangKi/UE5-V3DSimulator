@@ -45,7 +45,7 @@ bool FV3DEditorAssetSchemaTest::RunTest(const FString&)
     Doc.Json = MakeShared<FJsonObject>();
     Doc.Json->SetStringField(TEXT("AssetType"), TEXT("Model"));
     Doc.Json->SetStringField(TEXT("ModelType"), TEXT("Dynamic"));
-    Doc.Json->SetStringField(TEXT("EntityType"), TEXT("Vehicle"));
+    Doc.Json->SetStringField(TEXT("DynamicType"), TEXT("Vehicle"));
     auto Fields = V3DProjectEditor::Suggestions(Doc);
     TestTrue(TEXT("Vehicle tuning exposed"), Fields->HasField(TEXT("VehicleTuning")));
     TestTrue(TEXT("Mass exposed"), Fields->HasField(TEXT("MassKg")));
@@ -59,7 +59,7 @@ bool FV3DEditorAssetSchemaTest::RunTest(const FString&)
     TestTrue(TEXT("Unknown author fields survive"), Canonical.Contains(TEXT("AuthorCustomKey")));
     Doc.Json->SetStringField(TEXT("ItemType"), TEXT("Weapon"));
     TestFalse(TEXT("Mutually exclusive subtype rejected before write"), ModelDefinitionJson::ValidateDefinition(Doc.Json, Doc.Path, Doc.SourcePath, Model, Error));
-    Doc.Json->RemoveField(TEXT("EntityType"));
+    Doc.Json->SetStringField(TEXT("DynamicType"), TEXT("Item"));
     Doc.Json->SetStringField(TEXT("ItemType"), TEXT("Weapon"));
     Fields = V3DProjectEditor::Suggestions(Doc);
     TestTrue(TEXT("Weapon exposes HoldTransform"), Fields->HasField(TEXT("HoldTransform")));

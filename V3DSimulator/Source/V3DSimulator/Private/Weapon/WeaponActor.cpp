@@ -220,7 +220,7 @@ bool AWeaponActor::EquipFromModel(const FString& InModelReference, USceneCompone
     const bool bResolved = FRuntimeModelResolver::Resolve(
         this, InModelReference, Model, ResolveError)
         && Model.Definition.ModelType == EModelDefinitionType::Dynamic
-        && Model.Definition.ItemType == EModelItemType::Weapon;
+        && Model.Definition.IsWeapon();
     ModelReference = bResolved ? Model.Reference : FString();
     bRuntimeResourcesReleased = false;
 

@@ -189,7 +189,7 @@ void UCharacterLoadAsyncAction::ResolveAndLoadModel()
         return;
     }
 
-    if (Model.Definition.ModelType != EModelDefinitionType::Character)
+    if (!Model.Definition.IsHumanoid())
     {
         FailLoad(FString::Printf(
             TEXT("Character built-model lookup resolved a non-character model. Reference=%s"),

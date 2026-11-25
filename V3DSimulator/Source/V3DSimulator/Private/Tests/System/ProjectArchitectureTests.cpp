@@ -143,13 +143,13 @@ bool FProjectBuildPolicyTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("World accepts Dynamic"),
         V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::World, EModelDefinitionType::Dynamic));
     TestTrue(TEXT("World accepts Character"),
-        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::World, EModelDefinitionType::Character));
+        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::World, EModelDefinitionType::Dynamic));
     TestTrue(TEXT("Prefab accepts Static"),
         V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Prefab, EModelDefinitionType::Static));
     TestFalse(TEXT("Prefab rejects Dynamic"),
         V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Prefab, EModelDefinitionType::Dynamic));
     TestTrue(TEXT("Character accepts Character"),
-        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Character, EModelDefinitionType::Character));
+        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Character, EModelDefinitionType::Dynamic));
     TestTrue(TEXT("Dynamic accepts Dynamic"),
         V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Dynamic, EModelDefinitionType::Dynamic));
 

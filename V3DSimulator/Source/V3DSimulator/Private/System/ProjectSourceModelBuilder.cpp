@@ -466,7 +466,7 @@ void UProjectSourceModelBuilder::BeginParserLoad(const uint64 Generation)
     FglTFRuntimeConfig Config;
     Config.bAllowExternalFiles = true;
     Config.bAsBlob = V3DSourceModelImport::UsesBlob(V3DSourceModelImport::GetFormat(SourcePath));
-    if (Definition.ModelType == EModelDefinitionType::Character)
+    if (Definition.IsHumanoid())
     {
         // glTFRuntime's default glTF basis is correct for ordinary scene assets, but Unreal's
         // Character convention expects skeletal forward along Y. The plugin's own skeleton
@@ -826,7 +826,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
         FString Error;
         bool bDecoded = false;
         bool bCharacterMeshUsesSkin = false;
-        if (Definition.ModelType == EModelDefinitionType::Character)
+        if (Definition.IsHumanoid())
         {
             for (const TPair<int32, TSet<int32>>& SkinEntry : SkinMeshIndices)
             {
@@ -859,7 +859,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
                     SkinMeshIndices.FindOrAdd(MeshIndex).Add(BakedMeshIndex);
                 }
             }
-            else if (bDecoded && Definition.ModelType == EModelDefinitionType::Character)
+            else if (bDecoded && Definition.IsHumanoid())
             {
                 Error = TEXT("Character source has no skeleton; OBJ/STL are static formats, use a skinned FBX or glTF");
                 bDecoded = false;
@@ -917,7 +917,7 @@ void UProjectSourceModelBuilder::CaptureNextMeshUnderGate()
             return;
         }
 
-        if (Definition.ModelType == EModelDefinitionType::Character)
+        if (Definition.IsHumanoid())
         {
             int32 BaseColorTextureBindings = 0;
             for (const FGWorldBakedMaterial& BakedMaterial : BakedData.Materials)

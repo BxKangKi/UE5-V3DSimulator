@@ -280,9 +280,9 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
     Model.Definition.GlbPath = GlbPath;
     Model.Definition.JsonPath = FPaths::ChangeExtension(GlbPath, TEXT("json"));
     Model.Definition.ModelType = EModelDefinitionType::Dynamic;
-    Model.Definition.EntityType = EModelEntityType::Prop;
+    Model.Definition.DynamicType = EModelDynamicType::Prop;
     Model.DefinitionJson = FString::Printf(
-        TEXT("{\"UUID\":\"%s\",\"Name\":\"Minimal\",\"DisplayName\":\"Minimal Test Model\",\"ModelType\":\"Dynamic\",\"EntityType\":\"Prop\"}"),
+        TEXT("{\"UUID\":\"%s\",\"Name\":\"Minimal\",\"DisplayName\":\"Minimal Test Model\",\"ModelType\":\"Dynamic\",\"DynamicType\":\"Prop\"}"),
         *Model.Definition.UUID.ToString(EGuidFormats::DigitsWithHyphensLower));
     Model.Metadata.SourceNodeCount = 1;
     Model.Metadata.SourceMeshCount = 2;

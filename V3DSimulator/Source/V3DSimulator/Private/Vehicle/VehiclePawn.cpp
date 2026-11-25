@@ -48,6 +48,7 @@
 #include "System/WorldBakedModelAsset.h"
 #include "Net/UnrealNetwork.h"
 #include "Vehicle/VehicleSubSystem.h"
+#include "World/RailTrackSubsystem.h"
 #include "World/BuoyancyComponent.h"
 #include "World/WaterActor.h"
 
@@ -353,8 +354,16 @@ void AVehiclePawn::BeginPlay()
     Body->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);
     Body->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);
     Body->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
-    ApplyVehicleBodyPhysicsSettings();
-    Body->SetUseCCD(true);
+    if (VehicleType == EModelVehicleType::Train)
+    {
+        Body->SetSimulatePhysics(false);
+        Body->SetEnableGravity(false);
+    }
+    else
+    {
+        ApplyVehicleBodyPhysicsSettings();
+        Body->SetUseCCD(true);
+    }
     if (LowFrictionPhysicalMaterial)
     {
         Body->SetPhysMaterialOverride(LowFrictionPhysicalMaterial);
@@ -774,6 +783,13 @@ void AVehiclePawn::UpdateVehicleFromSubSystem(float DeltaSeconds)
 
     bAsyncPhysicsTickEnabled = false;
 
+    if (VehicleType == EModelVehicleType::Train)
+    {
+        UpdateTrainSimulation(SafeFrameDeltaTime);
+        UpdateTrainWheelVisuals(SafeFrameDeltaTime);
+        return;
+    }
+
     {
         struct FScopedBoolOverride
         {
@@ -950,6 +966,13 @@ void AVehiclePawn::ClearLoadedVehicleModel()
     BaseName.Reset();
     ObjectName.Reset();
     bVehicleModelLoaded = false;
+    ActiveRailTrackId = INDEX_NONE;
+    TrainTrackDistanceCm = 0.0f;
+    TrainRailDirectionSign = 1.0f;
+    TrainSpeedCmPerSec = 0.0f;
+    TrainFrontBogieYawDeg = 0.0f;
+    TrainRearBogieYawDeg = 0.0f;
+    bTrainLockedToRail = false;
     if (HasAuthority())
     {
         ReplicatedModelReference.Reset();
@@ -1072,6 +1095,13 @@ void AVehiclePawn::ResetVehicleTuningToClassDefaults()
         ? -1.0f
         : (Defaults->WheelSpinDirection < 0.0f ? -1.0f : 1.0f);
     WheelMeshNames = Defaults->WheelMeshNames;
+    TrainMaxSpeed = Defaults->TrainMaxSpeed;
+    TrainAcceleration = Defaults->TrainAcceleration;
+    TrainBrakeDeceleration = Defaults->TrainBrakeDeceleration;
+    TrainCoastDeceleration = Defaults->TrainCoastDeceleration;
+    TrainRailSnapDistance = Defaults->TrainRailSnapDistance;
+    TrainRailHeightOffset = Defaults->TrainRailHeightOffset;
+    TrainBogieWheelbase = Defaults->TrainBogieWheelbase;
     WheelGroundContactBuffer = Defaults->WheelGroundContactBuffer;
     WheelVisualGroundContactBuffer = Defaults->WheelVisualGroundContactBuffer;
 }
@@ -1084,8 +1114,11 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     }
 
     const TSharedPtr<FJsonObject>* NestedObject = nullptr;
-    if (!JsonObject->TryGetObjectField(TEXT("VehicleTuning"), NestedObject)
-        || !NestedObject || !NestedObject->IsValid()) return false;
+    const bool bHasTrainTuning = JsonObject->TryGetObjectField(TEXT("TrainTuning"), NestedObject)
+        && NestedObject && NestedObject->IsValid();
+    if (!bHasTrainTuning
+        && (!JsonObject->TryGetObjectField(TEXT("VehicleTuning"), NestedObject)
+            || !NestedObject || !NestedObject->IsValid())) return false;
     const TSharedPtr<FJsonObject> TuningObject = *NestedObject;
 
     bool bAppliedAnyField = false;
@@ -1218,6 +1251,13 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
         WheelMeshNames = MoveTemp(ParsedNames);
         bAppliedAnyField = true;
     }
+    ReadFloat(TEXT("MaxSpeedForward"), TrainMaxSpeed, 100.0f, VehicleTuningMaxSpeed);
+    ReadFloat(TEXT("Acceleration"), TrainAcceleration, 10.0f, 5000.0f);
+    ReadFloat(TEXT("BrakeDeceleration"), TrainBrakeDeceleration, 10.0f, 8000.0f);
+    ReadFloat(TEXT("CoastDeceleration"), TrainCoastDeceleration, 0.0f, 2000.0f);
+    ReadFloat(TEXT("RailSnapDistance"), TrainRailSnapDistance, 50.0f, 5000.0f);
+    ReadFloat(TEXT("RailHeightOffset"), TrainRailHeightOffset, -500.0f, 500.0f);
+    ReadFloat(TEXT("BogieWheelbase"), TrainBogieWheelbase, 0.0f, 5000.0f);
 
     MaxSteeringSpeedFactor = FMath::Max(MaxSteeringSpeedFactor, MinSteeringSpeedFactor);
     HighSpeedSteeringAngleDegrees = FMath::Min(HighSpeedSteeringAngleDegrees, MaxSteeringAngleDegrees);
@@ -1382,7 +1422,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
     FString ResolveError;
     if (!FRuntimeModelResolver::Resolve(this, InModelReference, Model, ResolveError)
         || Model.Definition.ModelType != EModelDefinitionType::Dynamic
-        || Model.Definition.EntityType != EModelEntityType::Vehicle)
+        || !Model.Definition.IsVehicle())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("VehiclePawn: built vehicle model rejected. Reference=%s Reason=%s"),
@@ -1400,6 +1440,8 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
     ModelReference = Model.Reference;
     BaseName = Model.Definition.Name;
     ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
+    VehicleType = Model.Definition.VehicleType == EModelVehicleType::Train
+        ? EModelVehicleType::Train : EModelVehicleType::Car;
     ResetVehicleTuningToClassDefaults();
 
     FSafeJsonLimits TuningLimits;
@@ -1929,6 +1971,10 @@ bool AVehiclePawn::ShouldUpdateVehicleSimulation() const
         }
     }
 
+    if (VehicleType == EModelVehicleType::Train)
+    {
+        return true;
+    }
     return Body->IsSimulatingPhysics();
 }
 
@@ -4027,4 +4073,232 @@ float AVehiclePawn::GetGravityMagnitude() const
         if (const auto* Fields = GetWorld()->GetSubsystem<UGravityFieldSubsystem>())
             return static_cast<float>(Fields->GetGravityAtLocation(GetActorLocation(), const_cast<AVehiclePawn*>(this)).Size());
     return 980.0f;
+}
+
+void AVehiclePawn::ComputeTrainBogieAxles(
+    float& OutFrontAxleX,
+    float& OutRearAxleX,
+    float& OutWheelBottomLocalZ) const
+{
+    OutWheelBottomLocalZ = LoadedWheelVisualRestBounds.IsValid
+        ? static_cast<float>(LoadedWheelVisualRestBounds.Min.Z)
+        : -static_cast<float>(BodyExtent.Z);
+
+    if (WheelOffsets.Num() >= 2)
+    {
+        float MinX = FLT_MAX;
+        float MaxX = -FLT_MAX;
+        for (const FVector& Offset : WheelOffsets)
+        {
+            MinX = FMath::Min(MinX, static_cast<float>(Offset.X));
+            MaxX = FMath::Max(MaxX, static_cast<float>(Offset.X));
+        }
+        const float MidX = 0.5f * (MinX + MaxX);
+        float FrontSum = 0.0f, RearSum = 0.0f;
+        int32 FrontCount = 0, RearCount = 0;
+        for (int32 WheelIdx = 0; WheelIdx < WheelOffsets.Num(); ++WheelIdx)
+        {
+            const float X = static_cast<float>(WheelOffsets[WheelIdx].X);
+            if (X >= MidX) { FrontSum += X; ++FrontCount; }
+            else { RearSum += X; ++RearCount; }
+        }
+        if (FrontCount > 0 && RearCount > 0)
+        {
+            OutFrontAxleX = FrontSum / static_cast<float>(FrontCount);
+            OutRearAxleX = RearSum / static_cast<float>(RearCount);
+            if ((OutFrontAxleX - OutRearAxleX) >= 20.0f)
+            {
+                return;
+            }
+        }
+    }
+
+    const float HalfBase = TrainBogieWheelbase > 20.0f
+        ? (TrainBogieWheelbase * 0.5f)
+        : FMath::Max(static_cast<float>(BodyExtent.X) * 0.65f, 80.0f);
+    OutFrontAxleX = HalfBase;
+    OutRearAxleX = -HalfBase;
+}
+
+void AVehiclePawn::UpdateTrainSimulation(float DeltaSeconds)
+{
+    if (!IsValid(Body) || DeltaSeconds <= 0.0f) return;
+    if (Body->IsSimulatingPhysics())
+    {
+        Body->SetSimulatePhysics(false);
+        Body->SetEnableGravity(false);
+    }
+
+    URailTrackSubsystem* RailTracks = URailTrackSubsystem::Get(this);
+    if (!RailTracks || !RailTracks->HasTracks())
+    {
+        return;
+    }
+
+    if (!bTrainLockedToRail)
+    {
+        FVector SnapPos = FVector::ZeroVector;
+        FVector SnapTan = FVector::ForwardVector;
+        FVector SnapUp = FVector::UpVector;
+        if (!RailTracks->FindNearestTrack(
+            GetActorLocation(), TrainRailSnapDistance,
+            ActiveRailTrackId, TrainTrackDistanceCm,
+            SnapPos, SnapTan, SnapUp))
+        {
+            return;
+        }
+        TrainRailDirectionSign = (FVector::DotProduct(GetActorForwardVector(), SnapTan) >= 0.0f) ? 1.0f : -1.0f;
+        bTrainLockedToRail = true;
+    }
+
+    const float InterpSpeed = FMath::Max(0.5f, ThrottleInputInterpSpeed);
+    SmoothedThrottleInput = FMath::FInterpTo(SmoothedThrottleInput, ThrottleInput, DeltaSeconds, InterpSpeed);
+
+    if (FMath::Abs(SmoothedThrottleInput) > 0.02f)
+    {
+        if (SmoothedThrottleInput * TrainSpeedCmPerSec < -10.0f)
+        {
+            const float BrakeRate = TrainBrakeDeceleration * FMath::Abs(SmoothedThrottleInput);
+            TrainSpeedCmPerSec = FMath::FInterpConstantTo(TrainSpeedCmPerSec, 0.0f, DeltaSeconds, BrakeRate);
+        }
+        else
+        {
+            TrainSpeedCmPerSec += SmoothedThrottleInput * TrainAcceleration * DeltaSeconds;
+            TrainSpeedCmPerSec = FMath::Clamp(TrainSpeedCmPerSec, -TrainMaxSpeed * 0.5f, TrainMaxSpeed);
+        }
+    }
+    else
+    {
+        TrainSpeedCmPerSec = FMath::FInterpConstantTo(TrainSpeedCmPerSec, 0.0f, DeltaSeconds, TrainCoastDeceleration);
+    }
+
+    TrainTrackDistanceCm += TrainSpeedCmPerSec * TrainRailDirectionSign * DeltaSeconds;
+
+    FVector CenterPos = FVector::ZeroVector;
+    FVector CenterTan = FVector::ForwardVector;
+    FVector CenterUp = FVector::UpVector;
+    bool bReachedOpenEnd = false;
+    if (!RailTracks->SampleTrackAtDistance(
+        ActiveRailTrackId, TrainTrackDistanceCm, TrainRailDirectionSign,
+        CenterPos, CenterTan, CenterUp, bReachedOpenEnd))
+    {
+        bTrainLockedToRail = false;
+        ActiveRailTrackId = INDEX_NONE;
+        TrainSpeedCmPerSec = 0.0f;
+        return;
+    }
+    if (bReachedOpenEnd)
+    {
+        TrainSpeedCmPerSec = 0.0f;
+    }
+
+    float FrontAxleX = 100.0f;
+    float RearAxleX = -100.0f;
+    float WheelBottomLocalZ = -static_cast<float>(BodyExtent.Z);
+    ComputeTrainBogieAxles(FrontAxleX, RearAxleX, WheelBottomLocalZ);
+
+    FVector PosFront = CenterPos, TanFront = CenterTan, UpFront = CenterUp;
+    FVector PosRear = CenterPos, TanRear = CenterTan, UpRear = CenterUp;
+    const bool bHasFront = RailTracks->SampleTrackOffset(
+        ActiveRailTrackId, TrainTrackDistanceCm, FrontAxleX * TrainRailDirectionSign,
+        PosFront, TanFront, UpFront);
+    const bool bHasRear = RailTracks->SampleTrackOffset(
+        ActiveRailTrackId, TrainTrackDistanceCm, RearAxleX * TrainRailDirectionSign,
+        PosRear, TanRear, UpRear);
+
+    FVector ChordForward = (bHasFront && bHasRear)
+        ? (PosFront - PosRear).GetSafeNormal()
+        : (CenterTan * TrainRailDirectionSign).GetSafeNormal();
+    if (ChordForward.IsNearlyZero())
+    {
+        ChordForward = (CenterTan * TrainRailDirectionSign).GetSafeNormal();
+    }
+    if (ChordForward.IsNearlyZero())
+    {
+        ChordForward = FVector::ForwardVector;
+    }
+
+    FVector BodyUp = (bHasFront && bHasRear) ? (UpFront + UpRear).GetSafeNormal() : CenterUp;
+    if (BodyUp.IsNearlyZero()) BodyUp = FVector::UpVector;
+    FVector BodyRight = FVector::CrossProduct(BodyUp, ChordForward).GetSafeNormal();
+    if (BodyRight.IsNearlyZero()) BodyRight = FVector::RightVector;
+    BodyUp = FVector::CrossProduct(ChordForward, BodyRight).GetSafeNormal();
+
+    const FMatrix BodyBasis(ChordForward, BodyRight, BodyUp, FVector::ZeroVector);
+    const FQuat BodyQuat = BodyBasis.ToQuat().GetNormalized();
+
+    FVector RailOrigin = CenterPos;
+    if (bHasFront && bHasRear)
+    {
+        const float Span = FMath::Max(FrontAxleX - RearAxleX, 1.0f);
+        const float OriginAlpha = FMath::Clamp(-RearAxleX / Span, 0.0f, 1.0f);
+        RailOrigin = FMath::Lerp(PosRear, PosFront, OriginAlpha);
+    }
+
+    const FVector TargetLocation = RailOrigin + BodyUp * (-WheelBottomLocalZ + TrainRailHeightOffset);
+    SetActorLocationAndRotation(TargetLocation, BodyQuat.Rotator(), false, nullptr, ETeleportType::None);
+
+    // Compute front & rear bogie swivel yaw relative to the train body chord
+    const FVector LocalFrontTan = BodyQuat.UnrotateVector(TanFront * TrainRailDirectionSign);
+    const FVector LocalRearTan = BodyQuat.UnrotateVector(TanRear * TrainRailDirectionSign);
+    TrainFrontBogieYawDeg = FMath::Clamp(
+        FMath::RadiansToDegrees(FMath::Atan2(LocalFrontTan.Y, FMath::Max(LocalFrontTan.X, 0.01))),
+        -25.0f, 25.0f);
+    TrainRearBogieYawDeg = FMath::Clamp(
+        FMath::RadiansToDegrees(FMath::Atan2(LocalRearTan.Y, FMath::Max(LocalRearTan.X, 0.01))),
+        -25.0f, 25.0f);
+}
+
+void AVehiclePawn::UpdateTrainWheelVisuals(float DeltaSeconds)
+{
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    if (!InstancedEntities || InstancedRenderRegistrationId == INDEX_NONE)
+    {
+        return;
+    }
+
+    WheelSpinDegrees.SetNum(WheelOffsets.Num());
+    float MinX = FLT_MAX, MaxX = -FLT_MAX;
+    for (const FVector& Offset : WheelOffsets)
+    {
+        MinX = FMath::Min(MinX, static_cast<float>(Offset.X));
+        MaxX = FMath::Max(MaxX, static_cast<float>(Offset.X));
+    }
+    const float MidX = WheelOffsets.IsEmpty() ? 0.0f : 0.5f * (MinX + MaxX);
+    const float AuthoredSpinSign = WheelSpinDirection > 0.0f ? 1.0f : -1.0f;
+
+    for (int32 WheelIndex = 0;
+         WheelIndex < LoadedWheelRenderPartIndices.Num() && WheelIndex < WheelOffsets.Num();
+         ++WheelIndex)
+    {
+        const float SafeWheelRadius = FMath::Max(5.0f, GetEffectiveWheelRadius(WheelIndex));
+        const FVector BaseScale = LoadedWheelBaseScales.IsValidIndex(WheelIndex)
+            ? LoadedWheelBaseScales[WheelIndex] : FVector::OneVector;
+        const float MirrorSign = (BaseScale.X * BaseScale.Y * BaseScale.Z) < 0.0f ? -1.0f : 1.0f;
+
+        WheelSpinDegrees[WheelIndex] = FMath::UnwindDegrees(
+            WheelSpinDegrees[WheelIndex]
+            + FMath::RadiansToDegrees((TrainSpeedCmPerSec / SafeWheelRadius) * DeltaSeconds)
+                * AuthoredSpinSign * MirrorSign);
+
+        const float BogieYaw = (WheelOffsets[WheelIndex].X >= MidX)
+            ? TrainFrontBogieYawDeg : TrainRearBogieYawDeg;
+        const FRotator RelativeRot(WheelSpinDegrees[WheelIndex], BogieYaw, 0.0f);
+
+        const FQuat BaseRotation = LoadedWheelBaseRotations.IsValidIndex(WheelIndex)
+            ? LoadedWheelBaseRotations[WheelIndex] : FQuat::Identity;
+        const FVector MeshCenterOffset = LoadedWheelVisualCenterOffsets.IsValidIndex(WheelIndex)
+            ? LoadedWheelVisualCenterOffsets[WheelIndex] : FVector::ZeroVector;
+        const float TargetSpring = GetTargetWheelSpringLength(WheelIndex);
+        const FVector LocalWheelCenter = WheelOffsets[WheelIndex] - FVector(0.0, 0.0, TargetSpring);
+
+        const FQuat VisualRotation = (RelativeRot.Quaternion() * BaseRotation).GetNormalized();
+        const FVector RelativeLocation = LocalWheelCenter - VisualRotation.RotateVector(MeshCenterOffset * BaseScale);
+        const FTransform WheelLocalTransform(VisualRotation, RelativeLocation, BaseScale);
+
+        InstancedEntities->UpdateEntityPartLocalTransform(
+            InstancedRenderRegistrationId,
+            LoadedWheelRenderPartIndices[WheelIndex],
+            WheelLocalTransform);
+    }
 }

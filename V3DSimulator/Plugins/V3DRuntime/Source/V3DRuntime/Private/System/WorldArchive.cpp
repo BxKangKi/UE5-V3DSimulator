@@ -421,8 +421,9 @@ namespace GWorldArchivePrivate
         v3d::model_record R;
         const auto& D = V.Definition;
         R.uuid = ToPortable(D.UUID); R.asset_type = static_cast<uint8>(D.AssetType);
-        R.model_type = static_cast<uint8>(D.ModelType); R.entity_type = static_cast<uint8>(D.EntityType);
-        R.item_type = static_cast<uint8>(D.ItemType); R.name = ToPortable(D.Name); R.display_name = ToPortable(D.DisplayName);
+        R.model_type = static_cast<uint8>(D.ModelType); R.dynamic_type = static_cast<uint8>(D.DynamicType);
+        R.item_type = static_cast<uint8>(D.ItemType); R.vehicle_type = static_cast<uint8>(D.VehicleType);
+        R.name = ToPortable(D.Name); R.display_name = ToPortable(D.DisplayName);
         R.gravity.enabled = D.GravityField.bEnabled; R.gravity.falloff = static_cast<uint8>(D.GravityField.Falloff);
         R.gravity.priority = D.GravityField.Priority; R.gravity.radius_cm = D.GravityField.RadiusCm;
         R.gravity.strength_cm_per_second_squared = D.GravityField.StrengthCmPerSecondSquared;
@@ -437,7 +438,9 @@ namespace GWorldArchivePrivate
         auto& D = R.Definition;
         D.UUID = ToUnreal(V.uuid); D.AssetType = static_cast<EAssetDefinitionType>(V.asset_type);
         D.ModelType = static_cast<EModelDefinitionType>(V.model_type);
-        D.EntityType = static_cast<EModelEntityType>(V.entity_type); D.ItemType = static_cast<EModelItemType>(V.item_type);
+        D.DynamicType = static_cast<EModelDynamicType>(V.dynamic_type);
+        D.ItemType = static_cast<EModelItemType>(V.item_type);
+        D.VehicleType = static_cast<EModelVehicleType>(V.vehicle_type);
         D.Name = ToUnreal(V.name); D.DisplayName = ToUnreal(V.display_name);
         D.GravityField.bEnabled = V.gravity.enabled; D.GravityField.Falloff = static_cast<EGravityFieldFalloff>(V.gravity.falloff);
         D.GravityField.Priority = V.gravity.priority; D.GravityField.RadiusCm = V.gravity.radius_cm;
@@ -1003,8 +1006,9 @@ namespace GWorldArchivePrivate
             Record.Definition.Name = Model->Definition.Name;
             Record.Definition.DisplayName = Model->Definition.DisplayName;
             Record.Definition.ModelType = Model->Definition.ModelType;
-            Record.Definition.EntityType = Model->Definition.EntityType;
+            Record.Definition.DynamicType = Model->Definition.DynamicType;
             Record.Definition.ItemType = Model->Definition.ItemType;
+            Record.Definition.VehicleType = Model->Definition.VehicleType;
             Record.Definition.GravityField = Model->Definition.GravityField;
             Record.Summary.SourceNodeCount = Model->Metadata.SourceNodeCount;
             Record.Summary.SourceMeshCount = Model->Metadata.SourceMeshCount;

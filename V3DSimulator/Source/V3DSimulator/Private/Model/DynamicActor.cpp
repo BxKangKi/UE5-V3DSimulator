@@ -534,8 +534,8 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
     FString ResolveError;
     if (!FRuntimeModelResolver::Resolve(this, InModelReference, Model, ResolveError)
         || Model.Definition.ModelType != EModelDefinitionType::Dynamic
-        || Model.Definition.EntityType == EModelEntityType::Vehicle
-        || Model.Definition.ItemType == EModelItemType::Weapon)
+        || Model.Definition.IsVehicle()
+        || Model.Definition.IsWeapon())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("DynamicActor: built model rejected. Reference=%s Reason=%s"),

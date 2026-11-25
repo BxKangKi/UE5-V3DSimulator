@@ -12,6 +12,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "Simulator/ModelDefinitionTypes.h"
 #include "VehiclePawn.generated.h"
 
 class UBoxComponent;
@@ -671,6 +672,23 @@ private:
     bool bSkipVehicleInputSmoothingForCurrentRun = false;
     float CurrentVehiclePhysicsStepSeconds = 0.0f;
 
+    // Train (VehicleType::Train) rail-guided kinematics & tuning
+    EModelVehicleType VehicleType = EModelVehicleType::Car;
+    float TrainMaxSpeed = 3600.0f;
+    float TrainAcceleration = 450.0f;
+    float TrainBrakeDeceleration = 900.0f;
+    float TrainCoastDeceleration = 80.0f;
+    float TrainRailSnapDistance = 800.0f;
+    float TrainRailHeightOffset = 0.0f;
+    float TrainBogieWheelbase = 0.0f;
+    int32 ActiveRailTrackId = INDEX_NONE;
+    float TrainTrackDistanceCm = 0.0f;
+    float TrainRailDirectionSign = 1.0f;
+    float TrainSpeedCmPerSec = 0.0f;
+    float TrainFrontBogieYawDeg = 0.0f;
+    float TrainRearBogieYawDeg = 0.0f;
+    bool bTrainLockedToRail = false;
+
     void RunVehiclePhysicsSteps(float DeltaSeconds);
     void StepVehiclePhysics(float DeltaSeconds);
     void UpdateVehicleInputSmoothing(float DeltaSeconds);
@@ -696,6 +714,9 @@ private:
     float GetTargetWheelSpringLength(int32 WheelIndex = INDEX_NONE) const;
     FVector GetFrontAxleForceLocation() const;
     void UpdateWheelVisuals(float DeltaSeconds);
+    void UpdateTrainSimulation(float DeltaSeconds);
+    void UpdateTrainWheelVisuals(float DeltaSeconds);
+    void ComputeTrainBogieAxles(float& OutFrontAxleX, float& OutRearAxleX, float& OutWheelBottomLocalZ) const;
     void ClearLoadedVehicleModel();
     void ReleaseRuntimeResources();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);

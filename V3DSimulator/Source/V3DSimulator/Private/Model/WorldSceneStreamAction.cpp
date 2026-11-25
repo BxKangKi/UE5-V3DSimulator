@@ -1457,7 +1457,9 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     // Avoid CPU copies and nav data for visual-only groups. Complex collision needs CPU vertex
     // access while it is built; simple collision does not require retaining the render vertices.
     Config.bBuildNavCollision = !bRenderOnly && bNeedsCollision && Config.bBuildNavCollision;
-    Config.bAllowCPUAccess = !bRenderOnly && bBuildComplexCollision;
+    const bool bIsRailMesh = USimulatorNodeTokenLibrary::HasEffectiveToken(
+        CurrentLoadingNode.ToString(), FName(TEXT("RAIL")));
+    Config.bAllowCPUAccess = (!bRenderOnly && bBuildComplexCollision) || bIsRailMesh;
     Config.bGenerateStaticMeshDescription = false;
     Config.CollisionComplexity = bBuildComplexCollision
         ? ECollisionTraceFlag::CTF_UseComplexAsSimple

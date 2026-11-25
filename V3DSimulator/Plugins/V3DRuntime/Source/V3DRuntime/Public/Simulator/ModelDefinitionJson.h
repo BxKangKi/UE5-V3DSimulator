@@ -26,8 +26,9 @@ struct V3DRUNTIME_API FModelDefinition
     FString GlbPath;
     FString JsonPath;
     EModelDefinitionType ModelType = EModelDefinitionType::Invalid;
-    EModelEntityType EntityType = EModelEntityType::None;
+    EModelDynamicType DynamicType = EModelDynamicType::None;
     EModelItemType ItemType = EModelItemType::None;
+    EModelVehicleType VehicleType = EModelVehicleType::None;
     bool bToon = false;
     uint8 MaterialMode = 0; // Stable wire values: 0 Auto, 1 legacy Opaque alias, 3 Translucent, 5 Opaque (Masked shader). Sidedness comes from the source.
     // These authoring values travel with the model JSON, never with settings.json or the GPU.
@@ -37,11 +38,45 @@ struct V3DRUNTIME_API FModelDefinition
     TMap<FString, FString> Bones;
     FGravityFieldSettings GravityField;
 
+    bool IsHumanoid() const
+    {
+        return ModelType == EModelDefinitionType::Dynamic && DynamicType == EModelDynamicType::Humanoid;
+    }
+
+    bool IsCreature() const
+    {
+        return ModelType == EModelDefinitionType::Dynamic && DynamicType == EModelDynamicType::Creature;
+    }
+
+    bool IsVehicle() const
+    {
+        return ModelType == EModelDefinitionType::Dynamic && DynamicType == EModelDynamicType::Vehicle;
+    }
+
+    bool IsCar() const
+    {
+        return IsVehicle() && (VehicleType == EModelVehicleType::Car || VehicleType == EModelVehicleType::None);
+    }
+
+    bool IsTrain() const
+    {
+        return IsVehicle() && VehicleType == EModelVehicleType::Train;
+    }
+
+    bool IsItem() const
+    {
+        return ModelType == EModelDefinitionType::Dynamic && DynamicType == EModelDynamicType::Item;
+    }
+
+    bool IsWeapon() const
+    {
+        return IsItem() && ItemType == EModelItemType::Weapon;
+    }
+
     bool IsLoadable() const
     {
-        return AssetType == EAssetDefinitionType::Model && (ModelType == EModelDefinitionType::Static
-            || ModelType == EModelDefinitionType::Dynamic
-            || ModelType == EModelDefinitionType::Character);
+        return AssetType == EAssetDefinitionType::Model
+            && (ModelType == EModelDefinitionType::Static || ModelType == EModelDefinitionType::Dynamic);
     }
 };
 
@@ -54,26 +89,12 @@ struct V3DRUNTIME_API FModelDefinition
  */
 namespace ModelDefinitionJson
 {
-    /**
-     * Creates missing sibling JSON for every recursively discovered supported model format.
-     * New metadata is persisted to disk before validation, and the default ModelType comes
-     * from ProjectBuildPolicy. Existing author-owned fields are preserved.
-     * OutDiscoveredModelFiles receives the exact normalized, de-duplicated source snapshot.
-     *
-     * This function performs file-system work only and is safe to call from a
-     * worker thread. It never touches UObjects or world state.
-     */
     V3DRUNTIME_API bool EnsureDefinitions(
         const FString& ModelRootDirectory,
         EV3DSimulatorProjectType ProjectType,
         TArray<FString>* OutUpdatedJsonFiles = nullptr,
         TArray<FString>* OutDiscoveredModelFiles = nullptr);
 
-    /**
-     * Strictly validates a canonical definition. Missing required metadata, unknown types,
-     * invalid UUIDs, mismatched subtypes and a character without a Bones object are rejected.
-     * OutCanonicalJson receives the normalized snapshot of the exact DOM that passed validation.
-     */
     V3DRUNTIME_API bool ValidateDefinition(const TSharedPtr<FJsonObject>& Root,
         const FString& JsonPath, const FString& ExpectedSourcePath, FModelDefinition& OutDefinition,
         FString& OutError, FString* OutCanonicalJson = nullptr);
@@ -84,5 +105,4 @@ namespace ModelDefinitionJson
         FModelDefinition& OutDefinition,
         FString& OutError,
         FString* OutCanonicalJson = nullptr);
-
 }

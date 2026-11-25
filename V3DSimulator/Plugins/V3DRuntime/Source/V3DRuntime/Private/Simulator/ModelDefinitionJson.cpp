@@ -219,7 +219,7 @@ bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root
         || OutDefinition.ModelType == EModelDefinitionType::Invalid)
     {
         OutError = FString::Printf(
-            TEXT("unsupported or case-mismatched ModelType '%s'; expected Static, Dynamic, or Character"),
+            TEXT("unsupported or case-mismatched ModelType '%s'; expected Static or Dynamic"),
             *TypeText);
         return false;
     }
@@ -259,52 +259,87 @@ bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root
 
     if (OutDefinition.ModelType == EModelDefinitionType::Dynamic)
     {
-        FString EntitySubtype;
+        FString DynamicSubtype;
         FString ItemSubtype;
-        const bool bHasEntityType = Root->TryGetStringField(TEXT("EntityType"), EntitySubtype);
+        FString VehicleSubtype;
+        const bool bHasDynamicType = Root->TryGetStringField(TEXT("DynamicType"), DynamicSubtype);
         const bool bHasItemType = Root->TryGetStringField(TEXT("ItemType"), ItemSubtype);
-        if (bHasEntityType && bHasItemType)
+        const bool bHasVehicleType = Root->TryGetStringField(TEXT("VehicleType"), VehicleSubtype);
+
+        if (bHasDynamicType)
         {
-            OutError = TEXT("Dynamic cannot specify both EntityType and ItemType");
+            DynamicSubtype.TrimStartAndEndInline();
+            if (!V3DSimulatorModelTypes::TryParseDynamicType(DynamicSubtype, OutDefinition.DynamicType))
+            {
+                OutError = FString::Printf(
+                    TEXT("unsupported DynamicType '%s'; expected Humanoid, Vehicle, Prop, Creature, or Item"),
+                    *DynamicSubtype);
+                return false;
+            }
+        }
+
+        if (OutDefinition.DynamicType == EModelDynamicType::Item)
+        {
+            if (bHasItemType)
+            {
+                ItemSubtype.TrimStartAndEndInline();
+                if (!V3DSimulatorModelTypes::TryParseItemType(ItemSubtype, OutDefinition.ItemType))
+                {
+                    OutError = FString::Printf(
+                        TEXT("unsupported ItemType '%s'; expected Weapon, Tool, or Misc"),
+                        *ItemSubtype);
+                    return false;
+                }
+            }
+            else
+            {
+                OutDefinition.ItemType = EModelItemType::Misc;
+            }
+        }
+        else if (bHasItemType)
+        {
+            OutError = TEXT("ItemType is only valid when DynamicType is Item");
             return false;
         }
-        if (bHasEntityType)
+
+        if (OutDefinition.DynamicType == EModelDynamicType::Vehicle)
         {
-            if (EntitySubtype == TEXT("Vehicle")) OutDefinition.EntityType = EModelEntityType::Vehicle;
-            else if (EntitySubtype == TEXT("Prop")) OutDefinition.EntityType = EModelEntityType::Prop;
-            else if (EntitySubtype == TEXT("Animal")) OutDefinition.EntityType = EModelEntityType::Animal;
+            if (bHasVehicleType)
+            {
+                VehicleSubtype.TrimStartAndEndInline();
+                if (!V3DSimulatorModelTypes::TryParseVehicleType(VehicleSubtype, OutDefinition.VehicleType))
+                {
+                    OutError = FString::Printf(
+                        TEXT("unsupported VehicleType '%s'; expected Car or Train"),
+                        *VehicleSubtype);
+                    return false;
+                }
+            }
             else
             {
-                OutError = FString::Printf(TEXT("unsupported EntityType '%s'"), *EntitySubtype);
-                return false;
+                OutDefinition.VehicleType = EModelVehicleType::Car;
             }
         }
-        if (bHasItemType)
+        else if (bHasVehicleType)
         {
-            if (ItemSubtype == TEXT("Weapon")) OutDefinition.ItemType = EModelItemType::Weapon;
-            else if (ItemSubtype == TEXT("Tool")) OutDefinition.ItemType = EModelItemType::Tool;
-            else if (ItemSubtype == TEXT("Misc")) OutDefinition.ItemType = EModelItemType::Misc;
-            else
-            {
-                OutError = FString::Printf(TEXT("unsupported ItemType '%s'"), *ItemSubtype);
-                return false;
-            }
+            OutError = TEXT("VehicleType is only valid when DynamicType is Vehicle");
+            return false;
         }
     }
-    else if (Root->HasField(TEXT("EntityType")) || Root->HasField(TEXT("ItemType")))
+    else if (Root->HasField(TEXT("DynamicType")) || Root->HasField(TEXT("ItemType")) || Root->HasField(TEXT("VehicleType")))
     {
-        OutError = TEXT("EntityType and ItemType are only valid when ModelType is Dynamic");
+        OutError = TEXT("DynamicType, ItemType, and VehicleType are only valid when ModelType is Dynamic");
         return false;
     }
 
-    if (OutDefinition.ModelType == EModelDefinitionType::Character)
+    if (OutDefinition.IsHumanoid())
     {
         const TSharedPtr<FJsonObject>* BonesObject = nullptr;
         if (!Root->TryGetObjectField(TEXT("Bones"), BonesObject)
             || BonesObject == nullptr
             || !BonesObject->IsValid())
         {
-            OutError = TEXT("Character requires a Bones object.");
+            OutError = TEXT("Humanoid Dynamic model requires a Bones object.");
             return false;
         }
 
@@ -319,8 +354,8 @@ bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root
     }
 
     if (!FGravityFieldSettings::ReadJson(Root, OutDefinition.GravityField, OutError)) return false;
-    if (OutDefinition.ModelType == EModelDefinitionType::Character && Root->HasField(TEXT("GravityField")))
-    { OutError = TEXT("GravityField is authored on Static or Dynamic models"); return false; }
+    if (OutDefinition.IsHumanoid() && Root->HasField(TEXT("GravityField")))
+    { OutError = TEXT("GravityField is not supported on Humanoid models"); return false; }
 
     OutDefinition.GlbPath = FSafeFileIO::NormalizeFilePath(ExpectedSourcePath);
     OutDefinition.JsonPath = FSafeFileIO::NormalizeFilePath(JsonPath);

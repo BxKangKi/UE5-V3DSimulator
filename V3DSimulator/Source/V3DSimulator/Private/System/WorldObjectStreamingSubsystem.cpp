@@ -775,7 +775,7 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
         FSimulatorFileServices::WriteLogAsync(TEXT("ModelUUID"), Message);
         return nullptr;
     }
-    if (Definition.ModelType == EModelDefinitionType::Character)
+    if (Definition.IsHumanoid())
     {
         return nullptr;
     }
@@ -832,8 +832,7 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
             }
         }
     }
-    else if (Definition.ModelType == EModelDefinitionType::Dynamic
-        && Definition.EntityType == EModelEntityType::Vehicle)
+    else if (Definition.IsVehicle())
     {
         UClass* Candidate = Registry ? Registry->VehiclePawnClass.LoadSynchronous() : nullptr;
         UClass* SpawnClass = ResolveClass(Candidate, AVehiclePawn::StaticClass(), AVehiclePawn::StaticClass());

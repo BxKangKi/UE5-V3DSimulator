@@ -12,7 +12,7 @@ EModelDefinitionType V3DSimulatorProjectBuildPolicy::DefaultModelType(const EV3D
 {
     switch (Type)
     {
-    case EV3DSimulatorProjectType::Character: return EModelDefinitionType::Character;
+    case EV3DSimulatorProjectType::Character: return EModelDefinitionType::Dynamic;
     case EV3DSimulatorProjectType::Dynamic: return EModelDefinitionType::Dynamic;
     case EV3DSimulatorProjectType::Prefab:
     case EV3DSimulatorProjectType::World:
@@ -27,8 +27,7 @@ bool V3DSimulatorProjectBuildPolicy::AllowsModelType(
     if (Type == EV3DSimulatorProjectType::World)
     {
         return ModelType == EModelDefinitionType::Static
-            || ModelType == EModelDefinitionType::Dynamic
-            || ModelType == EModelDefinitionType::Character;
+            || ModelType == EModelDefinitionType::Dynamic;
     }
     return ModelType == DefaultModelType(Type);
 }

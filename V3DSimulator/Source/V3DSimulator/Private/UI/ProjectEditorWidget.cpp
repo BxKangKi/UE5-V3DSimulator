@@ -1343,29 +1343,95 @@ void UProjectEditorWidget::RebuildNodeSearchResults()
         const FString NodeName = Matches[I];
         const bool bConfigured = MeshDataObj.IsValid() && MeshDataObj->HasField(NodeName);
 
-        NodeSearchResultsBox->AddSlot().AutoHeight().Padding(0, 0, 0, 4)
-        [
-            SNew(SBorder)
-            .BorderImage(WhiteBrush)
-            .BorderBackgroundColor(CardBorderColor(bDarkMode, !bConfigured))
-            .Padding(1.f)
+        FString CurDynType, CurVehType;
+        Current->Json->TryGetStringField(TEXT("DynamicType"), CurDynType);
+        Current->Json->TryGetStringField(TEXT("VehicleType"), CurVehType);
+        const bool bIsVehicleDoc = CurDynType == TEXT("Vehicle");
+        const FString TuningKey = (CurVehType == TEXT("Train")) ? TEXT("TrainTuning") : TEXT("VehicleTuning");
+
+        bool bIsWheel = false;
+        if (bIsVehicleDoc)
+        {
+            const TSharedPtr<FJsonObject>* TuneObjPtr = nullptr;
+            if (Current->Json->TryGetObjectField(TuningKey, TuneObjPtr) && TuneObjPtr && TuneObjPtr->IsValid())
+            {
+                const TArray<TSharedPtr<FJsonValue>>* WheelArr = nullptr;
+                if ((*TuneObjPtr)->TryGetArrayField(TEXT("WheelMeshNames"), WheelArr) && WheelArr)
+                {
+                    for (const TSharedPtr<FJsonValue>& WVal : *WheelArr)
+                    {
+                        if (WVal.IsValid() && WVal->Type == EJson::String
+                            && WVal->AsString().Equals(NodeName, ESearchCase::IgnoreCase))
+                        {
+                            bIsWheel = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        FString NodeDisplay = NodeName;
+        if (bIsWheel) NodeDisplay += TEXT("  [Wheel]");
+        if (bConfigured) NodeDisplay += TEXT("  [Configured]");
+
+        auto RowHBox = SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
             [
-                SNew(SBorder)
-                .BorderImage(WhiteBrush)
-                .BorderBackgroundColor(CardFillColor(Palette, bDarkMode, I, !bConfigured))
-                .Padding(FMargin(8.f, 4.f))
-                [
-                    SNew(SHorizontalBox)
-                    + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
-                    [
-                        SNew(STextBlock)
-                        .TextStyle(&EditorTextStyle)
-                        .ColorAndOpacity(FSlateColor(bConfigured ? Palette.Text : Palette.Muted))
-                        .Text(Text(bConfigured ? (NodeName + TEXT("  [Configured]")) : NodeName))
-                    ]
-                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-                    [
-                        MakeEditorButton(bConfigured ? TEXT("Remove") : TEXT("+ Add Settings"), [WeakSelf, NodeName, bConfigured]
+                SNew(STextBlock)
+                .TextStyle(&EditorTextStyle)
+                .ColorAndOpacity(FSlateColor((bConfigured || bIsWheel) ? Palette.Text : Palette.Muted))
+                .Text(Text(NodeDisplay))
+            ];
+
+        if (bIsVehicleDoc)
+        {
+            RowHBox->AddSlot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+            [
+                MakeEditorButton(bIsWheel ? TEXT("- Wheel") : TEXT("+ Wheel"), [WeakSelf, NodeName, bIsWheel, TuningKey]
+                {
+                    UProjectEditorWidget* Self = WeakSelf.Get();
+                    if (!Self || Self->bBusy || !Self->Current || !Self->Current->Json) return;
+                    if (Self->bRawDirty) { Self->Message = TEXT("Apply JSON first."); return; }
+                    Self->Remember();
+                    const TSharedPtr<FJsonObject>* TunePtr = nullptr;
+                    TSharedPtr<FJsonObject> TuneObj;
+                    if (Self->Current->Json->TryGetObjectField(TuningKey, TunePtr) && TunePtr && TunePtr->IsValid())
+                    {
+                        TuneObj = *TunePtr;
+                    }
+                    else
+                    {
+                        TuneObj = MakeShared<FJsonObject>();
+                        Self->Current->Json->SetObjectField(TuningKey, TuneObj);
+                    }
+                    TArray<TSharedPtr<FJsonValue>> UpdatedWheels;
+                    const TArray<TSharedPtr<FJsonValue>>* ExistingWheels = nullptr;
+                    if (TuneObj->TryGetArrayField(TEXT("WheelMeshNames"), ExistingWheels) && ExistingWheels)
+                    {
+                        for (const TSharedPtr<FJsonValue>& Val : *ExistingWheels)
+                        {
+                            if (!Val.IsValid() || Val->Type != EJson::String) continue;
+                            if (bIsWheel && Val->AsString().Equals(NodeName, ESearchCase::IgnoreCase)) continue;
+                            UpdatedWheels.Add(Val);
+                        }
+                    }
+                    if (!bIsWheel)
+                    {
+                        UpdatedWheels.Add(MakeShared<FJsonValueString>(NodeName));
+                    }
+                    TuneObj->SetArrayField(TEXT("WheelMeshNames"), UpdatedWheels);
+                    Self->Message = bIsWheel
+                        ? FString::Printf(TEXT("Removed wheel '%s' from %s.WheelMeshNames"), *NodeName, *TuningKey)
+                        : FString::Printf(TEXT("Added wheel '%s' to %s.WheelMeshNames"), *NodeName, *TuningKey);
+                    Self->Changed();
+                })
+            ];
+        }
+
+        RowHBox->AddSlot().AutoWidth().VAlign(VAlign_Center)
+        [
+            MakeEditorButton(bConfigured ? TEXT("Remove") : TEXT("+ Add Settings"), [WeakSelf, NodeName, bConfigured]
                         {
                             UProjectEditorWidget* Self = WeakSelf.Get();
                             if (!Self || Self->bBusy || !Self->Current || !Self->Current->Json) return;
@@ -1394,7 +1460,21 @@ void UProjectEditorWidget::RebuildNodeSearchResults()
                             }
                             Self->Changed();
                         })
-                    ]
+        ];
+
+        NodeSearchResultsBox->AddSlot().AutoHeight().Padding(0, 0, 0, 4)
+        [
+            SNew(SBorder)
+            .BorderImage(WhiteBrush)
+            .BorderBackgroundColor(CardBorderColor(bDarkMode, !(bConfigured || bIsWheel)))
+            .Padding(1.f)
+            [
+                SNew(SBorder)
+                .BorderImage(WhiteBrush)
+                .BorderBackgroundColor(CardFillColor(Palette, bDarkMode, I, !(bConfigured || bIsWheel)))
+                .Padding(FMargin(8.f, 4.f))
+                [
+                    RowHBox
                 ]
             ]
         ];
@@ -2467,7 +2547,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             ];
         }
         else if (Key == TEXT("Shader") || Key == TEXT("MaterialMode") || Key == TEXT("AssetType") || Key == TEXT("ModelType")
-            || Key == TEXT("EntityType") || Key == TEXT("ItemType") || Key == TEXT("ProjectType")
+            || Key == TEXT("DynamicType") || Key == TEXT("ItemType") || Key == TEXT("VehicleType") || Key == TEXT("ProjectType")
             || Key == TEXT("DominantHand") || Key == TEXT("PrimaryHandOverride") || Key == TEXT("Hand")
             || Key == TEXT("Role") || Key == TEXT("Falloff") || Key == TEXT("Shape")
             || Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode") || (Context == TEXT("Colliders") && Key == TEXT("Type")) || (Context == TEXT("Lights") && Key == TEXT("Unit")))
@@ -2478,9 +2558,10 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             if (Key == TEXT("Shader")) Names = {TEXT("Default"), TEXT("Toon")};
             else if (Key == TEXT("MaterialMode")) Names = {TEXT("Auto"), TEXT("Opaque"), TEXT("Opaque Two Sided"), TEXT("Translucent"), TEXT("Translucent Two Sided")};
             else if (Key == TEXT("AssetType")) Names = {TEXT("Model"), TEXT("Sound")};
-            else if (Key == TEXT("ModelType")) Names = {TEXT("Static"), TEXT("Dynamic"), TEXT("Character")};
-            else if (Key == TEXT("EntityType")) Names = {TEXT("Prop"), TEXT("Vehicle"), TEXT("Animal")};
-            else if (Key == TEXT("ItemType")) Names = {TEXT("Misc"), TEXT("Weapon"), TEXT("Tool")};
+            else if (Key == TEXT("ModelType")) Names = {TEXT("Static"), TEXT("Dynamic")};
+            else if (Key == TEXT("DynamicType")) Names = {TEXT("Humanoid"), TEXT("Vehicle"), TEXT("Prop"), TEXT("Creature"), TEXT("Item")};
+            else if (Key == TEXT("ItemType")) Names = {TEXT("Weapon"), TEXT("Tool"), TEXT("Misc")};
+            else if (Key == TEXT("VehicleType")) Names = {TEXT("Car"), TEXT("Train")};
             else if (Key == TEXT("ProjectType")) Names = {TEXT("World"), TEXT("Prefab"), TEXT("Dynamic"), TEXT("Character")};
             else if (Key == TEXT("DominantHand") || Key == TEXT("PrimaryHandOverride") || Key == TEXT("Hand")) Names = {TEXT("Right"), TEXT("Left")};
             else if (Key == TEXT("Role")) Names = {TEXT("Disabled"), TEXT("Primary"), TEXT("Secondary"), TEXT("Support")};
@@ -2496,13 +2577,53 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                 {
                     if (!Item || bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending || Info == ESelectInfo::Direct) return;
                     Remember(); Object->SetStringField(Key, *Item);
-                    // Only remove mutually exclusive discriminators, preserving all unrelated authored data.
+                    // Keep mutually exclusive discriminators and sub-configs consistent.
                     if (Key == TEXT("AssetType") && *Item == TEXT("Sound")) Object->RemoveField(TEXT("ModelType"));
                     if (Key == TEXT("ModelType") && *Item != TEXT("Dynamic"))
-                    { Object->RemoveField(TEXT("EntityType")); Object->RemoveField(TEXT("ItemType")); }
-                    if (Key == TEXT("EntityType")) Object->RemoveField(TEXT("ItemType"));
-                    if (Key == TEXT("ItemType")) Object->RemoveField(TEXT("EntityType"));
-                    if (Key == TEXT("ModelType") && *Item == TEXT("Character")) Object->RemoveField(TEXT("GravityField"));
+                    {
+                        Object->RemoveField(TEXT("DynamicType"));
+                        Object->RemoveField(TEXT("ItemType"));
+                        Object->RemoveField(TEXT("VehicleType"));
+                        Object->RemoveField(TEXT("Bones"));
+                        Object->RemoveField(TEXT("VehicleTuning"));
+                        Object->RemoveField(TEXT("TrainTuning"));
+                    }
+                    else if (Key == TEXT("DynamicType"))
+                    {
+                        if (*Item != TEXT("Item")) Object->RemoveField(TEXT("ItemType"));
+                        else if (!Object->HasField(TEXT("ItemType"))) Object->SetStringField(TEXT("ItemType"), TEXT("Misc"));
+
+                        if (*Item != TEXT("Vehicle"))
+                        {
+                            Object->RemoveField(TEXT("VehicleType"));
+                            Object->RemoveField(TEXT("VehicleTuning"));
+                            Object->RemoveField(TEXT("TrainTuning"));
+                        }
+                        else if (!Object->HasField(TEXT("VehicleType")))
+                        {
+                            Object->SetStringField(TEXT("VehicleType"), TEXT("Car"));
+                        }
+
+                        if (*Item == TEXT("Humanoid"))
+                        {
+                            Object->RemoveField(TEXT("GravityField"));
+                        }
+                        else
+                        {
+                            Object->RemoveField(TEXT("Bones"));
+                        }
+                    }
+                    else if (Key == TEXT("VehicleType"))
+                    {
+                        if (*Item == TEXT("Train"))
+                        {
+                            Object->RemoveField(TEXT("VehicleTuning"));
+                        }
+                        else
+                        {
+                            Object->RemoveField(TEXT("TrainTuning"));
+                        }
+                    }
                     Changed();
                 })[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(DisplayValue))]];
         }
@@ -2755,7 +2876,7 @@ void UProjectEditorWidget::StartPreview()
     if (!ModelDefinitionJson::ValidateDefinition(Current->Json, Current->Path, Current->SourcePath, Definition, Error))
     { Message = Error; return; }
     PreviewBuilder = NewObject<UProjectSourceModelBuilder>(this);
-    if (auto* R = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this); R && Definition.ModelType == EModelDefinitionType::Character)
+    if (auto* R = UV3DSimulatorGameInstance::GetAssetRegistryFromContext(this); R && Definition.IsHumanoid())
     {
         PreviewBuilder->SetCharacterSkeletonOverride(R->DefaultCharacterSkeleton.LoadSynchronous());
     }

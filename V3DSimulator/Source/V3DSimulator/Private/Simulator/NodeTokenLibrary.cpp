@@ -46,7 +46,7 @@ namespace SimulatorNodeTokens
             Token == TEXT("CAMERA") || Token == TEXT("SOCKET") || Token == TEXT("STATIC") ||
             Token == TEXT("VEHICLE") || Token == TEXT("WHEEL") || Token == TEXT("DOOR") ||
             Token == TEXT("SEAT") || Token == TEXT("SPAWN") || Token == TEXT("NAV") ||
-            Token == TEXT("WATER"))
+            Token == TEXT("WATER") || Token == TEXT("RAIL"))
         {
             return NodeTypeFamily;
         }
