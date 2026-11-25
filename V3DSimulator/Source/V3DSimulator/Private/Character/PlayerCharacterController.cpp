@@ -719,22 +719,36 @@ void APlayerCharacterController::RefreshAuthoritativePlayerHealthDisplay()
         ? SubSystem.Get() : UGameManagerSubSystem::FindGameManager(this);
     const UWorldData* WorldData = IsValid(Manager) ? Manager->GetWorldData() : nullptr;
     const UPlayerData* PlayerData = IsValid(Manager) ? Manager->GetPlayerData() : nullptr;
-    if (IsValid(Manager) && IsValid(WorldData) && IsValid(PlayerData) && !Manager->IsWorldLoading())
+    if (IsValid(Manager) && IsValid(WorldData) && !Manager->IsWorldLoading())
     {
         NextState.bSurvivalMode = Manager->GetPlayMode() == EPlayMode::RealLife;
-        // The existing save format keys health by the world's selected character record. Read it
-        // afresh, rather than retaining a pointer into Players across loads or character switches.
-        const FString PlayerId = WorldData->Player.IsEmpty()
-            ? FString(TEXT("Player")) : FPaths::GetCleanFilename(WorldData->Player);
-        const FWorldPlayerRecord* Record = PlayerData->FindPlayer(PlayerId);
-        const float MaximumHealth = WorldData->Gameplay.PlayerMaxHealth;
-        if (Record && FMath::IsFinite(Record->Health)
-            && FMath::IsFinite(MaximumHealth) && MaximumHealth > 0.0f)
+        const float MaximumHealth = (FMath::IsFinite(WorldData->Gameplay.PlayerMaxHealth) && WorldData->Gameplay.PlayerMaxHealth > 0.0f)
+            ? WorldData->Gameplay.PlayerMaxHealth
+            : 100.0f;
+
+        // Look up the active player record ("Player" by default), falling back to WorldData->Player filename,
+        // and defaulting to full MaximumHealth if no saved record exists yet so Survival HUD always appears.
+        const FWorldPlayerRecord* Record = nullptr;
+        if (IsValid(PlayerData))
         {
-            NextState.bHasState = true;
-            NextState.MaximumHealth = MaximumHealth;
-            NextState.CurrentHealth = FMath::Clamp(Record->Health, 0.0f, MaximumHealth);
+            Record = PlayerData->FindPlayer(Manager->GetActivePlayerId());
+            if (!Record && !WorldData->Player.IsEmpty())
+            {
+                Record = PlayerData->FindPlayer(FPaths::GetCleanFilename(WorldData->Player));
+            }
+            if (!Record)
+            {
+                Record = PlayerData->FindPlayer(TEXT("Player"));
+            }
         }
+
+        const float ResolvedHealth = (Record && FMath::IsFinite(Record->Health))
+            ? FMath::Clamp(Record->Health, 0.0f, MaximumHealth)
+            : MaximumHealth;
+
+        NextState.bHasState = true;
+        NextState.MaximumHealth = MaximumHealth;
+        NextState.CurrentHealth = ResolvedHealth;
     }
 
     if (PlayerHealthDisplayState.bHasState != NextState.bHasState

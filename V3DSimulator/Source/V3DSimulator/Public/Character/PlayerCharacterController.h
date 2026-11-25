@@ -314,6 +314,8 @@ public:
 
     /** Starts pause-menu travel and reports whether this controller now owns an accepted request. */
     bool TryExitToWorldSelectionFromPauseMenu();
+    void RefreshAuthoritativePlayerHealthDisplay();
+    void RefreshSurvivalHUD();
 
     /** True after an accepted request, including duplicate listeners fired by the same button click. */
     bool IsMenuWorldTravelPending() const { return bMenuWorldTravelPending; }
@@ -515,8 +517,7 @@ private:
     UFUNCTION()
     void OnRep_PlayerHealthDisplayState();
 
-    void RefreshAuthoritativePlayerHealthDisplay();
-    void RefreshSurvivalHUD();
+
     float HealthDisplayRefreshElapsed = 0.0f;
 
 };

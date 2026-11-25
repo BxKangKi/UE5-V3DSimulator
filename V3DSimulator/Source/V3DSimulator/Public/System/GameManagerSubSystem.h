@@ -226,6 +226,9 @@ public:
     bool SetWorldDay(double DayNumber);
     UFUNCTION(BlueprintPure, Category="Game|Player")
     UPlayerData* GetPlayerData() const { return ActivePlayerData.Get(); }
+    FString GetActivePlayerId() const { return ActivePlayerId.IsEmpty() ? FString(TEXT("Player")) : ActivePlayerId; }
+    /** Applies survival-mode (EPlayMode::RealLife) impact damage authoritatively and updates the player's HUD. */
+    bool ApplyPlayerImpactDamage(AActor* TargetActor, float DamageAmount);
     UFUNCTION(BlueprintPure, Category="Game|Weapon")
     AWeaponActor* GetEquippedWeaponActor() const { return EquippedWeapon.Get(); }
     UFUNCTION(BlueprintPure, Category="Game|Level")

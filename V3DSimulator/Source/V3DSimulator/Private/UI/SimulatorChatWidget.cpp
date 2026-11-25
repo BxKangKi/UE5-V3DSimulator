@@ -39,7 +39,7 @@ void USimulatorChatWidget::BuildNativeLayout()
     OutputScroll = WidgetTree->ConstructWidget<UScrollBox>();
     Box->AddChildToVerticalBox(OutputScroll)->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
     Output = AddText(OutputScroll, History.IsEmpty()
-        ? FText::FromString(TEXT("Press T to chat  |  /sim list  |  Esc: close"))
+        ? FText::FromString(TEXT("Press T to chat  |  /help  |  Esc: close"))
         : FText::FromString(FString::Join(History, TEXT("\n"))));
 
     UHorizontalBox* InputRow = WidgetTree->ConstructWidget<UHorizontalBox>();
@@ -98,7 +98,9 @@ void USimulatorChatWidget::FocusInput()
 }
 void USimulatorChatWidget::AppendMessage(const FString& Message)
 {
-    History.Add(Message.Left(512));
+    TArray<FString> SplitLines; Message.Left(1024).ParseIntoArrayLines(SplitLines, false);
+    if (SplitLines.IsEmpty()) History.Add(Message.Left(1024));
+    else for (const FString& SplitLine : SplitLines) History.Add(SplitLine);
     while (History.Num() > FMath::Clamp(MaxHistoryLines, 1, 64)) History.RemoveAt(0);
     if (Output) Output->SetText(FText::FromString(FString::Join(History, TEXT("\n"))));
     if (OutputScroll) OutputScroll->ScrollToEnd();
@@ -116,7 +118,7 @@ void USimulatorChatWidget::SubmitCurrentInput()
         {
             if (!Controller->SubmitChatCommand(Line))
             {
-                AppendMessage(TEXT("Unknown command. Try /sim list or /sim run <name>."));
+                AppendMessage(TEXT("Unknown command. Try /help."));
             }
         }
         else

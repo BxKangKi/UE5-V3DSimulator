@@ -1343,6 +1343,15 @@ void ACharacterController::MovementInput(const float X, const float Y)
     // movement component's normal braking, while flying intentionally eases out over time.
 }
 
+FVector ACharacterController::GetMeasuredVelocity() const
+{
+    if (IsValid(Component.Get()))
+    {
+        return Component->GetEffectiveVelocity();
+    }
+    return GetVelocity();
+}
+
 void ACharacterController::ClearTransientInputStatePreservingVelocity()
 {
     RawMoveInput = FVector::ZeroVector;

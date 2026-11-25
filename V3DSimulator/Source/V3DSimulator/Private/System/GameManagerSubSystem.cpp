@@ -3727,6 +3727,17 @@ void UGameManagerSubSystem::SetPlayMode(EPlayMode NewMode)
     InitializeToolbarSlotsIfNeeded();
     ApplySelectedToolbarItem(false);
     LastSaveMessage = PlayMode == EPlayMode::Creator ? TEXT("Creator Mode") : TEXT("Real Life Mode");
+    if (UWorld* World = GetWorld())
+    {
+        for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+        {
+            if (APlayerCharacterController* PC = Cast<APlayerCharacterController>(It->Get()))
+            {
+                PC->RefreshAuthoritativePlayerHealthDisplay();
+                PC->RefreshSurvivalHUD();
+            }
+        }
+    }
     NotifyToolbarChanged();
     NotifyStateChanged();
 }
@@ -5694,4 +5705,69 @@ void UGameManagerSubSystem::CommitPlayerStateBeforeSuspend()
             UE_LOG(LogTemp, Error, TEXT("%s"), *LastSaveMessage);
         }
     }
+}
+
+
+bool UGameManagerSubSystem::ApplyPlayerImpactDamage(AActor* TargetActor, const float DamageAmount)
+{
+    if (PlayMode != EPlayMode::RealLife || !FMath::IsFinite(DamageAmount) || DamageAmount <= 0.0f)
+    {
+        return false;
+    }
+
+    UWorld* World = GetWorld();
+    if (!IsValid(World) || World->GetNetMode() == NM_Client)
+    {
+        return false;
+    }
+
+    if (!IsValid(ActiveWorldData))
+    {
+        return false;
+    }
+    if (!IsValid(ActivePlayerData))
+    {
+        ActivePlayerData = NewObject<UPlayerData>(this);
+        if (!IsValid(ActivePlayerData))
+        {
+            return false;
+        }
+    }
+
+    const float MaxHealth = FMath::IsFinite(ActiveWorldData->Gameplay.PlayerMaxHealth) && ActiveWorldData->Gameplay.PlayerMaxHealth > 0.0f
+        ? ActiveWorldData->Gameplay.PlayerMaxHealth
+        : 100.0f;
+
+    const FString PlayerKey = GetActivePlayerId();
+    FWorldPlayerRecord& Record = ActivePlayerData->FindOrAddPlayer(PlayerKey);
+    if (!FMath::IsFinite(Record.Health) || Record.Health < 0.0f)
+    {
+        Record.Health = MaxHealth;
+    }
+
+    const float NextHealth = FMath::Clamp(Record.Health - DamageAmount, 0.0f, MaxHealth);
+    if (FMath::IsNearlyEqual(NextHealth, Record.Health, KINDA_SMALL_NUMBER))
+    {
+        return false;
+    }
+
+    Record.Health = NextHealth;
+
+    // Push updated health to the owning PlayerController immediately.
+    if (APawn* Pawn = Cast<APawn>(TargetActor))
+    {
+        if (APlayerCharacterController* PC = Cast<APlayerCharacterController>(Pawn->GetController()))
+        {
+            PC->RefreshAuthoritativePlayerHealthDisplay();
+            return true;
+        }
+    }
+    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    {
+        if (APlayerCharacterController* PC = Cast<APlayerCharacterController>(It->Get()))
+        {
+            PC->RefreshAuthoritativePlayerHealthDisplay();
+        }
+    }
+    return true;
 }

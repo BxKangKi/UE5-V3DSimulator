@@ -12,6 +12,10 @@
 #include "Widgets/Layout/SBox.h"
 #include "System/ProjectSourceModelBuilder.h"
 #include "Simulator/ModelDefinitionJson.h"
+#include "Simulator/NodeTokenLibrary.h"
+#include "Misc/FileHelper.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Animation/Skeleton.h"
@@ -1122,6 +1126,400 @@ bool UProjectEditorWidget::ApplyRaw()
     Remember(); Current->Json = Parsed.JsonObject; Changed(); return true;
 }
 
+
+namespace V3DNodeDiscovery
+{
+    static bool IsInstancedDirectiveName(const FString& RawName, const FSimulatorParsedNodeName& Parsed)
+    {
+        if (Parsed.HasEffectiveToken(FName(TEXT("INST"))))
+        {
+            return true;
+        }
+        if (RawName.Contains(TEXT(";INST"), ESearchCase::IgnoreCase)
+            || RawName.EndsWith(TEXT("_INST"), ESearchCase::IgnoreCase)
+            || RawName.Contains(TEXT("_INST_"), ESearchCase::IgnoreCase)
+            || RawName.Contains(TEXT(".INST"), ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    static void TryCollectMeshName(const FString& RawName, TSet<FString>& OutNames)
+    {
+        const FString Trimmed = RawName.TrimStartAndEnd();
+        if (Trimmed.IsEmpty())
+        {
+            return;
+        }
+        const FSimulatorParsedNodeName Parsed = USimulatorNodeTokenLibrary::ParseNodeName(Trimmed);
+        if (IsInstancedDirectiveName(Trimmed, Parsed))
+        {
+            return;
+        }
+        const FString Base = Parsed.BaseName.TrimStartAndEnd();
+        if (!Base.IsEmpty())
+        {
+            OutNames.Add(Base);
+        }
+    }
+
+    static void ExtractFromGltfJsonText(const FString& JsonText, TSet<FString>& OutNames)
+    {
+        TSharedPtr<FJsonObject> Root;
+        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+        if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+        {
+            return;
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+        if (Root->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes)
+        {
+            for (const TSharedPtr<FJsonValue>& Val : *Nodes)
+            {
+                if (!Val.IsValid() || Val->Type != EJson::Object) continue;
+                const TSharedPtr<FJsonObject> NodeObj = Val->AsObject();
+                if (!NodeObj.IsValid()) continue;
+                double MeshIdx = -1.0;
+                if (!NodeObj->TryGetNumberField(TEXT("mesh"), MeshIdx)) continue;
+                FString NodeName;
+                if (NodeObj->TryGetStringField(TEXT("name"), NodeName))
+                {
+                    TryCollectMeshName(NodeName, OutNames);
+                }
+            }
+        }
+    }
+
+    static void ExtractModelNodeNames(const FString& SourcePath, TArray<FString>& OutSortedNames)
+    {
+        OutSortedNames.Reset();
+        if (SourcePath.IsEmpty() || !FPaths::FileExists(SourcePath))
+        {
+            return;
+        }
+
+        TSet<FString> UniqueNames;
+        const FString Ext = FPaths::GetExtension(SourcePath).ToLower();
+        if (Ext == TEXT("glb"))
+        {
+            TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*SourcePath));
+            if (Reader && Reader->TotalSize() >= 20)
+            {
+                uint32 Magic = 0, Version = 0, TotalLength = 0;
+                uint32 ChunkLen = 0, ChunkType = 0;
+                *Reader << Magic << Version << TotalLength << ChunkLen << ChunkType;
+                constexpr uint32 GlbMagic = 0x46546C67u;
+                constexpr uint32 JsonChunkType = 0x4E4F534Au;
+                constexpr uint32 MaxJsonChunkBytes = 32u * 1024u * 1024u;
+                if (Magic == GlbMagic && ChunkType == JsonChunkType && ChunkLen > 0 && ChunkLen <= MaxJsonChunkBytes
+                    && static_cast<int64>(20 + ChunkLen) <= Reader->TotalSize())
+                {
+                    TArray<uint8> JsonBytes;
+                    JsonBytes.SetNumUninitialized(static_cast<int32>(ChunkLen));
+                    Reader->Serialize(JsonBytes.GetData(), ChunkLen);
+                    FUTF8ToTCHAR Conv(reinterpret_cast<const ANSICHAR*>(JsonBytes.GetData()), JsonBytes.Num());
+                    ExtractFromGltfJsonText(FString(Conv.Length(), Conv.Get()), UniqueNames);
+                }
+            }
+        }
+        else if (Ext == TEXT("gltf"))
+        {
+            const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
+            if (FileSize > 0 && FileSize <= 32ll * 1024 * 1024)
+            {
+                FString JsonText;
+                if (FFileHelper::LoadFileToString(JsonText, *SourcePath))
+                {
+                    ExtractFromGltfJsonText(JsonText, UniqueNames);
+                }
+            }
+        }
+        else if (Ext == TEXT("obj"))
+        {
+            const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
+            if (FileSize > 0 && FileSize <= 64ll * 1024 * 1024)
+            {
+                TArray<FString> Lines;
+                if (FFileHelper::LoadFileToStringArray(Lines, *SourcePath))
+                {
+                    for (const FString& Line : Lines)
+                    {
+                        if (Line.StartsWith(TEXT("o ")) || Line.StartsWith(TEXT("g ")))
+                        {
+                            TryCollectMeshName(Line.Mid(2), UniqueNames);
+                        }
+                    }
+                }
+            }
+        }
+
+        OutSortedNames = UniqueNames.Array();
+        OutSortedNames.Sort();
+    }
+}
+
+void UProjectEditorWidget::EnsureModelNodeNamesLoaded(const FString& SourcePath)
+{
+    if (CachedNodeNamesSourcePath == SourcePath)
+    {
+        return;
+    }
+    CachedNodeNamesSourcePath = SourcePath;
+    V3DNodeDiscovery::ExtractModelNodeNames(SourcePath, CachedModelNodeNames);
+}
+
+void UProjectEditorWidget::RebuildNodeSearchResults()
+{
+    using namespace V3DEditorUI;
+    if (!NodeSearchResultsBox.IsValid() || !Current || !Current->Json)
+    {
+        return;
+    }
+
+    NodeSearchResultsBox->ClearChildren();
+    const V3DHUDStyle::FAuthoringPalette Palette = GetThemePalette();
+    const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush("WhiteBrush");
+
+    const TSharedPtr<FJsonObject>* MeshDataPtr = nullptr;
+    TSharedPtr<FJsonObject> MeshDataObj;
+    if (Current->Json->TryGetObjectField(TEXT("MeshData"), MeshDataPtr) && MeshDataPtr && MeshDataPtr->IsValid())
+    {
+        MeshDataObj = *MeshDataPtr;
+    }
+
+    const FString Query = NodeSearchQuery.TrimStartAndEnd();
+    TArray<FString> Matches;
+    Matches.Reserve(CachedModelNodeNames.Num());
+    for (const FString& Name : CachedModelNodeNames)
+    {
+        if (Query.IsEmpty() || Name.Contains(Query, ESearchCase::IgnoreCase))
+        {
+            Matches.Add(Name);
+        }
+    }
+
+    const int32 TotalCount = CachedModelNodeNames.Num();
+    const int32 MatchCount = Matches.Num();
+    const int32 ShowLimit = FMath::Min(MatchCount, 60);
+
+    NodeSearchResultsBox->AddSlot().AutoHeight().Padding(2, 2, 2, 6)
+    [
+        SNew(STextBlock)
+        .TextStyle(&EditorTextStyle)
+        .ColorAndOpacity(FSlateColor(Palette.Muted))
+        .Text(Text(TotalCount > 0
+            ? FString::Printf(TEXT("Nodes found: %d / %d (INST excluded)"), MatchCount, TotalCount)
+            : TEXT("No embedded node names found (type a node name above and click + Add Custom Node).")))
+    ];
+
+    TWeakObjectPtr<UProjectEditorWidget> WeakSelf(this);
+    for (int32 I = 0; I < ShowLimit; ++I)
+    {
+        const FString NodeName = Matches[I];
+        const bool bConfigured = MeshDataObj.IsValid() && MeshDataObj->HasField(NodeName);
+
+        NodeSearchResultsBox->AddSlot().AutoHeight().Padding(0, 0, 0, 4)
+        [
+            SNew(SBorder)
+            .BorderImage(WhiteBrush)
+            .BorderBackgroundColor(CardBorderColor(bDarkMode, !bConfigured))
+            .Padding(1.f)
+            [
+                SNew(SBorder)
+                .BorderImage(WhiteBrush)
+                .BorderBackgroundColor(CardFillColor(Palette, bDarkMode, I, !bConfigured))
+                .Padding(FMargin(8.f, 4.f))
+                [
+                    SNew(SHorizontalBox)
+                    + SHorizontalBox::Slot().FillWidth(1).VAlign(VAlign_Center)
+                    [
+                        SNew(STextBlock)
+                        .TextStyle(&EditorTextStyle)
+                        .ColorAndOpacity(FSlateColor(bConfigured ? Palette.Text : Palette.Muted))
+                        .Text(Text(bConfigured ? (NodeName + TEXT("  [Configured]")) : NodeName))
+                    ]
+                    + SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
+                    [
+                        MakeEditorButton(bConfigured ? TEXT("Remove") : TEXT("+ Add Settings"), [WeakSelf, NodeName, bConfigured]
+                        {
+                            UProjectEditorWidget* Self = WeakSelf.Get();
+                            if (!Self || Self->bBusy || !Self->Current || !Self->Current->Json) return;
+                            if (Self->bRawDirty) { Self->Message = TEXT("Apply JSON first."); return; }
+                            Self->Remember();
+                            const TSharedPtr<FJsonObject>* ExistingMap = nullptr;
+                            TSharedPtr<FJsonObject> MapObj;
+                            if (Self->Current->Json->TryGetObjectField(TEXT("MeshData"), ExistingMap) && ExistingMap && ExistingMap->IsValid())
+                            {
+                                MapObj = *ExistingMap;
+                            }
+                            else
+                            {
+                                MapObj = MakeShared<FJsonObject>();
+                                Self->Current->Json->SetObjectField(TEXT("MeshData"), MapObj);
+                            }
+                            if (bConfigured)
+                            {
+                                MapObj->RemoveField(NodeName);
+                                Self->Message = TEXT("Removed node settings: ") + NodeName;
+                            }
+                            else
+                            {
+                                MapObj->SetObjectField(NodeName, V3DProjectEditor::EntryTemplate(TEXT("MeshData")));
+                                Self->Message = TEXT("Added node settings (Collision/Lights): ") + NodeName;
+                            }
+                            Self->Changed();
+                        })
+                    ]
+                ]
+            ]
+        ];
+    }
+
+    if (MatchCount > ShowLimit)
+    {
+        NodeSearchResultsBox->AddSlot().AutoHeight().Padding(2, 4, 2, 2)
+        [
+            SNew(STextBlock)
+            .TextStyle(&EditorTextStyle)
+            .ColorAndOpacity(FSlateColor(Palette.Muted))
+            .Text(Text(FString::Printf(TEXT("... %d more matches. Refine search to narrow results."), MatchCount - ShowLimit)))
+        ];
+    }
+}
+
+void UProjectEditorWidget::AddNodeSettingsSection(const TSharedRef<SVerticalBox>& Box)
+{
+    using namespace V3DEditorUI;
+    if (!Current || !Current->Json || Current->SourcePath.IsEmpty())
+    {
+        return;
+    }
+
+    FString AssetType;
+    Current->Json->TryGetStringField(TEXT("AssetType"), AssetType);
+    const FString Ext = FPaths::GetExtension(Current->SourcePath).ToLower();
+    const bool bIsModelFile = Ext == TEXT("glb") || Ext == TEXT("gltf") || Ext == TEXT("fbx") || Ext == TEXT("obj") || Ext == TEXT("stl");
+    if (!bIsModelFile || (!AssetType.IsEmpty() && AssetType != TEXT("Model")))
+    {
+        return;
+    }
+
+    EnsureModelNodeNamesLoaded(Current->SourcePath);
+
+    const V3DHUDStyle::FAuthoringPalette Palette = GetThemePalette();
+    const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush("WhiteBrush");
+    TWeakObjectPtr<UProjectEditorWidget> WeakSelf(this);
+
+    auto SearchBox = SNew(SEditableTextBox)
+        .Style(&EditorInputStyle)
+        .Text(Text(NodeSearchQuery))
+        .HintText(Text(TEXT("Search node name for MeshData (INST excluded)...")))
+        .OnTextChanged_Lambda([WeakSelf](const FText& NewText)
+        {
+            if (UProjectEditorWidget* Self = WeakSelf.Get())
+            {
+                Self->NodeSearchQuery = NewText.ToString();
+                Self->RebuildNodeSearchResults();
+            }
+        });
+
+    NodeSearchResultsBox = SNew(SVerticalBox);
+    RebuildNodeSearchResults();
+
+    auto SectionBody = SNew(SVerticalBox)
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+        [
+            SNew(STextBlock)
+            .TextStyle(&EditorTextStyle)
+            .ColorAndOpacity(FSlateColor(Palette.Text))
+            .Text(Text(TEXT("Node Settings (Collision / Colliders / Lights) — MeshData")))
+        ]
+        + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 6)
+        [
+            SNew(SHorizontalBox)
+            + SHorizontalBox::Slot().FillWidth(1).Padding(0, 0, 6, 0)[SearchBox]
+            + SHorizontalBox::Slot().AutoWidth().Padding(0, 0, 6, 0)
+            [
+                MakeEditorButton(TEXT("+ Add Custom Node"), [WeakSelf]
+                {
+                    UProjectEditorWidget* Self = WeakSelf.Get();
+                    if (!Self || Self->bBusy || !Self->Current || !Self->Current->Json) return;
+                    if (Self->bRawDirty) { Self->Message = TEXT("Apply JSON first."); return; }
+                    const FString RawName = Self->NodeSearchQuery.TrimStartAndEnd();
+                    const FSimulatorParsedNodeName Parsed = USimulatorNodeTokenLibrary::ParseNodeName(RawName);
+                    if (RawName.IsEmpty() || V3DNodeDiscovery::IsInstancedDirectiveName(RawName, Parsed))
+                    {
+                        Self->Message = TEXT("Enter a non-empty, non-INST node/mesh name.");
+                        return;
+                    }
+                    const FString CleanName = Parsed.BaseName.TrimStartAndEnd();
+                    if (CleanName.IsEmpty()) return;
+                    Self->Remember();
+                    const TSharedPtr<FJsonObject>* ExistingMap = nullptr;
+                    TSharedPtr<FJsonObject> MapObj;
+                    if (Self->Current->Json->TryGetObjectField(TEXT("MeshData"), ExistingMap) && ExistingMap && ExistingMap->IsValid())
+                    {
+                        MapObj = *ExistingMap;
+                    }
+                    else
+                    {
+                        MapObj = MakeShared<FJsonObject>();
+                        Self->Current->Json->SetObjectField(TEXT("MeshData"), MapObj);
+                    }
+                    if (!MapObj->HasField(CleanName))
+                    {
+                        MapObj->SetObjectField(CleanName, V3DProjectEditor::EntryTemplate(TEXT("MeshData")));
+                        Self->Message = TEXT("Added node settings: ") + CleanName;
+                        Self->Changed();
+                    }
+                    else
+                    {
+                        Self->Message = TEXT("Node settings already exist for: ") + CleanName;
+                    }
+                })
+            ]
+            + SHorizontalBox::Slot().AutoWidth()
+            [
+                MakeEditorButton(TEXT("Rescan"), [WeakSelf]
+                {
+                    if (UProjectEditorWidget* Self = WeakSelf.Get())
+                    {
+                        Self->CachedNodeNamesSourcePath.Reset();
+                        if (Self->Current) Self->EnsureModelNodeNamesLoaded(Self->Current->SourcePath);
+                        Self->RebuildNodeSearchResults();
+                    }
+                })
+            ]
+        ]
+        + SVerticalBox::Slot().AutoHeight()
+        [
+            SNew(SBox).MaxDesiredHeight(180.f)
+            [
+                SNew(SScrollBox)
+                + SScrollBox::Slot()[NodeSearchResultsBox.ToSharedRef()]
+            ]
+        ];
+
+    Box->AddSlot().AutoHeight().Padding(0, 0, 0, 10)
+    [
+        SNew(SBorder)
+        .BorderImage(WhiteBrush)
+        .BorderBackgroundColor(CardBorderColor(bDarkMode, true))
+        .Padding(1.f)
+        [
+            SNew(SBorder)
+            .BorderImage(WhiteBrush)
+            .BorderBackgroundColor(Palette.Panel)
+            .Padding(FMargin(10.f, 8.f))
+            [
+                SectionBody
+            ]
+        ]
+    ];
+}
+
 void UProjectEditorWidget::RefreshForm()
 {
     using namespace V3DEditorUI;
@@ -1140,6 +1538,7 @@ void UProjectEditorWidget::RefreshForm()
     if (!Current->SourcePath.IsEmpty() && !Current->Json->HasField(TEXT("AssetType")))
         Form->AddSlot().AutoHeight().Padding(0, 0, 0, 8)[MakeEditorButton(TEXT("Add AssetType"), [this]
         { Remember(); Current->Json->SetStringField(TEXT("AssetType"), FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase) ? TEXT("Sound") : TEXT("Model")); Changed(); })];
+    AddNodeSettingsSection(Form.ToSharedRef());
     AddObject(Current->Json, V3DProjectEditor::Suggestions(*Current), Form.ToSharedRef());
 }
 
@@ -1224,7 +1623,8 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             auto Nested = SNew(SVerticalBox);
             const auto HintObject = Hint && (*Hint).IsValid() && (*Hint)->Type == EJson::Object ? (*Hint)->AsObject() : V3DProjectEditor::EntryTemplate(Context);
             AddObject(Value->AsObject(), HintObject, Nested, Depth + 1, Key);
-            PairCardBody->AddSlot().AutoHeight().Padding(4, 2, 0, 0)[SNew(SExpandableArea).InitiallyCollapsed(true)
+            const bool bExpandObj = (Key == TEXT("MeshData") && !Value->AsObject()->Values.IsEmpty()) || Context == TEXT("MeshData");
+            PairCardBody->AddSlot().AutoHeight().Padding(4, 2, 0, 0)[SNew(SExpandableArea).InitiallyCollapsed(!bExpandObj)
                 .BorderImage(WhiteBrush)
                 .BorderBackgroundColor(Palette.Panel)
                 .BodyBorderImage(WhiteBrush)
@@ -1372,7 +1772,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             || Key == TEXT("EntityType") || Key == TEXT("ItemType") || Key == TEXT("ProjectType")
             || Key == TEXT("DominantHand") || Key == TEXT("PrimaryHandOverride") || Key == TEXT("Hand")
             || Key == TEXT("Role") || Key == TEXT("Falloff") || Key == TEXT("Shape")
-            || Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode"))
+            || Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode") || (Context == TEXT("Colliders") && Key == TEXT("Type")) || (Context == TEXT("Lights") && Key == TEXT("Unit")))
         {
             auto Options = MakeShared<TArray<TSharedPtr<FString>>>();
             FString DisplayValue = ValueText(Value);
@@ -1389,6 +1789,8 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             else if (Key == TEXT("Falloff")) Names = {TEXT("Constant"), TEXT("Linear"), TEXT("InverseSquare")};
             else if (Key == TEXT("Shape")) Names = {TEXT("Box"), TEXT("Sphere")};
             else if (Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode")) Names = {TEXT("Average"), TEXT("Min"), TEXT("Multiply"), TEXT("Max")};
+            else if (Context == TEXT("Colliders") && Key == TEXT("Type")) Names = {TEXT("None"), TEXT("Sphere"), TEXT("Capsule"), TEXT("Box")};
+            else if (Context == TEXT("Lights") && Key == TEXT("Unit")) Names = {TEXT("Unitless"), TEXT("Candelas"), TEXT("Lumens"), TEXT("EV")};
             for (const auto& Name : Names) Options->Add(MakeShared<FString>(Name));
             PairCardBody->AddSlot().AutoHeight()[SNew(SComboBox<TSharedPtr<FString>>).ComboBoxStyle(&EditorComboStyle).ItemStyle(&EditorRowStyle).OptionsSource(&Options.Get())
                 .OnGenerateWidget_Lambda([this, Options](TSharedPtr<FString> Item) { return SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Item.IsValid() ? Text(*Item) : FText::GetEmpty()); })
@@ -1585,7 +1987,7 @@ void UProjectEditorWidget::NativeDestruct()
 {
     ++RequestGeneration;
     bBusy = false; bFormRefreshPending = false; bShowFileBrowser = false;
-    BrowserEntries.Reset(); BrowserSelectedFiles.Reset();
+    BrowserEntries.Reset(); BrowserSelectedFiles.Reset(); CachedModelNodeNames.Reset(); CachedNodeNamesSourcePath.Reset();
     InvalidatePreview();
     if (IsValid(BuildStatus))
     {
@@ -1600,7 +2002,7 @@ void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
 {
     Super::ReleaseSlateResources(bReleaseChildren);
     bFormRefreshPending = false;
-    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset();
+    List.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset(); NodeSearchResultsBox.Reset();
 }
 
 void UProjectEditorWidget::StartPreview()

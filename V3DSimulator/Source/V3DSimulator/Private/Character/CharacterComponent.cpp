@@ -9,6 +9,7 @@
  */
 
 #include "Character/CharacterComponent.h"
+#include "System/GameManagerSubSystem.h"
 #include "Gravity/GravityFieldTypes.h"
 #include "Character/RagdollRecoveryMath.h"
 #include "Character/SwimmingSurfaceMath.h"
@@ -1035,18 +1036,52 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
         bRagdollRecoveryWantsSwimming = false;
     }
 
+    if (RagdollImpactDamageCooldown > 0.0f)
+    {
+        RagdollImpactDamageCooldown = FMath::Max(0.0f, RagdollImpactDamageCooldown - DeltaTime);
+    }
+
     const bool bRagdollLikeState = IsRagdollLikeState();
     if (!bRagdollLikeState)
     {
+        bHasPrevRagdollVelocity = false;
         UpdateRagdollVelocityHistory(DeltaTime, CurrentVelocity);
         ImpactVelocity = CalculateImpactVelocity(CurrentVelocity);
+        if (!bStreamingMovementSuspended && !bInvincible && ImpactVelocity.Size() > RagdollResistance)
+        {
+            ApplySurvivalImpactDamageIfNeeded(ImpactVelocity.Size());
+        }
     }
     else
     {
         // Active ragdoll uses the actor as a location-only camera/control anchor.
-        // Do not feed that anchor displacement back into later ragdoll velocity inheritance.
+        // Measure live physics velocity from the ragdoll skeleton for HUD readouts and survival impact damage,
+        // while keeping PrevVelocity isolated from non-ragdoll velocity inheritance.
         PrevVelocity = CurrentVelocity;
-        ImpactVelocity = FVector::ZeroVector;
+        const FVector RagdollVelocity = GetEffectiveVelocity();
+        if (bIsRagdoll && !bGettingUp)
+        {
+            if (bHasPrevRagdollVelocity)
+            {
+                ImpactVelocity = RagdollVelocity - PrevRagdollVelocity;
+                if (!bStreamingMovementSuspended && !bInvincible && ImpactVelocity.Size() > RagdollResistance)
+                {
+                    ApplySurvivalImpactDamageIfNeeded(ImpactVelocity.Size());
+                }
+            }
+            else
+            {
+                ImpactVelocity = FVector::ZeroVector;
+            }
+            PrevRagdollVelocity = RagdollVelocity;
+            bHasPrevRagdollVelocity = true;
+        }
+        else
+        {
+            PrevRagdollVelocity = RagdollVelocity;
+            bHasPrevRagdollVelocity = false;
+            ImpactVelocity = FVector::ZeroVector;
+        }
     }
 
     float EffectiveWaterLevel = WaterLevel;
@@ -2493,6 +2528,53 @@ inline float UCharacterComponent::ClampGroundSpeed(const float MaxSpeed, const f
     return FMath::Clamp(MaxSpeed * NormalZ * NormalZ, MaxSpeed * WalkableZ * WalkableZ, MaxSpeed);
 }
 
+FVector UCharacterComponent::GetEffectiveVelocity() const
+{
+    if (IsRagdollLikeState() && IsValid(MeshComp))
+    {
+        FVector PhysVel = MeshComp->GetPhysicsLinearVelocity(FName(BONE_HIPS));
+        if (!PhysVel.ContainsNaN() && PhysVel.SizeSquared() > KINDA_SMALL_NUMBER)
+        {
+            return PhysVel;
+        }
+        PhysVel = MeshComp->GetPhysicsLinearVelocity(NAME_None);
+        if (!PhysVel.ContainsNaN() && PhysVel.SizeSquared() > KINDA_SMALL_NUMBER)
+        {
+            return PhysVel;
+        }
+        const FVector CompVel = MeshComp->GetComponentVelocity();
+        if (!CompVel.ContainsNaN())
+        {
+            return CompVel;
+        }
+    }
+    return IsValid(OwnerCharacter) ? OwnerCharacter->GetVelocity() : FVector::ZeroVector;
+}
+
+void UCharacterComponent::ApplySurvivalImpactDamageIfNeeded(const float ImpactSpeed)
+{
+    if (!IsValid(OwnerCharacter) || RagdollImpactDamageCooldown > 0.0f
+        || !FMath::IsFinite(ImpactSpeed) || ImpactSpeed <= RagdollResistance)
+    {
+        return;
+    }
+
+    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(OwnerCharacter);
+    if (!IsValid(Manager) || Manager->GetPlayMode() != EPlayMode::RealLife)
+    {
+        return;
+    }
+
+    // Scale damage proportionally to impact speed above RagdollResistance (cm/s).
+    // Example: RagdollResistance=1000 cm/s (10 m/s); 1500 cm/s -> 20 HP, 2500 cm/s -> 60 HP, 3500 cm/s -> 100 HP.
+    const float ExcessSpeed = ImpactSpeed - RagdollResistance;
+    const float Damage = FMath::Max(1.0f, ExcessSpeed * 0.04f);
+    if (Manager->ApplyPlayerImpactDamage(OwnerCharacter, Damage))
+    {
+        RagdollImpactDamageCooldown = 0.25f;
+    }
+}
+
 inline FVector UCharacterComponent::CalculateImpactVelocity(const FVector &CurrentVelocity)
 {
     FVector Result = (CurrentVelocity - PrevVelocity);
@@ -2806,6 +2888,9 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, CharacterRagdollTuning::MaxBlendWeight);
     UCharacterFunctionLibrary::PrepareHairForRagdoll(*SkeletalMesh, InitialRagdollVelocity);
     ApplyInitialRagdollVelocity(SkeletalMesh, InitialRagdollVelocity);
+    PrevRagdollVelocity = InitialRagdollVelocity;
+    bHasPrevRagdollVelocity = true;
+    RagdollImpactDamageCooldown = FMath::Max(RagdollImpactDamageCooldown, 0.2f);
     BeginRagdollCameraStabilization();
 }
 

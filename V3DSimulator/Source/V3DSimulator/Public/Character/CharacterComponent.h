@@ -143,6 +143,8 @@ public:
     bool FindRagdollWaterLevel(float &OutWaterLevel) const;
 
     FVector GetImpactVelocity() const { return ImpactVelocity; }
+    /** Returns live character velocity, reading pelvis physics linear velocity while ragdolling. */
+    FVector GetEffectiveVelocity() const;
     bool IsRagdollDamage();
 
     /** Streaming stops/restores velocity artificially; rebase impact history at both boundaries. */
@@ -269,6 +271,9 @@ private:
 
     bool bStreamingMovementSuspended = false;
     FVector ImpactVelocity = FVector::ZeroVector;
+    FVector PrevRagdollVelocity = FVector::ZeroVector;
+    bool bHasPrevRagdollVelocity = false;
+    float RagdollImpactDamageCooldown = 0.0f;
     FVector CurrentSpeed = FVector::ZeroVector;
     FVector PrevVelocity = FVector::ZeroVector;
     FVector LastPreRagdollVelocity = FVector::ZeroVector;
@@ -407,4 +412,5 @@ private:
     float GetRagdollReleaseSpeedSquared(USkeletalMeshComponent *SkeletalMesh) const;
     void UpdateRagdoll(const float DeltaTime, ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);
     FORCEINLINE FVector CalculateImpactVelocity(const FVector &CurrentVelocity);
+    void ApplySurvivalImpactDamageIfNeeded(float ImpactSpeed);
 };

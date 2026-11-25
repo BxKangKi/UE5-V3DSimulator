@@ -67,6 +67,12 @@ private:
     TSharedPtr<SEditableTextBox> BrowserPathBox;
     TSharedPtr<SListView<TSharedPtr<FV3DFileBrowserEntry>>> BrowserListView;
 
+    // Per-node settings (MeshData) mesh/node name search (excluding INST)
+    FString NodeSearchQuery;
+    FString CachedNodeNamesSourcePath;
+    TArray<FString> CachedModelNodeNames;
+    TSharedPtr<SVerticalBox> NodeSearchResultsBox;
+
     bool bBusy = false, bRawDirty = false, bSettingRaw = false, bRebuildingForm = false;
     uint64 RequestGeneration = 0;
     int32 FormRowsRemaining = 1500;
@@ -86,6 +92,9 @@ private:
     void ConfirmFileBrowserImport();
     void Import3DAssetFiles(TArray<FString> SelectedFiles);
     void RefreshForm();
+    void EnsureModelNodeNamesLoaded(const FString& SourcePath);
+    void RebuildNodeSearchResults();
+    void AddNodeSettingsSection(const TSharedRef<SVerticalBox>& Box);
     void AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
         const TSharedRef<SVerticalBox>& Box, int32 Depth = 0, const FString& Context = FString());
     void Remember();

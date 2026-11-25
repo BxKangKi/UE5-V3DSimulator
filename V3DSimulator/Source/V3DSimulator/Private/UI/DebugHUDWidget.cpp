@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/DebugHUDWidget.h"
+#include "Character/CharacterController.h"
 #include "Components/Overlay.h"
 #include "Components/OverlaySlot.h"
 
@@ -151,7 +152,9 @@ void UDebugHUDWidget::UpdateDiagnostics(float DeltaSeconds)
         CharacterPosition = DebugHUDWidgetPrivate::FormatVector(TEXT("Character"), Character->GetActorLocation(), TEXT("cm"));
         CharacterRotation = DebugHUDWidgetPrivate::FormatRotation(TEXT("Character rotation"), Character->GetActorRotation());
         // Engine movement velocities are cm/s. Use m/s for both vector components and magnitude.
-        const FVector Velocity = Character->GetVelocity() / 100.0;
+        const ACharacterController* CharCtrl = Cast<ACharacterController>(Character);
+        const FVector RawVelocity = IsValid(CharCtrl) ? CharCtrl->GetMeasuredVelocity() : Character->GetVelocity();
+        const FVector Velocity = RawVelocity / 100.0;
         VelocityText = DebugHUDWidgetPrivate::FormatVector(TEXT("Velocity"), Velocity, TEXT("m/s"));
         const double Speed = Velocity.Size();
         if (FMath::IsFinite(Speed)) SpeedText = FString::Printf(TEXT("Speed: %.2f m/s"), Speed);

@@ -58,9 +58,9 @@ bool USimulatorCommandSubsystem::ExecuteCommand(
         return false;
     }
 
-    if (CommandLine.Len() > 1024 || !USimulationScriptSubsystem::CanRequest(RequestingController))
+    if (CommandLine.Len() > 1024)
     {
-        OutMessage = TEXT("Command rejected: line exceeds 1024 characters or authority/cheats permission is missing.");
+        OutMessage = TEXT("Command rejected: line exceeds 1024 characters.");
         return true;
     }
     TArray<FString> Tokens;
@@ -73,6 +73,43 @@ bool USimulatorCommandSubsystem::ExecuteCommand(
     FString Command = Tokens[0];
     Command.RemoveFromStart(TEXT("/"));
     Tokens.RemoveAt(0, 1, EAllowShrinking::No);
+
+    if (IsCommandName(Command, TEXT("help")))
+    {
+        TArray<FString> Lines;
+        Lines.Add(TEXT("Available commands:"));
+        Lines.Add(TEXT("  /help - Show this command list"));
+        Lines.Add(TEXT("  /weather <clear|rain|snow> [timer <sec>] - Set weather"));
+        Lines.Add(TEXT("  /time <dt|sec|day> <value> - Adjust or set world time"));
+        Lines.Add(TEXT("  /tp <x> <y> <z> [playerName] - Teleport to coordinates"));
+        Lines.Add(TEXT("  /sim list | /sim run <name> - List or run script commands"));
+        if (UWorld* World = RequestingController->GetWorld())
+        {
+            if (auto* Scripts = World->GetSubsystem<USimulationScriptSubsystem>())
+            {
+                TArray<FString> CustomNames;
+                for (FName Name : Scripts->GetCommandNames())
+                {
+                    if (auto* Object = Scripts->GetCommandObject(Name); Object && Object->GetDefinition().bAllowChat)
+                    {
+                        CustomNames.Add(Name.ToString());
+                    }
+                }
+                if (!CustomNames.IsEmpty())
+                {
+                    Lines.Add(TEXT("Custom /sim commands: ") + FString::Join(CustomNames, TEXT(", ")));
+                }
+            }
+        }
+        OutMessage = FString::Join(Lines, TEXT("\n"));
+        return true;
+    }
+
+    if (!USimulationScriptSubsystem::CanRequest(RequestingController))
+    {
+        OutMessage = TEXT("Command rejected: authority/cheats permission is missing.");
+        return true;
+    }
 
     if (IsCommandName(Command, TEXT("sim")))
     {
@@ -118,7 +155,8 @@ bool USimulatorCommandSubsystem::IsSimulatorCommand(const TCHAR* CommandLine)
     const TCHAR* Cursor = CommandLine;
     FString Name = FParse::Token(Cursor, false);
     Name.RemoveFromStart(TEXT("/"));
-    return IsCommandName(Name, TEXT("weather")) ||
+    return IsCommandName(Name, TEXT("help")) ||
+        IsCommandName(Name, TEXT("weather")) ||
         IsCommandName(Name, TEXT("time")) ||
         IsCommandName(Name, TEXT("tp")) || IsCommandName(Name, TEXT("sim"));
 }
