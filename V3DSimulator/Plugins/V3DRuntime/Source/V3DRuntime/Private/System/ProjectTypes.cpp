@@ -5,9 +5,7 @@ FString V3DSimulatorProjectTypes::ToString(const EV3DSimulatorProjectType Projec
 {
     switch (ProjectType)
     {
-    case EV3DSimulatorProjectType::Prefab: return TEXT("Prefab");
-    case EV3DSimulatorProjectType::Character: return TEXT("Character");
-    case EV3DSimulatorProjectType::Dynamic: return TEXT("Dynamic");
+    case EV3DSimulatorProjectType::Module: return TEXT("Module");
     case EV3DSimulatorProjectType::World:
     default: return TEXT("World");
     }
@@ -24,19 +22,9 @@ bool V3DSimulatorProjectTypes::TryParse(
         OutType = EV3DSimulatorProjectType::World;
         return true;
     }
-    if (Normalized.Equals(TEXT("Prefab"), ESearchCase::IgnoreCase))
+    if (Normalized.Equals(TEXT("Module"), ESearchCase::IgnoreCase))
     {
-        OutType = EV3DSimulatorProjectType::Prefab;
-        return true;
-    }
-    if (Normalized.Equals(TEXT("Character"), ESearchCase::IgnoreCase))
-    {
-        OutType = EV3DSimulatorProjectType::Character;
-        return true;
-    }
-    if (Normalized.Equals(TEXT("Dynamic"), ESearchCase::IgnoreCase))
-    {
-        OutType = EV3DSimulatorProjectType::Dynamic;
+        OutType = EV3DSimulatorProjectType::Module;
         return true;
     }
     return false;

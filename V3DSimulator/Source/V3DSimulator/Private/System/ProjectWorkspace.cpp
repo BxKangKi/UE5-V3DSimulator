@@ -43,7 +43,7 @@ FString V3DSimulatorProjectWorkspace::AssetArchivePath(const FString& ProjectNam
 {
     FString SafeName;
     return NormalizeProjectName(ProjectName, SafeName)
-        ? FPaths::Combine(V3DSimulatorPaths::ResourcesRoot(), SafeName + TEXT(".v3d"))
+        ? FPaths::Combine(V3DSimulatorPaths::ResourcesRoot(), SafeName + TEXT(".v3dm"))
         : FString();
 }
 
@@ -51,14 +51,12 @@ bool V3DSimulatorProjectWorkspace::EnsureWorkspaceRoots()
 {
     IFileManager& Files = IFileManager::Get();
     const FString Projects = ProjectsRoot();
-    const FString Resources = V3DSimulatorPaths::ResourcesRoot();
-    const FString Worlds = V3DSimulatorPaths::WorldsRoot();
+    const FString Archives = V3DSimulatorPaths::WorldsRoot();
     const FString Data = V3DSimulatorPaths::DataRoot();
-    return !Projects.IsEmpty() && !Resources.IsEmpty() && !Worlds.IsEmpty()
+    return !Projects.IsEmpty() && !Archives.IsEmpty() && !Data.IsEmpty()
         && Files.MakeDirectory(*Projects, true)
-        && Files.MakeDirectory(*Resources, true)
-        && Files.MakeDirectory(*Worlds, true)
-        && !Data.IsEmpty() && Files.MakeDirectory(*Data, true);
+        && Files.MakeDirectory(*Archives, true)
+        && Files.MakeDirectory(*Data, true);
 }
 
 bool V3DSimulatorProjectWorkspace::EnsureProjectDirectories(const FString& ProjectName)

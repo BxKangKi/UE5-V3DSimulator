@@ -16,6 +16,7 @@
 
 class AActor;
 class AInstancedEntityRenderActor;
+class UGravityFieldComponent;
 class UPrimitiveComponent;
 class UStaticMesh;
 
@@ -166,6 +167,8 @@ private:
         FString ResourceKey;
         TWeakObjectPtr<AActor> Owner;
         TWeakObjectPtr<UPrimitiveComponent> PhysicsRoot;
+        TWeakObjectPtr<UGravityFieldComponent> GravityField;
+        bool bGravityFieldResolved = false;
         TArray<FEntityPartBinding> Parts;
         FInstancedEntityRegistrationOptions Options;
 
@@ -202,6 +205,9 @@ private:
     TMap<FString, FResourceState> ResourceStates;
     TMap<int32, FEntityRegistration> Registrations;
     TSet<int32> UnregisteringIds;
+    TArray<int32> ScratchInvalidRegistrationIds;
+    TArray<FVector> ScratchObserverLocations;
+    TArray<int32> ScratchRegistrationIds;
     bool bUpdatingEntities = false;
     bool bDeinitializing = false;
     int32 NextRegistrationId = 1;

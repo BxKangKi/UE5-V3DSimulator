@@ -212,11 +212,13 @@ TSharedPtr<FJsonObject> V3DProjectEditor::Suggestions(const FV3DEditorDocument& 
     FString Type, Subtype, Project;
     Doc.Json->TryGetStringField(TEXT("AssetType"), Type);
     Doc.Json->TryGetStringField(TEXT("ProjectType"), Project);
-    if (!Project.IsEmpty())
+    const bool bIsProjectConfig = Doc.Path.EndsWith(TEXT("config.json"), ESearchCase::IgnoreCase) || !Project.IsEmpty();
+    if (bIsProjectConfig)
     {
-        Result->SetStringField(TEXT("ProjectType"), Project);
+        const FString EffectiveProjectType = Project.IsEmpty() ? TEXT("World") : Project;
+        Result->SetStringField(TEXT("ProjectType"), EffectiveProjectType);
         Result->SetStringField(TEXT("Name"), TEXT("Project"));
-        if (Project == TEXT("World"))
+        if (EffectiveProjectType == TEXT("World"))
         {
             Merge(TEXT("World"));
             Result->SetStringField(TEXT("WorldName"), TEXT("World"));

@@ -7,6 +7,7 @@
 #include "CharacterControllerMovementComponent.generated.h"
 
 class APhysicsVolume;
+class UCharacterComponent;
 
 /**
  * Character movement implementation used by V3DSimulator.
@@ -37,7 +38,10 @@ protected:
     virtual void SimulateMovement(float DeltaSeconds) override;
     virtual void PhysicsRotation(float DeltaTime) override;
 private:
+    const UCharacterComponent* GetCachedCharacterState() const;
     void AlignWithGravity();
+    mutable TWeakObjectPtr<AActor> CachedCharacterOwner;
+    mutable TWeakObjectPtr<UCharacterComponent> CachedCharacterComponent;
     double FieldGravityMagnitude = 0.0;
     bool bInGravityField = false;
 protected:

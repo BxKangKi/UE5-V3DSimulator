@@ -5384,7 +5384,7 @@ void UGameManagerSubSystem::FinishProjectBuild()
         OutputRootOrPath = V3DSimulatorProjectWorkspace::AssetArchivePath(BuildProjectName);
         if (OutputRootOrPath.IsEmpty())
         {
-            CompleteProjectArchiveBuild(false, FString(), TEXT("project .v3d output path is invalid"));
+            CompleteProjectArchiveBuild(false, FString(), TEXT("V3D module (.v3dm) output path is invalid"));
             return;
         }
     }
@@ -5393,7 +5393,7 @@ void UGameManagerSubSystem::FinishProjectBuild()
     ProjectBuild.Progress = 0.96f;
     LastSaveMessage = bWorldProject
         ? TEXT("Writing and verifying the world .v3d archive...")
-        : TEXT("Writing and verifying the project .v3d archive...");
+        : TEXT("Writing and verifying the V3D module (.v3dm) archive...");
     OnProjectBuildProgress.Broadcast(ProjectBuild.Progress);
     NotifyStateChanged();
     const FString ArchiveConfigJson = ProjectBuild.ConfigJson;
@@ -5476,7 +5476,7 @@ void UGameManagerSubSystem::CompleteProjectArchiveBuild(
     const EV3DSimulatorProjectType CompletedProjectType = ProjectBuild.Type;
     const int32 CompletedModelCount = ProjectBuild.TotalModels;
     const TCHAR* ArchiveKind = CompletedProjectType == EV3DSimulatorProjectType::World
-        ? TEXT(".v3d") : TEXT(".v3d");
+        ? TEXT(".v3d") : TEXT(".v3dm");
     const FString Message = bArchiveSuccess
         ? FString::Printf(TEXT("%s build completed: %d model(s) (%s)"),
             ArchiveKind, CompletedModelCount, *ArchivePath)

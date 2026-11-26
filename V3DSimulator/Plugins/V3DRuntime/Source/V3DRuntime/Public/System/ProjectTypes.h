@@ -4,14 +4,12 @@
 #include "CoreMinimal.h"
 #include "ProjectTypes.generated.h"
 
-/** Domain-level project category. Storage/config code consumes this type but does not own it. */
+/** Domain-level project category: World (.v3d) or Module (.v3dm). */
 UENUM(BlueprintType)
 enum class EV3DSimulatorProjectType : uint8
 {
     World UMETA(DisplayName="World"),
-    Prefab UMETA(DisplayName="Prefab"),
-    Character UMETA(DisplayName="Character"),
-    Dynamic UMETA(DisplayName="Dynamic")
+    Module UMETA(DisplayName="Module")
 };
 
 namespace V3DSimulatorProjectTypes

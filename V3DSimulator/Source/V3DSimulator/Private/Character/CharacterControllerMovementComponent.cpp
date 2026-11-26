@@ -9,6 +9,28 @@
 #include "Gravity/GravityFieldTypes.h"
 #include "Engine/World.h"
 
+const UCharacterComponent* UCharacterControllerMovementComponent::GetCachedCharacterState() const
+{
+    AActor* OwnerActor = CharacterOwner;
+    if (!IsValid(OwnerActor))
+    {
+        CachedCharacterOwner.Reset();
+        CachedCharacterComponent.Reset();
+        return nullptr;
+    }
+    if (CachedCharacterOwner.Get() == OwnerActor)
+    {
+        if (const UCharacterComponent* Cached = CachedCharacterComponent.Get(); IsValid(Cached))
+        {
+            return Cached;
+        }
+    }
+    CachedCharacterOwner = OwnerActor;
+    UCharacterComponent* Found = OwnerActor->FindComponentByClass<UCharacterComponent>();
+    CachedCharacterComponent = Found;
+    return Found;
+}
+
 void UCharacterControllerMovementComponent::PhysSwimming(const float DeltaTime, const int32 Iterations)
 {
     if (DeltaTime <= UE_SMALL_NUMBER)
@@ -18,7 +40,7 @@ void UCharacterControllerMovementComponent::PhysSwimming(const float DeltaTime, 
 
     // Physics/recovery owns the capsule anchor in this interval. Keep the Swimming mode
     // for animation/water queries, but do not run a second movement integrator.
-    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    const UCharacterComponent* State = GetCachedCharacterState();
     if (State && State->IsRagdollTransitionInProgress())
     {
         StopMovementImmediately();
@@ -112,7 +134,7 @@ float UCharacterControllerMovementComponent::GetGravityZ() const
 void UCharacterControllerMovementComponent::AlignWithGravity()
 {
     if (!HasValidData() || !UpdatedComponent) return;
-    const auto* State = CharacterOwner->FindComponentByClass<UCharacterComponent>();
+    const UCharacterComponent* State = GetCachedCharacterState();
     if (State && (State->IsRagdollTransitionInProgress() || State->IsStreamingMovementSuspended())) return;
     const FVector Up = -GetGravityDirection();
     const FQuat Current = UpdatedComponent->GetComponentQuat();
@@ -121,7 +143,7 @@ void UCharacterControllerMovementComponent::AlignWithGravity()
 }
 void UCharacterControllerMovementComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* TickFunction)
 {
-    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    const UCharacterComponent* State = GetCachedCharacterState();
     if (State && State->IsStreamingMovementSuspended())
     {
         StopMovementImmediately();
@@ -135,7 +157,7 @@ void UCharacterControllerMovementComponent::TickComponent(float DeltaTime, ELeve
 }
 void UCharacterControllerMovementComponent::PerformMovement(float DeltaSeconds)
 {
-    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    const UCharacterComponent* State = GetCachedCharacterState();
     if (State && State->IsStreamingMovementSuspended())
     {
         StopMovementImmediately();
@@ -149,7 +171,7 @@ void UCharacterControllerMovementComponent::PerformMovement(float DeltaSeconds)
 }
 void UCharacterControllerMovementComponent::SimulateMovement(float DeltaSeconds)
 {
-    const UCharacterComponent* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    const UCharacterComponent* State = GetCachedCharacterState();
     if (State && State->IsStreamingMovementSuspended())
     {
         StopMovementImmediately();
@@ -163,7 +185,7 @@ void UCharacterControllerMovementComponent::SimulateMovement(float DeltaSeconds)
 }
 void UCharacterControllerMovementComponent::PhysicsRotation(float DeltaTime)
 {
-    const auto* State = CharacterOwner ? CharacterOwner->FindComponentByClass<UCharacterComponent>() : nullptr;
+    const UCharacterComponent* State = GetCachedCharacterState();
     if (State && (State->IsRagdollTransitionInProgress() || State->IsStreamingMovementSuspended())) return;
     Super::PhysicsRotation(DeltaTime);
     AlignWithGravity();

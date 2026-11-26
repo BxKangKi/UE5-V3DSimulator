@@ -1440,16 +1440,23 @@ void UWorldObjectStreamingSubsystem::Tick(float DeltaTime)
     PumpLoads();
 
     // Coalesce everything observed during this tick into one immutable write per changed chunk.
-    TArray<FWorldChunkCoordinate> Dirty;
-    const double Now = FPlatformTime::Seconds();
-    if (HasPersistenceAuthority())
+    if (HasPersistenceAuthority() && !LoadedChunks.IsEmpty())
+    {
+        TArray<FWorldChunkCoordinate> Dirty;
+        const double Now = FPlatformTime::Seconds();
         for (const TPair<FWorldChunkCoordinate, FRuntimeChunk>& Pair : LoadedChunks)
+        {
             if (Pair.Value.bDirty && !Pair.Value.bSaving
                 && (Pair.Value.bUnloadAfterSave || Now >= Pair.Value.NextPeriodicSaveAt))
             {
                 Dirty.Add(Pair.Key);
             }
-    BeginSaveBatch(Dirty);
+        }
+        if (!Dirty.IsEmpty())
+        {
+            BeginSaveBatch(Dirty);
+        }
+    }
 }
 
 #if WITH_DEV_AUTOMATION_TESTS

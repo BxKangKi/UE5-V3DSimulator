@@ -27,12 +27,12 @@ FString V3DSimulatorPaths::ProjectsRoot()
 
 FString V3DSimulatorPaths::ResourcesRoot()
 {
-    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("V3Ds"), TEXT("Resources")));
+    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("V3Ds")));
 }
 
 FString V3DSimulatorPaths::WorldsRoot()
 {
-    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("V3Ds"), TEXT("Worlds")));
+    return FSafeFileIO::NormalizeFilePath(FPaths::Combine(UserRoot(), TEXT("V3Ds")));
 }
 
 FString V3DSimulatorPaths::DataRoot()

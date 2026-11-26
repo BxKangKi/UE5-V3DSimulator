@@ -15,7 +15,7 @@ struct V3DSIMULATOR_API FV3DSimulatorProjectSummary
     UPROPERTY(BlueprintReadOnly, Category="Project") FString DisplayName;
     UPROPERTY(BlueprintReadOnly, Category="Project") FGuid UUID;
     UPROPERTY(BlueprintReadOnly, Category="Project") EV3DSimulatorProjectType ProjectType = EV3DSimulatorProjectType::World;
-    /** World-only: mounts built Prefab/Character/Dynamic packs from top-level Resources/<Project>.v3d files. */
+    /** World-only: mounts built V3D module packs from V3Ds/<Project>.v3dm files. */
     UPROPERTY(BlueprintReadOnly, Category="Project") bool bAllowProjectAssets = false;
 };
 
@@ -31,7 +31,7 @@ struct V3DSIMULATOR_API FV3DSimulatorProjectConfig
     UPROPERTY(BlueprintReadOnly, Category="Project") EV3DSimulatorProjectType ProjectType = EV3DSimulatorProjectType::World;
     UPROPERTY(BlueprintReadOnly, Category="Project") FString WorldName;
     UPROPERTY(BlueprintReadOnly, Category="Project") FString Notes;
-    /** World-only: mounts built Prefab/Character/Dynamic packs from top-level Resources/<Project>.v3d files. */
+    /** World-only: mounts built V3D module packs from V3Ds/<Project>.v3dm files. */
     UPROPERTY(BlueprintReadOnly, Category="Project") bool bAllowProjectAssets = false;
 
     FString GetDisplayName(const FString& FolderFallback = FString()) const;

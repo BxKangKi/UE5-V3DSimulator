@@ -167,12 +167,12 @@ namespace ModelDatabasePrivate
         if (ResourcesRoot.IsEmpty() || !IFileManager::Get().DirectoryExists(*ResourcesRoot)) return;
 
         TArray<FString> ArchiveFiles;
-        IFileManager::Get().FindFiles(ArchiveFiles, *(FPaths::Combine(ResourcesRoot, TEXT("*.v3d"))), true, false);
+        IFileManager::Get().FindFiles(ArchiveFiles, *(FPaths::Combine(ResourcesRoot, TEXT("*.v3dm"))), true, false);
         ArchiveFiles.Sort();
         if (ArchiveFiles.Num() > 512)
         {
             UE_LOG(LogTemp, Warning,
-                TEXT("Resource archive discovery found %d packs; only the first 512 sorted archives are considered."),
+                TEXT("V3D module (.v3dm) discovery found %d modules; only the first 512 sorted modules are considered."),
                 ArchiveFiles.Num());
             ArchiveFiles.SetNum(512, EAllowShrinking::No);
         }
@@ -188,7 +188,7 @@ namespace ModelDatabasePrivate
             if (!Reader.IsValid())
             {
                 UE_LOG(LogTemp, Warning,
-                    TEXT("Resource asset archive ignored. Path=%s Reason=%s"),
+                    TEXT("V3D module (.v3dm) ignored. Path=%s Reason=%s"),
                     *CandidatePath, *OpenError);
                 continue;
             }
@@ -199,7 +199,7 @@ namespace ModelDatabasePrivate
                 || !V3DSimulatorProjectBuildPolicy::IsAssetProject(PackConfig.ProjectType))
             {
                 UE_LOG(LogTemp, Warning,
-                    TEXT("Resource asset archive ignored because embedded config is not an asset ProjectType. Path=%s Reason=%s"),
+                    TEXT("V3D module (.v3dm) ignored because embedded config is not a module ProjectType. Path=%s Reason=%s"),
                     *CandidatePath, *PackConfigError);
                 continue;
             }

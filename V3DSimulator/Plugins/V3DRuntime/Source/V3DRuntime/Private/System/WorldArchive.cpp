@@ -15,7 +15,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformMisc.h"
 #include "Misc/Crc.h"
-#include "Misc/Compression.h"
+#include "Misc/SecureHash.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
@@ -547,61 +547,31 @@ namespace GWorldArchivePrivate
             || Range.Name.EndsWith(TEXT(".json"), ESearchCase::CaseSensitive);
         if (ExpectedFileSize < HeaderBytes || Range.Name.IsEmpty()
             || !bValidName
-            || Range.StoredSize == 0 || Range.UncompressedSize == 0 || Range.Codec > 1
+            || Range.StoredSize == 0 || Range.UncompressedSize == 0 || Range.Codec != 0
+            || Range.StoredSize != Range.UncompressedSize
             || Range.StoredSize > static_cast<uint64>(MaximumBytes)
-            || Range.UncompressedSize > static_cast<uint64>(MaximumBytes)
             || Range.StoredSize > static_cast<uint64>(MAX_int32)
-            || Range.UncompressedSize > static_cast<uint64>(MAX_int32)
             || Range.Offset > DataEndOffset
-            || Range.StoredSize > DataEndOffset - Range.Offset
-            || (Range.Codec == 0 && Range.StoredSize != Range.UncompressedSize)
-            || (Range.Codec == 1 && Range.StoredSize >= Range.UncompressedSize))
+            || Range.StoredSize > DataEndOffset - Range.Offset)
         {
-            OutError = TEXT("The requested .v3d member range is invalid or exceeds its memory limit");
+            OutError = TEXT("The requested archive member range is invalid or exceeds its memory limit");
             return false;
         }
 
         if (Handle.Size() != ExpectedFileSize
             || !Handle.Seek(static_cast<int64>(Range.Offset)))
         {
-            OutError = TEXT("The .v3d file changed or could not be opened for a member range read");
+            OutError = TEXT("The archive file changed or could not be opened for a member range read");
             return false;
         }
 
-        TArray<uint8> Stored;
-        Stored.SetNumUninitialized(static_cast<int32>(Range.StoredSize));
-        if (!ReadExact(Handle, Stored.GetData(), Stored.Num()))
+        OutBytes.SetNumUninitialized(static_cast<int32>(Range.StoredSize));
+        if (!ReadExact(Handle, OutBytes.GetData(), OutBytes.Num()))
         {
-            OutError = TEXT("The requested .v3d member could not be read completely");
+            OutBytes.Reset();
+            OutError = TEXT("The requested archive member could not be read completely");
             return false;
         }
-
-        if (Range.Codec == 0)
-        {
-            if (Range.StoredSize != Range.UncompressedSize)
-            {
-                OutError = TEXT("An uncompressed archive member has inconsistent lengths");
-                return false;
-            }
-            OutBytes = MoveTemp(Stored);
-        }
-        else
-        {
-            OutBytes.SetNumUninitialized(static_cast<int32>(Range.UncompressedSize));
-            if (!FCompression::UncompressMemory(
-                    NAME_Zlib,
-                    OutBytes.GetData(), static_cast<int64>(OutBytes.Num()),
-                    Stored.GetData(), static_cast<int64>(Stored.Num()),
-                    COMPRESS_NoFlags,
-                    0))
-            {
-                OutBytes.Reset();
-                OutError = TEXT("The requested archive member failed zlib decompression");
-                return false;
-            }
-        }
-        // Release compressed input before scanning the expanded member for its checksum.
-        Stored.Empty();
         if (FCrc::MemCrc32(OutBytes.GetData(), OutBytes.Num()) != Range.Crc)
         {
             OutBytes.Reset();
@@ -671,10 +641,8 @@ namespace GWorldArchivePrivate
             return false;
         }
 
-        // One portable storage policy for every host. Compressing metadata that contains
-        // payload CRCs makes tiny platform float differences change all subsequent offsets and
-        // total size. Stored members also avoid the startup decompression tail. Legacy zlib
-        // archives remain supported by ReadChecksummedRange.
+        // One portable stored-member policy for every host: deterministic offsets/CRCs and
+        // zero startup decompression allocation overhead.
         const uint8* StoredData = RawBytes.GetData();
         const int32 StoredSize = RawBytes.Num();
         if (InOutOffset > MaxArchiveBytes || StoredSize > MaxArchiveBytes - InOutOffset
@@ -986,6 +954,105 @@ namespace GWorldArchivePrivate
             ScriptRanges.Add(MoveTemp(Range));
         }
 
+        struct FTextureDedupKey
+        {
+            uint8 Digest[20] = {};
+            int32 SizeX = 0;
+            int32 SizeY = 0;
+            int32 NumLayers = 0;
+            int32 PixelFormat = 0;
+            int32 MipCount = 0;
+            uint64 TotalMipBytes = 0;
+            uint8 Flags = 0;
+            uint8 AddressX = 0;
+            uint8 AddressY = 0;
+            uint8 Filter = 0;
+
+            bool operator==(const FTextureDedupKey& Other) const
+            {
+                return SizeX == Other.SizeX
+                    && SizeY == Other.SizeY
+                    && NumLayers == Other.NumLayers
+                    && PixelFormat == Other.PixelFormat
+                    && MipCount == Other.MipCount
+                    && TotalMipBytes == Other.TotalMipBytes
+                    && Flags == Other.Flags
+                    && AddressX == Other.AddressX
+                    && AddressY == Other.AddressY
+                    && Filter == Other.Filter
+                    && FMemory::Memcmp(Digest, Other.Digest, sizeof(Digest)) == 0;
+            }
+        };
+
+        struct FTextureDedupKeyFuncs : BaseKeyFuncs<TPair<FTextureDedupKey, FGWorldArchiveRange>, FTextureDedupKey, false>
+        {
+            static const FTextureDedupKey& GetSetKey(const TPair<FTextureDedupKey, FGWorldArchiveRange>& Element) { return Element.Key; }
+            static bool Matches(const FTextureDedupKey& A, const FTextureDedupKey& B) { return A == B; }
+            static uint32 GetKeyHash(const FTextureDedupKey& Key)
+            {
+                uint32 H = 0;
+                FMemory::Memcpy(&H, Key.Digest, sizeof(uint32));
+                H = HashCombineFast(H, GetTypeHash(Key.TotalMipBytes));
+                H = HashCombineFast(H, HashCombineFast(GetTypeHash(Key.SizeX), GetTypeHash(Key.SizeY)));
+                return H;
+            }
+        };
+
+        auto ComputeTextureDedupKey = [](const FGWorldBakedTexture& Texture) -> FTextureDedupKey
+        {
+            FTextureDedupKey Key;
+            Key.SizeX = Texture.SizeX;
+            Key.SizeY = Texture.SizeY;
+            Key.NumLayers = Texture.NumLayers;
+            Key.PixelFormat = Texture.PixelFormat;
+            Key.MipCount = Texture.Mips.Num();
+            Key.Flags = static_cast<uint8>((Texture.bSRGB ? 1 : 0) | (Texture.bTextureArray ? 2 : 0));
+            Key.AddressX = static_cast<uint8>(Texture.AddressX);
+            Key.AddressY = static_cast<uint8>(Texture.AddressY);
+            Key.Filter = static_cast<uint8>(Texture.Filter);
+
+            FSHA1 Sha1;
+            const auto UpdatePod = [&Sha1](const auto& Value)
+            {
+                Sha1.Update(reinterpret_cast<const uint8*>(&Value), sizeof(Value));
+            };
+            UpdatePod(Key.SizeX);
+            UpdatePod(Key.SizeY);
+            UpdatePod(Key.NumLayers);
+            UpdatePod(Key.PixelFormat);
+            UpdatePod(Key.MipCount);
+            UpdatePod(Key.Flags);
+            UpdatePod(Key.AddressX);
+            UpdatePod(Key.AddressY);
+            UpdatePod(Key.Filter);
+            const uint8 LodGroup = static_cast<uint8>(Texture.LODGroup);
+            UpdatePod(LodGroup);
+
+            uint64 TotalBytes = 0;
+            for (const FGWorldBakedTextureMip& Mip : Texture.Mips)
+            {
+                UpdatePod(Mip.SizeX);
+                UpdatePod(Mip.SizeY);
+                UpdatePod(Mip.SizeZ);
+                const int32 ByteCount = Mip.Bytes.Num();
+                UpdatePod(ByteCount);
+                if (ByteCount > 0)
+                {
+                    Sha1.Update(Mip.Bytes.GetData(), static_cast<uint32>(ByteCount));
+                    TotalBytes += static_cast<uint64>(ByteCount);
+                }
+            }
+            Key.TotalMipBytes = TotalBytes;
+            Sha1.Final();
+            Sha1.GetHash(Key.Digest);
+            return Key;
+        };
+
+        TMap<FTextureDedupKey, FGWorldArchiveRange, FDefaultSetAllocator, FTextureDedupKeyFuncs> DedupedTextureRanges;
+        int32 TotalTextureRefs = 0;
+        int32 DedupedTextureRefs = 0;
+        uint64 SavedTextureBytes = 0;
+
         TArray<FGWorldModelRecord> Records;
         Records.Reserve(Sorted.Num());
         for (const FGWorldBuildModel* Model : Sorted)
@@ -1058,10 +1125,23 @@ namespace GWorldArchivePrivate
             }
             for (const FGWorldBakedTexture& Texture : Model->BakedData.Textures)
             {
-                FGWorldArchiveRange Range;
+                ++TotalTextureRefs;
                 const FString Name = Prefix + FString::Printf(TEXT("textures/%d.dat"), Texture.TextureId);
+                const FTextureDedupKey DedupKey = ComputeTextureDedupKey(Texture);
+                if (const FGWorldArchiveRange* ExistingRange = DedupedTextureRanges.Find(DedupKey))
+                {
+                    FGWorldArchiveRange SharedRange = *ExistingRange;
+                    SharedRange.Name = Name;
+                    Manifest.TextureRanges.Add(Texture.TextureId, MoveTemp(SharedRange));
+                    ++DedupedTextureRefs;
+                    SavedTextureBytes += ExistingRange->StoredSize;
+                    continue;
+                }
+
+                FGWorldArchiveRange Range;
                 if (!WorldArchiveCodec::SerializeTexture(Texture, Bytes, OutError)
                     || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
+                DedupedTextureRanges.Add(DedupKey, Range);
                 Manifest.TextureRanges.Add(Texture.TextureId, MoveTemp(Range));
             }
             for (const v3d::animation& Clip : Model->BakedData.Animations)
@@ -1098,6 +1178,14 @@ namespace GWorldArchivePrivate
                     *Model->Definition.GlbPath);
                 return false;
             }
+        }
+
+        if (TotalTextureRefs > 0)
+        {
+            UE_LOG(LogTemp, Display,
+                TEXT("[V3DBuild.Dedup] TotalTextureRefs=%d UniqueTextures=%d Deduped=%d SavedBytes=%llu"),
+                TotalTextureRefs, DedupedTextureRanges.Num(), DedupedTextureRefs,
+                static_cast<unsigned long long>(SavedTextureBytes));
         }
 
         TArray<FGWorldSoundRecord> SoundRecords;
@@ -1188,6 +1276,7 @@ namespace GWorldArchivePrivate
                 return false;
             }
         }
+        TSet<uint64> VerifiedTextureOffsets;
         for (const FGWorldModelRecord& Record : Records)
         {
             if (Cancelled())
@@ -1280,15 +1369,19 @@ namespace GWorldArchivePrivate
             }
             for (const TPair<int32, FGWorldArchiveRange>& Pair : Manifest.TextureRanges)
             {
+                if (VerifiedTextureOffsets.Contains(Pair.Value.Offset))
+                {
+                    continue;
+                }
                 FGWorldBakedTexture Texture;
                 if (!ReadChecksummedRange(*VerificationHandle, TemporaryFileSize, DirectoryOffset,
                         Pair.Value, FGWorldArchive::MaxDatMemberBytes, VerifiedBytes, VerifyError)
-                    || !WorldArchiveCodec::DeserializeTexture(VerifiedBytes, Texture, VerifyError)
-                    || Texture.TextureId != Pair.Key)
+                    || !WorldArchiveCodec::DeserializeTexture(VerifiedBytes, Texture, VerifyError))
                 {
                     OutError = FString::Printf(TEXT("texture.dat verification failed: %s"), *VerifyError);
                     return false;
                 }
+                VerifiedTextureOffsets.Add(Pair.Value.Offset);
                 VerifiedBytes.Empty();
             }
             for (const auto& Pair : Manifest.AnimationRanges)
@@ -1640,7 +1733,8 @@ FString FGWorldArchive::MakeArchivePath(const FString& WorldRoot)
 {
     const FString Normalized = FSafeFileIO::NormalizeFilePath(WorldRoot);
     if (Normalized.IsEmpty()) return FString();
-    if (Normalized.EndsWith(TEXT(".v3d"), ESearchCase::CaseSensitive)) return Normalized;
+    if (Normalized.EndsWith(TEXT(".v3d"), ESearchCase::CaseSensitive)
+        || Normalized.EndsWith(TEXT(".v3dm"), ESearchCase::CaseSensitive)) return Normalized;
     const FString WorldName = FPaths::GetCleanFilename(Normalized);
     const FString Parent = FPaths::GetPath(Normalized);
     return WorldName.IsEmpty() ? FString() : FPaths::Combine(Parent, WorldName + TEXT(".v3d"));
@@ -2067,7 +2161,12 @@ bool FGWorldArchiveReader::ReadModelManifest(
     Ranges.Sort([](const TPair<uint64,uint64>& A,const TPair<uint64,uint64>& B){return A.Key<B.Key;});
     for (int32 Index = 1; Index < Ranges.Num(); ++Index)
     {
-        if (Ranges[Index-1].Key + Ranges[Index-1].Value > Ranges[Index].Key)
+        if (Ranges[Index - 1].Key == Ranges[Index].Key && Ranges[Index - 1].Value == Ranges[Index].Value)
+        {
+            // Exact shared range from deduplicated texture payloads.
+            continue;
+        }
+        if (Ranges[Index - 1].Key + Ranges[Index - 1].Value > Ranges[Index].Key)
         {
             OutManifest = FGWorldModelManifest();
             OutError = TEXT("Manifest .dat ranges overlap");
@@ -2410,13 +2509,14 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         FGWorldBakedTexture Texture;
         FString Error = OpenError;
         if (!ReadMemberBytes(Handle, *Range, Bytes, Error)
-            || !WorldArchiveCodec::DeserializeTexture(Bytes, Texture, Error, MaxTextureResolution)
-            || Texture.TextureId != TextureId)
+            || !WorldArchiveCodec::DeserializeTexture(Bytes, Texture, Error, MaxTextureResolution))
         {
             TextureErrors[Index] = Error.IsEmpty()
-                ? TEXT("Referenced texture.dat has a mismatched id") : MoveTemp(Error);
+                ? TEXT("Referenced texture.dat could not be decoded") : MoveTemp(Error);
             return;
         }
+        // Normalize local TextureId when multiple models or slots share a deduplicated texture payload.
+        Texture.TextureId = TextureId;
         TextureResults[Index] = MoveTemp(Texture);
         TextureSuccess[Index] = 1;
     });

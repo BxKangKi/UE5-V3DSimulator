@@ -144,14 +144,14 @@ bool FProjectBuildPolicyTest::RunTest(const FString& Parameters)
         V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::World, EModelDefinitionType::Dynamic));
     TestTrue(TEXT("World accepts Character"),
         V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::World, EModelDefinitionType::Dynamic));
-    TestTrue(TEXT("Prefab accepts Static"),
-        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Prefab, EModelDefinitionType::Static));
-    TestFalse(TEXT("Prefab rejects Dynamic"),
-        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Prefab, EModelDefinitionType::Dynamic));
-    TestTrue(TEXT("Character accepts Character"),
-        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Character, EModelDefinitionType::Dynamic));
-    TestTrue(TEXT("Dynamic accepts Dynamic"),
-        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Dynamic, EModelDefinitionType::Dynamic));
+    TestTrue(TEXT("Module is a module project"),
+        V3DSimulatorProjectBuildPolicy::IsAssetProject(EV3DSimulatorProjectType::Module));
+    TestFalse(TEXT("World is not a module project"),
+        V3DSimulatorProjectBuildPolicy::IsAssetProject(EV3DSimulatorProjectType::World));
+    TestTrue(TEXT("Module accepts Static"),
+        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Module, EModelDefinitionType::Static));
+    TestTrue(TEXT("Module accepts Dynamic"),
+        V3DSimulatorProjectBuildPolicy::AllowsModelType(EV3DSimulatorProjectType::Module, EModelDefinitionType::Dynamic));
 
     const FString ProjectResources = V3DSimulatorProjectWorkspace::ProjectResourcesRoot(TEXT("ExamplePrefab"));
     TestTrue(TEXT("Authoring assets belong to Projects/<Project>/resources"),
@@ -159,9 +159,9 @@ bool FProjectBuildPolicyTest::RunTest(const FString& Parameters)
         || ProjectResources.EndsWith(TEXT("Projects\\ExamplePrefab\\resources")));
 
     const FString ArchivePath = V3DSimulatorProjectWorkspace::AssetArchivePath(TEXT("ExamplePrefab"));
-    TestTrue(TEXT("Built asset archive belongs to top-level Resources/<Project>.v3d"),
-        ArchivePath.EndsWith(TEXT("Resources/ExamplePrefab.v3d"))
-        || ArchivePath.EndsWith(TEXT("Resources\\ExamplePrefab.v3d")));
+    TestTrue(TEXT("Built V3D module archive belongs to V3Ds/<Project>.v3dm"),
+        ArchivePath.EndsWith(TEXT("V3Ds/ExamplePrefab.v3dm"))
+        || ArchivePath.EndsWith(TEXT("V3Ds\\ExamplePrefab.v3dm")));
     return true;
 }
 #endif

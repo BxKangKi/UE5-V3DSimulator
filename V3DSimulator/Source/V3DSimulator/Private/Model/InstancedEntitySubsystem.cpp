@@ -171,6 +171,9 @@ void UInstancedEntitySubsystem::Deinitialize()
     RenderActors.Empty();
     ResourceStates.Empty();
     Registrations.Empty();
+    ScratchInvalidRegistrationIds.Empty();
+    ScratchObserverLocations.Empty();
+    ScratchRegistrationIds.Empty();
 
     Super::Deinitialize();
 }
@@ -857,32 +860,38 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
         return;
     }
 
-    TArray<int32> InvalidRegistrationIds;
-    TArray<FVector> ObserverLocations;
-    GatherObserverLocations(ObserverLocations);
+    ScratchInvalidRegistrationIds.Reset();
+    ScratchObserverLocations.Reset();
+    GatherObserverLocations(ScratchObserverLocations);
 
     TArray<FEntityInterpolationWorkItem> WorkItems;
     WorkItems.Reserve(Registrations.Num());
-    TArray<int32> RegistrationIds;
-    Registrations.GetKeys(RegistrationIds);
-    for (const int32 RegistrationId : RegistrationIds)
+    ScratchRegistrationIds.Reset();
+    Registrations.GetKeys(ScratchRegistrationIds);
+    for (const int32 RegistrationId : ScratchRegistrationIds)
     {
         FEntityRegistration* Current = Registrations.Find(RegistrationId);
         if (!Current) continue;
-        const FEntityRegistration& BeforePhysics = *Current;
+        FEntityRegistration& BeforePhysics = *Current;
         if (!BeforePhysics.Owner.IsValid())
         {
-            InvalidRegistrationIds.Add(RegistrationId);
+            ScratchInvalidRegistrationIds.Add(RegistrationId);
             continue;
+        }
+
+        if (!BeforePhysics.bGravityFieldResolved)
+        {
+            BeforePhysics.GravityField = BeforePhysics.Owner->FindComponentByClass<UGravityFieldComponent>();
+            BeforePhysics.bGravityFieldResolved = true;
         }
 
         const FTransform RootTransform = GetRegistrationRootTransform(BeforePhysics);
         const float DistanceSquared = CalculateNearestObserverDistanceSquared(
             RootTransform.GetLocation(),
-            ObserverLocations);
+            ScratchObserverLocations);
         const EDistanceTier Tier = ResolveDistanceTier(BeforePhysics, DistanceSquared);
 
-        const auto* Field = BeforePhysics.Owner->FindComponentByClass<UGravityFieldComponent>();
+        const UGravityFieldComponent* Field = BeforePhysics.GravityField.Get();
         const bool GravitySource = IsValid(Field) && Field->GetSettingsRef().bEnabled;
         bool bShouldPhysicsBeActive = true;
         if (!GravitySource && !BeforePhysics.Options.bAlwaysRelevant
@@ -990,7 +999,7 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
         }
     }
 
-    for (const int32 RegistrationId : InvalidRegistrationIds)
+    for (const int32 RegistrationId : ScratchInvalidRegistrationIds)
     {
         UnregisterEntity(RegistrationId);
     }

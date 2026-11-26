@@ -670,8 +670,7 @@ void UProjectSelectionWidget::BuildNativeLayout()
     FormBox->AddChildToVerticalBox(TypeSize)->SetPadding(FMargin(0.f, 0.f, 0.f, 20.f));
     NativeProjectType = WidgetTree->ConstructWidget<UComboBoxString>();
     NativeProjectType->OnGenerateWidgetEvent.BindDynamic(this, &UProjectSelectionWidget::GenerateNativeProjectType);
-    for (const EV3DSimulatorProjectType Type : { EV3DSimulatorProjectType::World,
-        EV3DSimulatorProjectType::Prefab, EV3DSimulatorProjectType::Character, EV3DSimulatorProjectType::Dynamic })
+    for (const EV3DSimulatorProjectType Type : { EV3DSimulatorProjectType::World, EV3DSimulatorProjectType::Module })
     {
         NativeProjectType->AddOption(V3DSimulatorProjectTypes::ToString(Type));
     }
@@ -713,7 +712,7 @@ void UProjectSelectionWidget::BuildNativeLayout()
     };
     NewProjectAcoustics = AddOption(TEXT("World: geometry acoustics"), false);
     NewProjectMusic = AddOption(TEXT("Environment music"), true);
-    NewProjectExternalAssets = AddOption(TEXT("Use external project assets"), false);
+    NewProjectExternalAssets = AddOption(TEXT("Allow V3D Modules (.v3dm)"), false);
 
     // 5. Validation Error text
     NativeCreateErrorText = AddText(FormBox, FText::GetEmpty());
@@ -786,6 +785,7 @@ void UProjectSelectionWidget::ApplyNativeStyle()
     {
         V3DHUDStyle::ApplyComboBox(*NativeProjectType, Palette, bDarkMode);
         NativeProjectType->RefreshOptions();
+        NativeProjectType->SetSelectedOption(V3DSimulatorProjectTypes::ToString(NewProjectType));
     }
     const int32 ToggleFontSize = FMath::Clamp(FMath::RoundToInt(BodyFontSize * 0.72f), 16, 26);
     for (UCheckBox* Toggle : { NewProjectAcoustics.Get(), NewProjectMusic.Get(), NewProjectExternalAssets.Get() })

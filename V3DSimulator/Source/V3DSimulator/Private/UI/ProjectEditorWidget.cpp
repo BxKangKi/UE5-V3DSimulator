@@ -2385,6 +2385,11 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
         const auto Value = *Existing;
         if (!Value.IsValid()) continue;
 
+        const bool bReadOnlyInForm = (Key == TEXT("UUID"));
+        const FString FieldDisplayName = (Key == TEXT("bAllowProjectAssets"))
+            ? FString(TEXT("Allow V3D Modules (.v3dm)"))
+            : (bReadOnlyInForm ? FString(TEXT("UUID (read-only — edit in JSON)")) : Key);
+
         auto PairCardBody = SNew(SVerticalBox);
         auto HeaderRow = SNew(SHorizontalBox);
         HeaderRow->AddSlot().FillWidth(1).VAlign(VAlign_Center)
@@ -2392,13 +2397,73 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             SNew(STextBlock)
             .TextStyle(&EditorTextStyle)
             .ColorAndOpacity(FSlateColor(Palette.Text))
-            .Text(Text(Key))
+            .Text(Text(FieldDisplayName))
         ];
-        HeaderRow->AddSlot().AutoWidth().VAlign(VAlign_Center)
-        [
-            MakeEditorButton(TEXT("Remove"), [this, Object, Key]
-            { if (bRawDirty) { Message = TEXT("Apply JSON first."); return; } Remember(); Object->RemoveField(Key); Changed(); })
-        ];
+        const auto IsRequiredField = [&]() -> bool
+        {
+            if (Depth == 0)
+            {
+                if (Key == TEXT("UUID") || Key == TEXT("Name") || Key == TEXT("Version")) return true;
+
+                FString ProjectTypeValue;
+                const bool bIsProjectConfig = Object->TryGetStringField(TEXT("ProjectType"), ProjectTypeValue)
+                    || (Current && Current->Path.EndsWith(TEXT("config.json"), ESearchCase::IgnoreCase));
+                if (bIsProjectConfig)
+                {
+                    if (Key == TEXT("ProjectType")) return true;
+                    if (ProjectTypeValue == TEXT("World")
+                        && (Key == TEXT("WorldName") || Key == TEXT("bAllowProjectAssets")))
+                    {
+                        return true;
+                    }
+                    return false;
+                }
+
+                FString AssetTypeValue;
+                const bool bIsAssetDoc = Object->TryGetStringField(TEXT("AssetType"), AssetTypeValue)
+                    || (Current && !Current->SourcePath.IsEmpty());
+                if (bIsAssetDoc)
+                {
+                    if (Key == TEXT("DisplayName") || Key == TEXT("AssetType")) return true;
+                    if (AssetTypeValue != TEXT("Sound"))
+                    {
+                        if (Key == TEXT("ModelType")) return true;
+                        FString ModelTypeValue;
+                        Object->TryGetStringField(TEXT("ModelType"), ModelTypeValue);
+                        if (ModelTypeValue == TEXT("Dynamic"))
+                        {
+                            if (Key == TEXT("DynamicType")) return true;
+                            FString DynamicTypeValue;
+                            Object->TryGetStringField(TEXT("DynamicType"), DynamicTypeValue);
+                            if (DynamicTypeValue == TEXT("Item") && Key == TEXT("ItemType")) return true;
+                            if (DynamicTypeValue == TEXT("Vehicle") && Key == TEXT("VehicleType")) return true;
+                        }
+                    }
+                }
+                return false;
+            }
+
+            if (Context == TEXT("Colliders") && Key == TEXT("Type")) return true;
+            if (Context == TEXT("Lights") && (Key == TEXT("Type") || Key == TEXT("Unit"))) return true;
+            if (Context == TEXT("Biomes") && (Key == TEXT("Name") || Key == TEXT("Shape"))) return true;
+            if ((Context == TEXT("EquipmentInteraction") || Context == TEXT("CharacterInteraction"))
+                && Key == TEXT("SchemaVersion")) return true;
+            if ((Context == TEXT("RightGrip") || Context == TEXT("LeftGrip"))
+                && (Key == TEXT("bEnabled") || Key == TEXT("Hand") || Key == TEXT("Role"))) return true;
+            if (Key == TEXT("X") || Key == TEXT("Y") || Key == TEXT("Z")
+                || Key == TEXT("Pitch") || Key == TEXT("Yaw") || Key == TEXT("Roll")
+                || Key == TEXT("ScaleX") || Key == TEXT("ScaleY") || Key == TEXT("ScaleZ")) return true;
+            return false;
+        };
+
+        if (!IsRequiredField())
+        {
+            HeaderRow->AddSlot().AutoWidth().VAlign(VAlign_Center)
+            [
+                MakeEditorButton(TEXT("Remove"), [this, Object, Key]
+                { if (bRawDirty) { Message = TEXT("Apply JSON first."); return; } Remember(); Object->RemoveField(Key); Changed(); })
+            ];
+        }
         PairCardBody->AddSlot().AutoHeight().Padding(0, 0, 0, 6)[HeaderRow];
 
         const FString SectionPath = PathPrefix.IsEmpty() ? Key : (PathPrefix + TEXT("/") + Key);
@@ -2589,7 +2654,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             else if (Key == TEXT("DynamicType")) Names = {TEXT("Humanoid"), TEXT("Vehicle"), TEXT("Prop"), TEXT("Creature"), TEXT("Item")};
             else if (Key == TEXT("ItemType")) Names = {TEXT("Weapon"), TEXT("Tool"), TEXT("Misc")};
             else if (Key == TEXT("VehicleType")) Names = {TEXT("Car"), TEXT("Train")};
-            else if (Key == TEXT("ProjectType")) Names = {TEXT("World"), TEXT("Prefab"), TEXT("Dynamic"), TEXT("Character")};
+            else if (Key == TEXT("ProjectType")) Names = {TEXT("World"), TEXT("Module")};
             else if (Key == TEXT("DominantHand") || Key == TEXT("PrimaryHandOverride") || Key == TEXT("Hand")) Names = {TEXT("Right"), TEXT("Left")};
             else if (Key == TEXT("Role")) Names = {TEXT("Disabled"), TEXT("Primary"), TEXT("Secondary"), TEXT("Support")};
             else if (Key == TEXT("Falloff")) Names = {TEXT("Constant"), TEXT("Linear"), TEXT("InverseSquare")};
@@ -2654,26 +2719,40 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                     Changed();
                 })[SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Text(DisplayValue))]];
         }
+        else if (bReadOnlyInForm)
+        {
+            PairCardBody->AddSlot().AutoHeight()
+            [
+                SNew(SEditableTextBox)
+                .Style(&EditorInputStyle)
+                .IsReadOnly(true)
+                .Text(Text(ValueText(Value)))
+                .ToolTipText(Text(TEXT("UUID is read-only in the form UI. Edit it in the Raw JSON panel if needed.")))
+            ];
+        }
         else
         {
             const EJson ExpectedType = Value->Type;
             const bool IsString = ExpectedType == EJson::String;
+            TWeakObjectPtr<UProjectEditorWidget> WeakInputSelf(this);
             auto InputWidget = SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Value)))
-                .OnTextCommitted_Lambda([this, Object, Key, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
+                .OnTextCommitted_Lambda([WeakInputSelf, Object, Key, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
                 {
-                    if (bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending) { Message = TEXT("Apply pending JSON before editing fields."); return; }
+                    UProjectEditorWidget* Self = WeakInputSelf.Get();
+                    if (!IsValid(Self)) return;
+                    if (Self->bBusy || Self->bRawDirty || Self->bRebuildingForm || Self->bFormRefreshPending) { Self->Message = TEXT("Apply pending JSON before editing fields."); return; }
                     if (IsString)
                     {
                         FString ExistingStr;
                         if (Object->TryGetStringField(Key, ExistingStr) && ExistingStr == TextValue.ToString()) return;
-                        Remember(); Object->SetStringField(Key, TextValue.ToString()); Changed(); return;
+                        Self->Remember(); Object->SetStringField(Key, TextValue.ToString()); Self->Changed(); return;
                     }
                     const auto Parsed = FSafeFileIO::ParseJsonText(TEXT("{\"v\":") + TextValue.ToString() + TEXT("}"), TEXT("Field"));
                     if (!Parsed.IsSuccess() || !Parsed.JsonObject.IsValid())
-                    { Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
+                    { Self->Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
                     const auto* Found = Parsed.JsonObject->Values.Find(TEXT("v"));
                     if (!Found || !Found->IsValid() || (*Found)->Type != ExpectedType)
-                    { Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
+                    { Self->Message = TEXT("Invalid value/type for ") + Key + TEXT(". Use advanced JSON to change types."); return; }
                     if (ExpectedType == EJson::Number)
                     {
                         double ExistingNum = 0.0;
@@ -2682,7 +2761,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                             return;
                         }
                     }
-                    Remember(); Object->SetField(Key, *Found); Changed();
+                    Self->Remember(); Object->SetField(Key, *Found); Self->Changed();
                 });
 
             if (ExpectedType == EJson::Number)

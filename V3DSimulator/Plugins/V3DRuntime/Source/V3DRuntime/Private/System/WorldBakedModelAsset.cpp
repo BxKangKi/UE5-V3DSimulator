@@ -1385,13 +1385,62 @@ UMaterialInterface* UWorldBakedModelAsset::FindCachedMaterial(
     return nullptr;
 }
 
+namespace
+{
+    struct FSharedArchiveTextureKey
+    {
+        FString ArchivePath;
+        uint64 Offset = 0;
+        uint64 StoredSize = 0;
+        uint32 Crc = 0;
+        int32 TextureLimit = 0;
+
+        bool operator==(const FSharedArchiveTextureKey& Other) const
+        {
+            return Offset == Other.Offset
+                && StoredSize == Other.StoredSize
+                && Crc == Other.Crc
+                && TextureLimit == Other.TextureLimit
+                && ArchivePath.Equals(Other.ArchivePath, ESearchCase::CaseSensitive);
+        }
+    };
+
+    uint32 GetTypeHash(const FSharedArchiveTextureKey& Key)
+    {
+        uint32 H = ::GetTypeHash(Key.Offset);
+        H = HashCombineFast(H, ::GetTypeHash(Key.StoredSize));
+        H = HashCombineFast(H, HashCombineFast(::GetTypeHash(Key.Crc), ::GetTypeHash(Key.TextureLimit)));
+        return HashCombineFast(H, DefaultKeyFuncs<FString>::GetKeyHash(Key.ArchivePath));
+    }
+
+    TMap<FSharedArchiveTextureKey, TWeakObjectPtr<UTexture>>& SharedArchiveTextureCache()
+    {
+        check(IsInGameThread());
+        static TMap<FSharedArchiveTextureKey, TWeakObjectPtr<UTexture>> Cache;
+        return Cache;
+    }
+
+    void PruneSharedArchiveTextureCacheIfNeeded()
+    {
+        auto& Cache = SharedArchiveTextureCache();
+        if (Cache.Num() <= 2048) return;
+        for (auto It = Cache.CreateIterator(); It; ++It)
+        {
+            if (!It.Value().IsValid())
+            {
+                It.RemoveCurrent();
+            }
+        }
+    }
+}
+
 UTexture* UWorldBakedModelAsset::FindCachedTexture(
     const int32 TextureId,
     FWorldBakedBuildReferenceGuard& ReferenceGuard, const int32 TextureLimit)
 {
     check(IsInGameThread());
     const uint64 TextureCacheKey =
-        (static_cast<uint64>(static_cast<uint32>(TextureId)) << 32) | TextureLimit;
+        (static_cast<uint64>(static_cast<uint32>(TextureId)) << 32) | static_cast<uint32>(TextureLimit);
     if (const TWeakObjectPtr<UTexture>* Cached = WeakTextureCache.Find(TextureCacheKey))
     {
         if (UTexture* Existing = Cached->Get())
@@ -1400,6 +1449,27 @@ UTexture* UWorldBakedModelAsset::FindCachedTexture(
             return Existing;
         }
         WeakTextureCache.Remove(TextureCacheKey);
+    }
+
+    if (Reader.IsValid() && Manifest.IsValid())
+    {
+        if (const FGWorldArchiveRange* TextureRange = Manifest->TextureRanges.Find(TextureId))
+        {
+            const FSharedArchiveTextureKey SharedKey{
+                Reader->GetArchivePath(), TextureRange->Offset, TextureRange->StoredSize, TextureRange->Crc, TextureLimit
+            };
+            auto& SharedCache = SharedArchiveTextureCache();
+            if (const TWeakObjectPtr<UTexture>* Shared = SharedCache.Find(SharedKey))
+            {
+                if (UTexture* Existing = Shared->Get(); IsValid(Existing))
+                {
+                    ReferenceGuard.Add(Existing);
+                    WeakTextureCache.Add(TextureCacheKey, Existing);
+                    return Existing;
+                }
+                SharedCache.Remove(SharedKey);
+            }
+        }
     }
     return nullptr;
 }
@@ -1417,14 +1487,9 @@ UTexture* UWorldBakedModelAsset::CreateTexture(
     const uint64 TextureCacheKey =
         (static_cast<uint64>(static_cast<uint32>(Baked.TextureId)) << 32)
         | static_cast<uint32>(TextureLimit);
-    if (const TWeakObjectPtr<UTexture>* Cached = WeakTextureCache.Find(TextureCacheKey))
+    if (UTexture* Existing = FindCachedTexture(Baked.TextureId, ReferenceGuard, TextureLimit))
     {
-        if (UTexture* Existing = Cached->Get())
-        {
-            ReferenceGuard.Add(Existing);
-            return Existing;
-        }
-        WeakTextureCache.Remove(TextureCacheKey);
+        return Existing;
     }
     FScopedSimulatorLoadCheckpoint Checkpoint(FString::Printf(
         TEXT("BakedTexture.Create Source=%s Id=%d Size=%dx%dx%d Mips=%d Limit=%d"),
@@ -1489,6 +1554,16 @@ UTexture* UWorldBakedModelAsset::CreateTexture(
             return nullptr;
         }
         WeakTextureCache.Add(TextureCacheKey, Texture);
+        if (Reader.IsValid() && Manifest.IsValid())
+        {
+            if (const FGWorldArchiveRange* ArrayRange = Manifest->TextureRanges.Find(Baked.TextureId))
+            {
+                PruneSharedArchiveTextureCacheIfNeeded();
+                SharedArchiveTextureCache().Add(
+                    FSharedArchiveTextureKey{ Reader->GetArchivePath(), ArrayRange->Offset, ArrayRange->StoredSize, ArrayRange->Crc, TextureLimit },
+                    Texture);
+            }
+        }
         return Texture;
     }
 
@@ -1552,6 +1627,10 @@ UTexture* UWorldBakedModelAsset::CreateTexture(
     Texture->NeverStream = true;
     Texture->UpdateResource();
     WeakTextureCache.Add(TextureCacheKey, Texture);
+    PruneSharedArchiveTextureCacheIfNeeded();
+    SharedArchiveTextureCache().Add(
+        FSharedArchiveTextureKey{ Reader->GetArchivePath(), TextureRange->Offset, TextureRange->StoredSize, TextureRange->Crc, TextureLimit },
+        Texture);
 
     return Texture;
 }

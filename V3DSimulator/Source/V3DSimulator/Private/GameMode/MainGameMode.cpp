@@ -761,7 +761,7 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
         return;
     }
 
-    // Validate that the selected .v3d archive under V3Ds/Worlds is actually a World-type project.
+    // Validate that the selected .v3d archive under V3Ds is actually a World-type project.
     {
         const FString ArchivePath = FPaths::Combine(V3DSimulatorPaths::WorldsRoot(), ResolvedFolderName + TEXT(".v3d"));
         FString ReadError;
@@ -794,7 +794,7 @@ void AMainGameMode::OpenSinglePlayerWorldByFolderName(const FString& WorldFolder
         {
             const FString WarningTitle = TEXT("Cannot Load World");
             const FString WarningMessage = FString::Printf(
-                TEXT("The selected file '%s.v3d' is not a World project (Detected ProjectType: %s).\n\nOnly World-type .v3d archives placed under V3Ds/Worlds can be loaded in Singleplay. Loading has been cancelled."),
+                TEXT("The selected file '%s.v3d' is not a World project (Detected ProjectType: %s).\n\nOnly World-type .v3d archives placed under V3Ds can be loaded in Singleplay (V3D modules use the .v3dm extension). Loading has been cancelled."),
                 *ResolvedFolderName, *DetectedType);
             UE_LOG(LogTemp, Warning, TEXT("[WorldSelection] %s"), *WarningMessage);
             if (IsValid(WorldSelectionWidget))

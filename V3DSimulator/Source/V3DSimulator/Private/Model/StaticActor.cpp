@@ -36,7 +36,6 @@
 #include "System/WorldArchive.h"
 #include "System/WorldBakedModelAsset.h"
 #include "HAL/PlatformFileManager.h"
-#include "Misc/Compression.h"
 #include "System/V3DTerrain.h"
 #include "System/WorldArchiveCodec.h"
 #include "System/WorldSurfaceSubsystem.h"
@@ -61,43 +60,24 @@ namespace StaticActorPrivate
         if (!Handle) return LayerNames;
 
         TMap<int32, FString> NamesById;
+        NamesById.Reserve(Manifest.MaterialRanges.Num());
         TArray<FString> FallbackTerrainNames;
         TMap<int32, int32> PaletteSourceByLayer;
         bool bHasPalette = false;
+        TArray<uint8> Payload;
 
         for (const TPair<int32, FGWorldArchiveRange>& Pair : Manifest.MaterialRanges)
         {
             const FGWorldArchiveRange& Range = Pair.Value;
-            if (Range.StoredSize == 0 || Range.UncompressedSize == 0
-                || Range.StoredSize > 16ull * 1024ull * 1024ull
-                || Range.UncompressedSize > 16ull * 1024ull * 1024ull)
+            if (Range.Codec != 0 || Range.StoredSize == 0
+                || Range.StoredSize != Range.UncompressedSize
+                || Range.StoredSize > 16ull * 1024ull * 1024ull)
             {
                 continue;
             }
             if (!Handle->Seek(static_cast<int64>(Range.Offset))) continue;
-            TArray<uint8> Stored;
-            Stored.SetNumUninitialized(static_cast<int32>(Range.StoredSize));
-            if (!Handle->Read(Stored.GetData(), static_cast<int64>(Range.StoredSize))) continue;
-
-            TArray<uint8> Payload;
-            if (Range.Codec == 0)
-            {
-                Payload = MoveTemp(Stored);
-            }
-            else if (Range.Codec == 1)
-            {
-                Payload.SetNumUninitialized(static_cast<int32>(Range.UncompressedSize));
-                if (!FCompression::UncompressMemory(NAME_Zlib,
-                    Payload.GetData(), Payload.Num(),
-                    Stored.GetData(), Stored.Num()))
-                {
-                    continue;
-                }
-            }
-            else
-            {
-                continue;
-            }
+            Payload.SetNumUninitialized(static_cast<int32>(Range.StoredSize), EAllowShrinking::No);
+            if (!Handle->Read(Payload.GetData(), static_cast<int64>(Range.StoredSize))) continue;
 
             FGWorldBakedMaterial Mat;
             FString Err;
