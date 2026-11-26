@@ -412,34 +412,47 @@ namespace V3DImpostorPrivate
         Prim.bHasMaterial = true;
         Prim.bHasIndices = true;
 
-        // A bounding-radius quad centered at Center. The impostor shader (V3D_ImpostorBillboardWPO)
-        // rotates these 4 vertices toward the camera using UV0, while the static vertex positions
-        // provide accurate local bounds for culling and LOD screen-size calculations.
+        // Three orthogonal crossed quads (XZ, YZ, XY) centered at Center with identical UV0.
+        // In rasterization, V3D_ImpostorWPO_VS collapses all vertices onto the camera-facing billboard;
+        // in Hardware Ray Tracing (static BLAS without per-ray WPO), the 3 orthogonal cards guarantee
+        // solid 360-degree silhouette coverage from every ray direction (sides, shadows, water reflections).
         Prim.Positions = {
+            // Card 0: XZ plane (normal -Y)
             Center + FVector3f(-Radius, 0.0f,  Radius),
             Center + FVector3f( Radius, 0.0f,  Radius),
             Center + FVector3f( Radius, 0.0f, -Radius),
-            Center + FVector3f(-Radius, 0.0f, -Radius)
+            Center + FVector3f(-Radius, 0.0f, -Radius),
+            // Card 1: YZ plane (normal +X)
+            Center + FVector3f(0.0f, -Radius,  Radius),
+            Center + FVector3f(0.0f,  Radius,  Radius),
+            Center + FVector3f(0.0f,  Radius, -Radius),
+            Center + FVector3f(0.0f, -Radius, -Radius),
+            // Card 2: XY plane (normal +Z)
+            Center + FVector3f(-Radius,  Radius, 0.0f),
+            Center + FVector3f( Radius,  Radius, 0.0f),
+            Center + FVector3f( Radius, -Radius, 0.0f),
+            Center + FVector3f(-Radius, -Radius, 0.0f)
         };
         Prim.Normals = {
-            FVector3f(0.0f, -1.0f, 0.0f),
-            FVector3f(0.0f, -1.0f, 0.0f),
-            FVector3f(0.0f, -1.0f, 0.0f),
-            FVector3f(0.0f, -1.0f, 0.0f)
+            FVector3f(0.0f, -1.0f, 0.0f), FVector3f(0.0f, -1.0f, 0.0f), FVector3f(0.0f, -1.0f, 0.0f), FVector3f(0.0f, -1.0f, 0.0f),
+            FVector3f(1.0f,  0.0f, 0.0f), FVector3f(1.0f,  0.0f, 0.0f), FVector3f(1.0f,  0.0f, 0.0f), FVector3f(1.0f,  0.0f, 0.0f),
+            FVector3f(0.0f,  0.0f, 1.0f), FVector3f(0.0f,  0.0f, 1.0f), FVector3f(0.0f,  0.0f, 1.0f), FVector3f(0.0f,  0.0f, 1.0f)
         };
         Prim.Tangents = {
-            FVector4f(1.0f, 0.0f, 0.0f, 1.0f),
-            FVector4f(1.0f, 0.0f, 0.0f, 1.0f),
-            FVector4f(1.0f, 0.0f, 0.0f, 1.0f),
-            FVector4f(1.0f, 0.0f, 0.0f, 1.0f)
+            FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f),
+            FVector4f(0.0f, 1.0f, 0.0f, 1.0f), FVector4f(0.0f, 1.0f, 0.0f, 1.0f), FVector4f(0.0f, 1.0f, 0.0f, 1.0f), FVector4f(0.0f, 1.0f, 0.0f, 1.0f),
+            FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f)
         };
         Prim.UVs.Add({
-            FVector2f(0.0f, 0.0f),
-            FVector2f(1.0f, 0.0f),
-            FVector2f(1.0f, 1.0f),
-            FVector2f(0.0f, 1.0f)
+            FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f), FVector2f(0.0f, 1.0f),
+            FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f), FVector2f(0.0f, 1.0f),
+            FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f), FVector2f(0.0f, 1.0f)
         });
-        Prim.Indices = { 0, 1, 2, 0, 2, 3 };
+        Prim.Indices = {
+            0, 1, 2, 0, 2, 3,
+            4, 5, 6, 4, 6, 7,
+            8, 9, 10, 8, 10, 11
+        };
         return Quad;
     }
 }

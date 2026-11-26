@@ -3,6 +3,7 @@
 #pragma once
 
 #include "Components/PrimitiveComponent.h"
+#include "Components/StaticMeshComponent.h"
 
 namespace V3DMeshRendering
 {
@@ -14,6 +15,11 @@ namespace V3DMeshRendering
         Component->SetRenderCustomDepth(true);
         Component->SetCastShadow(true);
         Component->SetVisibleInRayTracing(true);
+        if (UStaticMeshComponent* StaticMeshComp = Cast<UStaticMeshComponent>(Component))
+        {
+            StaticMeshComp->bEvaluateWorldPositionOffset = true;
+            StaticMeshComp->WorldPositionOffsetDisableDistance = 0;
+        }
         if (!Component->bCastDynamicShadow || !Component->bCastStaticShadow)
         {
             Component->bCastDynamicShadow = true;

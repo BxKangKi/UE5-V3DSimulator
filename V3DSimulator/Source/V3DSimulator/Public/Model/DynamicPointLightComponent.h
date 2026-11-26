@@ -57,9 +57,9 @@ private:
     UPROPERTY(EditAnywhere, Category = "Optimization", meta = (UIMin = "0.0", ClampMin = "0.0"))
     float CullingDistance = 10000.0f;
 
-    /** Distance up to which the fallback decal remains visible after the point light culls. */
+    /** Max distance for the fallback decal. 0 keeps the decal visible until the owning actor/impostor unloads. */
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal", meta = (UIMin = "0.0", ClampMin = "0.0"))
-    float DecalTransitionDistance = 25000.0f;
+    float DecalTransitionDistance = 0.0f;
 
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal", meta = (UIMin = "1.0", ClampMin = "1.0"))
     float MaxLightDecalSize = 2500.0f;

@@ -67,12 +67,12 @@ namespace
         {
             return;
         }
-        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor::Black);
-        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor::Black);
-        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor::Black);
-        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor::Black);
-        PostProcessMID->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
-        PostProcessMID->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.0f);
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Ambient Color"), FLinearColor(0.012f, 0.036f, 0.082f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Fog Scatter Color"), FLinearColor(0.018f, 0.052f, 0.115f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("Band Color"), FLinearColor(0.010f, 0.028f, 0.064f, 1.0f));
+        PostProcessMID->SetVectorParameterValue(TEXT("ShaftColor"), FLinearColor(0.06f, 0.14f, 0.24f, 1.0f));
+        PostProcessMID->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.58f);
+        PostProcessMID->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.12f);
     }
 
 }
@@ -107,6 +107,7 @@ AWaterActor::AWaterActor()
     StaticMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
     StaticMesh->SetGenerateOverlapEvents(false);
     StaticMesh->SetCastShadow(false);
+    StaticMesh->SetVisibleInRayTracing(false); // Prevent SingleLayerWater RT self-intersection blocking Lumen reflections.
     StaticMesh->SetRenderCustomDepth(false); // Shaft occlusion uses solid geometry only.
     StaticMesh->SetVisibility(true, true);
     StaticMesh->SetHiddenInGame(false, true);
@@ -128,6 +129,7 @@ void AWaterActor::BeginPlay()
     if (IsValid(StaticMesh.Get()))
     {
         StaticMesh->SetRenderCustomDepth(false);
+        StaticMesh->SetVisibleInRayTracing(false);
         StaticMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         StaticMesh->SetGenerateOverlapEvents(false);
         StaticMesh->SetVisibility(true, true);

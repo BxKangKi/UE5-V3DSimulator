@@ -516,10 +516,17 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
             }
         };
         const bool bLowQualityShading = (ShadingQuality == 0 || ShadowQuality == 0);
-        // Always keep SingleLayerWater active so water stays transparent at every quality preset.
+        // Always keep SingleLayerWater active so water stays transparent and reflective at every quality preset.
         SetRenderingOption(TEXT("r.Water.SingleLayer"), 1);
+        SetRenderingOption(TEXT("r.Water.SingleLayer.Reflection"), 1);
+        SetRenderingOption(TEXT("r.Water.SingleLayer.LumenReflections"), bLowQualityShading ? 0 : 1);
         SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing"),
             bUseHardwareRayTracing && !bLowQualityShading ? 1 : 0);
+        SetRenderingOption(TEXT("r.Lumen.Reflections.HardwareRayTracing"),
+            bUseHardwareRayTracing && !bLowQualityShading ? 1 : 0);
+        SetRenderingOption(TEXT("r.Lumen.Reflections.SingleLayerWater"), bLowQualityShading ? 0 : 1);
+        SetRenderingOption(TEXT("r.Lumen.TranslucencyReflections.FrontLayer.Allow"), bLowQualityShading ? 0 : 1);
+        SetRenderingOption(TEXT("r.Lumen.TranslucencyReflections.FrontLayer.EnableForProject"), bLowQualityShading ? 0 : 1);
         SetRenderingOption(TEXT("r.RayTracing.Shadows"),
             bUseHardwareRayTracing && ShadowQuality > 0 ? 1 : 0);
         // Classic clean low-spec 3D game shading on Low quality: disable noisy SSAO, contact shadows,
@@ -541,11 +548,13 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         SetRenderingOption(TEXT("r.Shadow.Virtual.Clipmap.LastLevel"), LastLevel);
         if (bUseHardwareRayTracing)
         {
-            // Keep distance culling enabled; extend its coverage with the shadow budget.
-            // Otherwise RT removes casters after ~100-300 m even with a longer CSM/VSM range.
-            SetRenderingOption(TEXT("r.RayTracing.Culling.Radius"), FMath::RoundToInt(ShadowRange));
+            // Extend RT culling coverage to full render distance so far-LOD impostors remain visible in RT reflections/GI.
+            const float RayTracingRange = FMath::Max(ShadowRange, GetMaxRenderDistanceCentimeters());
+            SetRenderingOption(TEXT("r.RayTracing.Culling.Radius"), FMath::RoundToInt(RayTracingRange));
             SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.CullClusterRadius"),
-                FMath::RoundToInt(ShadowRange));
+                FMath::RoundToInt(RayTracingRange));
+            SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.EvaluateWPO"), 1);
+            SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing.HitLighting"), 1);
         }
     }
 
@@ -556,6 +565,8 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         PPSettings.BloomThreshold = BloomThreshold;
         const bool bLowQualityPP = (ShadingQuality == 0 || ShadowQuality == 0);
         PPSettings.AmbientOcclusionIntensity = bLowQualityPP ? 0.0f : AmbientOcclusionIntensity;
+        PPSettings.bOverride_ReflectionMethod = true;
+        PPSettings.ReflectionMethod = bLowQualityPP ? EReflectionMethod::None : EReflectionMethod::Lumen;
 
         // Exposure=-11 is the explicit Auto sentinel. Auto uses the cheaper Basic metering mode
         // (single downsampled luminance value) with an EV100 adaptation window wide enough for

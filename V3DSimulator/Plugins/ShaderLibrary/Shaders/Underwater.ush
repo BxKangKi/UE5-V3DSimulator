@@ -28,14 +28,14 @@
 // Matched with SingleLayerWater (M_Water / WaterActor) so surface and underwater
 // transition seamlessly: red attenuates within metres, green at mid-depth, and
 // deep water (both character & seafloor) darkens naturally into deep marine navy.
-// SEUS HRR 3 inspired clear ocean optics: crystal-clear shallow water where the seabed is
-// clearly visible, transitioning into luminous turquoise-teal mid-depth and deep clear blue-teal.
-static const float3 UW_WATER_ABSORPTION = float3(0.00085f, 0.00028f, 0.00013f);
-static const float3 UW_WATER_SCATTERING = float3(0.000008f, 0.000028f, 0.000052f);
-static const float3 UW_WATER_EXTINCTION = float3(0.000858f, 0.000308f, 0.000182f);
+// Natural ocean-blue optical coefficients (cm^-1): eliminates air-like hyper-transparency
+// and turquoise/emerald glow, giving clear near visibility that smoothly fades into deep marine blue.
+static const float3 UW_WATER_ABSORPTION = float3(0.00480f, 0.00240f, 0.00105f);
+static const float3 UW_WATER_SCATTERING = float3(0.000045f, 0.000110f, 0.000230f);
+static const float3 UW_WATER_EXTINCTION = float3(0.004845f, 0.002510f, 0.001280f);
 // Pre-multiplied by log2(e) = 1.44269504f so inner loops use single-instruction exp2().
-static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.00123783f, 0.00044435f, 0.00026257f);
-static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.009324f, 0.090909f, 0.285714f);
+static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.0069899f, 0.0036212f, 0.0018466f);
+static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.009288f, 0.043825f, 0.179688f);
 static const float  UW_WATER_IOR = 1.3333f;
 static const float  UW_WATER_INV_IOR = 0.75001875f;
 static const float  UW_WATER_F0 = 0.0204f; // ((1.3333 - 1) / (1.3333 + 1))^2

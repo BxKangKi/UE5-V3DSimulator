@@ -1,10 +1,21 @@
-// Stable, world-anchored multi-octave slope normals for T_Water_H with quality scaling.
+// Natural, organic multi-octave water surface normals for M_Water (Raster & Hardware Ray Tracing).
+// Preserves V3DSampleWaterSlope and V3DWaterSurfaceNormalQuality signatures for zero-graph-edit drop-in.
 #ifndef V3D_WATER_SURFACE_HLSL
 #define V3D_WATER_SURFACE_HLSL
 
 float2 V3DSampleWaterSlope(Texture2D WaveTexture, SamplerState WaveSampler, float2 UV)
 {
     return Texture2DSample(WaveTexture, WaveSampler, UV).rg - 0.5f;
+}
+
+float2 V3DRotateSlope(float2 Slope, float CosA, float SinA)
+{
+    return float2(Slope.x * CosA + Slope.y * SinA, -Slope.x * SinA + Slope.y * CosA);
+}
+
+float2 V3DRotateUV(float2 UV, float CosA, float SinA)
+{
+    return float2(UV.x * CosA - UV.y * SinA, UV.x * SinA + UV.y * CosA);
 }
 
 float3 V3DWaterSurfaceNormalQuality(Texture2D WaveTexture, SamplerState WaveSampler,
@@ -17,62 +28,69 @@ float3 V3DWaterSurfaceNormalQuality(Texture2D WaveTexture, SamplerState WaveSamp
     const float2 nearUV = Position / safeNearScale;
     const float2 farUV = Position / safeFarScale;
     const float t = Time * clamp(Speed, -4.0f, 4.0f);
+    const float safeDepth = max(ViewDepth, 0.0f);
 
-    // Primary cross-scrolling ocean waves (all quality tiers).
-    const float2 nearA = V3DSampleWaterSlope(WaveTexture, WaveSampler, nearUV + t * float2(0.042f, 0.024f));
-    const float2 rotUV1 = float2(-nearUV.y * 0.82f + nearUV.x * 0.57f, nearUV.x * 0.82f + nearUV.y * 0.57f) * 1.18f;
-    float2 nearB = V3DSampleWaterSlope(WaveTexture, WaveSampler, rotUV1 + t * float2(-0.031f, 0.039f));
-    nearB = float2(nearB.x * 0.57f + nearB.y * 0.82f, -nearB.x * 0.82f + nearB.y * 0.57f);
+    // 1. Primary organic wind-wave pair with irrational scale & non-orthogonal rotation (37 deg)
+    //    plus gentle domain warping so waves roll naturally without visible tiling or sine-wave stripes.
+    const float2 w0 = V3DSampleWaterSlope(WaveTexture, WaveSampler, nearUV * 0.92f + t * float2(0.036f, 0.019f));
 
-    float2 nearSlope = (nearA + nearB) * 0.55f;
+    // Domain-warp layer 2 slightly using w0 so crests bend organically like real liquid.
+    const float2 uv1 = V3DRotateUV(nearUV + w0 * 0.07f, 0.7986f, 0.6018f) * 1.37f;
+    float2 w1 = V3DSampleWaterSlope(WaveTexture, WaveSampler, uv1 + t * float2(-0.028f, 0.034f));
+    w1 = V3DRotateSlope(w1, 0.7986f, 0.6018f);
 
-    // Medium+ (QualityLevel >= 1): 3rd swell octave breaks tiling and restores organic wave rolling.
+    float2 nearSlope = (w0 * 0.58f + w1 * 0.46f);
+
+    // 2. Medium+ (QualityLevel >= 1): broad counter-drifting ocean swell breaks repetition.
     [branch] if (QualityLevel >= 0.5f)
     {
-        const float2 swellUV = float2(nearUV.x * 0.61f - nearUV.y * 0.43f, nearUV.x * 0.43f + nearUV.y * 0.61f);
-        float2 swell = V3DSampleWaterSlope(WaveTexture, WaveSampler, swellUV + t * float2(0.018f, -0.027f));
-        nearSlope = nearSlope * 0.78f + swell * 0.42f;
+        const float2 uvSwell = V3DRotateUV(nearUV, 0.4848f, -0.8746f) * 0.49f;
+        float2 swell = V3DSampleWaterSlope(WaveTexture, WaveSampler, uvSwell + t * float2(0.014f, -0.021f));
+        swell = V3DRotateSlope(swell, 0.4848f, -0.8746f);
+        nearSlope = nearSlope * 0.76f + swell * 0.44f;
     }
 
-    // High+ (QualityLevel >= 2): 4th fine wind ripple octave for crisp sunlight glints & realistic motion.
+    // 3. High+ (QualityLevel >= 2): medium wind chop with smooth distance fade (no horizon shimmer).
     [branch] if (QualityLevel >= 1.5f)
     {
-        const float2 rippleUV = float2(nearUV.x * 1.92f + nearUV.y * 1.31f, -nearUV.x * 1.31f + nearUV.y * 1.92f);
-        const float2 ripple = V3DSampleWaterSlope(WaveTexture, WaveSampler, rippleUV + t * float2(-0.072f, -0.054f));
-        const float rippleFade = 1.0f - saturate(max(ViewDepth, 0.0f) / 3200.0f);
-        nearSlope += ripple * (0.28f * rippleFade);
+        const float2 uvChop = V3DRotateUV(nearUV + w1 * 0.04f, -0.3420f, 0.9397f) * 2.13f;
+        float2 chop = V3DSampleWaterSlope(WaveTexture, WaveSampler, uvChop + t * float2(-0.058f, -0.041f));
+        chop = V3DRotateSlope(chop, -0.3420f, 0.9397f);
+        const float chopFade = 1.0f - saturate(safeDepth / 3600.0f);
+        nearSlope += chop * (0.22f * chopFade * chopFade);
     }
 
-    // Epic (QualityLevel >= 3): subtle high-frequency capillary micro-ripples up close.
+    // 4. Epic (QualityLevel >= 3): fine close-up capillary micro-ripples for crisp sun glints.
     [branch] if (QualityLevel >= 2.5f)
     {
-        const float2 microUV = nearUV * 3.65f;
-        const float2 micro = V3DSampleWaterSlope(WaveTexture, WaveSampler, microUV + t * float2(0.115f, -0.095f));
-        const float microFade = 1.0f - saturate(max(ViewDepth, 0.0f) / 1400.0f);
-        nearSlope += micro * (0.16f * microFade);
+        const float2 uvMicro = V3DRotateUV(nearUV, 0.9272f, -0.3746f) * 3.85f;
+        float2 micro = V3DSampleWaterSlope(WaveTexture, WaveSampler, uvMicro + t * float2(0.092f, -0.074f));
+        micro = V3DRotateSlope(micro, 0.9272f, -0.3746f);
+        const float microFade = 1.0f - saturate(safeDepth / 1500.0f);
+        nearSlope += micro * (0.13f * microFade * microFade);
     }
 
-    // Distant ocean swells (2 counter-drifting layers on High+ to prevent flat/static horizon bands).
-    float2 farSlope = V3DSampleWaterSlope(WaveTexture, WaveSampler, farUV + t * float2(0.015f, -0.011f));
-    [branch] if (QualityLevel >= 1.5f)
+    // 5. Distant ocean swells: dual rotated layers prevent static horizon bands and aliasing.
+    float2 farSlope = V3DSampleWaterSlope(WaveTexture, WaveSampler, farUV * 0.95f + t * float2(0.013f, -0.009f));
+    [branch] if (QualityLevel >= 0.5f)
     {
-        const float2 farUV2 = float2(-farUV.y, farUV.x) * 1.42f;
-        float2 farB = V3DSampleWaterSlope(WaveTexture, WaveSampler, farUV2 + t * float2(-0.012f, 0.014f));
-        farB = float2(farB.y, -farB.x);
-        farSlope = (farSlope + farB) * 0.62f;
+        const float2 farUV2 = V3DRotateUV(farUV, 0.6428f, 0.7660f) * 1.43f;
+        float2 farB = V3DSampleWaterSlope(WaveTexture, WaveSampler, farUV2 + t * float2(-0.011f, 0.012f));
+        farB = V3DRotateSlope(farB, 0.6428f, 0.7660f);
+        farSlope = farSlope * 0.58f + farB * 0.48f;
     }
 
-    float blend = saturate((max(ViewDepth, 0.0f) - max(BlendStart, 0.0f)) / max(BlendLength, 100.0f));
+    float blend = saturate((safeDepth - max(BlendStart, 0.0f)) / max(BlendLength, 100.0f));
     blend = blend * blend * (3.0f - 2.0f * blend);
 
     float2 slope = lerp(
-        nearSlope * (1.85f * clamp(NearStrength, 0.0f, 1.5f)),
-        farSlope * (2.10f * clamp(FarStrength, 0.0f, 1.5f)),
+        nearSlope * (1.35f * clamp(NearStrength, 0.0f, 1.5f)),
+        farSlope * (1.25f * clamp(FarStrength, 0.0f, 1.5f)),
         blend);
 
     if (!all(isfinite(slope))) return float3(0.0f, 0.0f, 1.0f);
-    slope = clamp(slope, -0.65f, 0.65f);
-    return float3(slope, 1.0f) * rsqrt(1.0f + dot(slope, slope));
+    slope = clamp(slope, -0.45f, 0.45f);
+    return float3(slope.x, slope.y, 1.0f) * rsqrt(1.0f + dot(slope, slope));
 }
 
 #endif

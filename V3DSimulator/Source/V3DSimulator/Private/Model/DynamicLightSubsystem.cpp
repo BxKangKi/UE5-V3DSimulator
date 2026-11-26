@@ -137,9 +137,14 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
     UMaterialInterface* ResolvedMaterial = ResolveDecalMaterialForLight(this, InLight);
     const float CullingDist = FMath::Max(0.0f, InLight->GetCullingDistance());
     const float DecalDist = FMath::Max(0.0f, InLight->GetDecalTransitionDistance());
+    // DecalDist == 0 means keep the lightweight fallback decal visible until the owning actor/impostor unloads.
+    const bool bInfiniteDecalRange = (DecalDist <= KINDA_SMALL_NUMBER);
     const bool bCanUseDecalFallback = InLight->IsLightDecalFallbackEnabled()
         && IsValid(ResolvedMaterial)
-        && DecalDist > CullingDist;
+        && (bInfiniteDecalRange || DecalDist > CullingDist);
+    const float EffectiveDecalDistSq = bCanUseDecalFallback
+        ? (bInfiniteDecalRange ? 0.0f : FMath::Square(DecalDist))
+        : -1.0f;
 
     // Refresh existing entry if re-registered after SetLightDecal / distance updates.
     for (FLightOptimizationData& Existing : ManagedLights)
@@ -148,7 +153,7 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
         {
             Existing.Position = InLight->GetComponentLocation();
             Existing.CullingDistanceSq = FMath::Square(CullingDist);
-            Existing.DecalTransitionDistanceSq = bCanUseDecalFallback ? FMath::Square(DecalDist) : 0.0f;
+            Existing.DecalTransitionDistanceSq = EffectiveDecalDistSq;
             Existing.TargetDecalMaterial = bCanUseDecalFallback ? ResolvedMaterial : nullptr;
             if (!bCanUseDecalFallback)
             {
@@ -164,7 +169,7 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
     FLightOptimizationData NewData;
     NewData.Position = InLight->GetComponentLocation();
     NewData.CullingDistanceSq = FMath::Square(CullingDist);
-    NewData.DecalTransitionDistanceSq = bCanUseDecalFallback ? FMath::Square(DecalDist) : 0.0f;
+    NewData.DecalTransitionDistanceSq = EffectiveDecalDistSq;
     NewData.LightComponent = InLight;
     NewData.TargetDecalMaterial = bCanUseDecalFallback ? ResolvedMaterial : nullptr;
 
@@ -303,10 +308,12 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
         Data.Position = LightComp->GetComponentLocation();
         const float DistanceSquared = FVector::DistSquared(CameraLocation, Data.Position);
         const bool bUseLight = DistanceSquared < Data.CullingDistanceSq;
+        const bool bWithinDecalRange = (Data.DecalTransitionDistanceSq == 0.0f)
+            || (Data.DecalTransitionDistanceSq > Data.CullingDistanceSq && DistanceSquared < Data.DecalTransitionDistanceSq);
         const bool bUseDecal = !bUseLight &&
             Data.TargetDecalMaterial.IsValid() &&
-            Data.DecalTransitionDistanceSq > Data.CullingDistanceSq &&
-            DistanceSquared < Data.DecalTransitionDistanceSq;
+            Data.DecalTransitionDistanceSq >= 0.0f &&
+            bWithinDecalRange;
         Data.bTargetLightVisibility = bUseLight;
         Data.bTargetDecalVisibility = bUseDecal;
 

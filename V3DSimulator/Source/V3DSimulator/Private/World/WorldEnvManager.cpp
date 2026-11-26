@@ -1081,23 +1081,23 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     const float SurfaceTrans = 1.0f - Fresnel;
     const float LightScale = Daylight * SurfaceTrans;
 
-    // Natural average clear-blue water ambient equilibrium.
+    // Rich natural deep-blue marine ambient equilibrium (reduced green prevents emerald wash).
     const FLinearColor PhysicalFogAmbient(
-        0.006f * LightScale,
-        0.028f * LightScale,
-        0.062f * LightScale,
-        1.0f);
-    // Balanced natural blue marine in-scatter color.
-    const FLinearColor PhysicalFogScatter(
-        0.018f * LightScale,
-        0.078f * LightScale,
-        0.155f * LightScale,
-        1.0f);
-    // Natural sunlit clear-blue waterline meniscus band.
-    const FLinearColor PhysicalBandColor(
+        0.008f * LightScale,
         0.024f * LightScale,
-        0.092f * LightScale,
-        0.175f * LightScale,
+        0.068f * LightScale,
+        1.0f);
+    // Balanced deep-blue marine in-scatter color so underwater volume has clear water density.
+    const FLinearColor PhysicalFogScatter(
+        0.016f * LightScale,
+        0.056f * LightScale,
+        0.145f * LightScale,
+        1.0f);
+    // Natural sunlit blue waterline meniscus band.
+    const FLinearColor PhysicalBandColor(
+        0.022f * LightScale,
+        0.068f * LightScale,
+        0.165f * LightScale,
         1.0f);
     // Warm sunlit-ivory to golden shaft base tint (Beer-Lambert extinction in Underwater.ush shifts with depth).
     const float WarmShift = FMath::SmoothStep(0.0f, 0.35f, SunElevationSin);
@@ -1111,8 +1111,8 @@ void AWorldEnvManager::UpdatePhysicalUnderwaterColors(const float SunElevationSi
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Fog Scatter Color"), PhysicalFogScatter);
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("Band Color"), PhysicalBandColor);
     OceanPostProcessMaterial->SetVectorParameterValue(TEXT("ShaftColor"), PhysicalShaftColor);
-    OceanPostProcessMaterial->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.75f);
-    OceanPostProcessMaterial->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.0f);
+    OceanPostProcessMaterial->SetScalarParameterValue(TEXT("Scattering Aniso"), 0.55f);
+    OceanPostProcessMaterial->SetScalarParameterValue(TEXT("DistortionIntensity"), 0.08f);
 }
 
 void AWorldEnvManager::UpdateFoliageInteractors()
