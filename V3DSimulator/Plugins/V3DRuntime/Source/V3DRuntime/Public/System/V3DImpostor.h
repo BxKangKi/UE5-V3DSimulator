@@ -25,7 +25,7 @@ namespace V3DImpostor
     inline constexpr const TCHAR* CenterParamName = TEXT("ImpostorCenter");
 
     inline constexpr int32 DefaultGridFrames = 8;
-    inline constexpr int32 DefaultFrameResolution = 64;
+    inline constexpr int32 DefaultFrameResolution = 32;
 
     V3DRUNTIME_API bool IsImpostorMeshName(const FString& Name);
     V3DRUNTIME_API bool IsImpostorMaterial(const FGWorldBakedMaterial& Material);

@@ -137,6 +137,8 @@ struct texture {
     // Each mip contains every layer, with each full layer preceding the next.
     // All layers share dimensions/format/mip count. Layer count never shrinks with mips.
     std::vector<mip> mips;
+    texture_format alt_pixel_format=texture_format::unknown;
+    std::vector<mip> alt_mips;
 };
 struct range {
     std::string name;
@@ -430,19 +432,31 @@ inline bool validate(const texture& t,std::string& error) {
         return detail::failure(error,"Invalid texture id/name/dimensions/sampler/mip count");
     std::uint32_t w=t.width,h=t.height;
     for(const auto& m:t.mips){std::uint64_t expected=0;if(m.width!=w||m.height!=h||m.layers!=t.layers||m.bytes.empty()||m.bytes.size()>1024ull*1024ull*1024ull||(!texture_mip_bytes(t.pixel_format,w,h,t.layers,expected)||m.bytes.size()!=expected))return detail::failure(error,"Invalid texture format or mip byte layout");w=std::max(1u,w>>1);h=std::max(1u,h>>1);}
+    if(t.alt_pixel_format!=texture_format::unknown||!t.alt_mips.empty()){
+        if(t.alt_pixel_format==texture_format::unknown||t.alt_mips.size()!=t.mips.size())
+            return detail::failure(error,"Invalid alternate texture format or mip count");
+        std::uint32_t aw=t.width,ah=t.height;
+        for(const auto& m:t.alt_mips){std::uint64_t expected=0;if(m.width!=aw||m.height!=ah||m.layers!=t.layers||m.bytes.empty()||m.bytes.size()>1024ull*1024ull*1024ull||(!texture_mip_bytes(t.alt_pixel_format,aw,ah,t.layers,expected)||m.bytes.size()!=expected))return detail::failure(error,"Invalid alternate texture format or mip byte layout");aw=std::max(1u,aw>>1);ah=std::max(1u,ah>>1);}
+    }
     error.clear();return true;
 }
 inline bool encode(const texture& t,bytes& out,std::string& error) {
     out.clear();
     if(!validate(t,error))return false;
-    detail::writer w(out);w.u32(0x52584554);w.u32(2);w.i32(t.texture_id);w.string(t.name,max_name_bytes);w.u32(t.width);w.u32(t.height);w.u32(static_cast<std::uint32_t>(t.pixel_format));w.u32(t.layers);
+    const bool has_alt=(t.alt_pixel_format!=texture_format::unknown&&!t.alt_mips.empty());
+    detail::writer w(out);w.u32(0x52584554);w.u32(has_alt?3u:2u);w.i32(t.texture_id);w.string(t.name,max_name_bytes);w.u32(t.width);w.u32(t.height);w.u32(static_cast<std::uint32_t>(t.pixel_format));w.u32(t.layers);
     w.u8(t.address_x);w.u8(t.address_y);w.u8(t.filter);w.u8(t.lod_group);w.u8(t.srgb);w.u8(t.is_array);w.u16(0);w.count(t.mips.size());
-    for(const auto& m:t.mips){w.u32(m.width);w.u32(m.height);w.u32(m.layers);w.count(m.bytes.size());w.raw(m.bytes.data(),m.bytes.size());}return detail::finish(w,out,error);
+    for(const auto& m:t.mips){w.u32(m.width);w.u32(m.height);w.u32(m.layers);w.count(m.bytes.size());w.raw(m.bytes.data(),m.bytes.size());}
+    if(has_alt){
+        w.u32(static_cast<std::uint32_t>(t.alt_pixel_format));w.count(t.alt_mips.size());
+        for(const auto& m:t.alt_mips){w.u32(m.width);w.u32(m.height);w.u32(m.layers);w.count(m.bytes.size());w.raw(m.bytes.data(),m.bytes.size());}
+    }
+    return detail::finish(w,out,error);
 }
 inline bool decode(const std::uint8_t* data,std::size_t size,texture& out,std::string& error,std::uint32_t max_resolution=0) {
     if(size>max_member_bytes)return detail::failure(error,"Texture exceeds member limit");
     detail::reader r(data,size);texture t;
-    const auto magic=r.u32();const auto version=r.u32();if(magic!=0x52584554||version!=2)return detail::failure(error,"Unsupported texture magic/version");
+    const auto magic=r.u32();const auto version=r.u32();if(magic!=0x52584554||(version!=2&&version!=3))return detail::failure(error,"Unsupported texture magic/version");
     t.texture_id=r.i32();t.name=r.string(max_name_bytes);t.width=r.u32();t.height=r.u32();const auto format=r.u32();
     {t.pixel_format=static_cast<texture_format>(format);t.layers=r.u32();}
     t.address_x=r.u8();t.address_y=r.u8();t.filter=r.u8();t.lod_group=r.u8();t.srgb=r.boolean();t.is_array=r.boolean();if(r.u16()!=0)r.fail();
@@ -453,6 +467,18 @@ inline bool decode(const std::uint8_t* data,std::size_t size,texture& out,std::s
         w=std::max(1u,w>>1);h=std::max(1u,h>>1);
         if(max_resolution&&(m.width>max_resolution||m.height>max_resolution)&&i+1<nm){r.skip(n);continue;}
         m.bytes.resize(n);r.raw(m.bytes.data(),n);t.mips.push_back(std::move(m));
+    }
+    if(version==3&&r.ok()){
+        t.alt_pixel_format=static_cast<texture_format>(r.u32());
+        const auto anm=r.count(32,16);
+        if(anm!=nm){r.fail();}
+        std::uint32_t aw=t.width,ah=t.height;
+        for(std::uint32_t i=0;i<anm&&r.ok();++i){mip m;m.width=r.u32();m.height=r.u32();m.layers=r.u32();const auto n=r.count(1024u*1024u*1024u,1);std::uint64_t expected=0;
+            if(m.width!=aw||m.height!=ah||m.layers!=t.layers||!n||(!texture_mip_bytes(t.alt_pixel_format,aw,ah,t.layers,expected)||n!=expected)){r.fail();break;}
+            aw=std::max(1u,aw>>1);ah=std::max(1u,ah>>1);
+            if(max_resolution&&(m.width>max_resolution||m.height>max_resolution)&&i+1<anm){r.skip(n);continue;}
+            m.bytes.resize(n);r.raw(m.bytes.data(),n);t.alt_mips.push_back(std::move(m));
+        }
     }
     if(!r.end()||t.mips.empty())return detail::failure(error,"Malformed or truncated texture member");
     t.width=t.mips.front().width;t.height=t.mips.front().height;
@@ -1602,6 +1628,339 @@ template<class Char> bool instance_segment(const Char* text, std::size_t size)
         if (c != Char(prefix[i])) return false;
     }
     return true; // ;INST followed by ANY characters is an instance directive.
+}
+
+
+namespace detail {
+inline std::uint8_t clamp_u8(int v) { return static_cast<std::uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v)); }
+inline int extend_4to8(int v) { return (v << 4) | v; }
+inline int extend_5to8(int v) { return (v << 3) | (v >> 2); }
+inline int extend_6to8(int v) { return (v << 2) | (v >> 4); }
+inline int extend_7to8(int v) { return (v << 1) | (v >> 6); }
+
+inline void decode_bc_color_block_rgba8(const std::uint8_t* src, bool is_bc1, std::uint8_t* out_rgba) {
+    const std::uint16_t c0 = static_cast<std::uint16_t>(src[0]) | (static_cast<std::uint16_t>(src[1]) << 8);
+    const std::uint16_t c1 = static_cast<std::uint16_t>(src[2]) | (static_cast<std::uint16_t>(src[3]) << 8);
+    int r[4], g[4], b[4], a[4];
+    r[0] = extend_5to8((c0 >> 11) & 31); g[0] = extend_6to8((c0 >> 5) & 63); b[0] = extend_5to8(c0 & 31); a[0] = 255;
+    r[1] = extend_5to8((c1 >> 11) & 31); g[1] = extend_6to8((c1 >> 5) & 63); b[1] = extend_5to8(c1 & 31); a[1] = 255;
+    if (!is_bc1 || c0 > c1) {
+        r[2] = (2 * r[0] + r[1] + 1) / 3; g[2] = (2 * g[0] + g[1] + 1) / 3; b[2] = (2 * b[0] + b[1] + 1) / 3; a[2] = 255;
+        r[3] = (r[0] + 2 * r[1] + 1) / 3; g[3] = (g[0] + 2 * g[1] + 1) / 3; b[3] = (b[0] + 2 * b[1] + 1) / 3; a[3] = 255;
+    } else {
+        r[2] = (r[0] + r[1]) / 2; g[2] = (g[0] + g[1]) / 2; b[2] = (b[0] + b[1]) / 2; a[2] = 255;
+        r[3] = 0; g[3] = 0; b[3] = 0; a[3] = 0;
+    }
+    const std::uint32_t idx_bits = static_cast<std::uint32_t>(src[4]) | (static_cast<std::uint32_t>(src[5]) << 8)
+        | (static_cast<std::uint32_t>(src[6]) << 16) | (static_cast<std::uint32_t>(src[7]) << 24);
+    for (int i = 0; i < 16; ++i) {
+        const std::uint32_t idx = (idx_bits >> (i * 2)) & 3u;
+        out_rgba[i * 4 + 0] = static_cast<std::uint8_t>(r[idx]);
+        out_rgba[i * 4 + 1] = static_cast<std::uint8_t>(g[idx]);
+        out_rgba[i * 4 + 2] = static_cast<std::uint8_t>(b[idx]);
+        out_rgba[i * 4 + 3] = static_cast<std::uint8_t>(a[idx]);
+    }
+}
+
+inline void decode_bc3_alpha_block_rgba8(const std::uint8_t* src, std::uint8_t* out_rgba) {
+    const int a0 = src[0], a1 = src[1];
+    int pal[8]; pal[0] = a0; pal[1] = a1;
+    if (a0 > a1) {
+        for (int k = 1; k <= 6; ++k) pal[k + 1] = ((7 - k) * a0 + k * a1 + 3) / 7;
+    } else {
+        for (int k = 1; k <= 4; ++k) pal[k + 1] = ((5 - k) * a0 + k * a1 + 2) / 5;
+        pal[6] = 0; pal[7] = 255;
+    }
+    std::uint64_t bits = 0;
+    for (int b = 0; b < 6; ++b) bits |= static_cast<std::uint64_t>(src[2 + b]) << (b * 8);
+    for (int i = 0; i < 16; ++i) {
+        out_rgba[i * 4 + 3] = static_cast<std::uint8_t>(pal[(bits >> (i * 3)) & 7ull]);
+    }
+}
+
+inline void decode_etc2_rgb_block_rgba8(const std::uint8_t* src, std::uint8_t* out_rgba) {
+    static constexpr int etc1_mod[8][4] = {
+        {2, 8, -2, -8}, {5, 17, -5, -17}, {9, 29, -9, -29}, {13, 42, -13, -42},
+        {18, 60, -18, -60}, {24, 80, -24, -80}, {33, 106, -33, -106}, {47, 183, -47, -183}
+    };
+    static constexpr int etc2_dist[8] = {3, 6, 11, 16, 23, 32, 41, 64};
+
+    const bool diff = (src[3] & 0x02u) != 0;
+    const bool flip = (src[3] & 0x01u) != 0;
+    const auto s3 = [](int v) -> int { return (v & 4) ? (v - 8) : v; };
+
+    const std::uint16_t msb_word = (static_cast<std::uint16_t>(src[4]) << 8) | src[5];
+    const std::uint16_t lsb_word = (static_cast<std::uint16_t>(src[6]) << 8) | src[7];
+
+    auto write_px = [&](int x, int y, int r, int g, int b) {
+        const int dst = (y * 4 + x) * 4;
+        out_rgba[dst + 0] = clamp_u8(r);
+        out_rgba[dst + 1] = clamp_u8(g);
+        out_rgba[dst + 2] = clamp_u8(b);
+        out_rgba[dst + 3] = 255;
+    };
+
+    if (diff) {
+        const int r5 = (src[0] >> 3) & 31, dr = s3(src[0] & 7);
+        const int g5 = (src[1] >> 3) & 31, dg = s3(src[1] & 7);
+        const int b5 = (src[2] >> 3) & 31, db = s3(src[2] & 7);
+        const int r2 = r5 + dr, g2 = g5 + dg, b2 = b5 + db;
+
+        if (r2 < 0 || r2 > 31) {
+            // T-mode
+            const int r1t = extend_4to8(((src[0] >> 3) & 0x0Cu) | (src[0] & 0x03u));
+            const int g1t = extend_4to8((src[1] >> 4) & 0x0Fu);
+            const int b1t = extend_4to8(src[1] & 0x0Fu);
+            const int r2t = extend_4to8((src[2] >> 4) & 0x0Fu);
+            const int g2t = extend_4to8(src[2] & 0x0Fu);
+            const int b2t = extend_4to8((src[3] >> 4) & 0x0Fu);
+            const int d = etc2_dist[((src[3] >> 1) & 0x06u) | (src[3] & 0x01u)];
+            const int pal[4][3] = {
+                {r1t, g1t, b1t},
+                {clamp_u8(r2t + d), clamp_u8(g2t + d), clamp_u8(b2t + d)},
+                {r2t, g2t, b2t},
+                {clamp_u8(r2t - d), clamp_u8(g2t - d), clamp_u8(b2t - d)}
+            };
+            for (int x = 0; x < 4; ++x) for (int y = 0; y < 4; ++y) {
+                const int bit = x * 4 + y;
+                const int idx = (((msb_word >> bit) & 1) << 1) | ((lsb_word >> bit) & 1);
+                write_px(x, y, pal[idx][0], pal[idx][1], pal[idx][2]);
+            }
+            return;
+        }
+        if (g2 < 0 || g2 > 31) {
+            // H-mode
+            const int r1h = extend_4to8((src[0] >> 3) & 0x0Fu);
+            const int g1h = extend_4to8(((src[0] & 0x07u) << 1) | ((src[1] >> 4) & 0x01u));
+            const int b1h = extend_4to8((src[1] & 0x08u) | ((src[1] & 0x03u) << 1) | ((src[2] >> 7) & 0x01u));
+            const int r2h = extend_4to8((src[2] >> 3) & 0x0Fu);
+            const int g2h = extend_4to8(((src[2] & 0x07u) << 1) | ((src[3] >> 7) & 0x01u));
+            const int b2h = extend_4to8((src[3] >> 3) & 0x0Fu);
+            const int c1 = (r1h << 16) | (g1h << 8) | b1h;
+            const int c2 = (r2h << 16) | (g2h << 8) | b2h;
+            const int d = etc2_dist[((src[3] & 0x04u) | (src[3] & 0x01u)) | ((c1 >= c2) ? 2 : 0)];
+            const int pal[4][3] = {
+                {clamp_u8(r1h + d), clamp_u8(g1h + d), clamp_u8(b1h + d)},
+                {clamp_u8(r1h - d), clamp_u8(g1h - d), clamp_u8(b1h - d)},
+                {clamp_u8(r2h + d), clamp_u8(g2h + d), clamp_u8(b2h + d)},
+                {clamp_u8(r2h - d), clamp_u8(g2h - d), clamp_u8(b2h - d)}
+            };
+            for (int x = 0; x < 4; ++x) for (int y = 0; y < 4; ++y) {
+                const int bit = x * 4 + y;
+                const int idx = (((msb_word >> bit) & 1) << 1) | ((lsb_word >> bit) & 1);
+                write_px(x, y, pal[idx][0], pal[idx][1], pal[idx][2]);
+            }
+            return;
+        }
+        if (b2 < 0 || b2 > 31) {
+            // Planar mode
+            const int ro = extend_6to8((src[0] >> 1) & 0x3Fu);
+            const int go = extend_7to8(((src[0] & 0x01u) << 6) | ((src[1] >> 1) & 0x3Fu));
+            const int bo = extend_6to8(((src[1] & 0x01u) << 5) | ((src[2] >> 3) & 0x18u) | (src[2] & 0x07u));
+            const int rh = extend_6to8(((src[3] >> 2) & 0x3Eu) | ((src[3] >> 1) & 0x01u));
+            const int gh = extend_7to8(src[4] >> 1);
+            const int bh = extend_6to8(((src[4] & 0x01u) << 5) | ((src[5] >> 3) & 0x1Fu));
+            const int rv = extend_6to8(((src[5] & 0x07u) << 3) | ((src[6] >> 5) & 0x07u));
+            const int gv = extend_7to8(((src[6] & 0x1Fu) << 2) | ((src[7] >> 6) & 0x03u));
+            const int bv = extend_6to8(src[7] & 0x3Fu);
+            for (int y = 0; y < 4; ++y) for (int x = 0; x < 4; ++x) {
+                write_px(x, y, (x * (rh - ro) + y * (rv - ro) + 4 * ro + 2) >> 2,
+                               (x * (gh - go) + y * (gv - go) + 4 * go + 2) >> 2,
+                               (x * (bh - bo) + y * (bv - bo) + 4 * bo + 2) >> 2);
+            }
+            return;
+        }
+        // Differential mode
+        const int base[2][3] = {
+            {extend_5to8(r5), extend_5to8(g5), extend_5to8(b5)},
+            {extend_5to8(r2), extend_5to8(g2), extend_5to8(b2)}
+        };
+        const int tbl[2] = {(src[3] >> 5) & 7, (src[3] >> 2) & 7};
+        for (int x = 0; x < 4; ++x) for (int y = 0; y < 4; ++y) {
+            const int sub = flip ? (y >= 2 ? 1 : 0) : (x >= 2 ? 1 : 0);
+            const int bit = x * 4 + y;
+            const int sel = (((msb_word >> bit) & 1) << 1) | ((lsb_word >> bit) & 1);
+            const int mod_idx = (sel == 0) ? 0 : ((sel == 1) ? 1 : ((sel == 2) ? 2 : 3));
+            const int delta = etc1_mod[tbl[sub]][mod_idx];
+            write_px(x, y, base[sub][0] + delta, base[sub][1] + delta, base[sub][2] + delta);
+        }
+    } else {
+        // Individual mode
+        const int base[2][3] = {
+            {extend_4to8(src[0] >> 4), extend_4to8(src[1] >> 4), extend_4to8(src[2] >> 4)},
+            {extend_4to8(src[0] & 0x0Fu), extend_4to8(src[1] & 0x0Fu), extend_4to8(src[2] & 0x0Fu)}
+        };
+        const int tbl[2] = {(src[3] >> 5) & 7, (src[3] >> 2) & 7};
+        for (int x = 0; x < 4; ++x) for (int y = 0; y < 4; ++y) {
+            const int sub = flip ? (y >= 2 ? 1 : 0) : (x >= 2 ? 1 : 0);
+            const int bit = x * 4 + y;
+            const int sel = (((msb_word >> bit) & 1) << 1) | ((lsb_word >> bit) & 1);
+            const int delta = etc1_mod[tbl[sub]][sel];
+            write_px(x, y, base[sub][0] + delta, base[sub][1] + delta, base[sub][2] + delta);
+        }
+    }
+}
+
+inline void decode_eac_alpha_block_rgba8(const std::uint8_t* src, std::uint8_t* out_rgba) {
+    static constexpr int eac_mod[16][8] = {
+        {-3,-6,-9,-15,2,5,8,14}, {-3,-7,-10,-13,2,6,9,12}, {-2,-5,-8,-13,1,4,7,12}, {-2,-4,-6,-13,1,3,5,12},
+        {-3,-6,-8,-12,2,5,7,11}, {-3,-7,-9,-11,2,6,8,10}, {-4,-7,-8,-11,3,6,7,10}, {-3,-5,-8,-11,2,4,7,10},
+        {-2,-6,-8,-10,1,5,7,9},  {-2,-5,-8,-10,1,4,7,9},  {-2,-4,-8,-10,1,3,7,9},  {-2,-5,-7,-10,1,4,6,9},
+        {-3,-4,-7,-10,2,3,6,9},  {-1,-2,-3,-10,0,1,2,9},  {-4,-6,-8,-9,3,5,7,8},   {-3,-5,-7,-9,2,4,6,8}
+    };
+    const int base = src[0];
+    const int mult = (src[1] >> 4) & 0x0Fu;
+    const int tbl = src[1] & 0x0Fu;
+    std::uint64_t bits = 0;
+    for (int i = 0; i < 6; ++i) bits = (bits << 8) | src[2 + i];
+    for (int x = 0; x < 4; ++x) for (int y = 0; y < 4; ++y) {
+        const int p = x * 4 + y;
+        const int idx = static_cast<int>((bits >> (45 - p * 3)) & 7ull);
+        out_rgba[(y * 4 + x) * 4 + 3] = clamp_u8(base + eac_mod[tbl][idx] * mult);
+    }
+}
+} // namespace detail
+
+/**
+ * Decodes one mip (all layers) from any supported V3D texture format
+ * (rgba8_unorm, bgra8_unorm, r8_unorm, rg8_unorm, bc1_unorm, bc3_unorm,
+ *  etc2_rgb8_unorm, etc2_rgba8_unorm) into tightly packed RGBA8 pixels.
+ */
+inline bool decode_mip_to_rgba8(
+    const texture_format fmt,
+    const std::uint32_t width,
+    const std::uint32_t height,
+    const std::uint32_t layers,
+    const std::uint8_t* src,
+    const std::size_t src_size,
+    std::vector<std::uint8_t>& out_rgba8,
+    std::string& error)
+{
+    if (!width || !height || !layers || !src) return detail::failure(error, "Invalid mip dimensions or source buffer");
+    std::uint64_t expected = 0;
+    if (!texture_mip_bytes(fmt, width, height, layers, expected) || src_size != expected)
+        return detail::failure(error, "Source mip byte size does not match format");
+    const std::uint64_t dst_layer_bytes = static_cast<std::uint64_t>(width) * height * 4ull;
+    const std::uint64_t total_dst = dst_layer_bytes * layers;
+    if (total_dst > 1024ull * 1024ull * 1024ull) return detail::failure(error, "Decoded RGBA8 mip exceeds 1 GiB");
+    out_rgba8.resize(static_cast<std::size_t>(total_dst));
+
+    if (fmt == texture_format::rgba8_unorm) {
+        std::memcpy(out_rgba8.data(), src, static_cast<std::size_t>(total_dst));
+        error.clear(); return true;
+    }
+    if (fmt == texture_format::bgra8_unorm) {
+        const std::size_t npx = static_cast<std::size_t>(width) * height * layers;
+        for (std::size_t i = 0; i < npx; ++i) {
+            out_rgba8[i * 4 + 0] = src[i * 4 + 2];
+            out_rgba8[i * 4 + 1] = src[i * 4 + 1];
+            out_rgba8[i * 4 + 2] = src[i * 4 + 0];
+            out_rgba8[i * 4 + 3] = src[i * 4 + 3];
+        }
+        error.clear(); return true;
+    }
+    if (fmt == texture_format::r8_unorm) {
+        const std::size_t npx = static_cast<std::size_t>(width) * height * layers;
+        for (std::size_t i = 0; i < npx; ++i) {
+            const std::uint8_t v = src[i];
+            out_rgba8[i * 4 + 0] = v; out_rgba8[i * 4 + 1] = v; out_rgba8[i * 4 + 2] = v; out_rgba8[i * 4 + 3] = 255;
+        }
+        error.clear(); return true;
+    }
+    if (fmt == texture_format::rg8_unorm) {
+        const std::size_t npx = static_cast<std::size_t>(width) * height * layers;
+        for (std::size_t i = 0; i < npx; ++i) {
+            out_rgba8[i * 4 + 0] = src[i * 2 + 0]; out_rgba8[i * 4 + 1] = src[i * 2 + 1];
+            out_rgba8[i * 4 + 2] = 0; out_rgba8[i * 4 + 3] = 255;
+        }
+        error.clear(); return true;
+    }
+
+    const bool is_bc1 = (fmt == texture_format::bc1_unorm);
+    const bool is_bc3 = (fmt == texture_format::bc3_unorm);
+    const bool is_etc2_rgb = (fmt == texture_format::etc2_rgb8_unorm);
+    const bool is_etc2_rgba = (fmt == texture_format::etc2_rgba8_unorm);
+    if (!is_bc1 && !is_bc3 && !is_etc2_rgb && !is_etc2_rgba) {
+        return detail::failure(error, "Texture format is not decodable to RGBA8");
+    }
+
+    const std::size_t bx_count = (width + 3u) / 4u;
+    const std::size_t by_count = (height + 3u) / 4u;
+    const std::size_t block_bytes = (is_bc1 || is_etc2_rgb) ? 8u : 16u;
+    const std::size_t src_layer_bytes = bx_count * by_count * block_bytes;
+
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const std::uint8_t* src_layer = src + static_cast<std::size_t>(layer) * src_layer_bytes;
+        std::uint8_t* dst_layer = out_rgba8.data() + static_cast<std::size_t>(layer) * static_cast<std::size_t>(dst_layer_bytes);
+        std::uint8_t block[64];
+        for (std::size_t by = 0; by < by_count; ++by) {
+            for (std::size_t bx = 0; bx < bx_count; ++bx) {
+                const std::uint8_t* sb = src_layer + (by * bx_count + bx) * block_bytes;
+                if (is_bc1) {
+                    detail::decode_bc_color_block_rgba8(sb, true, block);
+                } else if (is_bc3) {
+                    detail::decode_bc_color_block_rgba8(sb + 8, false, block);
+                    detail::decode_bc3_alpha_block_rgba8(sb, block);
+                } else if (is_etc2_rgb) {
+                    detail::decode_etc2_rgb_block_rgba8(sb, block);
+                } else {
+                    detail::decode_etc2_rgb_block_rgba8(sb + 8, block);
+                    detail::decode_eac_alpha_block_rgba8(sb, block);
+                }
+                for (std::uint32_t py = 0; py < 4u; ++py) {
+                    const std::uint32_t dy = static_cast<std::uint32_t>(by * 4u) + py;
+                    if (dy >= height) break;
+                    std::uint8_t* dst_row = dst_layer + static_cast<std::size_t>(dy) * width * 4u;
+                    for (std::uint32_t px = 0; px < 4u; ++px) {
+                        const std::uint32_t dx = static_cast<std::uint32_t>(bx * 4u) + px;
+                        if (dx >= width) break;
+                        const std::uint8_t* p = block + (py * 4u + px) * 4u;
+                        std::uint8_t* o = dst_row + dx * 4u;
+                        o[0] = p[0]; o[1] = p[1]; o[2] = p[2]; o[3] = p[3];
+                    }
+                }
+            }
+        }
+    }
+    error.clear();
+    return true;
+}
+
+/**
+ * Decodes an entire v3d::texture (all mips and layers) into an uncompressed rgba8_unorm texture.
+ * Automatically picks src.mips or src.alt_mips if one of them is decodable.
+ */
+inline bool decode_texture_to_rgba8(const texture& src, texture& out_rgba8, std::string& error) {
+    texture_format fmt = src.pixel_format;
+    const std::vector<mip>* mips_ptr = &src.mips;
+    auto can_decode = [](texture_format f) {
+        return f == texture_format::rgba8_unorm || f == texture_format::bgra8_unorm
+            || f == texture_format::r8_unorm || f == texture_format::rg8_unorm
+            || f == texture_format::bc1_unorm || f == texture_format::bc3_unorm
+            || f == texture_format::etc2_rgb8_unorm || f == texture_format::etc2_rgba8_unorm;
+    };
+    if (!can_decode(fmt) && can_decode(src.alt_pixel_format) && !src.alt_mips.empty()) {
+        fmt = src.alt_pixel_format;
+        mips_ptr = &src.alt_mips;
+    }
+    out_rgba8 = src;
+    out_rgba8.pixel_format = texture_format::rgba8_unorm;
+    out_rgba8.alt_pixel_format = texture_format::unknown;
+    out_rgba8.alt_mips.clear();
+    out_rgba8.mips.clear();
+    out_rgba8.mips.reserve(mips_ptr->size());
+    for (const mip& m : *mips_ptr) {
+        mip decoded;
+        decoded.width = m.width;
+        decoded.height = m.height;
+        decoded.layers = m.layers;
+        if (!decode_mip_to_rgba8(fmt, m.width, m.height, m.layers, m.bytes.data(), m.bytes.size(), decoded.bytes, error)) {
+            return false;
+        }
+        out_rgba8.mips.push_back(std::move(decoded));
+    }
+    error.clear();
+    return true;
 }
 
 } // namespace v3d

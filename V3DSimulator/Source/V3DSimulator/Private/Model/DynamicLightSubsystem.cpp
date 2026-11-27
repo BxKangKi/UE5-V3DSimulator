@@ -4,13 +4,15 @@
 /**
  * @file DynamicLightSubsystem.cpp
  * Role: Defines this source unit's responsibility within V3DSimulator.
- * Key responsibilities: Implements the behavior exposed by this source unit's public API.
- * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ * Key responsibilities: Quality-scaled active dynamic light & shadow budgets,
+ * hysteresis distance culling, and throttled (1-2 per tick) light/decal transitions.
  */
 
 #include "Model/DynamicLightSubsystem.h"
 #include "Model/DynamicPointLightComponent.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
+#include "GameFramework/GameUserSettings.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Subsystems/SubsystemCollection.h"
 #include "System/GameUpdateSubSystem.h"
@@ -20,9 +22,71 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 
-
 namespace
 {
+    struct FDynamicLightQualityBudget
+    {
+        int32 MaxActiveLights = 16;
+        int32 MaxShadowLights = 4;
+        float DistanceScaleSq = 0.5625f; // (0.75)^2
+        int32 MaxTransitionsPerTick = 2;
+        int32 MaxDecalCreationsPerTick = 2;
+    };
+
+    FDynamicLightQualityBudget ResolveLightQualityBudget()
+    {
+        int32 Quality = 2; // Default High
+        if (GEngine)
+        {
+            if (const UGameUserSettings* Settings = GEngine->GetGameUserSettings())
+            {
+                Quality = FMath::Clamp(Settings->GetShadingQuality(), 0, 4);
+            }
+        }
+
+        FDynamicLightQualityBudget Budget;
+        switch (Quality)
+        {
+        case 0: // Low
+            Budget.MaxActiveLights = 4;
+            Budget.MaxShadowLights = 0;
+            Budget.DistanceScaleSq = 0.35f * 0.35f;
+            Budget.MaxTransitionsPerTick = 1;
+            Budget.MaxDecalCreationsPerTick = 1;
+            break;
+        case 1: // Medium
+            Budget.MaxActiveLights = 8;
+            Budget.MaxShadowLights = 2;
+            Budget.DistanceScaleSq = 0.55f * 0.55f;
+            Budget.MaxTransitionsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 1;
+            break;
+        case 2: // High
+            Budget.MaxActiveLights = 16;
+            Budget.MaxShadowLights = 4;
+            Budget.DistanceScaleSq = 0.75f * 0.75f;
+            Budget.MaxTransitionsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 2;
+            break;
+        case 3: // Epic
+            Budget.MaxActiveLights = 24;
+            Budget.MaxShadowLights = 6;
+            Budget.DistanceScaleSq = 1.0f;
+            Budget.MaxTransitionsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 2;
+            break;
+        case 4: // Cinematic
+        default:
+            Budget.MaxActiveLights = 32;
+            Budget.MaxShadowLights = 8;
+            Budget.DistanceScaleSq = 1.20f * 1.20f;
+            Budget.MaxTransitionsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 2;
+            break;
+        }
+        return Budget;
+    }
+
     void DestroyManagedDecal(UDecalComponent* Decal)
     {
         if (!IsValid(Decal))
@@ -30,8 +94,6 @@ namespace
             return;
         }
 
-        // The decal is dynamically added to the light owner's InstanceComponents array. Clear the
-        // material first, remove the ownership entry, and only then destroy the component.
         Decal->SetDecalMaterial(nullptr);
         if (AActor* Owner = Decal->GetOwner(); IsValid(Owner))
         {
@@ -54,8 +116,6 @@ namespace
             Color *= FLinearColor::MakeFromColorTemperature(LightComp->Temperature);
         }
 
-        // Normalize intensity across light units so 1000 Lumens / ~80 Candelas / ~10 Unitless
-        // produces a visible fallback decal instead of vanishing near 0.01 opacity.
         float NormalizedIntensity = 0.0f;
         const float RawIntensity = FMath::Max(0.0f, LightComp->Intensity);
         if (RawIntensity > KINDA_SMALL_NUMBER)
@@ -98,6 +158,10 @@ namespace
         if (UV3DSimulatorAssetRegistry* Registry =
             UV3DSimulatorGameInstance::GetAssetRegistryFromContext(WorldContext))
         {
+            if (UMaterialInterface* Loaded = Registry->StaticDecalLightMaterial.Get(); IsValid(Loaded))
+            {
+                return Loaded;
+            }
             if (!Registry->StaticDecalLightMaterial.IsNull())
             {
                 return Registry->StaticDecalLightMaterial.LoadSynchronous();
@@ -122,6 +186,8 @@ void UDynamicLightSubsystem::Deinitialize()
         Data.TargetDecalMaterial.Reset();
     }
     ManagedLights.Empty();
+    ScratchRankedLights.Empty();
+    ScratchPendingTransitions.Empty();
     Super::Deinitialize();
 }
 
@@ -137,7 +203,6 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
     UMaterialInterface* ResolvedMaterial = ResolveDecalMaterialForLight(this, InLight);
     const float CullingDist = FMath::Max(0.0f, InLight->GetCullingDistance());
     const float DecalDist = FMath::Max(0.0f, InLight->GetDecalTransitionDistance());
-    // DecalDist == 0 means keep the lightweight fallback decal visible until the owning actor/impostor unloads.
     const bool bInfiniteDecalRange = (DecalDist <= KINDA_SMALL_NUMBER);
     const bool bCanUseDecalFallback = InLight->IsLightDecalFallbackEnabled()
         && IsValid(ResolvedMaterial)
@@ -166,15 +231,36 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
         }
     }
 
+    const FDynamicLightQualityBudget Budget = ResolveLightQualityBudget();
+
     FLightOptimizationData NewData;
     NewData.Position = InLight->GetComponentLocation();
     NewData.CullingDistanceSq = FMath::Square(CullingDist);
     NewData.DecalTransitionDistanceSq = EffectiveDecalDistSq;
     NewData.LightComponent = InLight;
     NewData.TargetDecalMaterial = bCanUseDecalFallback ? ResolvedMaterial : nullptr;
+    NewData.bAuthoredCastShadows = InLight->CastShadows != 0;
 
-    // Apply the initial state.
-    NewData.bCurrentLightVisibility = InLight->IsVisible();
+    // Start newly streamed lights disabled when already at/above the active light cap so
+    // streaming a dense chunk of streetlights never causes a 1-frame GPU lighting/VSM spike.
+    if (ManagedLights.Num() >= Budget.MaxActiveLights)
+    {
+        if (InLight->IsVisible())
+        {
+            InLight->SetVisibility(false);
+        }
+        if (InLight->CastShadows != 0)
+        {
+            InLight->SetCastShadows(false);
+        }
+        NewData.bCurrentLightVisibility = false;
+        NewData.bCurrentCastShadows = false;
+    }
+    else
+    {
+        NewData.bCurrentLightVisibility = InLight->IsVisible();
+        NewData.bCurrentCastShadows = InLight->CastShadows != 0;
+    }
 
     ManagedLights.Add(NewData);
     RegisterGameUpdate();
@@ -186,7 +272,6 @@ void UDynamicLightSubsystem::UnregisterLight(UDynamicPointLightComponent *InLigh
     {
         if (ManagedLights[i].LightComponent.Get() == InLight)
         {
-            // Destroy dynamically spawned decal components, if any.
             DestroyManagedDecal(ManagedLights[i].DecalComponent.Get());
             ManagedLights[i].DecalComponent.Reset();
             ManagedLights[i].TargetDecalMaterial.Reset();
@@ -283,7 +368,6 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
         return;
     }
 
-    // Read the camera location once for the whole batch.
     APlayerController *PC = UGameplayStatics::GetPlayerController(GetWorld(), 0);
     if (!IsValid(PC))
     {
@@ -294,68 +378,94 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
     FRotator CameraRotation;
     PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
 
-    // Each light needs only one squared-distance comparison. A sequential contiguous pass is
-    // cheaper than dispatching worker tasks and keeps every weak UObject access thread-safe.
-    for (FLightOptimizationData &Data : ManagedLights)
+    const FDynamicLightQualityBudget Budget = ResolveLightQualityBudget();
+
+    // Pass 1: Measure distances and collect candidates within the quality-scaled culling range
+    // (with 10% distance hysteresis to stop boundary flickering).
+    ScratchRankedLights.Reset();
+    for (int32 Index = 0; Index < ManagedLights.Num(); ++Index)
     {
-        UDynamicPointLightComponent *LightComp = Data.LightComponent.Get();
+        FLightOptimizationData& Data = ManagedLights[Index];
+        UDynamicPointLightComponent* LightComp = Data.LightComponent.Get();
         if (!IsValid(LightComp))
         {
             continue;
         }
 
-        // Dynamic components may move, so refresh their position before calculating visibility.
         Data.Position = LightComp->GetComponentLocation();
-        const float DistanceSquared = FVector::DistSquared(CameraLocation, Data.Position);
-        const bool bUseLight = DistanceSquared < Data.CullingDistanceSq;
-        const bool bWithinDecalRange = (Data.DecalTransitionDistanceSq == 0.0f)
-            || (Data.DecalTransitionDistanceSq > Data.CullingDistanceSq && DistanceSquared < Data.DecalTransitionDistanceSq);
-        const bool bUseDecal = !bUseLight &&
-            Data.TargetDecalMaterial.IsValid() &&
-            Data.DecalTransitionDistanceSq >= 0.0f &&
-            bWithinDecalRange;
-        Data.bTargetLightVisibility = bUseLight;
-        Data.bTargetDecalVisibility = bUseDecal;
+        const float DistSq = static_cast<float>(FVector::DistSquared(CameraLocation, Data.Position));
+        Data.LastDistanceSq = DistSq;
 
-        // Apply light state.
-        if (Data.bTargetLightVisibility != Data.bCurrentLightVisibility)
+        const float EffectiveCullSq = Data.CullingDistanceSq * Budget.DistanceScaleSq;
+        const float HysteresisThresholdSq = Data.bCurrentLightVisibility ? EffectiveCullSq : (EffectiveCullSq * 0.81f);
+
+        Data.bTargetLightVisibility = false;
+        Data.bTargetCastShadows = false;
+        Data.bTargetDecalVisibility = false;
+
+        if (DistSq < HysteresisThresholdSq)
         {
-            Data.bCurrentLightVisibility = Data.bTargetLightVisibility;
-            LightComp->SetVisibility(Data.bCurrentLightVisibility);
+            // Small distance bonus for already-active lights prevents rank thrashing between equal-distance pairs.
+            const float SortKey = Data.bCurrentLightVisibility ? (DistSq * 0.90f) : DistSq;
+            ScratchRankedLights.Emplace(SortKey, Index);
+        }
+    }
+
+    // Pass 2: Pick only the closest MaxActiveLights for real point lights,
+    // and only the closest MaxShadowLights among them for shadow casting.
+    if (ScratchRankedLights.Num() > 1)
+    {
+        ScratchRankedLights.Sort([](const TPair<float, int32>& A, const TPair<float, int32>& B)
+        {
+            return A.Key < B.Key;
+        });
+    }
+
+    const int32 ActiveBudget = FMath::Min(ScratchRankedLights.Num(), Budget.MaxActiveLights);
+    int32 AssignedShadows = 0;
+    for (int32 Rank = 0; Rank < ActiveBudget; ++Rank)
+    {
+        FLightOptimizationData& Data = ManagedLights[ScratchRankedLights[Rank].Value];
+        Data.bTargetLightVisibility = true;
+        if (Data.bAuthoredCastShadows && AssignedShadows < Budget.MaxShadowLights)
+        {
+            Data.bTargetCastShadows = true;
+            ++AssignedShadows;
+        }
+    }
+
+    // Pass 3: Lights not chosen as real point lights fall back to lightweight decals if in range.
+    // Collect pending state transitions sorted nearest-first so we throttle strictly to 1-2 per tick.
+    ScratchPendingTransitions.Reset();
+    for (int32 Index = 0; Index < ManagedLights.Num(); ++Index)
+    {
+        FLightOptimizationData& Data = ManagedLights[Index];
+        if (!Data.LightComponent.IsValid())
+        {
+            continue;
         }
 
-        // Apply decal state.
-        if (Data.bTargetDecalVisibility != Data.bCurrentDecalVisibility)
+        if (!Data.bTargetLightVisibility)
         {
-            Data.bCurrentDecalVisibility = Data.bTargetDecalVisibility;
+            const bool bWithinDecalRange = (Data.DecalTransitionDistanceSq == 0.0f)
+                || (Data.DecalTransitionDistanceSq > Data.CullingDistanceSq
+                    && Data.LastDistanceSq < Data.DecalTransitionDistanceSq);
+            Data.bTargetDecalVisibility = Data.TargetDecalMaterial.IsValid()
+                && Data.DecalTransitionDistanceSq >= 0.0f
+                && bWithinDecalRange;
+        }
 
-            if (Data.bCurrentDecalVisibility)
-            {
-                // Lazily create the decal when it is needed but not yet allocated.
-                UDecalComponent *DecalComp = Data.DecalComponent.Get();
-                if (!IsValid(DecalComp) && Data.TargetDecalMaterial.IsValid())
-                {
-                    DecalComp = CreateDecalComponent(LightComp, Data.TargetDecalMaterial.Get());
-                    Data.DecalComponent = DecalComp;
-                }
+        const bool bNeedsTransition = (Data.bTargetLightVisibility != Data.bCurrentLightVisibility)
+            || (Data.bTargetDecalVisibility != Data.bCurrentDecalVisibility)
+            || (Data.bTargetLightVisibility && Data.bTargetCastShadows != Data.bCurrentCastShadows);
 
-                if (IsValid(DecalComp))
-                {
-                    DecalComp->SetWorldLocationAndRotation(Data.Position, FRotator(-90.0f, 0.0f, 0.0f));
-                    DecalComp->SetVisibility(true);
-                }
-            }
-            else
-            {
-                if (UDecalComponent *DecalComp = Data.DecalComponent.Get())
-                {
-                    DecalComp->SetVisibility(false);
-                }
-            }
+        if (bNeedsTransition)
+        {
+            ScratchPendingTransitions.Emplace(Data.LastDistanceSq, Index);
         }
         else if (Data.bCurrentDecalVisibility)
         {
-            // Keep visible decal synced with moving dynamic lights.
+            // Keep already-visible decal synced with moving dynamic lights.
             if (UDecalComponent* DecalComp = Data.DecalComponent.Get(); IsValid(DecalComp))
             {
                 if (!DecalComp->GetComponentLocation().Equals(Data.Position, 1.0f))
@@ -364,6 +474,79 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
                 }
             }
         }
+    }
+
+    if (ScratchPendingTransitions.Num() > 1)
+    {
+        ScratchPendingTransitions.Sort([](const TPair<float, int32>& A, const TPair<float, int32>& B)
+        {
+            return A.Key < B.Key;
+        });
+    }
+
+    // Pass 4: Execute at most MaxTransitionsPerTick (1-2) light/decal switches per update
+    // to eliminate render-state / VSM invalidation hitches.
+    int32 TransitionsApplied = 0;
+    int32 DecalCreationsApplied = 0;
+    for (const TPair<float, int32>& Entry : ScratchPendingTransitions)
+    {
+        if (TransitionsApplied >= Budget.MaxTransitionsPerTick)
+        {
+            break;
+        }
+
+        FLightOptimizationData& Data = ManagedLights[Entry.Value];
+        UDynamicPointLightComponent* LightComp = Data.LightComponent.Get();
+        if (!IsValid(LightComp))
+        {
+            continue;
+        }
+
+        // Handle decal creation cap before switching a light off -> decal on.
+        if (Data.bTargetDecalVisibility && !Data.bCurrentDecalVisibility)
+        {
+            UDecalComponent* DecalComp = Data.DecalComponent.Get();
+            if (!IsValid(DecalComp) && Data.TargetDecalMaterial.IsValid())
+            {
+                if (DecalCreationsApplied >= Budget.MaxDecalCreationsPerTick)
+                {
+                    continue; // Defer creation to next tick.
+                }
+                DecalComp = CreateDecalComponent(LightComp, Data.TargetDecalMaterial.Get());
+                Data.DecalComponent = DecalComp;
+                ++DecalCreationsApplied;
+            }
+            Data.bCurrentDecalVisibility = true;
+            if (IsValid(DecalComp))
+            {
+                DecalComp->SetWorldLocationAndRotation(Data.Position, FRotator(-90.0f, 0.0f, 0.0f));
+                DecalComp->SetVisibility(true);
+            }
+        }
+        else if (!Data.bTargetDecalVisibility && Data.bCurrentDecalVisibility)
+        {
+            Data.bCurrentDecalVisibility = false;
+            if (UDecalComponent* DecalComp = Data.DecalComponent.Get(); IsValid(DecalComp))
+            {
+                DecalComp->SetVisibility(false);
+            }
+        }
+
+        // Apply shadow casting change before or alongside light visibility.
+        const bool bDesiredShadow = Data.bTargetLightVisibility && Data.bTargetCastShadows;
+        if (bDesiredShadow != Data.bCurrentCastShadows)
+        {
+            Data.bCurrentCastShadows = bDesiredShadow;
+            LightComp->SetCastShadows(bDesiredShadow);
+        }
+
+        if (Data.bTargetLightVisibility != Data.bCurrentLightVisibility)
+        {
+            Data.bCurrentLightVisibility = Data.bTargetLightVisibility;
+            LightComp->SetVisibility(Data.bCurrentLightVisibility);
+        }
+
+        ++TransitionsApplied;
     }
 }
 
@@ -390,13 +573,11 @@ UDecalComponent *UDynamicLightSubsystem::CreateDecalComponent(UDynamicPointLight
     Owner->AddInstanceComponent(NewDecal);
     NewDecal->SetMobility(EComponentMobility::Movable);
     NewDecal->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
-    NewDecal->SetWorldLocationAndRotation(LightComp->GetComponentLocation(), FRotator(-90.0f, 0.0f, 0.0f)); // Default downward projection.
+    NewDecal->SetWorldLocationAndRotation(LightComp->GetComponentLocation(), FRotator(-90.0f, 0.0f, 0.0f));
 
-    // Clamp fallback decals so they cannot cover the whole scene with a white wash.
     const float LightRadius = FMath::Clamp(LightComp->AttenuationRadius, 1.0f, LightComp->GetMaxLightDecalSize());
     NewDecal->DecalSize = FVector(LightRadius, LightRadius, LightRadius);
 
-    // Prevent UE's default FadeScreenSize (0.01) from culling distant fallback decals!
     NewDecal->FadeScreenSize = 0.0f;
     NewDecal->SetFadeOut(0.0f, 0.0f, false);
     NewDecal->bDestroyOwnerAfterFade = false;

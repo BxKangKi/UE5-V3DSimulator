@@ -28,14 +28,15 @@
 // Matched with SingleLayerWater (M_Water / WaterActor) so surface and underwater
 // transition seamlessly: red attenuates within metres, green at mid-depth, and
 // deep water (both character & seafloor) darkens naturally into deep marine navy.
-// Natural ocean-blue optical coefficients (cm^-1): eliminates air-like hyper-transparency
-// and turquoise/emerald glow, giving clear near visibility that smoothly fades into deep marine blue.
-static const float3 UW_WATER_ABSORPTION = float3(0.00480f, 0.00240f, 0.00105f);
-static const float3 UW_WATER_SCATTERING = float3(0.000045f, 0.000110f, 0.000230f);
-static const float3 UW_WATER_EXTINCTION = float3(0.004845f, 0.002510f, 0.001280f);
+// Average natural water optical coefficients (Jerlov Type IB/II, cm^-1):
+// Gradual, natural depth attenuation so shallow daytime submersion stays bright and clear
+// before transitioning smoothly into deep marine blue over 6-15 m.
+static const float3 UW_WATER_ABSORPTION = float3(0.00320f, 0.00110f, 0.00065f);
+static const float3 UW_WATER_SCATTERING = float3(0.000032f, 0.000075f, 0.000135f);
+static const float3 UW_WATER_EXTINCTION = float3(0.003232f, 0.001175f, 0.000785f);
 // Pre-multiplied by log2(e) = 1.44269504f so inner loops use single-instruction exp2().
-static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.0069899f, 0.0036212f, 0.0018466f);
-static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.009288f, 0.043825f, 0.179688f);
+static const float3 UW_WATER_EXTINCTION_LOG2 = float3(0.0046628f, 0.0016952f, 0.0011325f);
+static const float3 UW_WATER_SCATTER_ALBEDO = float3(0.009901f, 0.063830f, 0.171975f);
 static const float  UW_WATER_IOR = 1.3333f;
 static const float  UW_WATER_INV_IOR = 0.75001875f;
 static const float  UW_WATER_F0 = 0.0204f; // ((1.3333 - 1) / (1.3333 + 1))^2
@@ -435,7 +436,8 @@ float4 UW_UnderWaterHazeCore(
     const float3 cameraPosWS = cameraPosTS - preViewTranslation;
 
     const float cameraWaterDepth = WaterLevel - cameraPosWS.z;
-    const float underwaterMask = smoothstep(5.0f, 150.0f, cameraWaterDepth);
+    // Activate underwater optics immediately below the surface (0-6 cm meniscus transition instead of 150 cm lag).
+    const float underwaterMask = smoothstep(0.0f, 6.0f, cameraWaterDepth);
     [branch] if (underwaterMask <= 0.001f)
     {
         return col;
@@ -539,22 +541,22 @@ float4 UW_UnderWaterHazeCore(
     const float moonEnergy = dot(moonLightColor, float3(0.2126f, 0.7152f, 0.0722f));
     const float effectiveMoonlight = smoothstep(-0.04f, 0.22f, moonElevation) * (1.0f - effectiveDaylight) * saturate(moonEnergy * 8.0f);
 
-    // 1) Pure physical Beer-Lambert attenuation of the already world-lit scene color.
+    // 1) Balanced Beer-Lambert attenuation of the world-lit scene color without abrupt shallow darkening.
     // Preserves real environment illumination (sunlight, moonlight, torches, or pitch darkness).
-    const float sunPathToPixel = pixelWaterDepth * invCosWater * 0.55f;
+    const float sunPathToPixel = pixelWaterDepth * invCosWater * 0.28f;
     const float3 surfaceDepthAtten = bValidSolid
         ? exp2(-UW_WATER_EXTINCTION_LOG2 * sunPathToPixel)
         : float3(effectiveDaylight + effectiveMoonlight * 0.05f, effectiveDaylight + effectiveMoonlight * 0.05f, effectiveDaylight + effectiveMoonlight * 0.05f);
     const float3 attenuatedScene = col.rgb * saturate(surfaceDepthAtten);
 
-    // 2) View-ray Beer-Lambert transmission + strictly light-driven volumetric in-scattering.
-    // Zero external light -> zero in-scatter radiance (no self-luminous blue haze under AutoExposure).
+    // 2) View-ray Beer-Lambert transmission + light-driven volumetric in-scattering.
+    // Keeps shallow-to-mid daytime underwater bright and naturally blue instead of darkening abruptly on submersion.
     const float clampedCamDepth = max(cameraWaterDepth, 0.0f);
-    const float downwellingPathCam = clampedCamDepth * invCosWater * 0.75f;
-    const float3 directDownwelling = sunTint * (effectiveDaylight * surfaceTrans * 0.85f) * exp2(-UW_WATER_EXTINCTION_LOG2 * downwellingPathCam);
-    const float3 daySkyDownwelling = float3(0.06f, 0.16f, 0.30f) * (0.22f * effectiveDaylight);
+    const float downwellingPathCam = clampedCamDepth * invCosWater * 0.45f;
+    const float3 directDownwelling = sunTint * (effectiveDaylight * surfaceTrans * 1.45f) * exp2(-UW_WATER_EXTINCTION_LOG2 * downwellingPathCam);
+    const float3 daySkyDownwelling = float3(0.10f, 0.24f, 0.42f) * (0.38f * effectiveDaylight);
     const float3 nightSkyDownwelling = moonLightColor * (0.04f * effectiveMoonlight);
-    const float3 skyDownwelling = (daySkyDownwelling + nightSkyDownwelling) * exp2(-UW_WATER_EXTINCTION_LOG2 * (clampedCamDepth * 0.85f));
+    const float3 skyDownwelling = (daySkyDownwelling + nightSkyDownwelling) * exp2(-UW_WATER_EXTINCTION_LOG2 * (clampedCamDepth * 0.50f));
     const float3 inScatterRadiance = (directDownwelling + skyDownwelling) * UW_WATER_SCATTER_ALBEDO;
 
     const float3 viewTransmittance = exp2(-UW_WATER_EXTINCTION_LOG2 * viewDist);

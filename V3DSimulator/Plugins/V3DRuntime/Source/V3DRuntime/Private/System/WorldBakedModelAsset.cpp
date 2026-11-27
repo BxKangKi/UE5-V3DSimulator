@@ -14,6 +14,7 @@
 #include "System/WorldBakedTexture.h"
 #include "System/V3DTerrain.h"
 #include "System/V3DImpostor.h"
+#include "System/V3DTextureCompression.h"
 #include "System/V3DMaterialTextureArray.h"
 #include "System/V3DStreamingBudget.h"
 #include "Misc/App.h"
@@ -430,10 +431,45 @@ namespace WorldBakedModelAssetPrivate
         if (auto* Forced = Supported(Config.ForceMaterial)) return Forced;
         if (UMaterialInterface* const* Named = Config.MaterialsOverrideByNameMap.Find(Baked.Name))
             return Supported(*Named) ? *Named : OpaqueFallback();
+        auto FindReservedEntry = [&](const FString& Normalized) -> UMaterialInterface* const*
+        {
+            if (Normalized.IsEmpty()) return nullptr;
+            if (UMaterialInterface* const* Exact = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Reserved.") + Normalized))
+            {
+                return Exact;
+            }
+            const FString Underscored = Normalized.Replace(TEXT(" "), TEXT("_")).Replace(TEXT("-"), TEXT("_"));
+            if (Underscored != Normalized)
+            {
+                if (UMaterialInterface* const* Alt = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Reserved.") + Underscored))
+                {
+                    return Alt;
+                }
+            }
+            // Support explicit dot-suffix reserved names (e.g. Window.glass, Car.tinted_glass)
+            // without matching arbitrary substrings like glass_opaque or fiberglass.
+            int32 DotIndex = INDEX_NONE;
+            if (Normalized.FindLastChar(TEXT('.'), DotIndex) && DotIndex + 1 < Normalized.Len())
+            {
+                const FString Suffix = Normalized.Mid(DotIndex + 1);
+                if (UMaterialInterface* const* BySuffix = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Reserved.") + Suffix))
+                {
+                    return BySuffix;
+                }
+                const FString SuffixUnderscored = Suffix.Replace(TEXT(" "), TEXT("_")).Replace(TEXT("-"), TEXT("_"));
+                if (SuffixUnderscored != Suffix)
+                {
+                    if (UMaterialInterface* const* BySuffixAlt = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Reserved.") + SuffixUnderscored))
+                    {
+                        return BySuffixAlt;
+                    }
+                }
+            }
+            return nullptr;
+        };
         const FString NormalizedName = FV3DMaterialAssetReferences::NormalizeMaterialName(Baked.Name);
-        const FString ReservedKey = TEXT("V3D.Reserved.") + NormalizedName;
-        if (UMaterialInterface* const* Reserved = Config.MaterialsOverrideByNameMap.Find(ReservedKey))
-            return Supported(*Reserved) ? *Reserved : OpaqueFallback();
+        if (UMaterialInterface* const* Reserved = FindReservedEntry(NormalizedName))
+            return FV3DMaterialAssetReferences::IsSupportedReservedParent(*Reserved) ? *Reserved : OpaqueFallback();
         // Any material whose name ends with .foliage (case-insensitive, optional .001 suffix stripped)
         // uses the dedicated AssetRegistry.FoliageMaterial parent (like TerrainMaterial), never exact "foliage".
         if (NormalizedName.EndsWith(TEXT(".foliage")))
@@ -520,9 +556,26 @@ namespace WorldBakedModelAssetPrivate
             return false;
         }
 
-        const FPixelFormatInfo& Format = GPixelFormats[Baked.PixelFormat];
-        if (!Format.Supported || Format.BlockSizeX <= 0 || Format.BlockSizeY <= 0
-            || Format.BlockSizeZ != 1 || Format.BlockBytes <= 0)
+        const bool bPrimarySupported = GPixelFormats[Baked.PixelFormat].Supported;
+        const bool bUseAltVariant = !bPrimarySupported
+            && Baked.AltPixelFormat > PF_Unknown && Baked.AltPixelFormat < PF_MAX
+            && GPixelFormats[Baked.AltPixelFormat].Supported
+            && !Baked.AltMips.IsEmpty();
+        const int32 ActiveFormat = bUseAltVariant ? Baked.AltPixelFormat : Baked.PixelFormat;
+        const TArray<FGWorldBakedTextureMip>& ActiveMips = bUseAltVariant ? Baked.AltMips : Baked.Mips;
+
+        const FPixelFormatInfo& Format = GPixelFormats[ActiveFormat];
+        const bool bCanSoftwareDecodeDXT = !Format.Supported
+            && (ActiveFormat == PF_DXT1 || ActiveFormat == PF_DXT5)
+            && GPixelFormats[PF_B8G8R8A8].Supported;
+        const int32 ValBlockSizeX = Format.Supported ? Format.BlockSizeX : (bCanSoftwareDecodeDXT ? 4 : 0);
+        const int32 ValBlockSizeY = Format.Supported ? Format.BlockSizeY : (bCanSoftwareDecodeDXT ? 4 : 0);
+        const int32 ValBlockSizeZ = Format.Supported ? Format.BlockSizeZ : (bCanSoftwareDecodeDXT ? 1 : 0);
+        const int32 ValBlockBytes = Format.Supported ? Format.BlockBytes
+            : (ActiveFormat == PF_DXT1 ? 8 : (ActiveFormat == PF_DXT5 ? 16 : 0));
+
+        if ((!Format.Supported && !bCanSoftwareDecodeDXT) || ValBlockSizeX <= 0 || ValBlockSizeY <= 0
+            || ValBlockSizeZ != 1 || ValBlockBytes <= 0)
         {
             OutError = FString::Printf(
                 TEXT("Baked texture pixel format is unsupported on this platform: %s"),
@@ -532,7 +585,7 @@ namespace WorldBakedModelAssetPrivate
 
         int32 ExpectedSizeX = Baked.SizeX;
         int32 ExpectedSizeY = Baked.SizeY;
-        for (const FGWorldBakedTextureMip& Mip : Baked.Mips)
+        for (const FGWorldBakedTextureMip& Mip : ActiveMips)
         {
             if (Mip.SizeX != ExpectedSizeX || Mip.SizeY != ExpectedSizeY
                 || Mip.SizeZ != Baked.NumLayers || Mip.Bytes.IsEmpty())
@@ -543,17 +596,17 @@ namespace WorldBakedModelAssetPrivate
             }
 
             const int64 BlocksX =
-                (static_cast<int64>(Mip.SizeX) + Format.BlockSizeX - 1) / Format.BlockSizeX;
+                (static_cast<int64>(Mip.SizeX) + ValBlockSizeX - 1) / ValBlockSizeX;
             const int64 BlocksY =
-                (static_cast<int64>(Mip.SizeY) + Format.BlockSizeY - 1) / Format.BlockSizeY;
+                (static_cast<int64>(Mip.SizeY) + ValBlockSizeY - 1) / ValBlockSizeY;
             const int64 BlocksZ =
-                (static_cast<int64>(Mip.SizeZ) + Format.BlockSizeZ - 1) / Format.BlockSizeZ;
+                (static_cast<int64>(Mip.SizeZ) + ValBlockSizeZ - 1) / ValBlockSizeZ;
             int64 BlockCountXY = 0;
             int64 BlockCount = 0;
             int64 ExpectedBytes = 0;
             if (!CheckedMultiply(BlocksX, BlocksY, BlockCountXY)
                 || !CheckedMultiply(BlockCountXY, BlocksZ, BlockCount)
-                || !CheckedMultiply(BlockCount, Format.BlockBytes, ExpectedBytes)
+                || !CheckedMultiply(BlockCount, ValBlockBytes, ExpectedBytes)
                 || ExpectedBytes > MaxTextureMipBytes
                 || ExpectedBytes != static_cast<int64>(Mip.Bytes.Num()))
             {
@@ -1495,14 +1548,45 @@ UTexture* UWorldBakedModelAsset::CreateTexture(
         TEXT("BakedTexture.Create Source=%s Id=%d Size=%dx%dx%d Mips=%d Limit=%d"),
         *Reference, Baked.TextureId, Baked.SizeX, Baked.SizeY, Baked.NumLayers, Baked.Mips.Num(), TextureLimit));
 
+    // Pick the hardware-native compressed variant for this platform:
+    // Desktop (Windows/Mac/Linux) uses BC1/BC3; Mobile (Android/iOS) swaps to ETC2 natively.
+    if (GPixelFormats[Baked.PixelFormat].Supported)
+    {
+        Baked.AltMips.Empty();
+    }
+    else if (Baked.AltPixelFormat > PF_Unknown && Baked.AltPixelFormat < PF_MAX
+        && GPixelFormats[Baked.AltPixelFormat].Supported
+        && !Baked.AltMips.IsEmpty())
+    {
+        Baked.PixelFormat = Baked.AltPixelFormat;
+        Baked.Mips = MoveTemp(Baked.AltMips);
+        Baked.AltPixelFormat = PF_Unknown;
+        Baked.AltMips.Empty();
+    }
+    else if (Baked.PixelFormat == PF_DXT1 || Baked.PixelFormat == PF_DXT5)
+    {
+        if (!V3DTextureCompression::DecompressToBGRA(Baked))
+        {
+            OutError = FString::Printf(TEXT("Failed to decode compressed texture for this platform: %s"), *Baked.Name);
+            return nullptr;
+        }
+    }
+
     // Existing .v3d archives can contain larger source mips. Select the first stored mip that
     // satisfies the current user cap instead of rebuilding/resampling pixels at load time. This
     // makes the setting effective immediately and avoids allocating/uploading discarded top mips.
     int32 FirstRuntimeMip = 0;
+    const FPixelFormatInfo& RuntimeFmtInfo = GPixelFormats[Baked.PixelFormat];
     while (TextureLimit > 0 && FirstRuntimeMip + 1 < Baked.Mips.Num()
         && (Baked.Mips[FirstRuntimeMip].SizeX > TextureLimit
             || Baked.Mips[FirstRuntimeMip].SizeY > TextureLimit))
     {
+        const FGWorldBakedTextureMip& NextMip = Baked.Mips[FirstRuntimeMip + 1];
+        if (RuntimeFmtInfo.BlockSizeX > 1
+            && ((NextMip.SizeX % RuntimeFmtInfo.BlockSizeX) != 0 || (NextMip.SizeY % RuntimeFmtInfo.BlockSizeY) != 0))
+        {
+            break;
+        }
         ++FirstRuntimeMip;
     }
     const FGWorldBakedTextureMip& RuntimeTopMip = Baked.Mips[FirstRuntimeMip];
@@ -1704,69 +1788,105 @@ UMaterialInterface* UWorldBakedModelAsset::CreateMaterial(
     }
     ReferenceGuard.Add(Material);
 
-    Material->SetScalarParameterValue(TEXT("V3D_UseAlphaMask"), Baked.MaterialType == 0 || Baked.MaterialType == 2 ? 0.f : 1.f);
     const FName FadeDistanceName(TEXT("FadeDistance"));
     // Static and dynamic models share the same sided parents. Camera fade is a per-MID scalar:
     // dynamic use (including Toon) enables 50 cm; static use disables it with the shader's -1 sentinel.
     Material->SetScalarParameterValue(FadeDistanceName, v3d::material_fade_distance(Selection.bDynamic));
-    for (const FGWorldBakedScalarParameter& Parameter : Baked.Scalars)
+
+    // Check if this material resolved to an explicit reserved material override (e.g. glass, tinted_glass).
+    // Reserved materials keep their authored Unreal shader parameters instead of being overwritten by
+    // placeholder glTF Principled BSDF defaults (opaque roughness/baseColor/alpha mask).
+    bool bIsReservedOverride = false;
     {
-        const FName ParameterName(*Parameter.Name);
-        // Archived parent defaults must not replace the current per-instance fade policy.
-        // Explicit request overrides below still take precedence. Compare with FName so
-        // mixed-case parameter names follow Unreal's lookup semantics.
-        if (ParameterName != FadeDistanceName && !Parameter.Name.StartsWith(TEXT("V3D.Internal.")))
+        const FString NormName = FV3DMaterialAssetReferences::NormalizeMaterialName(Baked.Name);
+        auto MatchesReservedPtr = [&](const FString& Key) -> bool
         {
-            Material->SetScalarParameterValue(ParameterName, Parameter.Value);
+            if (UMaterialInterface* const* Found = Config.MaterialsOverrideByNameMap.Find(TEXT("V3D.Reserved.") + Key))
+            {
+                return *Found == Base && IsValid(*Found);
+            }
+            return false;
+        };
+        const FString Underscored = NormName.Replace(TEXT(" "), TEXT("_")).Replace(TEXT("-"), TEXT("_"));
+        bIsReservedOverride = MatchesReservedPtr(NormName) || (Underscored != NormName && MatchesReservedPtr(Underscored));
+        if (!bIsReservedOverride)
+        {
+            int32 DotIndex = INDEX_NONE;
+            if (NormName.FindLastChar(TEXT('.'), DotIndex) && DotIndex + 1 < NormName.Len())
+            {
+                const FString Suffix = NormName.Mid(DotIndex + 1);
+                const FString SuffixUnderscored = Suffix.Replace(TEXT(" "), TEXT("_")).Replace(TEXT("-"), TEXT("_"));
+                bIsReservedOverride = MatchesReservedPtr(Suffix)
+                    || (SuffixUnderscored != Suffix && MatchesReservedPtr(SuffixUnderscored));
+            }
+        }
+    }
+
+    if (!bIsReservedOverride)
+    {
+        Material->SetScalarParameterValue(TEXT("V3D_UseAlphaMask"), Baked.MaterialType == 0 || Baked.MaterialType == 2 ? 0.f : 1.f);
+        for (const FGWorldBakedScalarParameter& Parameter : Baked.Scalars)
+        {
+            const FName ParameterName(*Parameter.Name);
+            // Archived parent defaults must not replace the current per-instance fade policy.
+            // Explicit request overrides below still take precedence. Compare with FName so
+            // mixed-case parameter names follow Unreal's lookup semantics.
+            if (ParameterName != FadeDistanceName && !Parameter.Name.StartsWith(TEXT("V3D.Internal.")))
+            {
+                Material->SetScalarParameterValue(ParameterName, Parameter.Value);
+            }
         }
     }
     for (const TPair<FString, float>& Override : Config.ScalarParamsOverrides)
     {
         Material->SetScalarParameterValue(FName(*Override.Key), Override.Value);
     }
-    if (Selection.Family == 2)
+    if (!bIsReservedOverride)
     {
-        // Keep Toon surfaces matte dielectric so indirect lighting never creates a metallic look,
-        // while DefaultLit continues to cast/receive shadows and respond to Directional Light brightness.
-        Material->SetScalarParameterValue(TEXT("metallicFactor"), 0.0f);
-        Material->SetScalarParameterValue(TEXT("specularFactor"), 0.0f);
-        Material->SetScalarParameterValue(TEXT("roughnessFactor"), 1.0f);
-    }
-    for (const FGWorldBakedVectorParameter& Parameter : Baked.Vectors)
-    {
-        Material->SetVectorParameterValue(FName(*Parameter.Name), Parameter.Value);
-    }
-    for (const FGWorldBakedTextureParameter& Parameter : Baked.Textures)
-    {
-        UTexture* Texture = nullptr;
-        if (Parameter.TextureId != INDEX_NONE)
+        if (Selection.Family == 2)
         {
-            UTexture* const* Found = Textures.Find(Parameter.TextureId);
-            Texture = Found ? *Found : nullptr;
+            // Keep Toon surfaces matte dielectric so indirect lighting never creates a metallic look,
+            // while DefaultLit continues to cast/receive shadows and respond to Directional Light brightness.
+            Material->SetScalarParameterValue(TEXT("metallicFactor"), 0.0f);
+            Material->SetScalarParameterValue(TEXT("specularFactor"), 0.0f);
+            Material->SetScalarParameterValue(TEXT("roughnessFactor"), 1.0f);
         }
-
-        if (!IsValid(Texture))
+        for (const FGWorldBakedVectorParameter& Parameter : Baked.Vectors)
         {
-            OutError = FString::Printf(
-                TEXT("Material %s has an unavailable texture parameter %s"),
-                *Baked.Name, *Parameter.Name);
-            return nullptr;
+            Material->SetVectorParameterValue(FName(*Parameter.Name), Parameter.Value);
         }
-        // Asset-path parameters do not pass through the baked-texture map, so retain them here
-        // before material mutation can enter engine code and expose a collection point.
-        ReferenceGuard.Add(Texture);
-        Material->SetTextureParameterValue(FName(*Parameter.Name), Texture);
-        if (V3DTerrain::IsPaletteMaterial(Baked))
+        for (const FGWorldBakedTextureParameter& Parameter : Baked.Textures)
         {
-            UTexture* Bound = nullptr;
-            UTexture2DArray* Array = Cast<UTexture2DArray>(Texture);
-            if (!Array || Array->GetArraySize() != 4
-                || !Material->GetTextureParameterValue(FMaterialParameterInfo(FName(*Parameter.Name)), Bound)
-                || Bound != Texture)
+            UTexture* Texture = nullptr;
+            if (Parameter.TextureId != INDEX_NONE)
             {
-                OutError = FString::Printf(TEXT("Terrain array binding failed: Material=%s Parameter=%s Texture=%s Layers=%d"),
-                    *Baked.Name, *Parameter.Name, *GetPathNameSafe(Texture), Array ? Array->GetArraySize() : 0);
+                UTexture* const* Found = Textures.Find(Parameter.TextureId);
+                Texture = Found ? *Found : nullptr;
+            }
+
+            if (!IsValid(Texture))
+            {
+                OutError = FString::Printf(
+                    TEXT("Material %s has an unavailable texture parameter %s"),
+                    *Baked.Name, *Parameter.Name);
                 return nullptr;
+            }
+            // Asset-path parameters do not pass through the baked-texture map, so retain them here
+            // before material mutation can enter engine code and expose a collection point.
+            ReferenceGuard.Add(Texture);
+            Material->SetTextureParameterValue(FName(*Parameter.Name), Texture);
+            if (V3DTerrain::IsPaletteMaterial(Baked))
+            {
+                UTexture* Bound = nullptr;
+                UTexture2DArray* Array = Cast<UTexture2DArray>(Texture);
+                if (!Array || Array->GetArraySize() != 4
+                    || !Material->GetTextureParameterValue(FMaterialParameterInfo(FName(*Parameter.Name)), Bound)
+                    || Bound != Texture)
+                {
+                    OutError = FString::Printf(TEXT("Terrain array binding failed: Material=%s Parameter=%s Texture=%s Layers=%d"),
+                        *Baked.Name, *Parameter.Name, *GetPathNameSafe(Texture), Array ? Array->GetArraySize() : 0);
+                    return nullptr;
+                }
             }
         }
     }

@@ -26,15 +26,19 @@ namespace V3DImpostorPrivate
         return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Clamp(Value, 0.0f, 1.0f) * 255.0f), 0, 255));
     }
 
-    // Matches V3D_HemiOctahedronToDir in v3d.hlsl verbatim.
+    // Full-sphere octahedral decode (matches V3D_HemiOctahedronToDir in v3d.ush verbatim).
+    // Supports arbitrary 90/180-deg X/Y/Z node rotations where local +Z may not point world-up.
     inline FVector3f HemiOctahedronToDir(const float U, const float V)
     {
         const float OctX = U * 2.0f - 1.0f;
         const float OctY = V * 2.0f - 1.0f;
-        const float TempX = (OctX + OctY) * 0.5f;
-        const float TempY = (OctX - OctY) * 0.5f;
-        const float Z = 1.0f - FMath::Abs(TempX) - FMath::Abs(TempY);
-        FVector3f Dir(TempX, TempY, FMath::Max(Z, 0.0f));
+        FVector3f Dir(OctX, OctY, 1.0f - FMath::Abs(OctX) - FMath::Abs(OctY));
+        if (Dir.Z < 0.0f)
+        {
+            const float OldX = Dir.X;
+            Dir.X = (1.0f - FMath::Abs(Dir.Y)) * (OldX >= 0.0f ? 1.0f : -1.0f);
+            Dir.Y = (1.0f - FMath::Abs(OldX)) * (Dir.Y >= 0.0f ? 1.0f : -1.0f);
+        }
         return Dir.GetSafeNormal(1.0e-6f, FVector3f(0.0f, 0.0f, 1.0f));
     }
 
@@ -412,47 +416,34 @@ namespace V3DImpostorPrivate
         Prim.bHasMaterial = true;
         Prim.bHasIndices = true;
 
-        // Three orthogonal crossed quads (XZ, YZ, XY) centered at Center with identical UV0.
-        // In rasterization, V3D_ImpostorWPO_VS collapses all vertices onto the camera-facing billboard;
-        // in Hardware Ray Tracing (static BLAS without per-ray WPO), the 3 orthogonal cards guarantee
-        // solid 360-degree silhouette coverage from every ray direction (sides, shadows, water reflections).
+        // Single YZ plane quad (+X Forward, +Z Up) centered at Center with half-extent Radius,
+        // matching a Blender-imported 1m x 1m (+X forward, +Z up) unit plane scaled to 2*Radius.
+        // V3D_ImpostorWPO_VS orients these 4 vertices toward the camera using UV0.
         Prim.Positions = {
-            // Card 0: XZ plane (normal -Y)
-            Center + FVector3f(-Radius, 0.0f,  Radius),
-            Center + FVector3f( Radius, 0.0f,  Radius),
-            Center + FVector3f( Radius, 0.0f, -Radius),
-            Center + FVector3f(-Radius, 0.0f, -Radius),
-            // Card 1: YZ plane (normal +X)
             Center + FVector3f(0.0f, -Radius,  Radius),
             Center + FVector3f(0.0f,  Radius,  Radius),
             Center + FVector3f(0.0f,  Radius, -Radius),
-            Center + FVector3f(0.0f, -Radius, -Radius),
-            // Card 2: XY plane (normal +Z)
-            Center + FVector3f(-Radius,  Radius, 0.0f),
-            Center + FVector3f( Radius,  Radius, 0.0f),
-            Center + FVector3f( Radius, -Radius, 0.0f),
-            Center + FVector3f(-Radius, -Radius, 0.0f)
+            Center + FVector3f(0.0f, -Radius, -Radius)
         };
         Prim.Normals = {
-            FVector3f(0.0f, -1.0f, 0.0f), FVector3f(0.0f, -1.0f, 0.0f), FVector3f(0.0f, -1.0f, 0.0f), FVector3f(0.0f, -1.0f, 0.0f),
-            FVector3f(1.0f,  0.0f, 0.0f), FVector3f(1.0f,  0.0f, 0.0f), FVector3f(1.0f,  0.0f, 0.0f), FVector3f(1.0f,  0.0f, 0.0f),
-            FVector3f(0.0f,  0.0f, 1.0f), FVector3f(0.0f,  0.0f, 1.0f), FVector3f(0.0f,  0.0f, 1.0f), FVector3f(0.0f,  0.0f, 1.0f)
+            FVector3f(1.0f, 0.0f, 0.0f),
+            FVector3f(1.0f, 0.0f, 0.0f),
+            FVector3f(1.0f, 0.0f, 0.0f),
+            FVector3f(1.0f, 0.0f, 0.0f)
         };
         Prim.Tangents = {
-            FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f),
-            FVector4f(0.0f, 1.0f, 0.0f, 1.0f), FVector4f(0.0f, 1.0f, 0.0f, 1.0f), FVector4f(0.0f, 1.0f, 0.0f, 1.0f), FVector4f(0.0f, 1.0f, 0.0f, 1.0f),
-            FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f), FVector4f(1.0f, 0.0f, 0.0f, 1.0f)
+            FVector4f(0.0f, 1.0f, 0.0f, 1.0f),
+            FVector4f(0.0f, 1.0f, 0.0f, 1.0f),
+            FVector4f(0.0f, 1.0f, 0.0f, 1.0f),
+            FVector4f(0.0f, 1.0f, 0.0f, 1.0f)
         };
         Prim.UVs.Add({
-            FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f), FVector2f(0.0f, 1.0f),
-            FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f), FVector2f(0.0f, 1.0f),
-            FVector2f(0.0f, 0.0f), FVector2f(1.0f, 0.0f), FVector2f(1.0f, 1.0f), FVector2f(0.0f, 1.0f)
+            FVector2f(0.0f, 0.0f),
+            FVector2f(1.0f, 0.0f),
+            FVector2f(1.0f, 1.0f),
+            FVector2f(0.0f, 1.0f)
         });
-        Prim.Indices = {
-            0, 1, 2, 0, 2, 3,
-            4, 5, 6, 4, 6, 7,
-            8, 9, 10, 8, 10, 11
-        };
+        Prim.Indices = { 0, 1, 2, 0, 2, 3 };
         return Quad;
     }
 }
@@ -564,6 +555,15 @@ bool V3DImpostor::Bake(
 
     const FString ImpostorMatPath = ResolveMaterialPath(WorldContextObject);
 
+    // Count per-mesh instance frequency so unique buildings/low-poly structures stay on geometry LODs
+    // while repeated props (trees, streetlights, poles) and foliage get lightweight impostors.
+    TMap<FName, int32> InstanceCountByMesh;
+    InstanceCountByMesh.Reserve(Metadata.SceneData.MeshMap.Num());
+    for (const TPair<FName, FModelNodeData>& NodePair : Metadata.SceneData.NodeMap)
+    {
+        ++InstanceCountByMesh.FindOrAdd(NodePair.Value.MeshName);
+    }
+
     TArray<FGWorldBakedMesh> NewMeshes;
     TArray<FGWorldBakedMaterial> NewMaterials;
     TArray<FGWorldBakedTexture> NewTextures;
@@ -571,6 +571,11 @@ bool V3DImpostor::Bake(
     for (TPair<FName, FModelMeshData>& Pair : Metadata.SceneData.MeshMap)
     {
         FModelMeshData& MeshData = Pair.Value;
+        // Per-node impostor toggle (default ON). When OFF, skip baking so lower geometry LODs replace the impostor range.
+        if (!MeshData.Data.bGenerateImpostor)
+        {
+            continue;
+        }
         // Pick the finest available LOD as capture source for highest impostor visual quality.
         const int32 SourceLodIndex = MeshData.LOD0 != INDEX_NONE ? MeshData.LOD0
             : (MeshData.LOD1 != INDEX_NONE ? MeshData.LOD1
@@ -581,18 +586,45 @@ bool V3DImpostor::Bake(
         const FGWorldBakedMesh& SourceMesh = Model.Meshes[*SourceSlot];
         if (IsImpostorMeshName(SourceMesh.Name)) continue;
 
-        // Skip terrain meshes (terrain uses continuous chunked geometry, not billboard impostors).
+        // Classify terrain, foliage, and triangle complexity.
         bool bIsTerrain = false;
+        bool bIsFoliage = false;
+        int64 SourceTriCount = 0;
         for (const FGWorldBakedPrimitive& Prim : SourceMesh.Primitives)
         {
-            if (const FGWorldBakedMaterial* const* Mat = MaterialMap.Find(Prim.MaterialId);
-                Mat && *Mat && V3DTerrain::IsPaletteMaterial(**Mat))
+            if (Prim.Mode == 4)
             {
-                bIsTerrain = true;
-                break;
+                SourceTriCount += (Prim.bHasIndices && Prim.Indices.Num() >= 3)
+                    ? (Prim.Indices.Num() / 3)
+                    : (Prim.Positions.Num() / 3);
+            }
+            if (const FGWorldBakedMaterial* const* Mat = MaterialMap.Find(Prim.MaterialId); Mat && *Mat)
+            {
+                if (V3DTerrain::IsPaletteMaterial(**Mat))
+                {
+                    bIsTerrain = true;
+                    break;
+                }
+                const FString LowerMat = (*Mat)->Name.TrimStartAndEnd().ToLower();
+                if (LowerMat.EndsWith(TEXT(".foliage")) || LowerMat.Contains(TEXT(".foliage.")))
+                {
+                    bIsFoliage = true;
+                }
             }
         }
         if (bIsTerrain) continue;
+
+        // Smart automatic filter: only bake impostors for foliage or repeated complex props
+        // (trees, streetlights, poles). Unique buildings and low-poly meshes stay on geometry LODs
+        // to eliminate unnecessary atlas bloat and loading bottlenecks.
+        const int32 InstanceCount = InstanceCountByMesh.FindRef(Pair.Key);
+        const bool bQualifiesForImpostor = bIsFoliage
+            || (InstanceCount >= 8 && SourceTriCount >= 500)
+            || (InstanceCount >= 4 && SourceTriCount >= 1500);
+        if (!bQualifiesForImpostor)
+        {
+            continue;
+        }
 
         // Compute tight bounding sphere from source vertices (honoring per-primitive AdditionalTransforms).
         const bool bHasPrimTransforms = SourceMesh.AdditionalTransforms.Num() == SourceMesh.Primitives.Num();

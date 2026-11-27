@@ -152,6 +152,9 @@ struct V3DRUNTIME_API FGWorldBakedTexture
     uint8 LODGroup = 0;
     bool bSRGB = false;
     TArray<FGWorldBakedTextureMip> Mips;
+    /** Optional secondary platform-compressed variant (e.g. mobile ETC2 alongside desktop BC1/BC3). */
+    int32 AltPixelFormat = 0;
+    TArray<FGWorldBakedTextureMip> AltMips;
 };
 
 /** Complete build-time result for one GLB. Members are split when written to .v3d. */

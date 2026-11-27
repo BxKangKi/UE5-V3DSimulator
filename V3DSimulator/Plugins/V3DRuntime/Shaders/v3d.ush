@@ -91,24 +91,35 @@ float4x3 V3D_SampleTerrain(
 #ifndef V3D_IMPOSTOR_HLSL_INCLUDED
 #define V3D_IMPOSTOR_HLSL_INCLUDED
 
-// Encodes a unit direction vector (Z >= 0) into hemi-octahedral UV coordinates in [0, 1]^2.
+// Encodes any 3D unit direction vector into full-sphere octahedral UV coordinates in [0, 1]^2.
+// Handles arbitrary 90/180-deg X/Y/Z node rotations and mirrored instances without hemisphere clamping.
 float2 V3D_DirToHemiOctahedron(float3 Dir)
 {
     float LenSq = dot(Dir, Dir);
     float3 N = LenSq > 1.0e-8 ? Dir * rsqrt(LenSq) : float3(0.0, 0.0, 1.0);
-    N.z = max(N.z, 0.0);
-    float L1 = abs(N.x) + abs(N.y) + N.z;
+    float L1 = abs(N.x) + abs(N.y) + abs(N.z);
     N /= max(L1, 1.0e-6);
-    float2 Oct = float2(N.x + N.y, N.x - N.y);
+    float2 Oct = N.xy;
+    if (N.z < 0.0)
+    {
+        Oct = float2(
+            (1.0 - abs(N.y)) * (N.x >= 0.0 ? 1.0 : -1.0),
+            (1.0 - abs(N.x)) * (N.y >= 0.0 ? 1.0 : -1.0));
+    }
     return saturate(Oct * 0.5 + 0.5);
 }
 
-// Decodes hemi-octahedral UV coordinates in [0, 1]^2 back to a unit direction vector (Z >= 0).
+// Decodes full-sphere octahedral UV coordinates in [0, 1]^2 back to a 3D unit direction vector.
 float3 V3D_HemiOctahedronToDir(float2 UV)
 {
     float2 Oct = UV * 2.0 - 1.0;
-    float2 Temp = float2(Oct.x + Oct.y, Oct.x - Oct.y) * 0.5;
-    float3 Dir = float3(Temp.x, Temp.y, 1.0 - abs(Temp.x) - abs(Temp.y));
+    float3 Dir = float3(Oct.x, Oct.y, 1.0 - abs(Oct.x) - abs(Oct.y));
+    if (Dir.z < 0.0)
+    {
+        float OldX = Dir.x;
+        Dir.x = (1.0 - abs(Dir.y)) * (OldX >= 0.0 ? 1.0 : -1.0);
+        Dir.y = (1.0 - abs(OldX)) * (Dir.y >= 0.0 ? 1.0 : -1.0);
+    }
     float LenSq = dot(Dir, Dir);
     return LenSq > 1.0e-8 ? Dir * rsqrt(LenSq) : float3(0.0, 0.0, 1.0);
 }
@@ -130,10 +141,6 @@ float3 V3D_ImpostorBillboardLocalWPO(
 {
     float LenSq = dot(LocalViewDir, LocalViewDir);
     float3 Forward = LenSq > 1.0e-6 ? LocalViewDir * rsqrt(LenSq) : float3(1.0, 0.0, 0.0);
-    // Clamp slightly below horizon to match hemi-octahedral capture (Z >= 0) without flipping.
-    Forward.z = max(Forward.z, 0.0);
-    float FwdLenSq = dot(Forward, Forward);
-    Forward = FwdLenSq > 1.0e-6 ? Forward * rsqrt(FwdLenSq) : float3(0.0, 0.0, 1.0);
 
     float3 LocalUp = abs(Forward.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
     float3 Right = normalize(cross(LocalUp, Forward));
@@ -231,12 +238,14 @@ float4x3 V3D_SampleImpostorArray(
     V3D_ImpostorOctahedralGrid(LocalViewDir, SafeFrames, F0, F1, F2, W);
 
     float2 CellUV = saturate(LocalUV) * InvFrames;
-    float2 DdxUV = ddx(LocalUV) * InvFrames;
-    float2 DdyUV = ddy(LocalUV) * InvFrames;
 
     float2 UV0 = F0 * InvFrames + CellUV;
     float2 UV1 = F1 * InvFrames + CellUV;
     float2 UV2 = F2 * InvFrames + CellUV;
+
+#if PIXELSHADER
+    float2 DdxUV = ddx(LocalUV) * InvFrames;
+    float2 DdyUV = ddy(LocalUV) * InvFrames;
 
     float4 C0 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV0, 0.0), DdxUV, DdyUV);
     float4 C1 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV1, 0.0), DdxUV, DdyUV);
@@ -245,6 +254,16 @@ float4x3 V3D_SampleImpostorArray(
     float4 N0 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV0, 1.0), DdxUV, DdyUV);
     float4 N1 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV1, 1.0), DdxUV, DdyUV);
     float4 N2 = ImpostorAtlasArray.SampleGrad(ImpostorAtlasArraySampler, float3(UV2, 1.0), DdxUV, DdyUV);
+#else
+    // Ray Tracing Hit Group shaders lack 2x2 pixel quads (ddx/ddy are illegal in DXC/SM6).
+    float4 C0 = ImpostorAtlasArray.SampleLevel(ImpostorAtlasArraySampler, float3(UV0, 0.0), 0.0);
+    float4 C1 = ImpostorAtlasArray.SampleLevel(ImpostorAtlasArraySampler, float3(UV1, 0.0), 0.0);
+    float4 C2 = ImpostorAtlasArray.SampleLevel(ImpostorAtlasArraySampler, float3(UV2, 0.0), 0.0);
+
+    float4 N0 = ImpostorAtlasArray.SampleLevel(ImpostorAtlasArraySampler, float3(UV0, 1.0), 0.0);
+    float4 N1 = ImpostorAtlasArray.SampleLevel(ImpostorAtlasArraySampler, float3(UV1, 1.0), 0.0);
+    float4 N2 = ImpostorAtlasArray.SampleLevel(ImpostorAtlasArraySampler, float3(UV2, 1.0), 0.0);
+#endif
 
     float Alpha = C0.a * W.x + C1.a * W.y + C2.a * W.z;
     float3 ColorSum = C0.rgb * (C0.a * W.x) + C1.rgb * (C1.a * W.y) + C2.rgb * (C2.a * W.z);
@@ -265,19 +284,23 @@ float4x3 V3D_SampleImpostorArray(
     return Out;
 }
 
-#if VERTEXSHADER
-// Full Vertex-Shader entry point for UE5 Custom node (WorldPositionOffset).
+// Full Vertex-Shader / RT-WPO Compute entry point for UE5 Custom node (WorldPositionOffset).
 // Handles StaticMesh, ISM/HISM per-instance transforms, rotation/scale, and LWC automatically.
 float3 V3D_ImpostorWPO_VS(
     FMaterialVertexParameters Parameters,
     float3 ImpostorCenter,
     float ImpostorRadius)
 {
-    float2 LocalUV = float2(0.5, 0.5);
-#if NUM_MATERIAL_TEXCOORDS_VERTEX > 0
-    LocalUV = Parameters.TexCoords[0].xy;
-#endif
     float3 LocalPos = Parameters.PreSkinnedPosition;
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > 0
+    float2 LocalUV = Parameters.TexCoords[0].xy;
+#else
+    // Derive corner UV directly from local vertex position when no TexCoord node is wired to the WPO graph.
+    // Works for both YZ (+X forward, +Z up) and XZ (-Y forward, +Z up) planes without collapsing to 0x0.
+    float3 RelPos = LocalPos - ImpostorCenter;
+    float HorizCoord = (abs(RelPos.y) >= abs(RelPos.x)) ? RelPos.y : RelPos.x;
+    float2 LocalUV = float2(HorizCoord >= 0.0 ? 1.0 : 0.0, RelPos.z >= 0.0 ? 0.0 : 1.0);
+#endif
 
     // Basis vectors of this instance in world space (works identically for StaticMesh, ISM, and HISM).
     float3 AxisX = TransformLocalVectorToWorld(Parameters, float3(1.0, 0.0, 0.0));
@@ -289,24 +312,34 @@ float3 V3D_ImpostorWPO_VS(
     float3 DeltaWS = AxisX * DeltaLocal.x + AxisY * DeltaLocal.y + AxisZ * DeltaLocal.z;
     float3 CenterTWS = Parameters.WorldPosition + DeltaWS;
 
+    // Transform camera-to-center direction into exact instance local space via M^-1
+    // (dot(V, Axis) / |Axis|^2), preserving arbitrary 3D rotations, non-uniform scale, and negative mirrors.
     float3 ViewDirWS = ResolvedView.TranslatedWorldCameraOrigin - CenterTWS;
-    float3 LocalViewDir = float3(
-        dot(ViewDirWS, AxisX) / max(dot(AxisX, AxisX), 1.0e-8),
-        dot(ViewDirWS, AxisY) / max(dot(AxisY, AxisY), 1.0e-8),
-        dot(ViewDirWS, AxisZ) / max(dot(AxisZ, AxisZ), 1.0e-8));
+    float InvLenSqX = rcp(max(dot(AxisX, AxisX), 1.0e-8));
+    float InvLenSqY = rcp(max(dot(AxisY, AxisY), 1.0e-8));
+    float InvLenSqZ = rcp(max(dot(AxisZ, AxisZ), 1.0e-8));
+    float3 LocalForward = float3(
+        dot(ViewDirWS, AxisX) * InvLenSqX,
+        dot(ViewDirWS, AxisY) * InvLenSqY,
+        dot(ViewDirWS, AxisZ) * InvLenSqZ);
+    float LFwdLenSq = dot(LocalForward, LocalForward);
+    LocalForward = LFwdLenSq > 1.0e-8 ? LocalForward * rsqrt(LFwdLenSq) : float3(1.0, 0.0, 0.0);
 
-    float3 LocalOffset = V3D_ImpostorBillboardLocalWPO(
-        LocalUV,
-        LocalPos,
-        ImpostorCenter,
-        LocalViewDir,
-        ImpostorRadius);
+    // Build billboard quad in the exact local space used by CaptureOctahedralAtlas, then map
+    // (TargetLocal - LocalPos) directly through the instance's (AxisX, AxisY, AxisZ) matrix.
+    // This guarantees 1:1 transform parity with the real mesh and eliminates LWC precision loss.
+    float3 LocalUpRef = abs(LocalForward.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 LocalRight = normalize(cross(LocalUpRef, LocalForward));
+    float3 LocalUp = normalize(cross(LocalForward, LocalRight));
 
-    return AxisX * LocalOffset.x + AxisY * LocalOffset.y + AxisZ * LocalOffset.z;
+    float SafeRadius = clamp(ImpostorRadius, 1.0, 100000.0);
+    float2 Centered = (LocalUV - 0.5) * 2.0;
+    float3 TargetLocal = ImpostorCenter + (LocalRight * Centered.x - LocalUp * Centered.y) * SafeRadius;
+    float3 OffsetLocal = TargetLocal - LocalPos;
+
+    return AxisX * OffsetLocal.x + AxisY * OffsetLocal.y + AxisZ * OffsetLocal.z;
 }
-#endif // VERTEXSHADER
 
-#if PIXELSHADER
 // Computes normalized camera-to-instance direction in Instance Local Space for Pixel Shader.
 float3 V3D_ImpostorLocalViewDir_PS(FMaterialPixelParameters Parameters)
 {
@@ -315,9 +348,9 @@ float3 V3D_ImpostorLocalViewDir_PS(FMaterialPixelParameters Parameters)
     float3 AxisZ = TransformLocalVectorToWorld(Parameters, float3(0.0, 0.0, 1.0));
     float3 V = Parameters.CameraVector;
     float3 LocalViewDir = float3(
-        dot(V, AxisX) / max(dot(AxisX, AxisX), 1.0e-8),
-        dot(V, AxisY) / max(dot(AxisY, AxisY), 1.0e-8),
-        dot(V, AxisZ) / max(dot(AxisZ, AxisZ), 1.0e-8));
+        dot(V, AxisX) * rcp(max(dot(AxisX, AxisX), 1.0e-8)),
+        dot(V, AxisY) * rcp(max(dot(AxisY, AxisY), 1.0e-8)),
+        dot(V, AxisZ) * rcp(max(dot(AxisZ, AxisZ), 1.0e-8)));
     float LenSq = dot(LocalViewDir, LocalViewDir);
     return LenSq > 1.0e-8 ? LocalViewDir * rsqrt(LenSq) : float3(1.0, 0.0, 0.0);
 }
@@ -332,12 +365,9 @@ float4x3 V3D_SampleImpostorArray_PS(
     FMaterialPixelParameters Parameters,
     Texture2DArray ImpostorAtlasArray,
     SamplerState ImpostorAtlasArraySampler,
-    float GridFrames)
+    float GridFrames,
+    float2 LocalUV)
 {
-    float2 LocalUV = float2(0.5, 0.5);
-#if NUM_TEX_COORD_INTERPOLATORS > 0
-    LocalUV = Parameters.TexCoords[0].xy;
-#endif
     float3 LocalViewDir = V3D_ImpostorLocalViewDir_PS(Parameters);
     float4x3 Sampled = V3D_SampleImpostorArray(
         ImpostorAtlasArray,
@@ -350,6 +380,23 @@ float4x3 V3D_SampleImpostorArray_PS(
     Sampled[1] = NLenSq > 1.0e-8 ? NormalWS * rsqrt(NLenSq) : float3(0.0, 0.0, 1.0);
     return Sampled;
 }
-#endif // PIXELSHADER
+
+float4x3 V3D_SampleImpostorArray_PS(
+    FMaterialPixelParameters Parameters,
+    Texture2DArray ImpostorAtlasArray,
+    SamplerState ImpostorAtlasArraySampler,
+    float GridFrames)
+{
+    float2 LocalUV = float2(0.5, 0.5);
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+    LocalUV = Parameters.TexCoords[0].xy;
+#endif
+    return V3D_SampleImpostorArray_PS(
+        Parameters,
+        ImpostorAtlasArray,
+        ImpostorAtlasArraySampler,
+        GridFrames,
+        LocalUV);
+}
 
 #endif // V3D_IMPOSTOR_HLSL_INCLUDED

@@ -11,6 +11,8 @@ public:
     SLATE_BEGIN_ARGS(SV3DModelPreview) {} SLATE_END_ARGS()
     void Construct(const FArguments&) { SetClipping(EWidgetClipping::ClipToBounds); }
     void SetModel(const FGWorldBuildModel& Model);
+    void SetSingleNodeGeometry(const FString& NodeName, TArray<TPair<FVector, FVector>>&& InEdges, const FBox& InBounds);
+    const FString& GetFocusedNodeName() const { return FocusedNodeName; }
     void ClearModel();
     void SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json);
     void ClearOverlays();
@@ -53,6 +55,7 @@ private:
 
     TArray<TPair<FVector, FVector>> Edges;
     TMap<FString, FTransform> NodeWorldTransforms;
+    FString FocusedNodeName;
     TArray<FOverlayLine> OverlayLines;
     TArray<FOverlayLabel> OverlayLabels;
 

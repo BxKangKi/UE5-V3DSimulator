@@ -515,6 +515,17 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
                 }
             }
         };
+        const auto SetRenderingFloatOption = [](const TCHAR* Name, const float Value)
+        {
+            if (IConsoleVariable* Variable = IConsoleManager::Get().FindConsoleVariable(Name))
+            {
+                if ((Variable->GetFlags() & ECVF_SetByMask) <= ECVF_SetByGameOverride
+                    && !FMath::IsNearlyEqual(Variable->GetFloat(), Value, 1.e-4f))
+                {
+                    Variable->Set(Value, ECVF_SetByGameOverride);
+                }
+            }
+        };
         const bool bLowQualityShading = (ShadingQuality == 0 || ShadowQuality == 0);
         // Always keep SingleLayerWater active so water stays transparent and reflective at every quality preset.
         SetRenderingOption(TEXT("r.Water.SingleLayer"), 1);
@@ -525,8 +536,9 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         SetRenderingOption(TEXT("r.Lumen.Reflections.HardwareRayTracing"),
             bUseHardwareRayTracing && !bLowQualityShading ? 1 : 0);
         SetRenderingOption(TEXT("r.Lumen.Reflections.SingleLayerWater"), bLowQualityShading ? 0 : 1);
-        SetRenderingOption(TEXT("r.Lumen.TranslucencyReflections.FrontLayer.Allow"), bLowQualityShading ? 0 : 1);
-        SetRenderingOption(TEXT("r.Lumen.TranslucencyReflections.FrontLayer.EnableForProject"), bLowQualityShading ? 0 : 1);
+        // Keep SingleLayerWater reflections fast without paying for full-scene FrontLayer translucent RT pass.
+        SetRenderingOption(TEXT("r.Lumen.TranslucencyReflections.FrontLayer.Allow"), 0);
+        SetRenderingOption(TEXT("r.Lumen.TranslucencyReflections.FrontLayer.EnableForProject"), 0);
         SetRenderingOption(TEXT("r.RayTracing.Shadows"),
             bUseHardwareRayTracing && ShadowQuality > 0 ? 1 : 0);
         // Classic clean low-spec 3D game shading on Low quality: disable noisy SSAO, contact shadows,
@@ -541,20 +553,42 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         // Apply after scalability, which otherwise silently scales the user's distance down.
         const float ShadowRange = GetEffectiveShadowDistanceCentimeters();
         SetRenderingOption(TEXT("r.Shadow.DistanceScale"), 1);
-        int32 LastLevel = V3DShadowDistance::LastClipmapLevel(ShadowRange);
+        int32 LastLevel = FMath::Min(V3DShadowDistance::LastClipmapLevel(ShadowRange), 20);
         if (const IConsoleVariable* FirstLevel = IConsoleManager::Get().FindConsoleVariable(
             TEXT("r.Shadow.Virtual.Clipmap.FirstLevel")))
             LastLevel = FMath::Max(LastLevel, FirstLevel->GetInt());
         SetRenderingOption(TEXT("r.Shadow.Virtual.Clipmap.LastLevel"), LastLevel);
+        // Prevent [VSM] Non-Nanite Marking Job Queue overflow & VSM GPU stutters on dense non-Nanite HISM worlds.
+        SetRenderingOption(TEXT("r.Shadow.Virtual.NonNanite.MarkJobQueueSize"), 2097152);
+        SetRenderingOption(TEXT("r.Shadow.Virtual.NonNanite.IncludeInCoarsePages"), 0);
+        SetRenderingOption(TEXT("r.Shadow.Virtual.MaxPhysicalPages"), 4096);
+        SetRenderingOption(TEXT("r.Shadow.Virtual.Cache.StaticSeparate"), 1);
+        SetRenderingOption(TEXT("r.Shadow.Virtual.AllowScreenOverflowMessages"), 0);
+        // Frame-pacing & anti-stutter budgets (keep PSO compile and async streaming smooth).
+        SetRenderingOption(TEXT("r.ShaderPipelineCache.Enabled"), 1);
+        SetRenderingFloatOption(TEXT("r.ShaderPipelineCache.BatchTime"), 2.0f);
+        SetRenderingFloatOption(TEXT("s.AsyncLoadingTimeLimit"), 4.0f);
+        SetRenderingFloatOption(TEXT("s.LevelStreamingActorsUpdateTimeLimit"), 3.0f);
+
         if (bUseHardwareRayTracing)
         {
-            // Extend RT culling coverage to full render distance so far-LOD impostors remain visible in RT reflections/GI.
-            const float RayTracingRange = FMath::Max(ShadowRange, GetMaxRenderDistanceCentimeters());
-            SetRenderingOption(TEXT("r.RayTracing.Culling.Radius"), FMath::RoundToInt(RayTracingRange));
+            // Keep Near-Field RT TLAS compact (150m-400m, 1.0 deg angle) to eliminate per-frame TLAS build stutters,
+            // and use Lumen HWRT FarField + AlphaMasked so distant impostors render in RT reflections/GI cheaply.
+            const float NearRayTracingRange = FMath::Clamp(ShadowRange, 15000.0f, 40000.0f);
+            SetRenderingOption(TEXT("r.RayTracing.Culling"), 1);
+            SetRenderingOption(TEXT("r.RayTracing.Culling.Radius"), FMath::RoundToInt(NearRayTracingRange));
+            SetRenderingFloatOption(TEXT("r.RayTracing.Culling.Angle"), 1.0f);
             SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.CullClusterRadius"),
-                FMath::RoundToInt(RayTracingRange));
-            SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.EvaluateWPO"), 1);
-            SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing.HitLighting"), 1);
+                FMath::RoundToInt(NearRayTracingRange));
+            const int32 EnableFarField = (ShadingQuality >= 3) ? 1 : 0;
+            SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing.FarField"), EnableFarField);
+            SetRenderingOption(TEXT("r.Lumen.Reflections.HardwareRayTracing.FarField"), EnableFarField);
+            SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing.AlphaMasked"), 1);
+            SetRenderingOption(TEXT("r.RayTracing.Shadows.EnableTwoSidedGeometry"), 1);
+            SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.EvaluateWPO"), 0);
+            SetRenderingOption(TEXT("r.RayTracing.Geometry.InstancedStaticMeshes.SimulationCount"), 0);
+            SetRenderingOption(TEXT("r.Lumen.HardwareRayTracing.HitLighting"), 0);
+            SetRenderingFloatOption(TEXT("r.Lumen.Reflections.MaxRoughnessToTrace"), 0.35f);
         }
     }
 

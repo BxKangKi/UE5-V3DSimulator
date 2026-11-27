@@ -1,5 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/V3DMaterialTextureArray.h"
+#include "Format/v3d.h"
 #include "System/V3DImpostor.h"
 #include "System/V3DTerrain.h"
 #include "Async/ParallelFor.h"
@@ -36,6 +37,38 @@ namespace V3DMaterialArrayPrivate
             || Name.Equals(TEXT("emissiveTexture"), ESearchCase::IgnoreCase);
     }
 
+    inline v3d::texture_format ToPortableTextureFormat(const EPixelFormat Fmt)
+    {
+        switch (Fmt)
+        {
+            case PF_R8G8B8A8:  return v3d::texture_format::rgba8_unorm;
+            case PF_B8G8R8A8:  return v3d::texture_format::bgra8_unorm;
+            case PF_G8:        return v3d::texture_format::r8_unorm;
+            case PF_R8G8:      return v3d::texture_format::rg8_unorm;
+            case PF_DXT1:      return v3d::texture_format::bc1_unorm;
+            case PF_DXT5:      return v3d::texture_format::bc3_unorm;
+            case PF_ETC2_RGB:  return v3d::texture_format::etc2_rgb8_unorm;
+            case PF_ETC2_RGBA: return v3d::texture_format::etc2_rgba8_unorm;
+            default:           return v3d::texture_format::unknown;
+        }
+    }
+
+    void FillSliceDefault(const int32 DstSize, const FLinearColor& DefaultFill, uint8* OutSliceBGRA)
+    {
+        const uint8 B = FloatToByte(DefaultFill.B);
+        const uint8 G = FloatToByte(DefaultFill.G);
+        const uint8 R = FloatToByte(DefaultFill.R);
+        const uint8 A = FloatToByte(DefaultFill.A);
+        const int64 PixelCount = static_cast<int64>(DstSize) * DstSize;
+        for (int64 I = 0; I < PixelCount; ++I)
+        {
+            OutSliceBGRA[I * 4 + 0] = B;
+            OutSliceBGRA[I * 4 + 1] = G;
+            OutSliceBGRA[I * 4 + 2] = R;
+            OutSliceBGRA[I * 4 + 3] = A;
+        }
+    }
+
     void SampleSourceSlice(
         const FGWorldBakedTexture* Tex,
         const int32 DstSize,
@@ -43,30 +76,104 @@ namespace V3DMaterialArrayPrivate
         const FLinearColor& DefaultFill,
         uint8* OutSliceBGRA)
     {
-        const bool bValidPixels = Tex && !Tex->bTextureArray && !Tex->Mips.IsEmpty()
-            && Tex->Mips[0].SizeX > 0 && Tex->Mips[0].SizeY > 0
-            && (static_cast<EPixelFormat>(Tex->PixelFormat) == PF_B8G8R8A8
-                || static_cast<EPixelFormat>(Tex->PixelFormat) == PF_R8G8B8A8)
-            && Tex->Mips[0].Bytes.Num() >= static_cast<int64>(Tex->Mips[0].SizeX) * Tex->Mips[0].SizeY * 4;
-
-        if (!bValidPixels)
+        if (!Tex || Tex->bTextureArray)
         {
-            const uint8 B = FloatToByte(DefaultFill.B);
-            const uint8 G = FloatToByte(DefaultFill.G);
-            const uint8 R = FloatToByte(DefaultFill.R);
-            const uint8 A = FloatToByte(DefaultFill.A);
-            for (int32 I = 0; I < DstSize * DstSize; ++I)
-            {
-                OutSliceBGRA[I * 4 + 0] = B;
-                OutSliceBGRA[I * 4 + 1] = G;
-                OutSliceBGRA[I * 4 + 2] = R;
-                OutSliceBGRA[I * 4 + 3] = A;
-            }
+            FillSliceDefault(DstSize, DefaultFill, OutSliceBGRA);
             return;
         }
 
-        const FGWorldBakedTextureMip& Src = Tex->Mips[0];
-        const bool bBGRA = (static_cast<EPixelFormat>(Tex->PixelFormat) == PF_B8G8R8A8);
+        const TArray<FGWorldBakedTextureMip>* SourceMips = nullptr;
+        EPixelFormat SourceFmt = PF_Unknown;
+        v3d::texture_format PortableFmt = v3d::texture_format::unknown;
+
+        if (!Tex->Mips.IsEmpty())
+        {
+            const EPixelFormat PrimaryFmt = static_cast<EPixelFormat>(Tex->PixelFormat);
+            const v3d::texture_format PrimaryPortable = ToPortableTextureFormat(PrimaryFmt);
+            if (PrimaryPortable != v3d::texture_format::unknown)
+            {
+                SourceMips = &Tex->Mips;
+                SourceFmt = PrimaryFmt;
+                PortableFmt = PrimaryPortable;
+            }
+        }
+        if (!SourceMips && !Tex->AltMips.IsEmpty())
+        {
+            const EPixelFormat AltFmt = static_cast<EPixelFormat>(Tex->AltPixelFormat);
+            const v3d::texture_format AltPortable = ToPortableTextureFormat(AltFmt);
+            if (AltPortable != v3d::texture_format::unknown)
+            {
+                SourceMips = &Tex->AltMips;
+                SourceFmt = AltFmt;
+                PortableFmt = AltPortable;
+            }
+        }
+
+        if (!SourceMips || SourceMips->IsEmpty())
+        {
+            FillSliceDefault(DstSize, DefaultFill, OutSliceBGRA);
+            return;
+        }
+
+        // Select the deepest stored mip that still meets DstSize to avoid unnecessary high-res decoding & aliasing.
+        int32 SelectedMipIdx = 0;
+        for (int32 MipIdx = 0; MipIdx < SourceMips->Num(); ++MipIdx)
+        {
+            const FGWorldBakedTextureMip& Candidate = (*SourceMips)[MipIdx];
+            if (Candidate.SizeX >= DstSize && Candidate.SizeY >= DstSize && !Candidate.Bytes.IsEmpty())
+            {
+                SelectedMipIdx = MipIdx;
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        const FGWorldBakedTextureMip& Src = (*SourceMips)[SelectedMipIdx];
+        if (Src.SizeX <= 0 || Src.SizeY <= 0 || Src.Bytes.IsEmpty())
+        {
+            FillSliceDefault(DstSize, DefaultFill, OutSliceBGRA);
+            return;
+        }
+
+        const uint8* SrcPixels = nullptr;
+        bool bBGRA = false;
+        std::vector<std::uint8_t> DecodedRGBA8;
+
+        if (SourceFmt == PF_B8G8R8A8 || SourceFmt == PF_R8G8B8A8)
+        {
+            const int64 RequiredBytes = static_cast<int64>(Src.SizeX) * Src.SizeY * 4;
+            if (Src.Bytes.Num() < RequiredBytes)
+            {
+                FillSliceDefault(DstSize, DefaultFill, OutSliceBGRA);
+                return;
+            }
+            SrcPixels = Src.Bytes.GetData();
+            bBGRA = (SourceFmt == PF_B8G8R8A8);
+        }
+        else
+        {
+            // Decode compressed (BC1/BC3/ETC2) or 1/2-channel portable mip into RGBA8 for array packing.
+            std::string DecodeError;
+            if (!v3d::decode_mip_to_rgba8(
+                    PortableFmt,
+                    static_cast<std::uint32_t>(Src.SizeX),
+                    static_cast<std::uint32_t>(Src.SizeY),
+                    1u,
+                    Src.Bytes.GetData(),
+                    static_cast<std::size_t>(Src.Bytes.Num()),
+                    DecodedRGBA8,
+                    DecodeError)
+                || DecodedRGBA8.size() < static_cast<std::size_t>(Src.SizeX) * static_cast<std::size_t>(Src.SizeY) * 4u)
+            {
+                FillSliceDefault(DstSize, DefaultFill, OutSliceBGRA);
+                return;
+            }
+            SrcPixels = DecodedRGBA8.data();
+            bBGRA = false;
+        }
+
         const bool bDecodeSRGB = bConvertSRGBToLinear && Tex->bSRGB;
 
         for (int32 Y = 0; Y < DstSize; ++Y)
@@ -75,7 +182,7 @@ namespace V3DMaterialArrayPrivate
             for (int32 X = 0; X < DstSize; ++X)
             {
                 const int32 SX = FMath::Clamp((X * Src.SizeX) / DstSize, 0, Src.SizeX - 1);
-                const uint8* P = Src.Bytes.GetData() + (static_cast<int64>(SY) * Src.SizeX + SX) * 4;
+                const uint8* P = SrcPixels + (static_cast<int64>(SY) * Src.SizeX + SX) * 4;
                 const uint8 RByte = bBGRA ? P[2] : P[0];
                 const uint8 GByte = P[1];
                 const uint8 BByte = bBGRA ? P[0] : P[2];

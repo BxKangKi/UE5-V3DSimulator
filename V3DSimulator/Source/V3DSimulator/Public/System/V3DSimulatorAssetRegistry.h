@@ -136,6 +136,9 @@ public:
     /** Synchronously resolves ImpostorMaterial on the game thread. */
     UMaterialInterface* ResolveImpostorMaterial() const;
 
+    /** Synchronously resolves ImpostorPlaneMesh (1m x 1m unit plane) on the game thread. */
+    UStaticMesh* ResolveImpostorPlaneMesh() const;
+
     /** Loaded once by the world surface subsystem; the registry retains only the soft path. */
     UPhysicalMaterial* ResolveDefaultPhysicalMaterial() const;
 
@@ -234,6 +237,10 @@ public:
     /** Base material used by baked V3D octahedral impostor LODs (ImpostorAtlasArray + /V3D/v3d.ush). */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> ImpostorMaterial;
+
+    /** Optional 1m x 1m (100cm x 100cm) plane mesh (+X forward, +Z up, YZ plane) used for plane-based impostor rendering. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UStaticMesh> ImpostorPlaneMesh;
 
     /** Base material used by baked V3D terrain palettes (Texture2DArray + vertex-color layer weights). */
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")

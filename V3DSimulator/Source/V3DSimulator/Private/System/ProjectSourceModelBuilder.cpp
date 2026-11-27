@@ -12,6 +12,7 @@
 #include "Model/V3DModelAnimation.h"
 #include "System/V3DTerrain.h"
 #include "System/V3DImpostor.h"
+#include "System/V3DTextureCompression.h"
 
 #include "Containers/Ticker.h"
 #include "Animation/Skeleton.h"
@@ -1035,6 +1036,10 @@ void UProjectSourceModelBuilder::CaptureSkinsAndMetadata()
             ? TEXT("decoded model validation failed") : Error);
         return;
     }
+    // Compress all eligible 8-bit RGBA/BGRA textures (model, terrain arrays, impostor atlases)
+    // into cross-platform hardware BC1 (DXT1) / BC3 (DXT5) blocks (4x-8x smaller .v3d & VRAM).
+    V3DTextureCompression::CompressModelTextures(BakedData);
+
     Metadata.SourceMeshCount = BakedData.Meshes.Num();
     Metadata.SourceMaterialCount = BakedData.Materials.Num();
     Metadata.SourceTextureCount = BakedData.Textures.Num();

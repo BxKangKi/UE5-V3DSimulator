@@ -92,7 +92,11 @@ private:
     UPROPERTY(Transient) TObjectPtr<UProjectSourceModelBuilder> PreviewBuilder;
     TSharedPtr<SV3DModelPreview> Preview;
     FString PreviewDocument;
+    FString FocusedPreviewNode;
+    uint64 NodePreviewGeneration = 0;
+    bool bNodePreviewLoading = false;
     void StartPreview();
+    void StartNodePreview(const FString& NodeName);
     void PreviewFinished(UProjectSourceModelBuilder* Builder, bool bSuccess);
     void RefreshFiles();
     void RefreshProjectDocuments(const FString& PreferredPath = FString(), const FString& CompletionMessage = FString());

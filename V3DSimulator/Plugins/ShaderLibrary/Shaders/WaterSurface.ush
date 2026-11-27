@@ -57,7 +57,7 @@ float3 V3DWaterSurfaceNormalQuality(Texture2D WaveTexture, SamplerState WaveSamp
         float2 chop = V3DSampleWaterSlope(WaveTexture, WaveSampler, uvChop + t * float2(-0.058f, -0.041f));
         chop = V3DRotateSlope(chop, -0.3420f, 0.9397f);
         const float chopFade = 1.0f - saturate(safeDepth / 3600.0f);
-        nearSlope += chop * (0.22f * chopFade * chopFade);
+        nearSlope += chop * (0.15f * chopFade * chopFade);
     }
 
     // 4. Epic (QualityLevel >= 3): fine close-up capillary micro-ripples for crisp sun glints.
@@ -67,7 +67,7 @@ float3 V3DWaterSurfaceNormalQuality(Texture2D WaveTexture, SamplerState WaveSamp
         float2 micro = V3DSampleWaterSlope(WaveTexture, WaveSampler, uvMicro + t * float2(0.092f, -0.074f));
         micro = V3DRotateSlope(micro, 0.9272f, -0.3746f);
         const float microFade = 1.0f - saturate(safeDepth / 1500.0f);
-        nearSlope += micro * (0.13f * microFade * microFade);
+        nearSlope += micro * (0.08f * microFade * microFade);
     }
 
     // 5. Distant ocean swells: dual rotated layers prevent static horizon bands and aliasing.
@@ -84,12 +84,12 @@ float3 V3DWaterSurfaceNormalQuality(Texture2D WaveTexture, SamplerState WaveSamp
     blend = blend * blend * (3.0f - 2.0f * blend);
 
     float2 slope = lerp(
-        nearSlope * (1.35f * clamp(NearStrength, 0.0f, 1.5f)),
-        farSlope * (1.25f * clamp(FarStrength, 0.0f, 1.5f)),
+        nearSlope * (1.12f * clamp(NearStrength, 0.0f, 1.5f)),
+        farSlope * (1.05f * clamp(FarStrength, 0.0f, 1.5f)),
         blend);
 
     if (!all(isfinite(slope))) return float3(0.0f, 0.0f, 1.0f);
-    slope = clamp(slope, -0.45f, 0.45f);
+    slope = clamp(slope, -0.34f, 0.34f);
     return float3(slope.x, slope.y, 1.0f) * rsqrt(1.0f + dot(slope, slope));
 }
 

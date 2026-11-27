@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #include "System/WorldBakedTexture.h"
 #include "Misc/ScopeExit.h"
+#include "System/V3DTextureCompression.h"
 
 bool UWorldBakedTextureMipProvider::InitializeArchiveSource(
     const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>& InReader,
@@ -74,7 +75,27 @@ bool UWorldBakedTextureMipProvider::GetInitialMipData(
         FGWorldBakedTexture Baked;
         FString Error;
         if (!Reader.IsValid() || !Reader->ReadTextureRange(Range, Baked, Error, Resolution)
-            || Baked.TextureId != TextureId || Baked.PixelFormat != PixelFormat
+            || Baked.TextureId != TextureId)
+        {
+            UE_LOG(LogTemp, Error, TEXT("Cannot restore baked texture %d: %s"), TextureId, *Error);
+            return false;
+        }
+        if (Baked.PixelFormat != PixelFormat)
+        {
+            if (Baked.AltPixelFormat == PixelFormat && !Baked.AltMips.IsEmpty())
+            {
+                Baked.PixelFormat = Baked.AltPixelFormat;
+                Baked.Mips = MoveTemp(Baked.AltMips);
+                Baked.AltPixelFormat = PF_Unknown;
+                Baked.AltMips.Empty();
+            }
+            else if (PixelFormat == PF_B8G8R8A8
+                && (Baked.PixelFormat == PF_DXT1 || Baked.PixelFormat == PF_DXT5))
+            {
+                V3DTextureCompression::DecompressToBGRA(Baked);
+            }
+        }
+        if (Baked.PixelFormat != PixelFormat
             || Baked.SizeX != MipLayout[0].SizeX || Baked.SizeY != MipLayout[0].SizeY)
         {
             UE_LOG(LogTemp, Error, TEXT("Cannot restore baked texture %d: %s"), TextureId, *Error);

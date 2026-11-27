@@ -82,8 +82,10 @@ namespace
             return false;
         }
 
+        const bool bHasCustomColliders = MeshData && !MeshData->Colliders.IsEmpty();
         const bool bEnableCollision =
-            !bRenderOnly && MeshData && (MeshData->bComplexCollision || MeshData->bSimpleCollision);
+            !bRenderOnly && MeshData
+            && (MeshData->bComplexCollision || (MeshData->bSimpleCollision && !bHasCustomColliders));
 
         Component->SetGenerateOverlapEvents(false);
         Component->SetCanEverAffectNavigation(bEnableCollision);
@@ -1314,10 +1316,10 @@ FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N, bool bLastIsImpostor 
 {
     if (N <= 1) return 1.0f;
     if (i <= 0) return 1.0f;
-    // Keep baked impostors strictly for distant silhouettes (~6% screen height), never up close.
+    // Transition to baked impostors at mid-far distance (~10% screen height) well before instance culling.
     if (bLastIsImpostor && i == N - 1)
     {
-        return FMath::Min(0.06f, FMath::Pow(0.35f, static_cast<float>(i)));
+        return FMath::Min(0.10f, FMath::Pow(0.45f, static_cast<float>(i)));
     }
     return FMath::Max(0.015f, FMath::Pow(0.35f, static_cast<float>(i)));
 }
@@ -1412,8 +1414,11 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
         LODScreenSize.Add(Index, CalculateLODScreenSize(Index, Count, bLastIsImpostor));
     }
 
+    const bool bHasCustomColliders = !Mesh->Data.Colliders.IsEmpty();
     const bool bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
-    const bool bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision;
+    // When explicit Colliders are authored on the mesh, let those shape components own simple collision
+    // instead of also generating an overlapping bounding-box FKBoxElem on the StaticMesh.
+    const bool bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision && !bHasCustomColliders;
     const bool bNeedsCollision = bBuildComplexCollision || bBuildSimpleCollision;
 
     if (bNeedsCollision && !IsValid(GeneratedMeshWorldContext))

@@ -29,6 +29,12 @@ bool FV3DMaterialAssetReferences::IsSupportedParent(const UMaterialInterface* Ma
     return IsValid(Material) && Material->GetMaterial() && Material->GetMaterial()->MaterialDomain == MD_Surface
         && (Material->GetBlendMode() == BLEND_Masked || Material->GetBlendMode() == BLEND_Translucent);
 }
+bool FV3DMaterialAssetReferences::IsSupportedReservedParent(const UMaterialInterface* Material)
+{
+    // Reserved materials (e.g. glass, tinted_glass) may use ThinTranslucent (TranslucentColoredTransmittance),
+    // Translucent, AlphaComposite, Masked, or Opaque surface shaders.
+    return IsValid(Material) && Material->GetMaterial() && Material->GetMaterial()->MaterialDomain == MD_Surface;
+}
 bool FV3DMaterialAssetReferences::MatchesSlot(const UMaterialInterface* Material, int32 Slot)
 {
     if (Slot < 0 || Slot >= SlotCount || !IsSupportedParent(Material) || Material->IsTwoSided() != (Slot >= 4)) return false;
@@ -104,7 +110,11 @@ bool FV3DMaterialSoftAssetReferences::Resolve(FV3DMaterialAssetReferences& OutRe
         const FString Key = FV3DMaterialAssetReferences::NormalizeMaterialName(Name);
         if (Key.IsEmpty()) return;
         auto* Material = Load(Ref);
-        if (!FV3DMaterialAssetReferences::IsSupportedParent(Material))
+        if (!Ref.IsNull() && !IsValid(Material))
+        {
+            Material = Ref.LoadSynchronous();
+        }
+        if (!FV3DMaterialAssetReferences::IsSupportedReservedParent(Material))
         {
             if (!Ref.IsNull()) OutFailures.Add(FString::Printf(TEXT("Reserved material '%s' -> %s: unavailable or unsupported; using Opaque (Masked)."), *Key, *Ref.ToSoftObjectPath().ToString()));
             Material = nullptr;

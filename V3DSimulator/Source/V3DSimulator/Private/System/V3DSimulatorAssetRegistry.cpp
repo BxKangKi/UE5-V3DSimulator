@@ -117,6 +117,24 @@ UMaterialInterface* UV3DSimulatorAssetRegistry::ResolveImpostorMaterial() const
     return ImpostorMaterial.LoadSynchronous();
 }
 
+UStaticMesh* UV3DSimulatorAssetRegistry::ResolveImpostorPlaneMesh() const
+{
+    if (!IsInGameThread() || IsGarbageCollecting() || ImpostorPlaneMesh.IsNull())
+    {
+        return nullptr;
+    }
+
+    if (UStaticMesh* Existing = ImpostorPlaneMesh.Get())
+    {
+        if (IsValid(Existing))
+        {
+            return Existing;
+        }
+    }
+
+    return ImpostorPlaneMesh.LoadSynchronous();
+}
+
 UPhysicalMaterial* UV3DSimulatorAssetRegistry::ResolveDefaultPhysicalMaterial() const
 {
     if (!IsInGameThread() || IsGarbageCollecting() || DefaultPhysicalMaterial.IsNull()) return nullptr;

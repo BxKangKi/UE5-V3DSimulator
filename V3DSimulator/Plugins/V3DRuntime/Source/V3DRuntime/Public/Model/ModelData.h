@@ -83,6 +83,9 @@ struct V3DRUNTIME_API FMeshData
     bool bIsEntity = false;
 
     UPROPERTY()
+    bool bGenerateImpostor = true;
+
+    UPROPERTY()
     TArray<FModelCollider> Colliders;
 
     UPROPERTY()

@@ -406,6 +406,21 @@ namespace WorldArchiveCodecPrivate
             if (!M.Bytes.IsEmpty()) Mip.bytes.assign(M.Bytes.GetData(), M.Bytes.GetData() + M.Bytes.Num());
             Out.mips.push_back(std::move(Mip));
         }
+        if (V.AltPixelFormat > PF_Unknown && !V.AltMips.IsEmpty())
+        {
+            if (!ToPortablePixelFormat(V.AltPixelFormat, Out.alt_pixel_format))
+            {
+                Error = FString::Printf(TEXT("Texture '%s' uses unsupported AltPixelFormat %d"),
+                    *V.Name, V.AltPixelFormat);
+                return false;
+            }
+            for (const auto& M : V.AltMips)
+            {
+                v3d::mip Mip; Mip.width = M.SizeX; Mip.height = M.SizeY; Mip.layers = M.SizeZ;
+                if (!M.Bytes.IsEmpty()) Mip.bytes.assign(M.Bytes.GetData(), M.Bytes.GetData() + M.Bytes.Num());
+                Out.alt_mips.push_back(std::move(Mip));
+            }
+        }
         return true;
     }
     bool ToUnreal(v3d::texture& V, FGWorldBakedTexture& Out, FString& Error)
@@ -446,6 +461,19 @@ namespace WorldArchiveCodecPrivate
             Mip.SizeX = M.width; Mip.SizeY = M.height; Mip.SizeZ = M.layers;
             if (!M.bytes.empty()) Mip.Bytes.Append(M.bytes.data(), static_cast<int32>(M.bytes.size()));
             std::vector<uint8_t>().swap(M.bytes);
+        }
+        if (V.alt_pixel_format != v3d::texture_format::unknown && !V.alt_mips.empty())
+        {
+            if (ToUnrealPixelFormat(V.alt_pixel_format, Out.AltPixelFormat))
+            {
+                for (auto& M : V.alt_mips)
+                {
+                    auto& Mip = Out.AltMips.AddDefaulted_GetRef();
+                    Mip.SizeX = M.width; Mip.SizeY = M.height; Mip.SizeZ = M.layers;
+                    if (!M.bytes.empty()) Mip.Bytes.Append(M.bytes.data(), static_cast<int32>(M.bytes.size()));
+                    std::vector<uint8_t>().swap(M.bytes);
+                }
+            }
         }
         return true;
     }

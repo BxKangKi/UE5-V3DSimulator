@@ -4,8 +4,8 @@
 /**
  * @file DynamicLightSubsystem.h
  * Role: Defines this source unit's responsibility within V3DSimulator.
- * Key responsibilities: Implements the behavior exposed by this source unit's public API.
- * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
+ * Key responsibilities: Implements quality-scaled dynamic light budgeting, shadow capping,
+ * hysteresis distance culling, and strictly throttled (1-2 per tick) light/decal transitions.
  */
 
 #pragma once
@@ -24,17 +24,23 @@ struct FLightOptimizationData
     FVector Position = FVector::ZeroVector;
     float CullingDistanceSq = 0.0f;
     float DecalTransitionDistanceSq = 0.0f;
+    float LastDistanceSq = FLT_MAX;
 
     TWeakObjectPtr<UDynamicPointLightComponent> LightComponent;
     TWeakObjectPtr<UDecalComponent> DecalComponent;
     TWeakObjectPtr<UMaterialInterface> TargetDecalMaterial;
 
+    // Authored shadow preference preserved across dynamic quality-tier capping.
+    bool bAuthoredCastShadows = false;
+    bool bTargetCastShadows = false;
+    bool bCurrentCastShadows = false;
+
     // Desired visibility calculated during the current update.
-    bool bTargetLightVisibility = true;
+    bool bTargetLightVisibility = false;
     bool bTargetDecalVisibility = false;
 
     // Cached visibility state used to avoid redundant SetVisibility calls.
-    bool bCurrentLightVisibility = true;
+    bool bCurrentLightVisibility = false;
     bool bCurrentDecalVisibility = false;
 };
 
@@ -52,6 +58,8 @@ public:
 
 private:
     TArray<FLightOptimizationData> ManagedLights;
+    TArray<TPair<float, int32>> ScratchRankedLights;
+    TArray<TPair<float, int32>> ScratchPendingTransitions;
     int32 GameUpdateHandle = INDEX_NONE;
     float CullingAccumulator = .2f;
 

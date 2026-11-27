@@ -1039,6 +1039,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
         TArray<FSoftObjectPath> MaterialPaths; Materials.GetPreloadPaths(MaterialPaths);
         for (const auto& Path : MaterialPaths) AddPath(Path);
         AddPath(Registry->ImpostorMaterial.ToSoftObjectPath());
+        AddPath(Registry->ImpostorPlaneMesh.ToSoftObjectPath());
 
     }
 

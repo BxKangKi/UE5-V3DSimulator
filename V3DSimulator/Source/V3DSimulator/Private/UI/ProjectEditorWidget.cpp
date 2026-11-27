@@ -49,6 +49,7 @@
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformProcess.h"
 #include "Misc/Paths.h"
+#include "Misc/Base64.h"
 
 namespace V3DEditorUI
 {
@@ -1130,6 +1131,9 @@ void UProjectEditorWidget::QueueFormRefresh()
 
 void UProjectEditorWidget::InvalidatePreview()
 {
+    ++NodePreviewGeneration;
+    bNodePreviewLoading = false;
+    FocusedPreviewNode.Reset();
     PreviewDocument.Reset();
     if (PreviewBuilder)
     {
@@ -1235,9 +1239,9 @@ namespace V3DNodeDiscovery
                 *Reader << Magic << Version << TotalLength << ChunkLen << ChunkType;
                 constexpr uint32 GlbMagic = 0x46546C67u;
                 constexpr uint32 JsonChunkType = 0x4E4F534Au;
-                constexpr uint32 MaxJsonChunkBytes = 32u * 1024u * 1024u;
+                constexpr uint32 MaxJsonChunkBytes = 64u * 1024u * 1024u;
                 if (Magic == GlbMagic && ChunkType == JsonChunkType && ChunkLen > 0 && ChunkLen <= MaxJsonChunkBytes
-                    && static_cast<int64>(20 + ChunkLen) <= Reader->TotalSize())
+                    && static_cast<int64>(20) + static_cast<int64>(ChunkLen) <= Reader->TotalSize())
                 {
                     TArray<uint8> JsonBytes;
                     JsonBytes.SetNumUninitialized(static_cast<int32>(ChunkLen));
@@ -1250,7 +1254,7 @@ namespace V3DNodeDiscovery
         else if (Ext == TEXT("gltf"))
         {
             const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
-            if (FileSize > 0 && FileSize <= 32ll * 1024 * 1024)
+            if (FileSize > 0 && FileSize <= 64ll * 1024 * 1024)
             {
                 FString JsonText;
                 if (FFileHelper::LoadFileToString(JsonText, *SourcePath))
@@ -1261,25 +1265,734 @@ namespace V3DNodeDiscovery
         }
         else if (Ext == TEXT("obj"))
         {
-            const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
-            if (FileSize > 0 && FileSize <= 64ll * 1024 * 1024)
+            TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*SourcePath));
+            if (Reader)
             {
-                TArray<FString> Lines;
-                if (FFileHelper::LoadFileToStringArray(Lines, *SourcePath))
+                const int64 TotalSize = Reader->TotalSize();
+                constexpr int64 ChunkCap = 64ll * 1024;
+                TArray<uint8> Buf;
+                Buf.SetNumUninitialized(static_cast<int32>(ChunkCap));
+                FString Carry;
+                int64 Pos = 0;
+                while (Pos < TotalSize)
                 {
-                    for (const FString& Line : Lines)
+                    const int64 ToRead = FMath::Min(ChunkCap, TotalSize - Pos);
+                    Reader->Serialize(Buf.GetData(), ToRead);
+                    Pos += ToRead;
+                    FUTF8ToTCHAR Conv(reinterpret_cast<const ANSICHAR*>(Buf.GetData()), static_cast<int32>(ToRead));
+                    Carry.AppendChars(Conv.Get(), Conv.Length());
+                    int32 LineStart = 0;
+                    int32 NewLineIdx = INDEX_NONE;
+                    while (Carry.FindChar(TEXT('\n'), NewLineIdx))
                     {
+                        FString Line = Carry.Mid(LineStart, NewLineIdx - LineStart).TrimEnd();
+                        Carry.RemoveAt(0, NewLineIdx + 1, EAllowShrinking::No);
+                        LineStart = 0;
                         if (Line.StartsWith(TEXT("o ")) || Line.StartsWith(TEXT("g ")))
                         {
                             TryCollectMeshName(Line.Mid(2), UniqueNames);
                         }
                     }
+                    if (Carry.Len() > 16384)
+                    {
+                        Carry.Reset();
+                    }
+                }
+                if (Carry.StartsWith(TEXT("o ")) || Carry.StartsWith(TEXT("g ")))
+                {
+                    TryCollectMeshName(Carry.Mid(2), UniqueNames);
                 }
             }
         }
 
         OutSortedNames = UniqueNames.Array();
         OutSortedNames.Sort();
+    }
+
+    struct FNodePreviewGeometry
+    {
+        TArray<TPair<FVector, FVector>> Edges;
+        FBox Bounds = FBox(ForceInit);
+        int32 VertexCount = 0;
+        int32 TriangleCount = 0;
+    };
+
+    static bool MatchesNodeName(const FString& RawName, const FString& TargetNodeName)
+    {
+        const FString Trimmed = RawName.TrimStartAndEnd();
+        if (Trimmed.IsEmpty()) return false;
+        if (Trimmed.Equals(TargetNodeName, ESearchCase::IgnoreCase)) return true;
+        const FSimulatorParsedNodeName Parsed = USimulatorNodeTokenLibrary::ParseNodeName(Trimmed);
+        if (IsInstancedDirectiveName(Trimmed, Parsed)) return false;
+        return Parsed.BaseName.TrimStartAndEnd().Equals(TargetNodeName, ESearchCase::IgnoreCase);
+    }
+
+    struct FGltfBufferSource
+    {
+        FString BaseDir;
+        FArchive* GlbReader = nullptr;
+        int64 GlbBinOffset = 0;
+        int64 GlbBinLength = 0;
+        const TArray<TSharedPtr<FJsonValue>>* BuffersJson = nullptr;
+        TMap<int32, TArray<uint8>> DecodedDataUriBuffers;
+
+        bool ReadSlice(const int32 BufferIndex, const int64 Offset, const int64 Length, TArray<uint8>& OutBytes, FString& OutError)
+        {
+            constexpr int64 MaxSliceBytes = 128ll * 1024 * 1024;
+            if (Offset < 0 || Length <= 0 || Length > MaxSliceBytes)
+            {
+                OutError = TEXT("Accessor buffer slice out of bounds.");
+                return false;
+            }
+
+            if (GlbReader && BufferIndex == 0 && GlbBinLength > 0)
+            {
+                if (Offset + Length > GlbBinLength || GlbBinOffset + Offset + Length > GlbReader->TotalSize())
+                {
+                    OutError = TEXT("GLB binary buffer slice exceeds chunk bounds.");
+                    return false;
+                }
+                OutBytes.SetNumUninitialized(static_cast<int32>(Length));
+                GlbReader->Seek(GlbBinOffset + Offset);
+                GlbReader->Serialize(OutBytes.GetData(), Length);
+                return !GlbReader->IsError();
+            }
+
+            if (!BuffersJson || !BuffersJson->IsValidIndex(BufferIndex) || !(*BuffersJson)[BufferIndex].IsValid()
+                || (*BuffersJson)[BufferIndex]->Type != EJson::Object)
+            {
+                OutError = TEXT("Referenced glTF buffer is missing.");
+                return false;
+            }
+
+            const TSharedPtr<FJsonObject> BufObj = (*BuffersJson)[BufferIndex]->AsObject();
+            FString Uri;
+            if (!BufObj->TryGetStringField(TEXT("uri"), Uri) || Uri.IsEmpty())
+            {
+                OutError = TEXT("glTF buffer has no binary chunk or URI.");
+                return false;
+            }
+
+            if (Uri.StartsWith(TEXT("data:"), ESearchCase::IgnoreCase))
+            {
+                TArray<uint8>* Cached = DecodedDataUriBuffers.Find(BufferIndex);
+                if (!Cached)
+                {
+                    const int32 CommaIdx = Uri.Find(TEXT(","));
+                    if (CommaIdx == INDEX_NONE)
+                    {
+                        OutError = TEXT("Malformed base64 data URI in glTF buffer.");
+                        return false;
+                    }
+                    TArray<uint8> Decoded;
+                    if (!FBase64::Decode(Uri.Mid(CommaIdx + 1), Decoded))
+                    {
+                        OutError = TEXT("Failed to decode base64 glTF buffer.");
+                        return false;
+                    }
+                    Cached = &DecodedDataUriBuffers.Add(BufferIndex, MoveTemp(Decoded));
+                }
+                if (Offset + Length > Cached->Num())
+                {
+                    OutError = TEXT("glTF data URI buffer slice out of bounds.");
+                    return false;
+                }
+                OutBytes.SetNumUninitialized(static_cast<int32>(Length));
+                FMemory::Memcpy(OutBytes.GetData(), Cached->GetData() + Offset, static_cast<SIZE_T>(Length));
+                return true;
+            }
+
+            if (Uri.Contains(TEXT("..")) || FPaths::IsRelative(Uri) == false)
+            {
+                OutError = TEXT("Unsafe external glTF buffer URI.");
+                return false;
+            }
+
+            const FString FullPath = FPaths::ConvertRelativePathToFull(FPaths::Combine(BaseDir, Uri));
+            TUniquePtr<FArchive> BinReader(IFileManager::Get().CreateFileReader(*FullPath));
+            if (!BinReader)
+            {
+                OutError = TEXT("Could not open external glTF buffer file: ") + Uri;
+                return false;
+            }
+            if (Offset + Length > BinReader->TotalSize())
+            {
+                OutError = TEXT("External glTF buffer slice exceeds file size.");
+                return false;
+            }
+            OutBytes.SetNumUninitialized(static_cast<int32>(Length));
+            BinReader->Seek(Offset);
+            BinReader->Serialize(OutBytes.GetData(), Length);
+            return !BinReader->IsError();
+        }
+    };
+
+    static bool ExtractGltfNodeFromRoot(
+        const TSharedPtr<FJsonObject>& Root,
+        FGltfBufferSource& BufferSource,
+        const FString& TargetNodeName,
+        const bool bIsHumanoid,
+        FNodePreviewGeometry& OutGeom,
+        FString& OutError)
+    {
+        if (!Root.IsValid())
+        {
+            OutError = TEXT("Invalid glTF JSON root.");
+            return false;
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+        const TArray<TSharedPtr<FJsonValue>>* Meshes = nullptr;
+        const TArray<TSharedPtr<FJsonValue>>* Accessors = nullptr;
+        const TArray<TSharedPtr<FJsonValue>>* BufferViews = nullptr;
+        const TArray<TSharedPtr<FJsonValue>>* Buffers = nullptr;
+
+        Root->TryGetArrayField(TEXT("nodes"), Nodes);
+        Root->TryGetArrayField(TEXT("meshes"), Meshes);
+        Root->TryGetArrayField(TEXT("accessors"), Accessors);
+        Root->TryGetArrayField(TEXT("bufferViews"), BufferViews);
+        Root->TryGetArrayField(TEXT("buffers"), Buffers);
+        BufferSource.BuffersJson = Buffers;
+
+        if (!Nodes || !Meshes || !Accessors || !BufferViews)
+        {
+            OutError = TEXT("glTF scene is missing nodes/meshes/accessors/bufferViews.");
+            return false;
+        }
+
+        TArray<int32> TargetMeshIndices;
+        for (const TSharedPtr<FJsonValue>& Val : *Nodes)
+        {
+            if (!Val.IsValid() || Val->Type != EJson::Object) continue;
+            const TSharedPtr<FJsonObject> NodeObj = Val->AsObject();
+            double MeshIdxNum = -1.0;
+            if (!NodeObj->TryGetNumberField(TEXT("mesh"), MeshIdxNum)) continue;
+            FString NodeName;
+            if (!NodeObj->TryGetStringField(TEXT("name"), NodeName)) continue;
+            if (MatchesNodeName(NodeName, TargetNodeName))
+            {
+                const int32 MeshIdx = static_cast<int32>(MeshIdxNum);
+                if (Meshes->IsValidIndex(MeshIdx))
+                {
+                    TargetMeshIndices.AddUnique(MeshIdx);
+                }
+            }
+        }
+
+        if (TargetMeshIndices.IsEmpty())
+        {
+            OutError = FString::Printf(TEXT("Node '%s' was not found with a mesh in the source model."), *TargetNodeName);
+            return false;
+        }
+
+        const FMatrix SceneBasis = bIsHumanoid
+            ? FBasisVectorMatrix(FVector(1, 0, 0), FVector(0, 0, 1), FVector(0, 1, 0), FVector::ZeroVector)
+            : FBasisVectorMatrix(FVector(0, 0, -1), FVector(1, 0, 0), FVector(0, 1, 0), FVector::ZeroVector);
+        constexpr double SceneScale = 100.0;
+
+        struct FPrimData
+        {
+            TArray<FVector> Positions;
+            TArray<uint32> Indices;
+            int32 Mode = 4;
+            int64 TriCount = 0;
+        };
+        TArray<FPrimData> DecodedPrims;
+        int64 TotalTriangles = 0;
+        bool bSawDraco = false;
+
+        for (const int32 MeshIdx : TargetMeshIndices)
+        {
+            const TSharedPtr<FJsonValue>& MeshVal = (*Meshes)[MeshIdx];
+            if (!MeshVal.IsValid() || MeshVal->Type != EJson::Object) continue;
+            const TArray<TSharedPtr<FJsonValue>>* Primitives = nullptr;
+            if (!MeshVal->AsObject()->TryGetArrayField(TEXT("primitives"), Primitives) || !Primitives) continue;
+
+            for (const TSharedPtr<FJsonValue>& PrimVal : *Primitives)
+            {
+                if (!PrimVal.IsValid() || PrimVal->Type != EJson::Object) continue;
+                const TSharedPtr<FJsonObject> PrimObj = PrimVal->AsObject();
+
+                const TSharedPtr<FJsonObject>* ExtObj = nullptr;
+                if (PrimObj->TryGetObjectField(TEXT("extensions"), ExtObj) && ExtObj && ExtObj->IsValid()
+                    && (*ExtObj)->HasField(TEXT("KHR_draco_mesh_compression")))
+                {
+                    bSawDraco = true;
+                    continue;
+                }
+
+                const TSharedPtr<FJsonObject>* AttrObj = nullptr;
+                if (!PrimObj->TryGetObjectField(TEXT("attributes"), AttrObj) || !AttrObj || !AttrObj->IsValid()) continue;
+
+                double PosAccNum = -1.0;
+                if (!(*AttrObj)->TryGetNumberField(TEXT("POSITION"), PosAccNum)) continue;
+                const int32 PosAccIdx = static_cast<int32>(PosAccNum);
+                if (!Accessors->IsValidIndex(PosAccIdx) || !(*Accessors)[PosAccIdx].IsValid() || (*Accessors)[PosAccIdx]->Type != EJson::Object) continue;
+
+                const TSharedPtr<FJsonObject> PosAcc = (*Accessors)[PosAccIdx]->AsObject();
+                double PosBvNum = -1.0, PosCountNum = 0.0, PosCompTypeNum = 0.0;
+                if (!PosAcc->TryGetNumberField(TEXT("bufferView"), PosBvNum)
+                    || !PosAcc->TryGetNumberField(TEXT("count"), PosCountNum)
+                    || !PosAcc->TryGetNumberField(TEXT("componentType"), PosCompTypeNum))
+                {
+                    continue;
+                }
+
+                const int32 PosBvIdx = static_cast<int32>(PosBvNum);
+                const int32 PosCount = static_cast<int32>(PosCountNum);
+                const int32 PosCompType = static_cast<int32>(PosCompTypeNum);
+                if (PosCount <= 0 || !BufferViews->IsValidIndex(PosBvIdx) || !(*BufferViews)[PosBvIdx].IsValid()
+                    || (*BufferViews)[PosBvIdx]->Type != EJson::Object)
+                {
+                    continue;
+                }
+
+                int32 CompBytes = 0;
+                if (PosCompType == 5126) CompBytes = 4;
+                else if (PosCompType == 5122 || PosCompType == 5123) CompBytes = 2;
+                else if (PosCompType == 5120 || PosCompType == 5121) CompBytes = 1;
+                else continue;
+
+                bool bNormalized = false;
+                PosAcc->TryGetBoolField(TEXT("normalized"), bNormalized);
+                double PosAccOffsetNum = 0.0;
+                PosAcc->TryGetNumberField(TEXT("byteOffset"), PosAccOffsetNum);
+
+                const TSharedPtr<FJsonObject> PosBv = (*BufferViews)[PosBvIdx]->AsObject();
+                double PosBufNum = 0.0, PosBvOffsetNum = 0.0, PosBvStrideNum = 0.0;
+                PosBv->TryGetNumberField(TEXT("buffer"), PosBufNum);
+                PosBv->TryGetNumberField(TEXT("byteOffset"), PosBvOffsetNum);
+                PosBv->TryGetNumberField(TEXT("byteStride"), PosBvStrideNum);
+
+                const int64 ElemBytes = static_cast<int64>(CompBytes) * 3;
+                const int64 Stride = (PosBvStrideNum >= static_cast<double>(ElemBytes)) ? static_cast<int64>(PosBvStrideNum) : ElemBytes;
+                const int64 ReadLen = static_cast<int64>(PosCount - 1) * Stride + ElemBytes;
+                const int64 ReadOffset = static_cast<int64>(PosBvOffsetNum) + static_cast<int64>(PosAccOffsetNum);
+
+                TArray<uint8> PosBytes;
+                if (!BufferSource.ReadSlice(static_cast<int32>(PosBufNum), ReadOffset, ReadLen, PosBytes, OutError))
+                {
+                    return false;
+                }
+
+                FPrimData Prim;
+                double ModeNum = 4.0;
+                PrimObj->TryGetNumberField(TEXT("mode"), ModeNum);
+                Prim.Mode = static_cast<int32>(ModeNum);
+                Prim.Positions.SetNumUninitialized(PosCount);
+
+                const uint8* RawPos = PosBytes.GetData();
+                for (int32 V = 0; V < PosCount; ++V)
+                {
+                    const uint8* Ptr = RawPos + static_cast<int64>(V) * Stride;
+                    double GX = 0.0, GY = 0.0, GZ = 0.0;
+                    if (PosCompType == 5126)
+                    {
+                        float F[3];
+                        FMemory::Memcpy(F, Ptr, 12);
+                        GX = F[0]; GY = F[1]; GZ = F[2];
+                    }
+                    else if (PosCompType == 5122)
+                    {
+                        int16 S[3];
+                        FMemory::Memcpy(S, Ptr, 6);
+                        GX = bNormalized ? FMath::Max(S[0] / 32767.0, -1.0) : static_cast<double>(S[0]);
+                        GY = bNormalized ? FMath::Max(S[1] / 32767.0, -1.0) : static_cast<double>(S[1]);
+                        GZ = bNormalized ? FMath::Max(S[2] / 32767.0, -1.0) : static_cast<double>(S[2]);
+                    }
+                    else if (PosCompType == 5123)
+                    {
+                        uint16 U[3];
+                        FMemory::Memcpy(U, Ptr, 6);
+                        GX = bNormalized ? (U[0] / 65535.0) : static_cast<double>(U[0]);
+                        GY = bNormalized ? (U[1] / 65535.0) : static_cast<double>(U[1]);
+                        GZ = bNormalized ? (U[2] / 65535.0) : static_cast<double>(U[2]);
+                    }
+                    else if (PosCompType == 5120)
+                    {
+                        int8 B[3];
+                        FMemory::Memcpy(B, Ptr, 3);
+                        GX = bNormalized ? FMath::Max(B[0] / 127.0, -1.0) : static_cast<double>(B[0]);
+                        GY = bNormalized ? FMath::Max(B[1] / 127.0, -1.0) : static_cast<double>(B[1]);
+                        GZ = bNormalized ? FMath::Max(B[2] / 127.0, -1.0) : static_cast<double>(B[2]);
+                    }
+                    else
+                    {
+                        uint8 B[3];
+                        FMemory::Memcpy(B, Ptr, 3);
+                        GX = bNormalized ? (B[0] / 255.0) : static_cast<double>(B[0]);
+                        GY = bNormalized ? (B[1] / 255.0) : static_cast<double>(B[1]);
+                        GZ = bNormalized ? (B[2] / 255.0) : static_cast<double>(B[2]);
+                    }
+
+                    const FVector UEPos = SceneBasis.TransformPosition(FVector(GX, GY, GZ)) * SceneScale;
+                    Prim.Positions[V] = UEPos;
+                    if (!UEPos.ContainsNaN())
+                    {
+                        OutGeom.Bounds += UEPos;
+                    }
+                }
+                OutGeom.VertexCount += PosCount;
+
+                // Indices (optional)
+                double IdxAccNum = -1.0;
+                if (PrimObj->TryGetNumberField(TEXT("indices"), IdxAccNum))
+                {
+                    const int32 IdxAccIdx = static_cast<int32>(IdxAccNum);
+                    if (Accessors->IsValidIndex(IdxAccIdx) && (*Accessors)[IdxAccIdx].IsValid() && (*Accessors)[IdxAccIdx]->Type == EJson::Object)
+                    {
+                        const TSharedPtr<FJsonObject> IdxAcc = (*Accessors)[IdxAccIdx]->AsObject();
+                        double IdxBvNum = -1.0, IdxCountNum = 0.0, IdxCompTypeNum = 0.0, IdxAccOffsetNum = 0.0;
+                        if (IdxAcc->TryGetNumberField(TEXT("bufferView"), IdxBvNum)
+                            && IdxAcc->TryGetNumberField(TEXT("count"), IdxCountNum)
+                            && IdxAcc->TryGetNumberField(TEXT("componentType"), IdxCompTypeNum))
+                        {
+                            IdxAcc->TryGetNumberField(TEXT("byteOffset"), IdxAccOffsetNum);
+                            const int32 IdxBvIdx = static_cast<int32>(IdxBvNum);
+                            const int32 IdxCount = static_cast<int32>(IdxCountNum);
+                            const int32 IdxCompType = static_cast<int32>(IdxCompTypeNum);
+                            int32 IdxBytes = 0;
+                            if (IdxCompType == 5121) IdxBytes = 1;
+                            else if (IdxCompType == 5123) IdxBytes = 2;
+                            else if (IdxCompType == 5125) IdxBytes = 4;
+
+                            if (IdxBytes > 0 && IdxCount > 0 && BufferViews->IsValidIndex(IdxBvIdx)
+                                && (*BufferViews)[IdxBvIdx].IsValid() && (*BufferViews)[IdxBvIdx]->Type == EJson::Object)
+                            {
+                                const TSharedPtr<FJsonObject> IdxBv = (*BufferViews)[IdxBvIdx]->AsObject();
+                                double IdxBufNum = 0.0, IdxBvOffsetNum = 0.0, IdxBvStrideNum = 0.0;
+                                IdxBv->TryGetNumberField(TEXT("buffer"), IdxBufNum);
+                                IdxBv->TryGetNumberField(TEXT("byteOffset"), IdxBvOffsetNum);
+                                IdxBv->TryGetNumberField(TEXT("byteStride"), IdxBvStrideNum);
+
+                                const int64 IdxStride = (IdxBvStrideNum >= static_cast<double>(IdxBytes)) ? static_cast<int64>(IdxBvStrideNum) : static_cast<int64>(IdxBytes);
+                                const int64 IdxReadLen = static_cast<int64>(IdxCount - 1) * IdxStride + IdxBytes;
+                                const int64 IdxReadOff = static_cast<int64>(IdxBvOffsetNum) + static_cast<int64>(IdxAccOffsetNum);
+
+                                TArray<uint8> RawIdxBytes;
+                                if (!BufferSource.ReadSlice(static_cast<int32>(IdxBufNum), IdxReadOff, IdxReadLen, RawIdxBytes, OutError))
+                                {
+                                    return false;
+                                }
+
+                                Prim.Indices.SetNumUninitialized(IdxCount);
+                                const uint8* RawIdx = RawIdxBytes.GetData();
+                                for (int32 K = 0; K < IdxCount; ++K)
+                                {
+                                    const uint8* Ptr = RawIdx + static_cast<int64>(K) * IdxStride;
+                                    if (IdxCompType == 5121)
+                                    {
+                                        Prim.Indices[K] = *Ptr;
+                                    }
+                                    else if (IdxCompType == 5123)
+                                    {
+                                        uint16 V16 = 0;
+                                        FMemory::Memcpy(&V16, Ptr, 2);
+                                        Prim.Indices[K] = V16;
+                                    }
+                                    else
+                                    {
+                                        uint32 V32 = 0;
+                                        FMemory::Memcpy(&V32, Ptr, 4);
+                                        Prim.Indices[K] = V32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    Prim.Indices.SetNumUninitialized(PosCount);
+                    for (int32 K = 0; K < PosCount; ++K) Prim.Indices[K] = static_cast<uint32>(K);
+                }
+
+                const int32 NumIdx = Prim.Indices.Num();
+                if (Prim.Mode == 4) Prim.TriCount = NumIdx / 3;
+                else if (Prim.Mode == 5 || Prim.Mode == 6) Prim.TriCount = FMath::Max(0, NumIdx - 2);
+                else Prim.TriCount = 0;
+
+                if (Prim.TriCount > 0)
+                {
+                    TotalTriangles += Prim.TriCount;
+                    DecodedPrims.Add(MoveTemp(Prim));
+                }
+            }
+        }
+
+        if (DecodedPrims.IsEmpty())
+        {
+            OutError = bSawDraco
+                ? FString::Printf(TEXT("Node '%s' uses Draco mesh compression, which is not supported by streaming single-node preview."), *TargetNodeName)
+                : FString::Printf(TEXT("Node '%s' has no triangle geometry to preview."), *TargetNodeName);
+            return false;
+        }
+
+        OutGeom.TriangleCount = static_cast<int32>(FMath::Min<int64>(TotalTriangles, MAX_int32));
+        const int64 TriStep = FMath::Max<int64>(1, TotalTriangles / 1200);
+        OutGeom.Edges.Reserve(3600);
+
+        for (const FPrimData& Prim : DecodedPrims)
+        {
+            for (int64 T = 0; T < Prim.TriCount && OutGeom.Edges.Num() <= 3597; T += TriStep)
+            {
+                uint32 IA = 0, IB = 0, IC = 0;
+                if (Prim.Mode == 4)
+                {
+                    const int32 Base = static_cast<int32>(T * 3);
+                    IA = Prim.Indices[Base];
+                    IB = Prim.Indices[Base + 1];
+                    IC = Prim.Indices[Base + 2];
+                }
+                else if (Prim.Mode == 5)
+                {
+                    const int32 Base = static_cast<int32>(T);
+                    IA = Prim.Indices[Base];
+                    IB = Prim.Indices[Base + 1];
+                    IC = Prim.Indices[Base + 2];
+                }
+                else
+                {
+                    const int32 Base = static_cast<int32>(T);
+                    IA = Prim.Indices[0];
+                    IB = Prim.Indices[Base + 1];
+                    IC = Prim.Indices[Base + 2];
+                }
+
+                if (!Prim.Positions.IsValidIndex(static_cast<int32>(IA))
+                    || !Prim.Positions.IsValidIndex(static_cast<int32>(IB))
+                    || !Prim.Positions.IsValidIndex(static_cast<int32>(IC)))
+                {
+                    continue;
+                }
+
+                const FVector& A = Prim.Positions[static_cast<int32>(IA)];
+                const FVector& B = Prim.Positions[static_cast<int32>(IB)];
+                const FVector& C = Prim.Positions[static_cast<int32>(IC)];
+                if (A.ContainsNaN() || B.ContainsNaN() || C.ContainsNaN()) continue;
+                OutGeom.Edges.Emplace(A, B);
+                OutGeom.Edges.Emplace(B, C);
+                OutGeom.Edges.Emplace(C, A);
+            }
+        }
+
+        if (!OutGeom.Bounds.IsValid || OutGeom.Edges.Num() < 3)
+        {
+            OutError = FString::Printf(TEXT("Node '%s' produced no valid wireframe edges."), *TargetNodeName);
+            return false;
+        }
+        return true;
+    }
+
+    static bool ExtractSingleNodeMesh(
+        const FString& SourcePath,
+        const FString& TargetNodeName,
+        const bool bIsHumanoid,
+        FNodePreviewGeometry& OutGeom,
+        FString& OutError)
+    {
+        OutGeom = FNodePreviewGeometry();
+        if (SourcePath.IsEmpty() || !FPaths::FileExists(SourcePath))
+        {
+            OutError = TEXT("Source model file does not exist.");
+            return false;
+        }
+        if (TargetNodeName.IsEmpty())
+        {
+            OutError = TEXT("Node name is empty.");
+            return false;
+        }
+
+        const FString Ext = FPaths::GetExtension(SourcePath).ToLower();
+        if (Ext == TEXT("glb"))
+        {
+            TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*SourcePath));
+            if (!Reader || Reader->TotalSize() < 20)
+            {
+                OutError = TEXT("Could not open GLB file for streaming preview.");
+                return false;
+            }
+            uint32 Magic = 0, Version = 0, TotalLength = 0;
+            uint32 JsonChunkLen = 0, JsonChunkType = 0;
+            *Reader << Magic << Version << TotalLength << JsonChunkLen << JsonChunkType;
+            constexpr uint32 GlbMagic = 0x46546C67u;
+            constexpr uint32 JsonType = 0x4E4F534Au;
+            constexpr uint32 BinType = 0x004E4942u;
+            constexpr uint32 MaxJsonChunkBytes = 64u * 1024u * 1024u;
+            if (Magic != GlbMagic || JsonChunkType != JsonType || JsonChunkLen == 0 || JsonChunkLen > MaxJsonChunkBytes
+                || static_cast<int64>(20) + static_cast<int64>(JsonChunkLen) > Reader->TotalSize())
+            {
+                OutError = TEXT("Invalid or unsupported GLB header/JSON chunk.");
+                return false;
+            }
+
+            TArray<uint8> JsonBytes;
+            JsonBytes.SetNumUninitialized(static_cast<int32>(JsonChunkLen));
+            Reader->Serialize(JsonBytes.GetData(), JsonChunkLen);
+
+            int64 BinOffset = 0;
+            int64 BinLen = 0;
+            const int64 NextChunkPos = (static_cast<int64>(20) + static_cast<int64>(JsonChunkLen) + 3ll) & ~3ll;
+            if (NextChunkPos + 8 <= Reader->TotalSize())
+            {
+                Reader->Seek(NextChunkPos);
+                uint32 ChunkLen = 0, ChunkType = 0;
+                *Reader << ChunkLen << ChunkType;
+                if (ChunkType == BinType && NextChunkPos + 8 + static_cast<int64>(ChunkLen) <= Reader->TotalSize())
+                {
+                    BinOffset = NextChunkPos + 8;
+                    BinLen = static_cast<int64>(ChunkLen);
+                }
+            }
+
+            FUTF8ToTCHAR Conv(reinterpret_cast<const ANSICHAR*>(JsonBytes.GetData()), JsonBytes.Num());
+            TSharedPtr<FJsonObject> Root;
+            const TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(FString(Conv.Length(), Conv.Get()));
+            if (!FJsonSerializer::Deserialize(JsonReader, Root) || !Root.IsValid())
+            {
+                OutError = TEXT("Failed to parse GLB JSON chunk.");
+                return false;
+            }
+
+            FGltfBufferSource BufSrc;
+            BufSrc.BaseDir = FPaths::GetPath(SourcePath);
+            BufSrc.GlbReader = Reader.Get();
+            BufSrc.GlbBinOffset = BinOffset;
+            BufSrc.GlbBinLength = BinLen;
+            return ExtractGltfNodeFromRoot(Root, BufSrc, TargetNodeName, bIsHumanoid, OutGeom, OutError);
+        }
+
+        if (Ext == TEXT("gltf"))
+        {
+            const int64 FileSize = IFileManager::Get().FileSize(*SourcePath);
+            if (FileSize <= 0 || FileSize > 64ll * 1024 * 1024)
+            {
+                OutError = TEXT("glTF JSON file exceeds 64 MiB limit.");
+                return false;
+            }
+            FString JsonText;
+            if (!FFileHelper::LoadFileToString(JsonText, *SourcePath))
+            {
+                OutError = TEXT("Could not read glTF JSON file.");
+                return false;
+            }
+            TSharedPtr<FJsonObject> Root;
+            const TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(JsonText);
+            if (!FJsonSerializer::Deserialize(JsonReader, Root) || !Root.IsValid())
+            {
+                OutError = TEXT("Failed to parse glTF JSON.");
+                return false;
+            }
+            FGltfBufferSource BufSrc;
+            BufSrc.BaseDir = FPaths::GetPath(SourcePath);
+            return ExtractGltfNodeFromRoot(Root, BufSrc, TargetNodeName, bIsHumanoid, OutGeom, OutError);
+        }
+
+        if (Ext == TEXT("obj"))
+        {
+            TUniquePtr<FArchive> Reader(IFileManager::Get().CreateFileReader(*SourcePath));
+            if (!Reader)
+            {
+                OutError = TEXT("Could not open OBJ file.");
+                return false;
+            }
+            TArray<FVector> Verts;
+            TArray<FIntVector> Tris;
+            bool bActiveGroup = false;
+
+            auto ProcessLine = [&](const FString& Line)
+            {
+                if (Line.StartsWith(TEXT("o ")) || Line.StartsWith(TEXT("g ")))
+                {
+                    bActiveGroup = MatchesNodeName(Line.Mid(2), TargetNodeName);
+                }
+                else if (Line.StartsWith(TEXT("v ")))
+                {
+                    TArray<FString> Parts;
+                    Line.ParseIntoArrayWS(Parts);
+                    if (Parts.Num() >= 4)
+                    {
+                        const double X = FCString::Atod(*Parts[1]) * 100.0;
+                        const double Y = FCString::Atod(*Parts[2]) * 100.0;
+                        const double Z = FCString::Atod(*Parts[3]) * 100.0;
+                        Verts.Emplace(-Z, X, Y);
+                    }
+                }
+                else if (bActiveGroup && Line.StartsWith(TEXT("f ")))
+                {
+                    TArray<FString> Parts;
+                    Line.ParseIntoArrayWS(Parts);
+                    TArray<int32> FaceIdx;
+                    FaceIdx.Reserve(Parts.Num());
+                    for (int32 K = 1; K < Parts.Num(); ++K)
+                    {
+                        FString VertTok = Parts[K];
+                        int32 Slash = INDEX_NONE;
+                        if (VertTok.FindChar(TEXT('/'), Slash)) VertTok.LeftInline(Slash);
+                        int32 Idx = FCString::Atoi(*VertTok);
+                        if (Idx < 0) Idx = Verts.Num() + Idx;
+                        else Idx -= 1;
+                        if (Verts.IsValidIndex(Idx)) FaceIdx.Add(Idx);
+                    }
+                    for (int32 K = 1; K + 1 < FaceIdx.Num(); ++K)
+                    {
+                        Tris.Emplace(FaceIdx[0], FaceIdx[K], FaceIdx[K + 1]);
+                    }
+                }
+            };
+
+            const int64 TotalSize = Reader->TotalSize();
+            constexpr int64 ChunkCap = 64ll * 1024;
+            TArray<uint8> Buf;
+            Buf.SetNumUninitialized(static_cast<int32>(ChunkCap));
+            FString Carry;
+            int64 Pos = 0;
+            while (Pos < TotalSize)
+            {
+                const int64 ToRead = FMath::Min(ChunkCap, TotalSize - Pos);
+                Reader->Serialize(Buf.GetData(), ToRead);
+                Pos += ToRead;
+                FUTF8ToTCHAR Conv(reinterpret_cast<const ANSICHAR*>(Buf.GetData()), static_cast<int32>(ToRead));
+                Carry.AppendChars(Conv.Get(), Conv.Length());
+                int32 NewLineIdx = INDEX_NONE;
+                while (Carry.FindChar(TEXT('\n'), NewLineIdx))
+                {
+                    FString Line = Carry.Left(NewLineIdx).TrimEnd();
+                    Carry.RemoveAt(0, NewLineIdx + 1, EAllowShrinking::No);
+                    ProcessLine(Line);
+                }
+            }
+            if (!Carry.IsEmpty()) ProcessLine(Carry.TrimEnd());
+
+            if (Tris.IsEmpty())
+            {
+                OutError = FString::Printf(TEXT("Node '%s' has no faces in OBJ file."), *TargetNodeName);
+                return false;
+            }
+            for (const FIntVector& Tri : Tris)
+            {
+                OutGeom.Bounds += Verts[Tri.X];
+                OutGeom.Bounds += Verts[Tri.Y];
+                OutGeom.Bounds += Verts[Tri.Z];
+            }
+            OutGeom.VertexCount = Verts.Num();
+            OutGeom.TriangleCount = Tris.Num();
+            const int32 Step = FMath::Max(1, Tris.Num() / 1200);
+            OutGeom.Edges.Reserve(3600);
+            for (int32 I = 0; I < Tris.Num() && OutGeom.Edges.Num() <= 3597; I += Step)
+            {
+                const FVector& A = Verts[Tris[I].X];
+                const FVector& B = Verts[Tris[I].Y];
+                const FVector& C = Verts[Tris[I].Z];
+                OutGeom.Edges.Emplace(A, B);
+                OutGeom.Edges.Emplace(B, C);
+                OutGeom.Edges.Emplace(C, A);
+            }
+            return OutGeom.Bounds.IsValid && OutGeom.Edges.Num() >= 3;
+        }
+
+        OutError = FString::Printf(TEXT("Per-node streaming preview supports .glb, .gltf, and .obj (got .%s)."), *Ext);
+        return false;
     }
 }
 
@@ -1428,6 +2141,18 @@ void UProjectEditorWidget::RebuildNodeSearchResults()
                 })
             ];
         }
+
+        const bool bIsPreviewedNode = !FocusedPreviewNode.IsEmpty() && NodeName.Equals(FocusedPreviewNode, ESearchCase::IgnoreCase);
+        RowHBox->AddSlot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+        [
+            MakeEditorButton(bIsPreviewedNode ? TEXT("Previewing") : TEXT("Preview"), [WeakSelf, NodeName]
+            {
+                if (UProjectEditorWidget* Self = WeakSelf.Get())
+                {
+                    Self->StartNodePreview(NodeName);
+                }
+            })
+        ];
 
         RowHBox->AddSlot().AutoWidth().VAlign(VAlign_Center)
         [
@@ -2456,6 +3181,21 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             return false;
         };
 
+        if (Context == TEXT("MeshData") && Value->Type == EJson::Object)
+        {
+            TWeakObjectPtr<UProjectEditorWidget> WeakNodePreviewSelf(this);
+            HeaderRow->AddSlot().AutoWidth().VAlign(VAlign_Center).Padding(0, 0, 6, 0)
+            [
+                MakeEditorButton(TEXT("Preview"), [WeakNodePreviewSelf, Key]
+                {
+                    if (UProjectEditorWidget* Self = WeakNodePreviewSelf.Get())
+                    {
+                        Self->StartNodePreview(Key);
+                    }
+                })
+            ];
+        }
+
         if (!IsRequiredField())
         {
             HeaderRow->AddSlot().AutoWidth().VAlign(VAlign_Center)
@@ -2977,6 +3717,78 @@ void UProjectEditorWidget::ReleaseSlateResources(bool bReleaseChildren)
     List.Reset(); FormScrollBox.Reset(); Form.Reset(); Raw.Reset(); Preview.Reset(); JsonHighlighter.Reset(); BrowserPathBox.Reset(); BrowserListView.Reset(); NodeSearchResultsBox.Reset(); MaterialSearchResultsBox.Reset();
 }
 
+void UProjectEditorWidget::StartNodePreview(const FString& NodeName)
+{
+    if (bBusy || !Current || !ApplyRaw()) return;
+    if (Current->SourcePath.IsEmpty() || FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase))
+    { Message = TEXT("Select a model resource for per-node geometry preview."); return; }
+
+    const FString CleanNode = NodeName.TrimStartAndEnd();
+    if (CleanNode.IsEmpty()) return;
+
+    if (PreviewBuilder)
+    {
+        PreviewBuilder->OnFinished.RemoveAll(this);
+        PreviewBuilder->Cancel();
+        PreviewBuilder = nullptr;
+    }
+
+    FString DynamicType;
+    if (Current->Json.IsValid())
+    {
+        Current->Json->TryGetStringField(TEXT("DynamicType"), DynamicType);
+    }
+    const bool bIsHumanoid = DynamicType.Equals(TEXT("Humanoid"), ESearchCase::IgnoreCase);
+
+    const uint64 Gen = ++NodePreviewGeneration;
+    bNodePreviewLoading = true;
+    FocusedPreviewNode = CleanNode;
+    PreviewDocument = Current->Path;
+    const FString SourcePath = Current->SourcePath;
+    const FString DocPath = Current->Path;
+    Message = FString::Printf(TEXT("Loading streaming node preview for '%s'..."), *CleanNode);
+    RebuildNodeSearchResults();
+
+    TWeakObjectPtr<UProjectEditorWidget> WeakSelf(this);
+    const bool bQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakSelf, Gen, SourcePath, DocPath, CleanNode, bIsHumanoid]()
+        {
+            V3DNodeDiscovery::FNodePreviewGeometry Geom;
+            FString Error;
+            const bool bOk = V3DNodeDiscovery::ExtractSingleNodeMesh(SourcePath, CleanNode, bIsHumanoid, Geom, Error);
+
+            FSafeFileIO::DispatchTrackedGameThread(
+                [WeakSelf, Gen, DocPath, CleanNode, bOk, Geom = MoveTemp(Geom), Error = MoveTemp(Error)]() mutable
+                {
+                    UProjectEditorWidget* Self = WeakSelf.Get();
+                    if (!Self || Gen != Self->NodePreviewGeneration) return;
+                    Self->bNodePreviewLoading = false;
+                    if (!Self->Current || Self->Current->Path != DocPath || !Self->Preview.IsValid()) return;
+
+                    if (bOk)
+                    {
+                        Self->Preview->SetSingleNodeGeometry(CleanNode, MoveTemp(Geom.Edges), Geom.Bounds);
+                        Self->Preview->SetOverlaysFromJson(Self->Current->Json);
+                        Self->Message = FString::Printf(
+                            TEXT("Node preview ready: '%s' (%d verts, %d tris, local space). LMB: Orbit, RMB: Pan, Wheel: Zoom."),
+                            *CleanNode, Geom.VertexCount, Geom.TriangleCount);
+                    }
+                    else
+                    {
+                        Self->FocusedPreviewNode.Reset();
+                        Self->Message = Error;
+                    }
+                    Self->RebuildNodeSearchResults();
+                });
+        });
+
+    if (!bQueued)
+    {
+        bNodePreviewLoading = false;
+        Message = TEXT("Preview worker queue is unavailable.");
+    }
+}
+
 void UProjectEditorWidget::StartPreview()
 {
     if (bBusy || !Current || !ApplyRaw()) return;
@@ -2985,7 +3797,39 @@ void UProjectEditorWidget::StartPreview()
     if (Current->SourcePath.IsEmpty() || FPaths::GetExtension(Current->SourcePath).Equals(TEXT("wav"), ESearchCase::IgnoreCase))
     { Message = TEXT("Select a model resource for geometry preview."); return; }
     if (IFileManager::Get().FileSize(*Current->SourcePath) > 32ll * 1024 * 1024)
-    { Message = TEXT("Preview source limit is 32 MiB. JSON editing and full builds remain available."); return; }
+    {
+        // Large 3D model (> 32 MiB): automatically stream a single node instead of loading the entire asset.
+        FString TargetNode = FocusedPreviewNode;
+        if (TargetNode.IsEmpty() && Current->Json.IsValid())
+        {
+            const TSharedPtr<FJsonObject>* MeshDataPtr = nullptr;
+            if (Current->Json->TryGetObjectField(TEXT("MeshData"), MeshDataPtr) && MeshDataPtr && MeshDataPtr->IsValid())
+            {
+                for (const auto& Pair : (*MeshDataPtr)->Values)
+                {
+                    if (!Pair.Key.IsEmpty()) { TargetNode = Pair.Key; break; }
+                }
+            }
+        }
+        if (TargetNode.IsEmpty())
+        {
+            EnsureModelNodeNamesLoaded(Current->SourcePath);
+            if (!CachedModelNodeNames.IsEmpty())
+            {
+                TargetNode = CachedModelNodeNames[0];
+            }
+        }
+        if (!TargetNode.IsEmpty())
+        {
+            StartNodePreview(TargetNode);
+            return;
+        }
+        Message = TEXT("Large model (> 32 MiB): select or add a node in Node Settings to preview it individually.");
+        return;
+    }
+    ++NodePreviewGeneration;
+    bNodePreviewLoading = false;
+    FocusedPreviewNode.Reset();
     FModelDefinition Definition; FString Error;
     if (!ModelDefinitionJson::ValidateDefinition(Current->Json, Current->Path, Current->SourcePath, Definition, Error))
     { Message = Error; return; }

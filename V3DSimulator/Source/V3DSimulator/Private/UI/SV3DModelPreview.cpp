@@ -52,6 +52,7 @@ void SV3DModelPreview::ClearModel()
 {
     Edges.Reset();
     NodeWorldTransforms.Reset();
+    FocusedNodeName.Reset();
     ModelCenter = FVector::ZeroVector;
     ModelRadius = 1.f;
     bHasModel = false;
@@ -89,10 +90,29 @@ void SV3DModelPreview::UpdateEffectiveBounds()
     }
 }
 
+void SV3DModelPreview::SetSingleNodeGeometry(const FString& NodeName, TArray<TPair<FVector, FVector>>&& InEdges, const FBox& InBounds)
+{
+    Edges = MoveTemp(InEdges);
+    NodeWorldTransforms.Reset();
+    FocusedNodeName = NodeName;
+    if (!FocusedNodeName.IsEmpty())
+    {
+        NodeWorldTransforms.Add(FocusedNodeName, FTransform::Identity);
+    }
+    bHasModel = InBounds.IsValid && Edges.Num() >= 3;
+    ModelCenter = InBounds.IsValid ? InBounds.GetCenter() : FVector::ZeroVector;
+    ModelRadius = InBounds.IsValid ? FMath::Max(1.f, static_cast<float>(InBounds.GetExtent().Size())) : 1.f;
+    Zoom = 1.f;
+    PanOffset = FVector::ZeroVector;
+    UpdateEffectiveBounds();
+    Invalidate(EInvalidateWidgetReason::Paint);
+}
+
 void SV3DModelPreview::SetModel(const FGWorldBuildModel& Model)
 {
     Edges.Reset(3000);
     NodeWorldTransforms.Reset();
+    FocusedNodeName.Reset();
     FBox Bounds(ForceInit);
     TMap<int32, const FGWorldNodeTransform*> Nodes;
     Nodes.Reserve(Model.Metadata.NodeTransforms.Num());
@@ -276,10 +296,11 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
     }
 
     const float GizmoScale = bHasModel ? FMath::Clamp(ModelRadius * 0.16f, 8.f, 80.f) : 20.f;
+    const bool bSingleNodeMode = !FocusedNodeName.IsEmpty();
 
-    // 1. Dynamic Transform (Position / Rotation / Scale)
+    // 1. Dynamic Transform (Position / Rotation / Scale) — full model mode only
     const TSharedPtr<FJsonObject>* TransformObj = nullptr;
-    if (Json->TryGetObjectField(TEXT("Transform"), TransformObj) && TransformObj && TransformObj->IsValid())
+    if (!bSingleNodeMode && Json->TryGetObjectField(TEXT("Transform"), TransformObj) && TransformObj && TransformObj->IsValid())
     {
         const FTransform DynXform = ReadJsonTransform(*TransformObj);
         const FLinearColor TransformColor(0.35f, 0.80f, 1.0f, 0.9f);
@@ -310,6 +331,10 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
             if (!NodeObj.IsValid()) continue;
 
             const FString NodeKey(Pair.Key);
+            if (bSingleNodeMode && !NodeKey.Equals(FocusedNodeName, ESearchCase::IgnoreCase))
+            {
+                continue;
+            }
             const FTransform* FoundNodeXform = NodeWorldTransforms.Find(NodeKey);
             const FTransform NodeXform = FoundNodeXform ? *FoundNodeXform : FTransform::Identity;
 
@@ -392,6 +417,9 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
         }
     }
 
+    // 2b-6. Whole-actor overlays (skip in single-node local preview mode)
+    if (!bSingleNodeMode)
+    {
     // 2b. Vehicle / Train WheelMeshNames visualization (bogie axle chord + wheel markers)
     {
         const TSharedPtr<FJsonObject>* TuningObj = nullptr;
@@ -523,6 +551,7 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
             OverlayLabels.Add({LocalCenter, FString::Printf(TEXT("Gravity R=%.0fcm"), GravR), GravColor});
         }
     }
+    }
 
     bHasOverlays = Bounds.IsValid && !OverlayLines.IsEmpty();
     OverlayCenter = Bounds.IsValid ? Bounds.GetCenter() : FVector::ZeroVector;
@@ -616,7 +645,31 @@ int32 SV3DModelPreview::OnPaint(const FPaintArgs& Args, const FGeometry& Geometr
             FSlateDrawElement::MakeText(Out, LabelLayer, TextGeom, Lbl.Text, LabelFont,
                 ESlateDrawEffect::None, Lbl.Color * Style.GetColorAndOpacityTint());
         }
+        if (!FocusedNodeName.IsEmpty())
+        {
+            const FPaintGeometry BadgeGeom = Geometry.ToPaintGeometry(
+                FVector2f(static_cast<float>(Size.X) - 16.f, 18.f),
+                FSlateLayoutTransform(FVector2f(8.f, 6.f)));
+            FSlateDrawElement::MakeText(Out, LabelLayer, BadgeGeom,
+                FString::Printf(TEXT("Node: %s (Local Space)"), *FocusedNodeName),
+                LabelFont, ESlateDrawEffect::None,
+                FLinearColor(0.65f, 0.90f, 1.f, 0.95f) * Style.GetColorAndOpacityTint());
+        }
         return LabelLayer;
+    }
+
+    if (!FocusedNodeName.IsEmpty())
+    {
+        const int32 BadgeLayer = Layer + 2;
+        const FSlateFontInfo BadgeFont = FCoreStyle::GetDefaultFontStyle("Regular", 9);
+        const FPaintGeometry BadgeGeom = Geometry.ToPaintGeometry(
+            FVector2f(static_cast<float>(Size.X) - 16.f, 18.f),
+            FSlateLayoutTransform(FVector2f(8.f, 6.f)));
+        FSlateDrawElement::MakeText(Out, BadgeLayer, BadgeGeom,
+            FString::Printf(TEXT("Node: %s (Local Space)"), *FocusedNodeName),
+            BadgeFont, ESlateDrawEffect::None,
+            FLinearColor(0.65f, 0.90f, 1.f, 0.95f) * Style.GetColorAndOpacityTint());
+        return BadgeLayer;
     }
 
     return Layer + 1;

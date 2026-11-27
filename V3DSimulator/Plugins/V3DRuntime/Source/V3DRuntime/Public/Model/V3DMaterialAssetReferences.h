@@ -33,6 +33,7 @@ struct V3DRUNTIME_API FV3DMaterialAssetReferences
     static const TCHAR* FallbackPath(bool bTwoSided);
     static UMaterialInterface* LoadFallback(bool bTwoSided, bool bAllowSynchronousLoading = true);
     static bool IsSupportedParent(const UMaterialInterface* Material);
+    static bool IsSupportedReservedParent(const UMaterialInterface* Material);
     UMaterialInterface* Get(int32 Slot) const;
     static const TCHAR* SlotName(int32 Slot);
     static bool MatchesSlot(const UMaterialInterface* Material, int32 Slot);

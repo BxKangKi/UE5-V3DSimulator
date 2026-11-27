@@ -15,6 +15,11 @@
 UDynamicPointLightComponent::UDynamicPointLightComponent()
 {
     PrimaryComponentTick.bCanEverTick = false; // Disable ticking to remove scheduling overhead.
+    bCastVolumetricShadow = false;
+    bAffectTranslucentLighting = false;
+    CastStaticShadows = false;
+    MaxDrawDistance = 12000.0f;
+    MaxDistanceFadeRange = 2000.0f;
 }
 
 void UDynamicPointLightComponent::NotifySubsystemRefresh()

@@ -84,6 +84,7 @@ TSharedRef<FJsonObject> FMeshData::Serialization() const
     Json->SetBoolField(TEXT("ComplexCollision"), bComplexCollision);
     Json->SetBoolField(TEXT("SimpleCollision"), bSimpleCollision);
     Json->SetBoolField(TEXT("IsEntity"), bIsEntity);
+    Json->SetBoolField(TEXT("GenerateImpostor"), bGenerateImpostor);
 
     // Automates TArray struct serialization using a lambda capture.
     FJsonHelper::SetArray<FModelCollider>(Json, TEXT("Colliders"), Colliders, [](const FModelCollider &Item)
@@ -103,6 +104,7 @@ bool FMeshData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     Json->TryGetBoolField(TEXT("ComplexCollision"), bComplexCollision);
     Json->TryGetBoolField(TEXT("SimpleCollision"), bSimpleCollision);
     Json->TryGetBoolField(TEXT("IsEntity"), bIsEntity);
+    Json->TryGetBoolField(TEXT("GenerateImpostor"), bGenerateImpostor);
 
     // Automates TArray struct deserialization.
     FJsonHelper::TryGetArray<FModelCollider>(Json, TEXT("Colliders"), Colliders, [](const TSharedPtr<FJsonObject> &Obj, FModelCollider &OutItem)
