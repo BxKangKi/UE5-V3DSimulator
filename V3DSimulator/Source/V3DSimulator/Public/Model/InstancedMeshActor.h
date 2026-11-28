@@ -72,6 +72,8 @@ public:
     bool AddNodeInstances(TConstArrayView<FWorldPreparedInstance> Instances, TArray<FName>& OutAdded);
     void SetInstanceCullDistances(int32 Start, int32 End);
     bool RemoveNodeInstance(FName NodeName);
+    /** Unloads an entire HISM cluster page in one shot instead of per-instance RemoveInstance churn. */
+    bool UnloadWholeClusterPageForNode(FName NodeName, const TSet<FName>& PendingUnloadSet, TArray<FName>& OutRemovedNodes);
     /** Starts at most two bounded async tree builds per slice; never waits on the game thread. */
     bool FlushInstanceRenderUpdates(bool bFinalize = false);
     bool CanMutateNode(FName NodeName) const;

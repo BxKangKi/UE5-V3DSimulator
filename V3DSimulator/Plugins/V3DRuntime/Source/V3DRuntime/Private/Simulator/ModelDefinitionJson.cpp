@@ -242,6 +242,10 @@ bool ModelDefinitionJson::ValidateDefinition(const TSharedPtr<FJsonObject>& Root
     if (Root->HasField(TEXT("BuildTerrainFlipNormalGreen"))
         && !Root->TryGetBoolField(TEXT("BuildTerrainFlipNormalGreen"), OutDefinition.bBuildTerrainFlipNormalGreen))
     { OutError = TEXT("BuildTerrainFlipNormalGreen must be a boolean"); return false; }
+    OutDefinition.bShowInItemList = true;
+    if (Root->HasField(TEXT("ShowInItemList"))
+        && !Root->TryGetBoolField(TEXT("ShowInItemList"), OutDefinition.bShowInItemList))
+    { OutError = TEXT("ShowInItemList must be a boolean"); return false; }
 
     FString Shader = TEXT("Default"), Mode = TEXT("Auto");
     if ((Root->HasField(TEXT("Shader")) && !Root->TryGetStringField(TEXT("Shader"), Shader))

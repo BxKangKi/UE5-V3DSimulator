@@ -8,6 +8,7 @@
  */
 
 #include "Model/DynamicActor.h"
+#include "World/BuoyancyComponent.h"
 #include "Gravity/GravityFieldComponent.h"
 
 #include "Components/BoxComponent.h"
@@ -332,6 +333,8 @@ bool ADynamicActor::LoadConfigJson(const FString& DefinitionJson)
 
     RootObject->TryGetBoolField(TEXT("EnableCollision"), Config.bEnableCollision);
     RootObject->TryGetBoolField(TEXT("SimulatePhysics"), Config.bSimulatePhysics);
+    Config.bEnableBuoyancy = true;
+    RootObject->TryGetBoolField(TEXT("EnableBuoyancy"), Config.bEnableBuoyancy);
     double LoadedMassKg = Config.MassKg;
     if (RootObject->TryGetNumberField(TEXT("MassKg"), LoadedMassKg)
         && FMath::IsFinite(LoadedMassKg))
@@ -383,6 +386,38 @@ void ADynamicActor::ApplyConfigToPhysicsProxy()
         {
             Root->SetMassOverrideInKg(NAME_None, 0.0f, false);
         }
+
+        if (Config.bEnableBuoyancy)
+        {
+            if (!IsValid(BuoyancyComponent))
+            {
+                BuoyancyComponent = NewObject<UBuoyancyComponent>(this, TEXT("DynamicBuoyancy"));
+                if (IsValid(BuoyancyComponent))
+                {
+                    AddInstanceComponent(BuoyancyComponent);
+                    BuoyancyComponent->SetTargetComponentName(Root->GetFName());
+                    BuoyancyComponent->RegisterComponent();
+                }
+            }
+            if (IsValid(BuoyancyComponent))
+            {
+                BuoyancyComponent->RebuildSamplePoints();
+            }
+        }
+        else if (IsValid(BuoyancyComponent))
+        {
+            RemoveInstanceComponent(BuoyancyComponent);
+            BuoyancyComponent->UnregisterComponent();
+            BuoyancyComponent->DestroyComponent();
+            BuoyancyComponent = nullptr;
+        }
+    }
+    else if (IsValid(BuoyancyComponent))
+    {
+        RemoveInstanceComponent(BuoyancyComponent);
+        BuoyancyComponent->UnregisterComponent();
+        BuoyancyComponent->DestroyComponent();
+        BuoyancyComponent = nullptr;
     }
 }
 
@@ -568,7 +603,7 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
     RegistrationOptions.bDynamic = Config.bSimulatePhysics && !bRenderOnlyMode;
     RegistrationOptions.bAllowPhysicsDistanceDeactivation = RegistrationOptions.bDynamic;
     RegistrationOptions.bStoreAsEntityTemplate = true;
-    RegistrationOptions.InterpolationSpeed = RegistrationOptions.bDynamic ? 18.0f : 0.0f;
+    RegistrationOptions.InterpolationSpeed = 0.0f;
 
     // Configure the per-entity physics proxy before registration so the distance manager captures
     // the real collision/simulation state that must be restored after far-distance suspension.

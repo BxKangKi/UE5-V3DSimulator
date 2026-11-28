@@ -237,6 +237,8 @@ static FString MakeKindLabel(EToolbarItemKind Kind)
         return TEXT("Weapon");
     case EToolbarItemKind::Vehicle:
         return TEXT("Vehicle");
+    case EToolbarItemKind::Prop:
+        return TEXT("Prop");
     default:
         return TEXT("None");
     }

@@ -636,9 +636,15 @@ struct collider {
     dvec3 center{}, size{};
 };
 struct light {
+    std::uint8_t type = 0; // 0 point, 1 spot, 2 rect.
     dvec3 location{};
+    dvec3 rotation{}; // pitch, yaw, roll in degrees.
+    float color_r = 1.0f, color_g = 1.0f, color_b = 1.0f;
     float intensity = 0, source_radius = 0, soft_source_radius = 0;
     float attenuation_radius = 0, length = 0;
+    float inner_cone_angle = 22.0f, outer_cone_angle = 44.0f;
+    float source_width = 64.0f, source_height = 64.0f;
+    float barn_door_angle = 88.0f, barn_door_length = 20.0f;
     std::uint8_t unit = 0;
      // 0 unitless, 1 candelas, 2 lumens, 3 EV, 4 nits.
 };
@@ -742,10 +748,15 @@ inline bool valid_settings(const mesh_settings& s) {
     if (s.colliders.size()>65536 || s.lights.size()>65536) return false;
     for (const auto& c:s.colliders) if(c.type>3 || !finite_vector(c.center) || !positive_size(c.size)) return false;
     for (const auto& l:s.lights)
-        if (!finite_vector(l.location) || !std::isfinite(l.intensity) || !std::isfinite(l.source_radius)
+        if (l.type>2 || !finite_vector(l.location) || !finite_vector(l.rotation)
+            || !std::isfinite(l.color_r) || !std::isfinite(l.color_g) || !std::isfinite(l.color_b)
+            || !std::isfinite(l.intensity) || !std::isfinite(l.source_radius)
             || !std::isfinite(l.soft_source_radius) || !std::isfinite(l.attenuation_radius)
-            || !std::isfinite(l.length) || l.unit>4 || l.source_radius<0 || l.soft_source_radius<0
-            || l.attenuation_radius<0 || l.length<0) return false;
+            || !std::isfinite(l.length) || !std::isfinite(l.inner_cone_angle) || !std::isfinite(l.outer_cone_angle)
+            || !std::isfinite(l.source_width) || !std::isfinite(l.source_height)
+            || !std::isfinite(l.barn_door_angle) || !std::isfinite(l.barn_door_length)
+            || l.unit>4 || l.source_radius<0 || l.soft_source_radius<0
+            || l.attenuation_radius<0 || l.length<0 || l.source_width<0 || l.source_height<0) return false;
     return true;
 }
 inline void write_settings(detail::writer& w, const mesh_settings& s) {
@@ -769,8 +780,14 @@ inline void write_settings(detail::writer& w, const mesh_settings& s) {
         w.f32(l.attenuation_radius);
         w.f32(l.length);
         w.u8(l.unit);
-        w.u8(0);
+        const std::uint8_t ext_flags = static_cast<std::uint8_t>(0x80u | (l.type & 0x03u));
+        w.u8(ext_flags);
         w.u16(0);
+        w.vector(l.rotation);
+        w.f32(l.color_r); w.f32(l.color_g); w.f32(l.color_b);
+        w.f32(l.inner_cone_angle); w.f32(l.outer_cone_angle);
+        w.f32(l.source_width); w.f32(l.source_height);
+        w.f32(l.barn_door_angle); w.f32(l.barn_door_length);
     }
 }
 inline bool read_settings(detail::reader& r, mesh_settings& s) {
@@ -807,7 +824,21 @@ inline bool read_settings(detail::reader& r, mesh_settings& s) {
         x.unit=r.u8();
         const auto p=r.u8();
         const auto q=r.u16();
-        if(p||q)return false;
+        if(q)return false;
+        if(p==0)
+        {
+            x.type=0;
+        }
+        else if((p & 0x80u)!=0)
+        {
+            x.type=static_cast<std::uint8_t>(p & 0x03u);
+            x.rotation=r.vector();
+            x.color_r=r.f32(); x.color_g=r.f32(); x.color_b=r.f32();
+            x.inner_cone_angle=r.f32(); x.outer_cone_angle=r.f32();
+            x.source_width=r.f32(); x.source_height=r.f32();
+            x.barn_door_angle=r.f32(); x.barn_door_length=r.f32();
+        }
+        else return false;
         s.lights.push_back(std::move(x));
     }
     return r.ok() && valid_settings(s);
@@ -862,7 +893,7 @@ inline bool validate(const model_metadata& m,std::string& error) {
     using namespace archive_detail;
     if(!valid_summary(m.summary) || m.nodes.size()!=std::size_t(m.summary.source_node_count)
         || m.instances.size()>2000000 || m.waters.size()>2000000 || m.meshes.size()>1000000 || m.settings.size()>1000000
-        || m.instances.size()+m.waters.size()>m.nodes.size() || m.meshes.size()>std::size_t(m.summary.source_mesh_count))
+        || m.instances.size()+m.waters.size()>m.nodes.size() || m.meshes.size()>std::max(std::size_t(m.summary.source_mesh_count),m.nodes.size()))
         return fail(error,"Invalid V3D scene counts or bounds");
     std::vector<std::int32_t> parents(m.nodes.size(),-2);
     for(const auto& n:m.nodes) {

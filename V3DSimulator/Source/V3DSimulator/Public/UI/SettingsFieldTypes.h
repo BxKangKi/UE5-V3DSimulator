@@ -45,7 +45,9 @@ enum class ESettingsField : uint8
     ShadowDistanceMeters UMETA(DisplayName="Shadow Distance"),
     AutoExposureMinEV UMETA(DisplayName="Auto Exposure Min EV"),
     AutoExposureMaxEV UMETA(DisplayName="Auto Exposure Max EV"),
-    DarkMode UMETA(DisplayName="Dark Mode")
+    DarkMode UMETA(DisplayName="Dark Mode"),
+    VSync UMETA(DisplayName="V-Sync"),
+    FrameRateLimit UMETA(DisplayName="Max Frame Rate")
 };
 
 UENUM(BlueprintType)

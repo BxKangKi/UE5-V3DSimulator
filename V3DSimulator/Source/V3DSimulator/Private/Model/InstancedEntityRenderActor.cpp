@@ -282,7 +282,8 @@ void AInstancedEntityRenderActor::FlushDirtyTransforms()
         const TObjectPtr<UInstancedStaticMeshComponent>* ComponentPtr = MeshComponents.Find(MeshKey);
         UInstancedStaticMeshComponent* Component = ComponentPtr ? ComponentPtr->Get() : nullptr;
         const TArray<FTransform>* Transforms = CachedWorldTransforms.Find(MeshKey);
-        if (!IsValid(Component) || !Transforms || Transforms->Num() == 0)
+        if (!IsValid(Component) || !Transforms || Transforms->Num() == 0
+            || Component->GetInstanceCount() != Transforms->Num())
         {
             continue;
         }

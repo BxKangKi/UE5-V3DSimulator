@@ -35,6 +35,7 @@ struct V3DRUNTIME_API FModelDefinition
     int32 BuildTextureResolution = v3d::build_texture_resolution;
     int32 BuildTerrainTextureResolution = v3d::build_terrain_texture_resolution;
     bool bBuildTerrainFlipNormalGreen = false;
+    bool bShowInItemList = true;
     TMap<FString, FString> Bones;
     FGravityFieldSettings GravityField;
 
@@ -61,6 +62,11 @@ struct V3DRUNTIME_API FModelDefinition
     bool IsTrain() const
     {
         return IsVehicle() && VehicleType == EModelVehicleType::Train;
+    }
+
+    bool IsProp() const
+    {
+        return ModelType == EModelDefinitionType::Dynamic && DynamicType == EModelDynamicType::Prop;
     }
 
     bool IsItem() const

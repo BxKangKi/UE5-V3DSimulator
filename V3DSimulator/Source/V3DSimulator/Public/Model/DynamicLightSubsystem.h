@@ -59,6 +59,7 @@ public:
 private:
     TArray<FLightOptimizationData> ManagedLights;
     TArray<TPair<float, int32>> ScratchRankedLights;
+    TArray<TPair<float, int32>> ScratchDecalCandidates;
     TArray<TPair<float, int32>> ScratchPendingTransitions;
     int32 GameUpdateHandle = INDEX_NONE;
     float CullingAccumulator = .2f;

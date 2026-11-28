@@ -81,6 +81,7 @@ private:
 
     bool bDeinitializing = false;
     bool bUpdating = false;
+    float PawnScanAccumulator = 0.5f;
     TSet<TWeakObjectPtr<AActor>> RegisteredMovables;
     TMap<FRegionKey, FBox> UnavailableRegions;
     TMap<TWeakObjectPtr<AActor>, FFrozenState> FrozenActors;

@@ -73,7 +73,7 @@ void AInstancedMeshActor::BuildStreamNodeSnapshot(const FVector& Observer, const
     const float Radius, TMap<FName, FModelNodeData>& OutNodes) const
 {
     check(IsInGameThread());
-    if (GroupDefinitions.IsValid()) BuildNativeNodeSnapshot(*GroupDefinitions, *LoadedNodes, Observer, OwnerTransform, Radius, OutNodes,
+    if (GroupDefinitions.IsValid() && LoadedNodes.IsValid()) BuildNativeNodeSnapshot(*GroupDefinitions, *LoadedNodes, Observer, OwnerTransform, Radius, OutNodes,
         V3DStreamingPolicy::GetMaxRenderDistanceCm(this));
     else OutNodes.Reset();
 }
@@ -104,7 +104,8 @@ void AInstancedMeshActor::BuildNativeNodeSnapshot(const FInstancedMeshGroupInitD
 void AInstancedMeshActor::GetLoadedNodeSnapshot(TSet<FName>& OutLoadedNodes) const
 {
     check(IsInGameThread());
-    OutLoadedNodes = *LoadedNodes;
+    if (LoadedNodes.IsValid()) OutLoadedNodes = *LoadedNodes;
+    else OutLoadedNodes.Reset();
 }
 
 UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh* Mesh)
@@ -117,7 +118,7 @@ UInstancedStaticMeshComponent* AInstancedMeshActor::AssignStaticMesh(UStaticMesh
 
     V3DMeshRendering::ConfigureWorldMesh(MeshComponent);
     UStaticMesh* ExistingMesh = MeshComponent->GetStaticMesh();
-    if (IsValid(ExistingMesh) && ExistingMesh != Mesh && !LoadedNodes->IsEmpty())
+    if (IsValid(ExistingMesh) && ExistingMesh != Mesh && LoadedNodes.IsValid() && !LoadedNodes->IsEmpty())
     {
         return nullptr;
     }
@@ -136,8 +137,10 @@ UHierarchicalInstancedStaticMeshComponent* AInstancedMeshActor::CreateChunkCompo
     const FIntVector& Chunk, FName& OutPage)
 {
     check(IsInGameThread());
+    if (!IsValid(Root) || !IsValid(MeshComponent)) return nullptr;
     OutPage = FName(*FString::Printf(TEXT("HISM_%d_%d_%d_%d"), Chunk.X, Chunk.Y, Chunk.Z, NextPageId++));
     auto* Component = NewObject<UHierarchicalInstancedStaticMeshComponent>(this, OutPage, RF_Transient);
+    if (!IsValid(Component)) return nullptr;
     Component->bAutoRebuildTreeOnInstanceChanges = false;
     Component->bEnableDensityScaling = false;
     Component->SetForcedLodModel(0);
@@ -201,7 +204,7 @@ bool AInstancedMeshActor::AddNodeInstances(TConstArrayView<FWorldPreparedInstanc
 {
     check(IsInGameThread());
     OutAdded.Reset();
-    if (bRuntimeResourcesReleased || !IsValid(MeshComponent) || !IsValid(MeshComponent->GetStaticMesh())) return false;
+    if (bRuntimeResourcesReleased || !LoadedNodes.IsValid() || !IsValid(MeshComponent) || !IsValid(MeshComponent->GetStaticMesh())) return false;
     TSet<FName> Seen;
     TArray<const FWorldPreparedInstance*> Rows;
     // Reject invalid/duplicate input before mutating components or slot bookkeeping.
@@ -221,6 +224,7 @@ bool AInstancedMeshActor::AddNodeInstances(TConstArrayView<FWorldPreparedInstanc
         if (!IsValid(Component) || Component->IsAsyncBuilding()
             || Component->GetNumInstances() >= V3DHISMChunkPolicy::MaxInstancesPerComponent)
             Component = CreateChunkComponent(Chunk, PageName);
+        if (!IsValid(Component)) return false;
         const int32 Capacity = V3DHISMChunkPolicy::MaxInstancesPerComponent - Component->GetNumInstances();
         TArray<FTransform> Transforms;
         Transforms.Reserve(FMath::Min(Capacity, Rows.Num() - Offset));
@@ -283,45 +287,93 @@ void AInstancedMeshActor::DestroyChunkComponent(const FName PageName)
     DirtyPages.Remove(PageName);
 }
 
-bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
+bool AInstancedMeshActor::UnloadWholeClusterPageForNode(
+    const FName NodeName,
+    const TSet<FName>& PendingUnloadSet,
+    TArray<FName>& OutRemovedNodes)
 {
     check(IsInGameThread());
+    OutRemovedNodes.Reset();
     const FInstanceSlot* SlotPtr = InstanceSlots.Find(NodeName);
-    if (!SlotPtr) { LoadedNodes->Remove(NodeName); return false; }
-    const FInstanceSlot Slot = *SlotPtr;
-    auto* Component = ChunkComponents.FindRef(Slot.Page).Get();
-    FChunkPage* Page = ChunkPages.Find(Slot.Page);
+    if (!SlotPtr) return false;
+    const FName PageName = SlotPtr->Page;
+    auto* Component = ChunkComponents.FindRef(PageName).Get();
+    FChunkPage* Page = ChunkPages.Find(PageName);
     if (!IsValid(Component) || !Page || Component->IsAsyncBuilding()) return false;
-    const bool bSwap = Component->SupportsRemoveSwap();
-    if (!Component->RemoveInstance(Slot.Index)) return false;
-    if (bSwap)
+    // Only destroy the entire HISM component when every node in this page is unloading.
+    for (const FName& PageNode : Page->Nodes)
     {
-        Page->Nodes.RemoveAtSwap(Slot.Index, 1, EAllowShrinking::No);
-        if (Page->Nodes.IsValidIndex(Slot.Index))
-            InstanceSlots.FindChecked(Page->Nodes[Slot.Index]).Index = Slot.Index;
+        if (!PendingUnloadSet.Contains(PageNode)) return false;
     }
-    else
+    OutRemovedNodes = Page->Nodes;
+    for (const FName& RemovedNode : OutRemovedNodes)
     {
-        Page->Nodes.RemoveAt(Slot.Index, 1, EAllowShrinking::No);
-        for (int32 Index = Slot.Index; Index < Page->Nodes.Num(); ++Index)
-            InstanceSlots.FindChecked(Page->Nodes[Index]).Index = Index;
+        InstanceSlots.Remove(RemovedNode);
+        if (LoadedNodes.IsValid()) LoadedNodes->Remove(RemovedNode);
     }
-    InstanceSlots.Remove(NodeName);
-    LoadedNodes->Remove(NodeName);
-    if (Page->Nodes.IsEmpty()) DestroyChunkComponent(Slot.Page);
-    else DirtyPages.Add(Slot.Page);
-    if (LoadedNodes->IsEmpty())
+    DestroyChunkComponent(PageName);
+    if (!LoadedNodes.IsValid() || LoadedNodes->IsEmpty())
     {
-        LoadedNodes->Empty();
+        if (LoadedNodes.IsValid()) LoadedNodes->Empty();
         InstanceSlots.Empty();
         ChunkComponents.Empty();
         ChunkPages.Empty();
         OpenChunkPages.Empty();
         DirtyPages.Empty();
         if (DynamicComponentMap.IsEmpty()) DynamicComponentMap.Empty();
-        MeshComponent->SetStaticMesh(nullptr);
-        MeshComponent->EmptyOverrideMaterials();
-        MeshComponent->SetPhysMaterialOverride(nullptr);
+        if (IsValid(MeshComponent))
+        {
+            MeshComponent->SetStaticMesh(nullptr);
+            MeshComponent->EmptyOverrideMaterials();
+            MeshComponent->SetPhysMaterialOverride(nullptr);
+        }
+        FV3DStreamingBudget::NotifyUnloaded();
+    }
+    return true;
+}
+
+bool AInstancedMeshActor::RemoveNodeInstance(const FName NodeName)
+{
+    check(IsInGameThread());
+    const FInstanceSlot* SlotPtr = InstanceSlots.Find(NodeName);
+    if (!SlotPtr) { if (LoadedNodes.IsValid()) LoadedNodes->Remove(NodeName); return false; }
+    const FInstanceSlot Slot = *SlotPtr;
+    auto* Component = ChunkComponents.FindRef(Slot.Page).Get();
+    FChunkPage* Page = ChunkPages.Find(Slot.Page);
+    if (!IsValid(Component) || !Page || Component->IsAsyncBuilding() || !Page->Nodes.IsValidIndex(Slot.Index)) return false;
+    const bool bSwap = Component->SupportsRemoveSwap();
+    if (!Component->RemoveInstance(Slot.Index)) return false;
+    if (bSwap)
+    {
+        Page->Nodes.RemoveAtSwap(Slot.Index, 1, EAllowShrinking::No);
+        if (Page->Nodes.IsValidIndex(Slot.Index))
+            if (FInstanceSlot* Swapped = InstanceSlots.Find(Page->Nodes[Slot.Index])) Swapped->Index = Slot.Index;
+    }
+    else
+    {
+        Page->Nodes.RemoveAt(Slot.Index, 1, EAllowShrinking::No);
+        for (int32 Index = Slot.Index; Index < Page->Nodes.Num(); ++Index)
+            if (FInstanceSlot* Shifted = InstanceSlots.Find(Page->Nodes[Index])) Shifted->Index = Index;
+    }
+    InstanceSlots.Remove(NodeName);
+    if (LoadedNodes.IsValid()) LoadedNodes->Remove(NodeName);
+    if (Page->Nodes.IsEmpty()) DestroyChunkComponent(Slot.Page);
+    else DirtyPages.Add(Slot.Page);
+    if (!LoadedNodes.IsValid() || LoadedNodes->IsEmpty())
+    {
+        if (LoadedNodes.IsValid()) LoadedNodes->Empty();
+        InstanceSlots.Empty();
+        ChunkComponents.Empty();
+        ChunkPages.Empty();
+        OpenChunkPages.Empty();
+        DirtyPages.Empty();
+        if (DynamicComponentMap.IsEmpty()) DynamicComponentMap.Empty();
+        if (IsValid(MeshComponent))
+        {
+            MeshComponent->SetStaticMesh(nullptr);
+            MeshComponent->EmptyOverrideMaterials();
+            MeshComponent->SetPhysMaterialOverride(nullptr);
+        }
         FV3DStreamingBudget::NotifyUnloaded();
     }
     return true;
@@ -340,7 +392,7 @@ bool AInstancedMeshActor::FlushInstanceRenderUpdates(const bool bFinalize)
         // No synchronous BuildTree, task waits, or per-instance automatic rebuilds.
         Component->BuildTreeIfOutdated(true, false);
         It.RemoveCurrent();
-        if (++BuildsStarted >= 2) break;
+        if (++BuildsStarted >= 1) break;
     }
     return DirtyPages.IsEmpty();
 }

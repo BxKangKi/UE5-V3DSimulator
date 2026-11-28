@@ -49,7 +49,8 @@ enum class EToolMode : uint8
     None = 0 UMETA(DisplayName="None"),
     PlaceStatic = 1 UMETA(DisplayName="Place Static"),
     PlaceVehicle = 2 UMETA(DisplayName="Place Vehicle"),
-    Weapon = 3 UMETA(DisplayName="Weapon")
+    Weapon = 3 UMETA(DisplayName="Weapon"),
+    PlaceProp = 4 UMETA(DisplayName="Place Prop")
 };
 
 UENUM(BlueprintType)
@@ -65,7 +66,8 @@ enum class EToolbarItemKind : uint8
     None = 0 UMETA(DisplayName="None"),
     Static = 1 UMETA(DisplayName="Static"),
     Weapon = 2 UMETA(DisplayName="Weapon"),
-    Vehicle = 3 UMETA(DisplayName="Vehicle")
+    Vehicle = 3 UMETA(DisplayName="Vehicle"),
+    Prop = 4 UMETA(DisplayName="Prop")
 };
 
 USTRUCT(BlueprintType)
@@ -624,6 +626,9 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> PlacementGridMaterial;
 
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInstanceDynamic> PlacementPreviewMaterial;
+
 
 
     /**
@@ -779,11 +784,13 @@ private:
 
     UPROPERTY(Transient)
     TArray<TWeakObjectPtr<AVehiclePawn>> SpawnedVehicles;
+    TArray<TWeakObjectPtr<ADynamicActor>> SpawnedProps;
 
     /** Opaque v3d:// keys copied from the verified archive directory; never source filenames. */
     TArray<FString> StaticReferences;
     TArray<FString> VehicleReferences;
     TArray<FString> WeaponReferences;
+    TArray<FString> PropReferences;
     TArray<FToolbarItem> AvailableItems;
     TArray<FToolbarItem> ToolbarSlots;
     int32 SelectedToolbarSlotIndex = 0;
@@ -812,6 +819,9 @@ private:
     FVector CachedPlacementGridCenter = FVector::ZeroVector;
     float CachedPlacementGridRadius = 0.0f;
     bool bPlacementGridBuilt = false;
+    TWeakObjectPtr<ADynamicActor> PlacementPreviewActor;
+    FString PlacementPreviewModelReference;
+    int32 PlacementPreviewStyledMeshCount = 0;
     bool bIsSavingScene = false;
 
     struct FProjectBuildState
@@ -906,10 +916,15 @@ private:
     FString GetAssetDisplayName(const FString& ModelReference) const;
     void AutoSaveScene();
     void ClearPlacementGridMesh();
+    void UpdatePlacementSilhouette();
+    void ClearPlacementSilhouette();
+    void ApplySilhouetteStyleToPreviewActor(ADynamicActor* PreviewActor);
     FString MakeObjectName(const FString& BaseName, EPlacedObjectKind Kind) const;
     int32 CountExistingBaseName(const FString& BaseName, EPlacedObjectKind Kind) const;
     void PlaceCurrentStatic(const FVector& Location);
     void PlaceVehicle(const FVector& Location, const FString& ModelReference);
+    void PlaceProp(const FVector& Location, const FString& ModelReference);
+    bool ShouldShowModelInItemList(const FString& ModelReference) const;
     void TryEnterOrExitVehicle();
     void StartNextProjectBuildModel();
     void RefreshProjectBuildProgress();

@@ -228,7 +228,12 @@ void UStreamingMovementGateSubsystem::Tick(const float DeltaTime)
     UWorldObjectStreamingSubsystem* Chunks = GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>();
     // Idle/main-menu worlds need neither a full pawn scan nor destination queries.
     if ((!Chunks || !Chunks->IsRunning()) && UnavailableRegions.IsEmpty() && FrozenActors.IsEmpty()) return;
-    for (TActorIterator<APawn> It(GetWorld()); It; ++It) RegisteredMovables.Add(*It);
+    PawnScanAccumulator += DeltaTime;
+    if (PawnScanAccumulator >= 0.5f || RegisteredMovables.IsEmpty())
+    {
+        PawnScanAccumulator = 0.0f;
+        for (TActorIterator<APawn> It(GetWorld()); It; ++It) RegisteredMovables.Add(*It);
+    }
 
     // Loading, freezing and resuming may unregister/destroy actors through callbacks.
     const TArray<TWeakObjectPtr<AActor>> Snapshot = RegisteredMovables.Array();
@@ -247,15 +252,53 @@ void UStreamingMovementGateSubsystem::Tick(const float DeltaTime)
         const FFrozenState FrozenSnapshot = FoundFrozen ? *FoundFrozen : FFrozenState();
         const FFrozenState* Frozen = FoundFrozen ? &FrozenSnapshot : nullptr;
         const FVector Velocity = Frozen ? Frozen->LinearVelocity : Actor->GetVelocity();
-        const FVector Destination = Actor->GetActorLocation() + Velocity * FMath::Clamp(DeltaTime, 0.0f, 0.25f);
+        const FVector CurrentLocation = Actor->GetActorLocation();
+        const FVector Destination = CurrentLocation + Velocity * FMath::Clamp(DeltaTime, 0.0f, 0.25f);
         if (Destination.ContainsNaN()) continue;
-        bool bAvailable = IsDestinationAvailable(Destination);
+        // Proactively pre-warm multiple chunk horizons ahead of fast-moving cars/players so crossing
+        // chunk borders never freezes movement.
+        if (Chunks && Chunks->IsRunning() && Velocity.SizeSquared() > 2500.0)
+        {
+            static constexpr float LookAheadHorizons[] = { 0.75f, 1.5f, 2.5f };
+            for (const float Horizon : LookAheadHorizons)
+            {
+                const FVector LookAheadChunkPos = CurrentLocation + Velocity * Horizon;
+                if (!LookAheadChunkPos.ContainsNaN() && !Chunks->IsLocationLoaded(LookAheadChunkPos))
+                {
+                    Chunks->EnsureLocationLoaded(LookAheadChunkPos);
+                }
+            }
+        }
+        bool bChunkLoaded = true;
+        if (Chunks && Chunks->IsRunning() && !Chunks->IsLocationLoaded(Destination))
+        {
+            Chunks->EnsureLocationLoaded(Destination);
+            bChunkLoaded = false;
+        }
+        bool bActorGrounded = false;
+        if (!Frozen)
+        {
+            if (const ACharacter* GroundCheckChar = Cast<ACharacter>(Actor))
+            {
+                if (const UCharacterMovementComponent* MoveComp = GroundCheckChar->GetCharacterMovement())
+                {
+                    bActorGrounded = MoveComp->IsMovingOnGround();
+                }
+            }
+            else if (FMath::Abs(Velocity.Z) < 250.0)
+            {
+                // Vehicles/physics bodies travelling horizontally on loaded roads should not be
+                // micro-frozen whenever a nearby building/prop AABB is still streaming in.
+                bActorGrounded = true;
+            }
+        }
+        bool bAvailable = bChunkLoaded && (bActorGrounded || IsDestinationAvailable(Destination));
         if (bDeinitializing || !WeakActor.IsValid() || !RegisteredMovables.Contains(WeakActor)) continue;
         const UCharacterComponent* CharacterState = Actor->FindComponentByClass<UCharacterComponent>();
         const bool bProbePhysics = Frozen ? Frozen->bRagdoll || !Frozen->bCharacterMovement
             : !Cast<ACharacter>(Actor) || (CharacterState && CharacterState->IsRagdollActive());
         const float LookAhead = FMath::Clamp(DeltaTime * 2.0f, 0.05f, 0.25f);
-        if (bAvailable && bProbePhysics)
+        if (bAvailable && bProbePhysics && !bActorGrounded)
         {
             if (Frozen)
             {

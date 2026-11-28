@@ -944,7 +944,11 @@ void UInstancedEntitySubsystem::UpdateFromGameUpdate(float DeltaSeconds)
             Work.CurrentTransform = Binding.RenderWorldTransform;
             Work.TargetTransform = Binding.LocalTransform * EffectiveRootTransform;
             Work.DeltaSeconds = InterpolationDelta;
-            Work.InterpolationSpeed = FMath::Max(0.0f, Registration.Options.InterpolationSpeed);
+            const bool bDirectNearDynamicLock = Registration.Options.bAlwaysRelevant
+                || (Tier == EDistanceTier::Near && Registration.Options.bDynamic);
+            Work.InterpolationSpeed = bDirectNearDynamicLock
+                ? 0.0f
+                : FMath::Max(0.0f, Registration.Options.InterpolationSpeed);
             Work.TeleportDistance = FMath::Max(0.0f, Registration.Options.TeleportDistance);
         }
     }

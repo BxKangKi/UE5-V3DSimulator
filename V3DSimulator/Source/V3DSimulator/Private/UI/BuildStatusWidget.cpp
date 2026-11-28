@@ -399,11 +399,8 @@ void UBuildStatusWidget::HandleBuildCompleted(const bool bSuccess, const FString
     OnBuildStatusUpdated.Broadcast(1.0f, TerminalMessage, TerminalPhase);
     OnBuildFinished.Broadcast(bSuccess, TerminalMessage);
 
-    // Blueprint callbacks may confirm this result, begin another build, or remove this view.
-    if (CompletedRevision == ObservationRevision && !bConfirmationSent && bSuccess && bAutoCloseOnSuccess)
-    {
-        ScheduleAutoClose();
-    }
+    // Keep the build result visible until the user explicitly clicks Confirm (never auto-skip on success).
+    (void)CompletedRevision;
 }
 
 void UBuildStatusWidget::HandleManagerStateChanged()
@@ -552,28 +549,147 @@ void UBuildStatusWidget::HandleAutoCloseTimer()
     }
 }
 
+namespace
+{
+    bool IsErrorLogLine(const FString& Line)
+    {
+        return Line.Contains(TEXT("failed"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("error"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("invalid"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("cannot"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("rejected"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("missing"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("corrupt"), ESearchCase::IgnoreCase);
+    }
+
+    bool IsWarningLogLine(const FString& Line)
+    {
+        return Line.Contains(TEXT("warning"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("cancelled"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("skipped"), ESearchCase::IgnoreCase);
+    }
+
+    bool IsSuccessLogLine(const FString& Line)
+    {
+        return Line.Contains(TEXT("completed"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("succeeded"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("built "), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("verified"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("ready"), ESearchCase::IgnoreCase);
+    }
+
+    bool IsStepLogLine(const FString& Line)
+    {
+        return Line.Contains(TEXT("Building model"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("Writing"), ESearchCase::IgnoreCase)
+            || Line.Contains(TEXT("Indexing"), ESearchCase::IgnoreCase);
+    }
+
+    FLinearColor ResolveBuildLogColor(const FString& Line, const bool bForceError, const bool bForceSuccess)
+    {
+        if (bForceError || IsErrorLogLine(Line))
+        {
+            return FLinearColor(1.0f, 0.28f, 0.28f, 1.0f); // Bright Red
+        }
+        if (IsWarningLogLine(Line))
+        {
+            return FLinearColor(1.0f, 0.78f, 0.22f, 1.0f); // Warm Amber
+        }
+        if (bForceSuccess || IsSuccessLogLine(Line))
+        {
+            return FLinearColor(0.30f, 0.92f, 0.48f, 1.0f); // Bright Green
+        }
+        if (IsStepLogLine(Line))
+        {
+            return FLinearColor(0.68f, 0.88f, 1.0f, 1.0f); // Soft Cyan
+        }
+        return FLinearColor(0.92f, 0.94f, 0.97f, 1.0f); // Crisp White
+    }
+}
+
 void UBuildStatusWidget::UpdateAssignedWidgets()
 {
     if (IsDesignTime()) return;
-    bool bOutputChanged = false;
-    if (UTextBlock* Text = StatusTextBlock.Get())
+    const FString FullText = BuildOutputText.IsEmpty() ? DisplayedMessage : BuildOutputText;
+    const bool bFailed = (BuildPhase == EProjectBuildPhase::Failed);
+    const bool bSucceeded = (BuildPhase == EProjectBuildPhase::Completed);
+    const bool bNeedsRebuild = (FullText != LastRenderedOutputText) || (BuildPhase != LastRenderedPhase);
+
+    UScrollBox* ActiveScroll = IsUsingNativeLayout() ? NativeOutputScroll.Get() : OutputScrollBox.Get();
+    if (IsValid(ActiveScroll) && IsValid(WidgetTree))
     {
-        const FText Value = FText::FromString(BuildOutputText.IsEmpty() ? DisplayedMessage : BuildOutputText);
-        bOutputChanged = !Text->GetText().EqualTo(Value);
-        if (bOutputChanged) Text->SetText(Value);
+        if (bNeedsRebuild || ActiveScroll->GetChildrenCount() == 0)
+        {
+            LastRenderedOutputText = FullText;
+            LastRenderedPhase = BuildPhase;
+            ActiveScroll->ClearChildren();
+
+            TArray<FString> Lines;
+            if (!OutputLines.IsEmpty())
+            {
+                Lines = OutputLines;
+            }
+            else if (!FullText.IsEmpty())
+            {
+                FullText.ParseIntoArrayLines(Lines, false);
+            }
+
+            const FSlateFontInfo BaseFont = IsValid(NativeStatusText)
+                ? NativeStatusText->GetFont()
+                : (StatusTextBlock.IsValid() ? StatusTextBlock->GetFont() : FSlateFontInfo());
+
+            for (int32 LineIdx = 0; LineIdx < Lines.Num(); ++LineIdx)
+            {
+                const FString& Line = Lines[LineIdx];
+                if (Line.IsEmpty()) continue;
+                // Construct UTextBlock directly (not via AddText) so ApplyNativeStyle never resets per-line colors.
+                UTextBlock* LineWidget = WidgetTree->ConstructWidget<UTextBlock>(UTextBlock::StaticClass());
+                if (IsValid(LineWidget))
+                {
+                    if (BaseFont.FontObject)
+                    {
+                        LineWidget->SetFont(BaseFont);
+                    }
+                    LineWidget->SetText(FText::FromString(Line));
+                    LineWidget->SetAutoWrapText(true);
+                    LineWidget->SetJustification(ETextJustify::Right);
+                    const bool bIsLastLine = (LineIdx == Lines.Num() - 1);
+                    LineWidget->SetColorAndOpacity(FSlateColor(
+                        ResolveBuildLogColor(Line, bFailed && bIsLastLine, bSucceeded && bIsLastLine)));
+                    ActiveScroll->AddChild(LineWidget);
+                }
+            }
+            ActiveScroll->ScrollToEnd();
+        }
     }
-    if (UScrollBox* ScrollBox = OutputScrollBox.Get(); bOutputChanged && IsValid(ScrollBox))
+    else if (UTextBlock* Text = StatusTextBlock.Get())
     {
-        ScrollBox->ScrollToEnd();
+        if (bNeedsRebuild)
+        {
+            LastRenderedOutputText = FullText;
+            LastRenderedPhase = BuildPhase;
+            Text->SetText(FText::FromString(FullText));
+            Text->SetColorAndOpacity(FSlateColor(ResolveBuildLogColor(FullText, bFailed, bSucceeded)));
+        }
     }
+
+    const FLinearColor StatusAccent = bFailed
+        ? FLinearColor(0.95f, 0.25f, 0.25f, 1.0f)
+        : (bSucceeded ? FLinearColor(0.28f, 0.88f, 0.45f, 1.0f) : AccentColor);
+
     if (UProgressBar* Progress = AssignedProgressBar.Get())
     {
         Progress->SetPercent(FMath::Clamp(DisplayedProgress, 0.0f, 1.0f));
+        Progress->SetFillColorAndOpacity(StatusAccent);
     }
     if (UTextBlock* Text = PercentTextBlock.Get())
     {
         Text->SetText(FText::FromString(FString::Printf(
             TEXT("%d%%"), FMath::RoundToInt(FMath::Clamp(DisplayedProgress, 0.0f, 1.0f) * 100.0f))));
+        if (bFailed || bSucceeded)
+        {
+            Text->SetColorAndOpacity(FSlateColor(StatusAccent));
+        }
     }
     if (UTextBlock* Text = ProjectNameTextBlock.Get())
     {

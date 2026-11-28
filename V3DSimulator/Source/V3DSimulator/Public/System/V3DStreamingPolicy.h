@@ -51,15 +51,34 @@ namespace V3DStreamingPolicy
             FMath::Max(BoundRadius + 2000.0, BoundRadius * FMath::Max(1.0, Distance + 1.0)));
     }
 
+    /** Computes exact world-space dimensions by combining local mesh Size with per-axis Transform Scale. */
+    inline FVector ScaledWorldSize(const FVector& LocalSize, const FTransform& Transform)
+    {
+        return LocalSize.GetAbs() * Transform.GetScale3D().GetAbs();
+    }
+
+    inline double ScaledLoadRadius(const FVector& LocalSize, const FTransform& Transform,
+        const double Distance, const double MaxDistanceCm = DefaultMaxRenderDistanceCm)
+    {
+        return LoadRadius(ScaledWorldSize(LocalSize, Transform), 1.0, Distance, MaxDistanceCm);
+    }
+
     inline bool MeshInRange(const FVector& Size, const FTransform& Transform,
         const FVector& Observer, const double Distance, const double MaxDistanceCm,
         const bool bAlwaysLoaded = false, const double Hysteresis = 1.0)
     {
-        if (!BoundsInRenderRange(FVector::ZeroVector, Size, Transform, Observer, MaxDistanceCm))
+        const FVector Half = Size.GetAbs() * 0.5;
+        const FBox Bounds = FBox(-Half, Half).TransformBy(Transform);
+        const double DistSqToBounds = Bounds.ComputeSquaredDistanceToPoint(Observer);
+        if (DistSqToBounds > FMath::Square(MaxDistanceCm))
             return false;
-        const double Radius = LoadRadius(Size, Transform.GetScale3D().GetAbs().GetMax(), Distance, MaxDistanceCm);
-        return bAlwaysLoaded || FVector::DistSquared(Observer, Transform.GetLocation())
-            <= FMath::Square(Radius * FMath::Clamp(Hysteresis, 1.0, 2.0));
+        if (bAlwaysLoaded)
+            return true;
+        // Account for both local mesh size and per-axis transform scale, measuring distance to the transformed bounds.
+        const double Radius = ScaledLoadRadius(Size, Transform, Distance, MaxDistanceCm);
+        const double EffectiveRadius = Radius * FMath::Clamp(Hysteresis, 1.0, 2.0);
+        return DistSqToBounds <= FMath::Square(EffectiveRadius)
+            || FVector::DistSquared(Observer, Transform.GetLocation()) <= FMath::Square(EffectiveRadius);
     }
     inline bool SceneInRange(const FVector& Center, const FVector& Size, const FTransform& Transform,
         const FVector& Observer, const double Distance, const double Hysteresis = 1.0,
@@ -67,11 +86,11 @@ namespace V3DStreamingPolicy
     {
         const FVector Half = Size.GetAbs() * 0.5;
         const FBox Bounds = FBox(Center - Half, Center + Half).TransformBy(Transform);
-        if (Bounds.ComputeSquaredDistanceToPoint(Observer) > FMath::Square(MaxDistanceCm))
+        const double DistSqToBounds = Bounds.ComputeSquaredDistanceToPoint(Observer);
+        if (DistSqToBounds > FMath::Square(MaxDistanceCm))
             return false;
-        const double Radius = LoadRadius(Size, Transform.GetScale3D().GetAbs().GetMax(), Distance, MaxDistanceCm);
+        const double Radius = ScaledLoadRadius(Size, Transform, Distance, MaxDistanceCm);
         // Coarse scene selection must contain every child mesh's screen-size range.
-        return Bounds.ComputeSquaredDistanceToPoint(Observer)
-            <= FMath::Square(Radius * FMath::Clamp(Hysteresis, 1.0, 2.0));
+        return DistSqToBounds <= FMath::Square(Radius * FMath::Clamp(Hysteresis, 1.0, 2.0));
     }
 }

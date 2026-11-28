@@ -26,11 +26,12 @@ namespace
 {
     struct FDynamicLightQualityBudget
     {
-        int32 MaxActiveLights = 16;
+        int32 MaxActiveLights = 64;
         int32 MaxShadowLights = 4;
-        float DistanceScaleSq = 0.5625f; // (0.75)^2
+        int32 MaxActiveDecals = 24;
+        float DistanceScaleSq = 1.0f;
         int32 MaxTransitionsPerTick = 2;
-        int32 MaxDecalCreationsPerTick = 2;
+        int32 MaxDecalCreationsPerTick = 1;
     };
 
     FDynamicLightQualityBudget ResolveLightQualityBudget()
@@ -48,42 +49,52 @@ namespace
         switch (Quality)
         {
         case 0: // Low
-            Budget.MaxActiveLights = 4;
+            Budget.MaxActiveLights = 16;
             Budget.MaxShadowLights = 0;
-            Budget.DistanceScaleSq = 0.35f * 0.35f;
+            Budget.MaxActiveDecals = 8;
+            Budget.DistanceScaleSq = 0.65f * 0.65f;
             Budget.MaxTransitionsPerTick = 1;
             Budget.MaxDecalCreationsPerTick = 1;
             break;
         case 1: // Medium
-            Budget.MaxActiveLights = 8;
+            Budget.MaxActiveLights = 32;
             Budget.MaxShadowLights = 2;
-            Budget.DistanceScaleSq = 0.55f * 0.55f;
+            Budget.MaxActiveDecals = 16;
+            Budget.DistanceScaleSq = 0.85f * 0.85f;
             Budget.MaxTransitionsPerTick = 2;
             Budget.MaxDecalCreationsPerTick = 1;
             break;
         case 2: // High
-            Budget.MaxActiveLights = 16;
+            Budget.MaxActiveLights = 64;
             Budget.MaxShadowLights = 4;
-            Budget.DistanceScaleSq = 0.75f * 0.75f;
-            Budget.MaxTransitionsPerTick = 2;
-            Budget.MaxDecalCreationsPerTick = 2;
-            break;
-        case 3: // Epic
-            Budget.MaxActiveLights = 24;
-            Budget.MaxShadowLights = 6;
+            Budget.MaxActiveDecals = 24;
             Budget.DistanceScaleSq = 1.0f;
             Budget.MaxTransitionsPerTick = 2;
-            Budget.MaxDecalCreationsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 1;
+            break;
+        case 3: // Epic
+            Budget.MaxActiveLights = 96;
+            Budget.MaxShadowLights = 6;
+            Budget.MaxActiveDecals = 32;
+            Budget.DistanceScaleSq = 1.25f * 1.25f;
+            Budget.MaxTransitionsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 1;
             break;
         case 4: // Cinematic
         default:
-            Budget.MaxActiveLights = 32;
+            Budget.MaxActiveLights = 128;
             Budget.MaxShadowLights = 8;
-            Budget.DistanceScaleSq = 1.20f * 1.20f;
+            Budget.MaxActiveDecals = 48;
+            Budget.DistanceScaleSq = 1.50f * 1.50f;
             Budget.MaxTransitionsPerTick = 2;
-            Budget.MaxDecalCreationsPerTick = 2;
+            Budget.MaxDecalCreationsPerTick = 1;
             break;
         }
+#if PLATFORM_ANDROID || PLATFORM_IOS
+        Budget.MaxActiveLights = FMath::Max(8, Budget.MaxActiveLights / 2);
+        Budget.MaxShadowLights = Budget.MaxShadowLights / 2;
+        Budget.MaxActiveDecals = FMath::Max(4, Budget.MaxActiveDecals / 2);
+#endif
         return Budget;
     }
 
@@ -187,6 +198,7 @@ void UDynamicLightSubsystem::Deinitialize()
     }
     ManagedLights.Empty();
     ScratchRankedLights.Empty();
+    ScratchDecalCandidates.Empty();
     ScratchPendingTransitions.Empty();
     Super::Deinitialize();
 }
@@ -434,8 +446,48 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
         }
     }
 
-    // Pass 3: Lights not chosen as real point lights fall back to lightweight decals if in range.
-    // Collect pending state transitions sorted nearest-first so we throttle strictly to 1-2 per tick.
+    // Pass 3A: Rank all eligible far-LOD decal candidates by distance from camera so decals
+    // follow the player evenly across the entire world instead of biasing toward early-streamed chunks.
+    ScratchDecalCandidates.Reset();
+    const bool bLightBudgetSaturated = (ScratchRankedLights.Num() > Budget.MaxActiveLights);
+    for (int32 Index = 0; Index < ManagedLights.Num(); ++Index)
+    {
+        FLightOptimizationData& Data = ManagedLights[Index];
+        if (!Data.LightComponent.IsValid() || Data.bTargetLightVisibility)
+        {
+            continue;
+        }
+
+        const float EffectiveCullSq = Data.CullingDistanceSq * Budget.DistanceScaleSq;
+        const bool bIsFarLodBand = (Data.LastDistanceSq >= EffectiveCullSq * 0.85f) || bLightBudgetSaturated;
+        const bool bWithinDecalRange = (Data.DecalTransitionDistanceSq == 0.0f)
+            || (Data.DecalTransitionDistanceSq > Data.CullingDistanceSq
+                && Data.LastDistanceSq < Data.DecalTransitionDistanceSq);
+        if (bIsFarLodBand
+            && Data.TargetDecalMaterial.IsValid()
+            && Data.DecalTransitionDistanceSq >= 0.0f
+            && bWithinDecalRange)
+        {
+            const float SortKey = Data.bCurrentDecalVisibility ? (Data.LastDistanceSq * 0.90f) : Data.LastDistanceSq;
+            ScratchDecalCandidates.Emplace(SortKey, Index);
+        }
+    }
+
+    if (ScratchDecalCandidates.Num() > 1)
+    {
+        ScratchDecalCandidates.Sort([](const TPair<float, int32>& A, const TPair<float, int32>& B)
+        {
+            return A.Key < B.Key;
+        });
+    }
+
+    const int32 DecalBudget = FMath::Min(ScratchDecalCandidates.Num(), Budget.MaxActiveDecals);
+    for (int32 Rank = 0; Rank < DecalBudget; ++Rank)
+    {
+        ManagedLights[ScratchDecalCandidates[Rank].Value].bTargetDecalVisibility = true;
+    }
+
+    // Pass 3B: Collect pending state transitions sorted nearest-first so we throttle strictly to 1-2 per tick.
     ScratchPendingTransitions.Reset();
     for (int32 Index = 0; Index < ManagedLights.Num(); ++Index)
     {
@@ -443,16 +495,6 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
         if (!Data.LightComponent.IsValid())
         {
             continue;
-        }
-
-        if (!Data.bTargetLightVisibility)
-        {
-            const bool bWithinDecalRange = (Data.DecalTransitionDistanceSq == 0.0f)
-                || (Data.DecalTransitionDistanceSq > Data.CullingDistanceSq
-                    && Data.LastDistanceSq < Data.DecalTransitionDistanceSq);
-            Data.bTargetDecalVisibility = Data.TargetDecalMaterial.IsValid()
-                && Data.DecalTransitionDistanceSq >= 0.0f
-                && bWithinDecalRange;
         }
 
         const bool bNeedsTransition = (Data.bTargetLightVisibility != Data.bCurrentLightVisibility)
@@ -526,10 +568,9 @@ void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
         else if (!Data.bTargetDecalVisibility && Data.bCurrentDecalVisibility)
         {
             Data.bCurrentDecalVisibility = false;
-            if (UDecalComponent* DecalComp = Data.DecalComponent.Get(); IsValid(DecalComp))
-            {
-                DecalComp->SetVisibility(false);
-            }
+            // Release unused decal & MID memory promptly instead of retaining dormant far-LOD decals.
+            DestroyManagedDecal(Data.DecalComponent.Get());
+            Data.DecalComponent.Reset();
         }
 
         // Apply shadow casting change before or alongside light visibility.
@@ -572,7 +613,7 @@ UDecalComponent *UDynamicLightSubsystem::CreateDecalComponent(UDynamicPointLight
 
     Owner->AddInstanceComponent(NewDecal);
     NewDecal->SetMobility(EComponentMobility::Movable);
-    NewDecal->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+    NewDecal->SetupAttachment(RootComponent);
     NewDecal->SetWorldLocationAndRotation(LightComp->GetComponentLocation(), FRotator(-90.0f, 0.0f, 0.0f));
 
     const float LightRadius = FMath::Clamp(LightComp->AttenuationRadius, 1.0f, LightComp->GetMaxLightDecalSize());

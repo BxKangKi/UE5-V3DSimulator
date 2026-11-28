@@ -3,6 +3,7 @@
 #include "Widgets/SOverlay.h"
 #include "InputCoreTypes.h"
 #include "UI/BuildStatusWidget.h"
+#include "Engine/CollisionProfile.h"
 #include "UI/HUDStyle.h"
 #include "Setting/GameSettings.h"
 #include "Styling/CoreStyle.h"
@@ -609,7 +610,21 @@ TSharedRef<SWidget> UProjectEditorWidget::RebuildWidget()
             + SVerticalBox::Slot().AutoHeight().Padding(0,12)
                 [SNew(SBorder).Padding(12).BorderImage(FCoreStyle::Get().GetBrush("WhiteBrush"))
                     .BorderBackgroundColor_Lambda([this] { return FSlateColor(GetThemePalette().Panel); })
-                    [SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true).Text_Lambda([this] { return Text(Message); })]]
+                    [SNew(STextBlock).TextStyle(&EditorTextStyle).AutoWrapText(true)
+                        .ColorAndOpacity_Lambda([this]
+                        {
+                            const bool bIsError = Message.Contains(TEXT("failed"), ESearchCase::IgnoreCase)
+                                || Message.Contains(TEXT("error"), ESearchCase::IgnoreCase)
+                                || Message.Contains(TEXT("invalid"), ESearchCase::IgnoreCase)
+                                || Message.Contains(TEXT("cannot"), ESearchCase::IgnoreCase)
+                                || Message.Contains(TEXT("missing"), ESearchCase::IgnoreCase)
+                                || Message.Contains(TEXT("rejected"), ESearchCase::IgnoreCase)
+                                || Message.Contains(TEXT("unbalanced"), ESearchCase::IgnoreCase);
+                            return bIsError
+                                ? FSlateColor(FLinearColor(1.0f, 0.32f, 0.32f, 1.0f))
+                                : FSlateColor(GetThemePalette().Text);
+                        })
+                        .Text_Lambda([this] { return Text(Message); })]]
             + SVerticalBox::Slot().FillHeight(1)[SNew(SBox).IsEnabled_Lambda([this] { return !bBusy && !bFormRefreshPending; })[Body]]];
     RefreshFiles();
     RefreshForm();
@@ -3050,6 +3065,179 @@ void UProjectEditorWidget::RefreshForm()
     }
 }
 
+namespace
+{
+    TArray<FString> GetColliderKeysForType(const FString& ColType)
+    {
+        if (ColType.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+        {
+            return {TEXT("Type")};
+        }
+        if (ColType.Equals(TEXT("Sphere"), ESearchCase::IgnoreCase))
+        {
+            return {TEXT("Type"), TEXT("X"), TEXT("Y"), TEXT("Z"), TEXT("Radius")};
+        }
+        if (ColType.Equals(TEXT("Capsule"), ESearchCase::IgnoreCase))
+        {
+            return {TEXT("Type"), TEXT("X"), TEXT("Y"), TEXT("Z"), TEXT("Radius"), TEXT("Height")};
+        }
+        return {TEXT("Type"), TEXT("X"), TEXT("Y"), TEXT("Z"), TEXT("DX"), TEXT("DY"), TEXT("DZ")};
+    }
+
+    bool NormalizeColliderObject(const TSharedPtr<FJsonObject>& Obj, const FString& RequestedType = FString())
+    {
+        if (!Obj.IsValid()) return false;
+        FString ColType = RequestedType;
+        if (ColType.IsEmpty())
+        {
+            if (!Obj->TryGetStringField(TEXT("Type"), ColType) || ColType.IsEmpty())
+            {
+                ColType = TEXT("Box");
+            }
+        }
+
+        double X = 0.0, Y = 0.0, Z = 0.0;
+        const bool bHasX = Obj->TryGetNumberField(TEXT("X"), X);
+        const bool bHasY = Obj->TryGetNumberField(TEXT("Y"), Y);
+        const bool bHasZ = Obj->TryGetNumberField(TEXT("Z"), Z);
+
+        double DX = 0.0, DY = 0.0, DZ = 0.0;
+        const bool bHasDX = Obj->TryGetNumberField(TEXT("DX"), DX);
+        const bool bHasDY = Obj->TryGetNumberField(TEXT("DY"), DY);
+        const bool bHasDZ = Obj->TryGetNumberField(TEXT("DZ"), DZ);
+
+        double Radius = 0.0, Height = 0.0;
+        const bool bHasRadius = Obj->TryGetNumberField(TEXT("Radius"), Radius);
+        const bool bHasHeight = Obj->TryGetNumberField(TEXT("Height"), Height);
+
+        const TArray<FString> AllowedKeys = GetColliderKeysForType(ColType);
+        bool bNeedsUpdate = !RequestedType.IsEmpty() || (Obj->Values.Num() != AllowedKeys.Num());
+        if (!bNeedsUpdate)
+        {
+            for (const FString& K : AllowedKeys)
+            {
+                if (!Obj->HasField(K))
+                {
+                    bNeedsUpdate = true;
+                    break;
+                }
+            }
+        }
+        if (!bNeedsUpdate)
+        {
+            return false;
+        }
+
+        const auto RemoveUnused = [&Obj](const TArray<const TCHAR*>& KeysToRemove)
+        {
+            for (const TCHAR* K : KeysToRemove)
+            {
+                Obj->RemoveField(K);
+            }
+        };
+
+        Obj->SetStringField(TEXT("Type"), ColType);
+        if (ColType.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+        {
+            RemoveUnused({TEXT("X"), TEXT("Y"), TEXT("Z"), TEXT("DX"), TEXT("DY"), TEXT("DZ"), TEXT("Radius"), TEXT("Height"), TEXT("HalfHeight")});
+            return true;
+        }
+
+        if (!bHasX) Obj->SetNumberField(TEXT("X"), 0.0);
+        if (!bHasY) Obj->SetNumberField(TEXT("Y"), 0.0);
+        if (!bHasZ) Obj->SetNumberField(TEXT("Z"), 0.0);
+
+        if (ColType.Equals(TEXT("Sphere"), ESearchCase::IgnoreCase))
+        {
+            double ResolvedRadius = bHasRadius ? FMath::Abs(Radius)
+                : ((bHasDX || bHasDY || bHasDZ) ? FMath::Max3(FMath::Abs(DX), FMath::Abs(DY), FMath::Abs(DZ)) : 50.0);
+            ResolvedRadius = FMath::Max(1.0, ResolvedRadius);
+            RemoveUnused({TEXT("DX"), TEXT("DY"), TEXT("DZ"), TEXT("Height"), TEXT("HalfHeight")});
+            Obj->SetNumberField(TEXT("Radius"), ResolvedRadius);
+        }
+        else if (ColType.Equals(TEXT("Capsule"), ESearchCase::IgnoreCase))
+        {
+            double ResolvedRadius = bHasRadius ? FMath::Abs(Radius)
+                : (bHasDX && FMath::Abs(DX) > 0.0 ? FMath::Abs(DX) : 35.0);
+            ResolvedRadius = FMath::Max(1.0, ResolvedRadius);
+
+            double ResolvedHeight = 180.0;
+            if (bHasHeight && FMath::Abs(Height) > 0.0)
+            {
+                ResolvedHeight = FMath::Abs(Height);
+            }
+            else if (bHasDZ || bHasDY)
+            {
+                const double LegacyHalfH = FMath::Max(FMath::Abs(DZ), FMath::Abs(DY));
+                ResolvedHeight = LegacyHalfH > 0.0 ? LegacyHalfH * 2.0 : 180.0;
+            }
+            ResolvedHeight = FMath::Max(ResolvedRadius * 2.0, ResolvedHeight);
+
+            RemoveUnused({TEXT("DX"), TEXT("DY"), TEXT("DZ"), TEXT("HalfHeight")});
+            Obj->SetNumberField(TEXT("Radius"), ResolvedRadius);
+            Obj->SetNumberField(TEXT("Height"), ResolvedHeight);
+        }
+        else
+        {
+            const double FallbackXY = bHasRadius ? FMath::Max(1.0, FMath::Abs(Radius)) : 100.0;
+            const double FallbackZ = bHasHeight ? FMath::Max(1.0, FMath::Abs(Height) * 0.5) : FallbackXY;
+            const double ResolvedDX = bHasDX ? FMath::Max(1.0, FMath::Abs(DX)) : FallbackXY;
+            const double ResolvedDY = bHasDY ? FMath::Max(1.0, FMath::Abs(DY)) : FallbackXY;
+            const double ResolvedDZ = bHasDZ ? FMath::Max(1.0, FMath::Abs(DZ)) : FallbackZ;
+
+            RemoveUnused({TEXT("Radius"), TEXT("Height"), TEXT("HalfHeight")});
+            Obj->SetNumberField(TEXT("DX"), ResolvedDX);
+            Obj->SetNumberField(TEXT("DY"), ResolvedDY);
+            Obj->SetNumberField(TEXT("DZ"), ResolvedDZ);
+        }
+        return true;
+    }
+
+    void EnforceColliderConstraints(const TSharedPtr<FJsonObject>& Obj, const FString& EditedKey)
+    {
+        if (!Obj.IsValid()) return;
+        FString ColType;
+        Obj->TryGetStringField(TEXT("Type"), ColType);
+        if (EditedKey == TEXT("Radius"))
+        {
+            double R = 1.0;
+            if (Obj->TryGetNumberField(TEXT("Radius"), R))
+            {
+                R = FMath::Max(1.0, FMath::Abs(R));
+                Obj->SetNumberField(TEXT("Radius"), R);
+                if (ColType.Equals(TEXT("Capsule"), ESearchCase::IgnoreCase))
+                {
+                    double H = 0.0;
+                    if (!Obj->TryGetNumberField(TEXT("Height"), H) || H < R * 2.0)
+                    {
+                        Obj->SetNumberField(TEXT("Height"), R * 2.0);
+                    }
+                }
+            }
+        }
+        else if (EditedKey == TEXT("Height") && ColType.Equals(TEXT("Capsule"), ESearchCase::IgnoreCase))
+        {
+            double R = 35.0;
+            Obj->TryGetNumberField(TEXT("Radius"), R);
+            R = FMath::Max(1.0, FMath::Abs(R));
+            double H = R * 2.0;
+            if (Obj->TryGetNumberField(TEXT("Height"), H))
+            {
+                H = FMath::Max(R * 2.0, FMath::Abs(H));
+                Obj->SetNumberField(TEXT("Height"), H);
+            }
+        }
+        else if (EditedKey == TEXT("DX") || EditedKey == TEXT("DY") || EditedKey == TEXT("DZ"))
+        {
+            double V = 1.0;
+            if (Obj->TryGetNumberField(EditedKey, V))
+            {
+                Obj->SetNumberField(EditedKey, FMath::Max(1.0, FMath::Abs(V)));
+            }
+        }
+    }
+}
+
 void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, const TSharedPtr<FJsonObject>& Suggested,
     const TSharedRef<SVerticalBox>& Box, int32 Depth, const FString& Context, const FString& PathPrefix)
 {
@@ -3058,9 +3246,19 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
     const V3DHUDStyle::FAuthoringPalette Palette = GetThemePalette();
     const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush("WhiteBrush");
     TArray<FString> Keys;
-    for (const auto& Pair : Object->Values) Keys.Add(FString(Pair.Key));
-    if (Suggested) for (const auto& Pair : Suggested->Values) Keys.AddUnique(FString(Pair.Key));
-    Keys.Sort();
+    if (Context == TEXT("Colliders"))
+    {
+        NormalizeColliderObject(Object);
+        FString ColType = TEXT("Box");
+        Object->TryGetStringField(TEXT("Type"), ColType);
+        Keys = GetColliderKeysForType(ColType);
+    }
+    else
+    {
+        for (const auto& Pair : Object->Values) Keys.Add(FString(Pair.Key));
+        if (Suggested) for (const auto& Pair : Suggested->Values) Keys.AddUnique(FString(Pair.Key));
+        Keys.Sort();
+    }
 
     int32 RowIndex = 0;
     for (const auto& Key : Keys)
@@ -3168,7 +3366,9 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                 return false;
             }
 
-            if (Context == TEXT("Colliders") && Key == TEXT("Type")) return true;
+            if (Context == TEXT("Colliders")
+                && (Key == TEXT("Type") || Key == TEXT("DX") || Key == TEXT("DY") || Key == TEXT("DZ")
+                    || Key == TEXT("Radius") || Key == TEXT("Height"))) return true;
             if (Context == TEXT("Lights") && (Key == TEXT("Type") || Key == TEXT("Unit"))) return true;
             if (Context == TEXT("Biomes") && (Key == TEXT("Name") || Key == TEXT("Shape"))) return true;
             if ((Context == TEXT("EquipmentInteraction") || Context == TEXT("CharacterInteraction"))
@@ -3382,7 +3582,8 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             || Key == TEXT("DynamicType") || Key == TEXT("ItemType") || Key == TEXT("VehicleType") || Key == TEXT("ProjectType")
             || Key == TEXT("DominantHand") || Key == TEXT("PrimaryHandOverride") || Key == TEXT("Hand")
             || Key == TEXT("Role") || Key == TEXT("Falloff") || Key == TEXT("Shape")
-            || Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode") || (Context == TEXT("Colliders") && Key == TEXT("Type")) || (Context == TEXT("Lights") && Key == TEXT("Unit")))
+            || Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode") || Key == TEXT("CollisionProfile")
+            || (Context == TEXT("Colliders") && Key == TEXT("Type")) || (Context == TEXT("Lights") && (Key == TEXT("Type") || Key == TEXT("Unit"))))
         {
             auto Options = MakeShared<TArray<TSharedPtr<FString>>>();
             FString DisplayValue = ValueText(Value);
@@ -3401,14 +3602,43 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             else if (Key == TEXT("Shape")) Names = {TEXT("Box"), TEXT("Sphere")};
             else if (Key == TEXT("FrictionCombineMode") || Key == TEXT("RestitutionCombineMode")) Names = {TEXT("Average"), TEXT("Min"), TEXT("Multiply"), TEXT("Max")};
             else if (Context == TEXT("Colliders") && Key == TEXT("Type")) Names = {TEXT("None"), TEXT("Sphere"), TEXT("Capsule"), TEXT("Box")};
+            else if (Context == TEXT("Lights") && Key == TEXT("Type")) Names = {TEXT("Point"), TEXT("Spot"), TEXT("Rect")};
             else if (Context == TEXT("Lights") && Key == TEXT("Unit")) Names = {TEXT("Unitless"), TEXT("Candelas"), TEXT("Lumens"), TEXT("EV")};
+            else if (Key == TEXT("CollisionProfile"))
+            {
+                if (const UCollisionProfile* Profiles = UCollisionProfile::Get())
+                {
+                    TArray<TSharedPtr<FName>> ProfileNames;
+                    Profiles->GetProfileNames(ProfileNames);
+                    for (const TSharedPtr<FName>& ProfileName : ProfileNames)
+                    {
+                        if (ProfileName.IsValid() && !ProfileName->IsNone())
+                        {
+                            Names.AddUnique(ProfileName->ToString());
+                        }
+                    }
+                }
+                if (Names.IsEmpty())
+                {
+                    Names = {TEXT("NoCollision"), TEXT("BlockAll"), TEXT("BlockAllDynamic"), TEXT("OverlapAll"),
+                        TEXT("OverlapAllDynamic"), TEXT("IgnoreOnlyPawn"), TEXT("OverlapOnlyPawn"), TEXT("Pawn"),
+                        TEXT("CharacterMesh"), TEXT("PhysicsActor"), TEXT("Vehicle"), TEXT("Trigger"), TEXT("Ragdoll")};
+                }
+                if (!DisplayValue.IsEmpty()) Names.AddUnique(DisplayValue);
+            }
             for (const auto& Name : Names) Options->Add(MakeShared<FString>(Name));
             PairCardBody->AddSlot().AutoHeight()[SNew(SComboBox<TSharedPtr<FString>>).ComboBoxStyle(&EditorComboStyle).ItemStyle(&EditorRowStyle).OptionsSource(&Options.Get())
                 .OnGenerateWidget_Lambda([this, Options](TSharedPtr<FString> Item) { return SNew(STextBlock).TextStyle(&EditorTextStyle).Text(Item.IsValid() ? Text(*Item) : FText::GetEmpty()); })
-                .OnSelectionChanged_Lambda([this, Object, Key, Options](TSharedPtr<FString> Item, ESelectInfo::Type Info)
+                .OnSelectionChanged_Lambda([this, Object, Key, Context, Options](TSharedPtr<FString> Item, ESelectInfo::Type Info)
                 {
                     if (!Item || bBusy || bRawDirty || bRebuildingForm || bFormRefreshPending || Info == ESelectInfo::Direct) return;
                     Remember(); Object->SetStringField(Key, *Item);
+                    if (Context == TEXT("Colliders") && Key == TEXT("Type"))
+                    {
+                        NormalizeColliderObject(Object, *Item);
+                        Changed();
+                        return;
+                    }
                     // Keep mutually exclusive discriminators and sub-configs consistent.
                     if (Key == TEXT("AssetType") && *Item == TEXT("Sound")) Object->RemoveField(TEXT("ModelType"));
                     if (Key == TEXT("ModelType") && *Item != TEXT("Dynamic"))
@@ -3476,7 +3706,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
             const bool IsString = ExpectedType == EJson::String;
             TWeakObjectPtr<UProjectEditorWidget> WeakInputSelf(this);
             auto InputWidget = SNew(SEditableTextBox).Style(&EditorInputStyle).Text(Text(ValueText(Value)))
-                .OnTextCommitted_Lambda([WeakInputSelf, Object, Key, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
+                .OnTextCommitted_Lambda([WeakInputSelf, Object, Key, Context, IsString, ExpectedType](const FText& TextValue, ETextCommit::Type)
                 {
                     UProjectEditorWidget* Self = WeakInputSelf.Get();
                     if (!IsValid(Self)) return;
@@ -3501,7 +3731,9 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                             return;
                         }
                     }
-                    Self->Remember(); Object->SetField(Key, *Found); Self->Changed();
+                    Self->Remember(); Object->SetField(Key, *Found);
+                    if (Context == TEXT("Colliders")) EnforceColliderConstraints(Object, Key);
+                    Self->Changed();
                 });
 
             if (ExpectedType == EJson::Number)
@@ -3512,13 +3744,17 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                 else if (Key == TEXT("AttenuationRadius") || Key == TEXT("RadiusCm") || Key == TEXT("Range")) StepSize = 50.0;
                 else if (Key == TEXT("X") || Key == TEXT("Y") || Key == TEXT("Z")
                     || Key == TEXT("DX") || Key == TEXT("DY") || Key == TEXT("DZ")
+                    || Key == TEXT("Radius") || Key == TEXT("Height")
                     || Key == TEXT("Pitch") || Key == TEXT("Yaw") || Key == TEXT("Roll")
-                    || Key == TEXT("SourceRadius") || Key == TEXT("SoftSourceRadius") || Key == TEXT("Length")) StepSize = 5.0;
+                    || Key == TEXT("SourceRadius") || Key == TEXT("SoftSourceRadius") || Key == TEXT("Length")
+                    || Key == TEXT("InnerConeAngle") || Key == TEXT("OuterConeAngle")
+                    || Key == TEXT("SourceWidth") || Key == TEXT("SourceHeight")
+                    || Key == TEXT("BarnDoorAngle") || Key == TEXT("BarnDoorLength")) StepSize = 5.0;
 
                 TWeakObjectPtr<UProjectEditorWidget> WeakNudgeSelf(this);
-                auto MakeNudge = [WeakNudgeSelf, Object, Key](const double Delta)
+                auto MakeNudge = [WeakNudgeSelf, Object, Key, Context](const double Delta)
                 {
-                    return [WeakNudgeSelf, Object, Key, Delta]
+                    return [WeakNudgeSelf, Object, Key, Context, Delta]
                     {
                         UProjectEditorWidget* Self = WeakNudgeSelf.Get();
                         if (!Self || Self->bBusy || Self->bRawDirty || Self->bRebuildingForm || Self->bFormRefreshPending) return;
@@ -3526,6 +3762,7 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
                         if (!Object->TryGetNumberField(Key, CurVal) || !FMath::IsFinite(CurVal)) return;
                         Self->Remember();
                         Object->SetNumberField(Key, FMath::RoundToDouble((CurVal + Delta) * 1000.0) / 1000.0);
+                        if (Context == TEXT("Colliders")) EnforceColliderConstraints(Object, Key);
                         Self->Changed();
                     };
                 };
@@ -3562,6 +3799,8 @@ void UProjectEditorWidget::AddObject(const TSharedPtr<FJsonObject>& Object, cons
         ];
         ++RowIndex;
     }
+
+    if (Context == TEXT("Colliders")) return;
 
     auto NewType = MakeShared<FString>(TEXT("String"));
     auto Types = MakeShared<TArray<TSharedPtr<FString>>>();

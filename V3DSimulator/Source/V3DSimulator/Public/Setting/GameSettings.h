@@ -53,6 +53,13 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Editor")
     bool bEditorDarkMode = false;
 
+    UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category="Graphics")
+    bool bVSyncEnabled = false;
+
+    /** 0 = Unlimited, otherwise target FPS cap (30, 60, 90, 120, 144, 165, 240). */
+    UPROPERTY(Config, EditAnywhere, BlueprintReadWrite, Category="Graphics")
+    int32 FrameRateLimit = 0;
+
     UFUNCTION(BlueprintPure, Category="Settings|Input")
     FKey GetKeyMappingOverride(FName ActionId) const;
 

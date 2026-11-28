@@ -82,6 +82,9 @@ ACharacterController::ACharacterController(const FObjectInitializer& ObjectIniti
     SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("SpringArm"));
     SpringArm->SetupAttachment(RootComponent);
     SpringArm->bUsePawnControlRotation = true;
+    SpringArm->PrimaryComponentTick.TickGroup = TG_PostPhysics;
+    SpringArm->bUseCameraLagSubstepping = true;
+    SpringArm->CameraLagMaxTimeStep = 1.0f / 120.0f;
     FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
     FollowCamera->SetupAttachment(SpringArm);
     FollowCamera->bUsePawnControlRotation = false;
@@ -1055,7 +1058,12 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
     }
     else
     {
-        constexpr float PhysicsStateAuditIntervalSeconds = 1.0f;
+        if (USkeletalMeshComponent* MeshCompForHair = GetMesh(); IsValid(MeshCompForHair))
+        {
+            UCharacterFunctionLibrary::StabilizeSecondaryPhysicsBodies(*MeshCompForHair, GetVelocity(), DeltaSeconds);
+        }
+
+        constexpr float PhysicsStateAuditIntervalSeconds = 5.0f;
         PhysicsStateAuditAccumulator += FMath::Max(0.0f, DeltaSeconds);
         const bool bRunSafetyAudit = PhysicsStateAuditAccumulator >= PhysicsStateAuditIntervalSeconds;
         if (bNeedsPostRagdollCleanup || bRunSafetyAudit)
@@ -1069,11 +1077,10 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
                 {
                     UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
                 }
-                else
+                else if (bNeedsPostRagdollCleanup)
                 {
-                    // Secondary chains are an always-on partial-physics subsystem. Reasserting the
-                    // split during the low-frequency audit repairs any body state lost to async
-                    // physics-state recreation without waking settled bodies or resetting velocity.
+                    // Reassert the secondary-chain split after ragdoll transitions without
+                    // mutating every body/constraint on healthy frames.
                     UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(*MeshComp);
                 }
 

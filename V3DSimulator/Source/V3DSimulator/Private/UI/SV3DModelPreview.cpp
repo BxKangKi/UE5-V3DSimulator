@@ -355,21 +355,45 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
                     const FVector ColSize = ReadJsonVec(ColObj, TEXT("D"), 50.0);
                     if (ColType.Equals(TEXT("Sphere"), ESearchCase::IgnoreCase))
                     {
-                        const float R = static_cast<float>(FMath::Max3(FMath::Abs(ColSize.X), FMath::Abs(ColSize.Y), FMath::Abs(ColSize.Z)));
-                        AddSphereLines(ColCenter, R > 0.f ? R : 50.f, NodeXform, ColliderColor, 1.8f, Bounds);
+                        double RadiusVal = 0.0;
+                        if (!ColObj->TryGetNumberField(TEXT("Radius"), RadiusVal))
+                        {
+                            RadiusVal = FMath::Max3(FMath::Abs(ColSize.X), FMath::Abs(ColSize.Y), FMath::Abs(ColSize.Z));
+                        }
+                        const float R = static_cast<float>(FMath::Max(1.0, FMath::Abs(RadiusVal)));
+                        AddSphereLines(ColCenter, R, NodeXform, ColliderColor, 1.8f, Bounds);
                     }
                     else if (ColType.Equals(TEXT("Capsule"), ESearchCase::IgnoreCase))
                     {
-                        const float R = static_cast<float>(FMath::Max(1.0, FMath::Abs(ColSize.X)));
-                        const float HalfH = static_cast<float>(FMath::Max(static_cast<double>(R), FMath::Abs(ColSize.Z)));
+                        double RadiusVal = 35.0;
+                        if (!ColObj->TryGetNumberField(TEXT("Radius"), RadiusVal))
+                        {
+                            RadiusVal = FMath::Abs(ColSize.X);
+                        }
+                        double HalfHVal = 90.0;
+                        double HeightVal = 0.0;
+                        if (ColObj->TryGetNumberField(TEXT("Height"), HeightVal))
+                        {
+                            HalfHVal = FMath::Abs(HeightVal) * 0.5;
+                        }
+                        else if (ColObj->TryGetNumberField(TEXT("HalfHeight"), HalfHVal))
+                        {
+                            HalfHVal = FMath::Abs(HalfHVal);
+                        }
+                        else
+                        {
+                            HalfHVal = FMath::Max(FMath::Abs(ColSize.Z), FMath::Abs(ColSize.Y));
+                        }
+                        const float R = static_cast<float>(FMath::Max(1.0, FMath::Abs(RadiusVal)));
+                        const float HalfH = static_cast<float>(FMath::Max(static_cast<double>(R), HalfHVal));
                         AddCapsuleLines(ColCenter, R, HalfH, NodeXform, ColliderColor, 1.8f, Bounds);
                     }
                     else
                     {
                         const FVector HalfExtents(
-                            FMath::Max(1.0, FMath::Abs(ColSize.X) * 0.5),
-                            FMath::Max(1.0, FMath::Abs(ColSize.Y) * 0.5),
-                            FMath::Max(1.0, FMath::Abs(ColSize.Z) * 0.5));
+                            FMath::Max(1.0, FMath::Abs(ColSize.X)),
+                            FMath::Max(1.0, FMath::Abs(ColSize.Y)),
+                            FMath::Max(1.0, FMath::Abs(ColSize.Z)));
                         AddBoxLines(ColCenter, HalfExtents, NodeXform, ColliderColor, 1.8f, Bounds);
                     }
                     const FVector WorldLabelPos = NodeXform.TransformPosition(ColCenter);
@@ -387,7 +411,13 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
                     if (!Val.IsValid() || Val->Type != EJson::Object) continue;
                     const TSharedPtr<FJsonObject> LightObj = Val->AsObject();
 
+                    FString LightType = TEXT("Point");
+                    LightObj->TryGetStringField(TEXT("Type"), LightType);
                     const FVector LightLoc = ReadJsonVec(LightObj, TEXT(""), 0.0);
+                    const FRotator LightRot(
+                        ReadJsonNum(LightObj, TEXT("Pitch"), 0.0),
+                        ReadJsonNum(LightObj, TEXT("Yaw"), 0.0),
+                        ReadJsonNum(LightObj, TEXT("Roll"), 0.0));
                     const float Intensity = static_cast<float>(ReadJsonNum(LightObj, TEXT("Intensity"), 10.0));
                     const float SourceRadius = static_cast<float>(ReadJsonNum(LightObj, TEXT("SourceRadius"), 10.0));
                     const float AttenRadius = static_cast<float>(ReadJsonNum(LightObj, TEXT("AttenuationRadius"), 1000.0));
@@ -396,22 +426,59 @@ void SV3DModelPreview::SetOverlaysFromJson(const TSharedPtr<FJsonObject>& Json)
                     LightObj->TryGetStringField(TEXT("Unit"), Unit);
 
                     const FVector WorldLightLoc = NodeXform.TransformPosition(LightLoc);
+                    const FQuat LightQuat = NodeXform.GetRotation() * LightRot.Quaternion();
                     AddCrossMarker(WorldLightLoc, FMath::Max(6.f, GizmoScale * 0.45f), LightCoreColor, Bounds);
-                    if (SourceRadius > 0.5f)
+                    if (LightType.Equals(TEXT("Spot"), ESearchCase::IgnoreCase))
                     {
-                        AddSphereLines(LightLoc, SourceRadius, NodeXform, LightCoreColor, 1.6f, Bounds, 14);
+                        const float OuterDeg = FMath::Clamp(static_cast<float>(ReadJsonNum(LightObj, TEXT("OuterConeAngle"), 44.0)), 1.0f, 80.0f);
+                        const float ConeLen = FMath::Clamp(AttenRadius, 40.0f, 600.0f);
+                        const float ConeRad = ConeLen * FMath::Tan(FMath::DegreesToRadians(OuterDeg));
+                        const FVector Fwd = LightQuat.GetAxisX();
+                        const FVector Right = LightQuat.GetAxisY();
+                        const FVector Up = LightQuat.GetAxisZ();
+                        const FVector BaseCenter = WorldLightLoc + Fwd * ConeLen;
+                        constexpr int32 Segs = 16;
+                        FVector PrevPt = BaseCenter + Right * ConeRad;
+                        for (int32 s = 1; s <= Segs; ++s)
+                        {
+                            const float Ang = (2.0f * PI * s) / Segs;
+                            const FVector Pt = BaseCenter + (Right * FMath::Cos(Ang) + Up * FMath::Sin(Ang)) * ConeRad;
+                            OverlayLines.Add({PrevPt, Pt, LightAttenColor, 1.3f});
+                            if (s % 4 == 0) OverlayLines.Add({WorldLightLoc, Pt, LightCoreColor, 1.5f});
+                            PrevPt = Pt;
+                        }
                     }
-                    if (AttenRadius > 1.f)
+                    else if (LightType.Equals(TEXT("Rect"), ESearchCase::IgnoreCase))
                     {
-                        AddSphereLines(LightLoc, AttenRadius, NodeXform, LightAttenColor, 1.0f, Bounds, 20);
+                        const float HalfW = FMath::Max(1.0f, static_cast<float>(ReadJsonNum(LightObj, TEXT("SourceWidth"), 64.0)) * 0.5f);
+                        const float HalfH = FMath::Max(1.0f, static_cast<float>(ReadJsonNum(LightObj, TEXT("SourceHeight"), 64.0)) * 0.5f);
+                        const FVector Fwd = LightQuat.GetAxisX();
+                        const FVector Right = LightQuat.GetAxisY();
+                        const FVector Up = LightQuat.GetAxisZ();
+                        const FVector C0 = WorldLightLoc - Right * HalfW - Up * HalfH;
+                        const FVector C1 = WorldLightLoc + Right * HalfW - Up * HalfH;
+                        const FVector C2 = WorldLightLoc + Right * HalfW + Up * HalfH;
+                        const FVector C3 = WorldLightLoc - Right * HalfW + Up * HalfH;
+                        OverlayLines.Add({C0, C1, LightCoreColor, 2.0f});
+                        OverlayLines.Add({C1, C2, LightCoreColor, 2.0f});
+                        OverlayLines.Add({C2, C3, LightCoreColor, 2.0f});
+                        OverlayLines.Add({C3, C0, LightCoreColor, 2.0f});
+                        OverlayLines.Add({WorldLightLoc, WorldLightLoc + Fwd * FMath::Max(40.0f, FMath::Min(AttenRadius * 0.25f, 200.0f)), LightAttenColor, 1.8f});
                     }
-                    if (Length > 0.5f)
+                    else
                     {
-                        const FVector L0 = NodeXform.TransformPosition(LightLoc - FVector(Length * 0.5f, 0, 0));
-                        const FVector L1 = NodeXform.TransformPosition(LightLoc + FVector(Length * 0.5f, 0, 0));
-                        OverlayLines.Add({L0, L1, LightCoreColor, 2.5f});
+                        if (SourceRadius > 0.5f)
+                            AddSphereLines(LightLoc, SourceRadius, NodeXform, LightCoreColor, 1.6f, Bounds, 14);
+                        if (AttenRadius > 1.f)
+                            AddSphereLines(LightLoc, AttenRadius, NodeXform, LightAttenColor, 1.0f, Bounds, 20);
+                        if (Length > 0.5f)
+                        {
+                            const FVector L0 = NodeXform.TransformPosition(LightLoc - FVector(Length * 0.5f, 0, 0));
+                            const FVector L1 = NodeXform.TransformPosition(LightLoc + FVector(Length * 0.5f, 0, 0));
+                            OverlayLines.Add({L0, L1, LightCoreColor, 2.5f});
+                        }
                     }
-                    OverlayLabels.Add({WorldLightLoc, FString::Printf(TEXT("Light[%d] %.0f %s (%s)"), Idx, Intensity, *Unit, *NodeKey), LightCoreColor});
+                    OverlayLabels.Add({WorldLightLoc, FString::Printf(TEXT("Light[%d] %s %.0f %s (%s)"), Idx, *LightType, Intensity, *Unit, *NodeKey), LightCoreColor});
                 }
             }
         }

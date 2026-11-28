@@ -32,11 +32,18 @@ namespace SecondaryPhysicsTuning
     // One gram per hair body, independent of imported collider volume/scale.
     // Keep this strictly positive so Chaos can compute inverse mass/inertia.
     constexpr float HairBodyMassKg = 0.001f;
-    // Moderate damping: retain secondary motion, but settle faster after a turn.
-    constexpr float HairLinearDamping = 0.75f;
-    constexpr float HairAngularDamping = 3.0f;
+    // Smooth aerodynamic drag + rotational damping to prevent whipping/popping during fast travel.
+    constexpr float HairLinearDamping = 3.5f;
+    constexpr float HairAngularDamping = 8.0f;
+    constexpr float HairMaxAngularVelocityDeg = 220.0f;
+    constexpr float HairMaxDepenetrationVelocity = 40.0f;
+    constexpr float HairMaxRelativeLinearSpeedCmPerSec = 260.0f;
     constexpr float HairSwingLimitDegrees = 30.0f;
     constexpr float HairTwistLimitDegrees = 18.0f;
+    constexpr float HairAngularDriveStiffness = 28.0f;
+    constexpr float HairAngularDriveDamping = 6.0f;
+    constexpr float HairSoftLimitStiffness = 45.0f;
+    constexpr float HairSoftLimitDamping = 9.0f;
     constexpr float DynamicSwingLimitDegrees = 32.0f;
     constexpr float DynamicTwistLimitDegrees = 20.0f;
 }
@@ -301,6 +308,8 @@ void UCharacterFunctionLibrary::ConfigureHairPhysics(USkeletalMeshComponent& Ske
             Body->SetMassOverride(SecondaryPhysicsTuning::HairBodyMassKg, true);
             Body->UpdateMassProperties();
         }
+        Body->SetMaxAngularVelocityInRadians(FMath::DegreesToRadians(SecondaryPhysicsTuning::HairMaxAngularVelocityDeg), false, true);
+        Body->SetMaxDepenetrationVelocity(SecondaryPhysicsTuning::HairMaxDepenetrationVelocity);
     }
 
     for (const UPhysicsConstraintTemplate* Template : Asset->ConstraintSetup)
@@ -321,6 +330,15 @@ void UCharacterFunctionLibrary::ConfigureHairPhysics(USkeletalMeshComponent& Ske
             if (Joint->GetAngularTwistMotion() == ACM_Limited
                 && Joint->GetAngularTwistLimit() > SecondaryPhysicsTuning::HairTwistLimitDegrees)
                 Joint->SetAngularTwistLimit(ACM_Limited, SecondaryPhysicsTuning::HairTwistLimitDegrees);
+            Joint->SetAngularDriveMode(EAngularDriveMode::SLERP);
+            Joint->SetOrientationDriveSLERP(true);
+            Joint->SetAngularVelocityDriveSLERP(true);
+            Joint->SetAngularDriveParams(
+                SecondaryPhysicsTuning::HairAngularDriveStiffness,
+                SecondaryPhysicsTuning::HairAngularDriveDamping,
+                0.0f);
+            Joint->SetAngularOrientationTarget(FQuat::Identity);
+            Joint->SetAngularVelocityTarget(FVector::ZeroVector);
             Joint->SetContactTransferScale(0.0f);
             Joint->SetDisableCollision(true);
         }
@@ -418,6 +436,8 @@ void UCharacterFunctionLibrary::SetBodiesBelowPhysics(
     SkeletalMesh.bSkipKinematicUpdateWhenInterpolating = false;
     SkeletalMesh.bUpdateMeshWhenKinematic = false;
     SkeletalMesh.bUpdateJointsFromAnimation = false;
+    SkeletalMesh.SetTeleportDistanceThreshold(300.0f);
+    SkeletalMesh.SetTeleportRotationThreshold(90.0f);
 
     TArray<FName> HairRoots;
     SecondaryMotionRouting::GatherHairPhysicsRoots(SkeletalMesh, HairRoots);
@@ -504,6 +524,80 @@ void UCharacterFunctionLibrary::PrepareHairForRagdoll(
 void UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(USkeletalMeshComponent &SkeletalMesh)
 {
     SetBodiesBelowPhysics(SkeletalMesh, false);
+}
+
+void UCharacterFunctionLibrary::StabilizeSecondaryPhysicsBodies(
+    USkeletalMeshComponent &SkeletalMesh,
+    const FVector &ReferenceLinearVelocity,
+    const float DeltaSeconds)
+{
+    if (!IsInGameThread() || SkeletalMesh.Bodies.IsEmpty())
+    {
+        return;
+    }
+
+    const FVector SafeRefVel = ReferenceLinearVelocity.ContainsNaN() ? FVector::ZeroVector : ReferenceLinearVelocity;
+    const double RefSpeedSq = SafeRefVel.SizeSquared();
+    const double MaxRelSpeed = SecondaryPhysicsTuning::HairMaxRelativeLinearSpeedCmPerSec;
+    const double MaxRelSpeedSq = MaxRelSpeed * MaxRelSpeed;
+    const double MaxAngRad = FMath::DegreesToRadians(SecondaryPhysicsTuning::HairMaxAngularVelocityDeg);
+    const double MaxAngRadSq = MaxAngRad * MaxAngRad;
+
+    // During high-speed locomotion (sprint, flying, vehicle, rapid camera/turn bursts), gently blend
+    // secondary bodies into the character's velocity frame so hair streams smoothly instead of snapping.
+    const float HighSpeedBlendAlpha = (RefSpeedSq > 360000.0 && DeltaSeconds > 0.0f) // > 600 cm/s
+        ? FMath::Clamp(DeltaSeconds * 10.0f, 0.0f, 0.55f)
+        : 0.0f;
+
+    for (FBodyInstance* Body : SkeletalMesh.Bodies)
+    {
+        if (!Body || !Body->IsValidBodyInstance() || !Body->IsInstanceSimulatingPhysics())
+        {
+            continue;
+        }
+
+        FVector Vel = Body->GetUnrealWorldVelocity();
+        bool bDirtyVel = false;
+        if (Vel.ContainsNaN())
+        {
+            Vel = SafeRefVel;
+            bDirtyVel = true;
+        }
+        else
+        {
+            if (HighSpeedBlendAlpha > 0.0f)
+            {
+                Vel = FMath::Lerp(Vel, SafeRefVel, HighSpeedBlendAlpha);
+                bDirtyVel = true;
+            }
+            const FVector RelVel = Vel - SafeRefVel;
+            const double RelSpeedSq = RelVel.SizeSquared();
+            if (RelSpeedSq > MaxRelSpeedSq)
+            {
+                const double Scale = MaxRelSpeed / FMath::Sqrt(RelSpeedSq);
+                Vel = SafeRefVel + RelVel * Scale;
+                bDirtyVel = true;
+            }
+        }
+        if (bDirtyVel)
+        {
+            Body->SetLinearVelocity(Vel, false, false);
+        }
+
+        FVector AngVel = Body->GetUnrealWorldAngularVelocityInRadians();
+        if (AngVel.ContainsNaN())
+        {
+            Body->SetAngularVelocityInRadians(FVector::ZeroVector, false, false);
+        }
+        else
+        {
+            const double AngSq = AngVel.SizeSquared();
+            if (AngSq > MaxAngRadSq)
+            {
+                Body->SetAngularVelocityInRadians(AngVel * (MaxAngRad / FMath::Sqrt(AngSq)), false, false);
+            }
+        }
+    }
 }
 
 void UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(USkeletalMeshComponent &SkeletalMesh)
@@ -950,12 +1044,12 @@ void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
 
             BodySetup->DefaultInstance.InertiaTensorScale = FVector(1.0f);
             BodySetup->DefaultInstance.bOverrideMaxAngularVelocity = true;
-            BodySetup->DefaultInstance.MaxAngularVelocity = 720.0f;
-            BodySetup->DefaultInstance.SetMaxDepenetrationVelocity(120.0f);
+            BodySetup->DefaultInstance.MaxAngularVelocity = SecondaryPhysicsTuning::HairMaxAngularVelocityDeg;
+            BodySetup->DefaultInstance.SetMaxDepenetrationVelocity(SecondaryPhysicsTuning::HairMaxDepenetrationVelocity);
             BodySetup->DefaultInstance.SetOverrideIterationCounts(true);
-            BodySetup->DefaultInstance.SetPositionSolverIterationCount(8);
-            BodySetup->DefaultInstance.SetVelocitySolverIterationCount(2);
-            BodySetup->DefaultInstance.SetProjectionSolverIterationCount(1);
+            BodySetup->DefaultInstance.SetPositionSolverIterationCount(10);
+            BodySetup->DefaultInstance.SetVelocitySolverIterationCount(4);
+            BodySetup->DefaultInstance.SetProjectionSolverIterationCount(2);
             BodySetup->DefaultInstance.SleepFamily = ESleepFamily::Sensitive;
 
             const bool bIsAnchor = BoneIndex == RootBoneIndex;
@@ -1111,7 +1205,23 @@ void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
         DefaultInstance.SetDisableCollision(true);
         // Hair is a visual secondary chain, never a source of force for the character ragdoll.
         DefaultInstance.ProfileInstance.bParentDominates = bHairChain;
-        if (bHairChain) DefaultInstance.ProfileInstance.ContactTransferScale = 0.0f;
+        if (bHairChain)
+        {
+            DefaultInstance.ProfileInstance.ContactTransferScale = 0.0f;
+            DefaultInstance.ProfileInstance.ConeLimit.bSoftConstraint = true;
+            DefaultInstance.ProfileInstance.ConeLimit.Stiffness = SecondaryPhysicsTuning::HairSoftLimitStiffness;
+            DefaultInstance.ProfileInstance.ConeLimit.Damping = SecondaryPhysicsTuning::HairSoftLimitDamping;
+            DefaultInstance.ProfileInstance.TwistLimit.bSoftConstraint = true;
+            DefaultInstance.ProfileInstance.TwistLimit.Stiffness = SecondaryPhysicsTuning::HairSoftLimitStiffness;
+            DefaultInstance.ProfileInstance.TwistLimit.Damping = SecondaryPhysicsTuning::HairSoftLimitDamping;
+            DefaultInstance.SetAngularDriveMode(EAngularDriveMode::SLERP);
+            DefaultInstance.SetOrientationDriveSLERP(true);
+            DefaultInstance.SetAngularVelocityDriveSLERP(true);
+            DefaultInstance.SetAngularDriveParams(
+                SecondaryPhysicsTuning::HairAngularDriveStiffness,
+                SecondaryPhysicsTuning::HairAngularDriveDamping,
+                0.0f);
+        }
         DefaultInstance.EnableProjection();
 #if WITH_EDITOR
         NewConstraint->SetDefaultProfile(DefaultInstance);

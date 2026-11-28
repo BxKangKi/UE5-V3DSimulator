@@ -34,7 +34,12 @@
 #include "glTFRuntimeParser.h"
 #include "Materials/MaterialInterface.h"
 #include "HAL/PlatformTime.h"
+#include "Components/LocalLightComponent.h"
+#include "Components/RectLightComponent.h"
+#include "Components/SpotLightComponent.h"
+#include "Model/DynamicPointLightComponent.h"
 #include "Model/InstancedEntitySubsystem.h"
+#include "Model/ModelData.h"
 #include "Model/V3DMaterialOverrideUtils.h"
 #include "Simulator/RuntimeModelResolver.h"
 #include "Setting/GameSettings.h"
@@ -307,6 +312,8 @@ AVehiclePawn::AVehiclePawn()
 
     SpringArm = CreateDefaultSubobject<USpringArmComponent>(TEXT("VehicleSpringArm"));
     SpringArm->SetupAttachment(Body);
+    SpringArm->PrimaryComponentTick.TickGroup = TG_PostPhysics;
+    SpringArm->AddTickPrerequisiteComponent(Body);
     SpringArm->TargetArmLength = 550.0f;
     SpringArm->SetRelativeRotation(FRotator(-12.0f, 0.0f, 0.0f));
     SpringArm->bUsePawnControlRotation = true;
@@ -314,9 +321,12 @@ AVehiclePawn::AVehiclePawn()
     SpringArm->bInheritYaw = true;
     SpringArm->bInheritRoll = false;
     SpringArm->bEnableCameraLag = true;
-    SpringArm->CameraLagSpeed = 8.0f;
+    SpringArm->CameraLagSpeed = 24.0f;
+    SpringArm->CameraLagMaxDistance = 85.0f;
+    SpringArm->bUseCameraLagSubstepping = true;
+    SpringArm->CameraLagMaxTimeStep = 1.0f / 120.0f;
     SpringArm->bEnableCameraRotationLag = true;
-    SpringArm->CameraRotationLagSpeed = 12.0f;
+    SpringArm->CameraRotationLagSpeed = 18.0f;
 
     Camera = CreateDefaultSubobject<UCameraComponent>(TEXT("VehicleCamera"));
     Camera->SetupAttachment(SpringArm, USpringArmComponent::SocketName);
@@ -602,19 +612,13 @@ void AVehiclePawn::RunVehiclePhysicsSteps(float DeltaSeconds)
     // Keep the total simulated time instead of dropping long frames. The step size is bounded so
     // tire/suspension smoothing, input smoothing, and impulse integration see the same seconds in
     // normal Tick and in Chaos async physics tick.
-    const float SafeDeltaSeconds = FMath::Clamp(DeltaSeconds, 0.0f, VehiclePhysicsMaxCatchUpSeconds);
-    const float MaxStepSeconds = FMath::Clamp(
-        MaxVehiclePhysicsSubstepSeconds,
-        0.004f,
-        0.05f);
-    const int32 RequestedMaxStepCount = MaxVehiclePhysicsSubsteps;
-    const int32 MaxStepCount = FMath::Clamp(RequestedMaxStepCount, 1, VehiclePhysicsHardMaxSubsteps);
-    const int32 StepCount = FMath::Clamp(FMath::CeilToInt(SafeDeltaSeconds / MaxStepSeconds), 1, MaxStepCount);
-    const float StepSeconds = SafeDeltaSeconds / static_cast<float>(StepCount);
-
-    for (int32 StepIndex = 0; StepIndex < StepCount; ++StepIndex)
+    // Chaos already substeps rigid-body integration internally. Running multiple game-thread
+    // passes over the same unchanged BodyTransform caused discontinuous impulse jolts on
+    // frame-time fluctuations. Clamp dt to 1/30s and execute one clean step per tick.
+    const float SafeDeltaSeconds = FMath::Clamp(DeltaSeconds, 0.0f, 1.0f / 30.0f);
+    if (SafeDeltaSeconds > KINDA_SMALL_NUMBER)
     {
-        StepVehiclePhysics(StepSeconds);
+        StepVehiclePhysics(SafeDeltaSeconds);
     }
 }
 
@@ -870,6 +874,8 @@ void AVehiclePawn::ClearDriveInput()
 
 void AVehiclePawn::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    ClearVehicleLights();
+
     if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
     {
         VehicleSubSystem->UnregisterVehicle(this);
@@ -926,6 +932,8 @@ void AVehiclePawn::ClearLoadedVehicleModel()
         InstancedRenderRegistrationId = INDEX_NONE;
     }
 
+    ClearVehicleLights();
+
     // Generated meshes are retained by the shared ISM actor while at least one entity uses the
     // built model member. This actor owns only a temporary load cache and can release it immediately.
     MeshCache.Empty();
@@ -981,6 +989,96 @@ void AVehiclePawn::ClearLoadedVehicleModel()
     DeactivateVehicleUntilModelLoaded();
 }
 
+
+void AVehiclePawn::ClearVehicleLights()
+{
+    for (TObjectPtr<ULocalLightComponent>& LightComp : LoadedLightComponents)
+    {
+        if (IsValid(LightComp))
+        {
+            LightComp->DestroyComponent();
+        }
+    }
+    LoadedLightComponents.Empty();
+}
+
+void AVehiclePawn::SpawnVehicleLights(const TArray<FLightData>& Lights)
+{
+    ClearVehicleLights();
+    if (!IsValid(Body) || Lights.IsEmpty())
+    {
+        return;
+    }
+
+    for (const FLightData& LightData : Lights)
+    {
+        if (LightData.Location.ContainsNaN() || LightData.Rotation.ContainsNaN())
+        {
+            continue;
+        }
+        ULocalLightComponent* SpawnedLight = nullptr;
+        const float MaxDraw = FMath::Max(18000.0f, LightData.AttenuationRadius * 4.0f);
+        if (LightData.Type == ELightType::Spot)
+        {
+            USpotLightComponent* SpotLight = NewObject<USpotLightComponent>(this);
+            if (SpotLight)
+            {
+                SpotLight->SetSourceRadius(LightData.SourceRadius);
+                SpotLight->SetSoftSourceRadius(LightData.SoftSourceRadius);
+                SpotLight->SetSourceLength(LightData.Length);
+                SpotLight->SetInnerConeAngle(FMath::Clamp(LightData.InnerConeAngle, 0.0f, 80.0f));
+                SpotLight->SetOuterConeAngle(FMath::Clamp(FMath::Max(LightData.InnerConeAngle, LightData.OuterConeAngle), 1.0f, 80.0f));
+                SpawnedLight = SpotLight;
+            }
+        }
+        else if (LightData.Type == ELightType::Rect)
+        {
+            URectLightComponent* RectLight = NewObject<URectLightComponent>(this);
+            if (RectLight)
+            {
+                RectLight->SetSourceWidth(FMath::Max(1.0f, LightData.SourceWidth));
+                RectLight->SetSourceHeight(FMath::Max(1.0f, LightData.SourceHeight));
+                RectLight->SetBarnDoorAngle(FMath::Clamp(LightData.BarnDoorAngle, 0.0f, 88.0f));
+                RectLight->SetBarnDoorLength(FMath::Max(0.0f, LightData.BarnDoorLength));
+                SpawnedLight = RectLight;
+            }
+        }
+        else
+        {
+            UDynamicPointLightComponent* PointLight = NewObject<UDynamicPointLightComponent>(this);
+            if (PointLight)
+            {
+                PointLight->SetSourceRadius(LightData.SourceRadius);
+                PointLight->SetSoftSourceRadius(LightData.SoftSourceRadius);
+                PointLight->SetSourceLength(LightData.Length);
+                PointLight->SetLightDecalFallbackEnabled(false);
+                PointLight->SetCullingDistance(MaxDraw);
+                SpawnedLight = PointLight;
+            }
+        }
+        if (!SpawnedLight)
+        {
+            continue;
+        }
+        AddInstanceComponent(SpawnedLight);
+        SpawnedLight->SetMobility(EComponentMobility::Movable);
+        SpawnedLight->SetupAttachment(Body);
+        SpawnedLight->SetRelativeLocation(LightData.Location);
+        SpawnedLight->SetRelativeRotation(LightData.Rotation);
+        SpawnedLight->SetLightColor(LightData.Color);
+        SpawnedLight->SetAttenuationRadius(LightData.AttenuationRadius);
+        SpawnedLight->SetIntensityUnits(LightData.Unit);
+        SpawnedLight->SetIntensity(LightData.Intensity);
+        SpawnedLight->SetCastShadows(false);
+        SpawnedLight->SetIndirectLightingIntensity(0.0f);
+        SpawnedLight->bCastVolumetricShadow = false;
+        SpawnedLight->bAffectTranslucentLighting = false;
+        SpawnedLight->MaxDrawDistance = MaxDraw;
+        SpawnedLight->MaxDistanceFadeRange = 3000.0f;
+        SpawnedLight->RegisterComponent();
+        LoadedLightComponents.Add(SpawnedLight);
+    }
+}
 
 bool AVehiclePawn::IsWheelMeshName(const FString& Name) const
 {
@@ -1474,7 +1572,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
         Options.bAllowPhysicsDistanceDeactivation = Options.bDynamic;
         Options.bAlwaysRelevant = IsOccupied();
         Options.bStoreAsVehicleTemplate = bStoreAsVehicleTemplate;
-        Options.InterpolationSpeed = 32.0f;
+        Options.InterpolationSpeed = 0.0f;
         Options.TeleportDistance = 2500.0f;
         Options.MidDistance = 40000.0f;
         Options.PhysicsSuspendDistance = 80000.0f;
@@ -1594,6 +1692,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
 
         // A second vehicle may have populated the shared template while this vehicle was
         // asynchronously preparing meshes. Drop any now-redundant local preload state.
+        SpawnVehicleLights(CachedVehicleTemplate.AuthoredLights);
         MeshCache.Empty();
         BakedAsset = nullptr;
         FinishSuccessfulModelLoad();
@@ -1649,8 +1748,23 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
         if (!MeshName.IsEmpty()) MeshNamesByIndex.Add(MeshIndex, MeshName);
     }
 
+    FModelData ParsedModelData;
+    if (TuningJson.IsSuccess() && TuningJson.JsonObject.IsValid())
+    {
+        const TSharedPtr<FJsonObject>* ModelSubObj = nullptr;
+        if (TuningJson.JsonObject->TryGetObjectField(TEXT("Model"), ModelSubObj) && ModelSubObj && (*ModelSubObj).IsValid())
+        {
+            ParsedModelData.Deserialization(*ModelSubObj);
+        }
+        if (ParsedModelData.MeshData.IsEmpty())
+        {
+            ParsedModelData.Deserialization(TuningJson.JsonObject);
+        }
+    }
+
     TArray<FInstancedEntityMeshPart> RenderParts;
     TArray<FVehicleWheelVisual> WheelNodes;
+    TArray<FLightData> AuthoredLights;
     int32 BodyRenderPartCount = 0;
 
     for (const FglTFRuntimeNode& Node : Nodes)
@@ -1674,6 +1788,27 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
         }
 
         const FString MeshName = MeshNamesByIndex.FindRef(Node.MeshIndex);
+        if (!ParsedModelData.MeshData.IsEmpty())
+        {
+            const FMeshData* AuthoredMeshSettings = !MeshName.IsEmpty() ? ParsedModelData.MeshData.Find(FName(*MeshName)) : nullptr;
+            if (!AuthoredMeshSettings && !Node.Name.IsEmpty())
+            {
+                AuthoredMeshSettings = ParsedModelData.MeshData.Find(FName(*Node.Name));
+            }
+            if (AuthoredMeshSettings)
+            {
+                for (const FLightData& RawLight : AuthoredMeshSettings->Lights)
+                {
+                    FLightData TransformedLight = RawLight;
+                    TransformedLight.Location = NodeWorldTransform.TransformPosition(RawLight.Location);
+                    TransformedLight.Rotation = (NodeWorldTransform.GetRotation() * RawLight.Rotation.Quaternion()).Rotator();
+                    if (!TransformedLight.Location.ContainsNaN())
+                    {
+                        AuthoredLights.Add(MoveTemp(TransformedLight));
+                    }
+                }
+            }
+        }
         if (IsWheelMeshName(Node.Name) || IsWheelMeshName(MeshName))
         {
             FVehicleWheelVisual& WheelVisual = WheelNodes.AddDefaulted_GetRef();
@@ -1724,6 +1859,10 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
             {
                 WheelVisual.Transform.AddToTranslation(ModelToPhysicsOffset);
                 WheelVisual.Center += ModelToPhysicsOffset;
+            }
+            for (FLightData& LightItem : AuthoredLights)
+            {
+                LightItem.Location += ModelToPhysicsOffset;
             }
             LoadedBodyVisualBounds.Min += ModelToPhysicsOffset;
             LoadedBodyVisualBounds.Max += ModelToPhysicsOffset;
@@ -1841,6 +1980,8 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
     VehicleTemplateData.WheelVisualRestBounds = LoadedWheelVisualRestBounds;
     VehicleTemplateData.CombinedLocalBounds = CombinedLocalBounds;
     VehicleTemplateData.RuntimeWheelRadius = RuntimeWheelRadius;
+    VehicleTemplateData.AuthoredLights = AuthoredLights;
+    SpawnVehicleLights(AuthoredLights);
     if (!InstancedEntities->StoreVehicleTemplateData(ModelReference, VehicleTemplateData))
     {
         UE_LOG(LogTemp, Warning,
@@ -2246,6 +2387,11 @@ void AVehiclePawn::ExitVehicle()
         float ExitWaterLevel = 0.0f;
         const bool bExitIntoWater = IsVehicleExitLocationInWater(this, SafeExitLocation, ExitCapsuleHalfHeight, ExitWaterLevel);
 
+        // Capture the vehicle's true linear velocity before detaching so exiting a moving vehicle
+        // conserves real-world momentum instead of snapping the player to zero speed.
+        const FVector VehicleExitVelocity = IsValid(Body) ? Body->GetPhysicsLinearVelocity() : GetVelocity();
+        const FVector SafeExitVelocity = VehicleExitVelocity.ContainsNaN() ? FVector::ZeroVector : VehicleExitVelocity;
+
         StoredPawn->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
         StoredPawn->SetActorLocationAndRotation(SafeExitLocation, SafeExitRotation, false, nullptr, ETeleportType::TeleportPhysics);
         StoredPawn->SetActorHiddenInGame(false);
@@ -2256,6 +2402,26 @@ void AVehiclePawn::ExitVehicle()
         if (bExitIntoWater)
         {
             ApplyVehicleWaterExitState(StoredPawn.Get(), ExitWaterLevel);
+        }
+
+        if (SafeExitVelocity.SizeSquared() > 25.0)
+        {
+            if (ACharacter* ExitingCharacter = Cast<ACharacter>(StoredPawn))
+            {
+                if (UCharacterMovementComponent* Movement = ExitingCharacter->GetCharacterMovement())
+                {
+                    if (!bExitIntoWater && SafeExitVelocity.SizeSquared2D() > FMath::Square(320.0))
+                    {
+                        Movement->SetMovementMode(MOVE_Falling);
+                    }
+                    Movement->Velocity = SafeExitVelocity;
+                }
+            }
+            else if (UPrimitiveComponent* RootPrim = Cast<UPrimitiveComponent>(StoredPawn->GetRootComponent());
+                IsValid(RootPrim) && RootPrim->IsSimulatingPhysics())
+            {
+                RootPrim->SetPhysicsLinearVelocity(SafeExitVelocity);
+            }
         }
 
         // After collision is re-enabled, resync overlaps so water volumes can notify any
@@ -2507,7 +2673,7 @@ bool AVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutLocation
 
 void AVehiclePawn::AddVehicleForce(const FVector& Force)
 {
-    if (!IsValid(Body) || Force.IsNearlyZero(1.0f))
+    if (!IsValid(Body) || Force.ContainsNaN() || Force.IsNearlyZero(1.0f))
     {
         return;
     }
@@ -2521,7 +2687,7 @@ void AVehiclePawn::AddVehicleForce(const FVector& Force)
 
 void AVehiclePawn::AddVehicleForceAtLocation(const FVector& Force, const FVector& Location)
 {
-    if (!IsValid(Body) || Force.IsNearlyZero(1.0f))
+    if (!IsValid(Body) || Force.ContainsNaN() || Location.ContainsNaN() || Force.IsNearlyZero(1.0f))
     {
         return;
     }
@@ -2535,7 +2701,7 @@ void AVehiclePawn::AddVehicleForceAtLocation(const FVector& Force, const FVector
 
 void AVehiclePawn::AddVehicleTorqueInRadians(const FVector& Torque)
 {
-    if (!IsValid(Body) || Torque.IsNearlyZero(1.0f))
+    if (!IsValid(Body) || Torque.ContainsNaN() || Torque.IsNearlyZero(1.0f))
     {
         return;
     }
@@ -2936,13 +3102,15 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             && (bSuspensionCompressingIntoGround || !bWasGrounded || DeepCompressionAlpha > 0.05f);
         const float NeutralSpringRate = RequiredSupportForcePerWheel / NeutralCompression;
         const float RequestedSpringRate = FMath::Max(1.0f, SuspensionStrength) * MassScale;
+        // Keep static equilibrium pinned tightly to the authored wheel-to-chassis pose (1.0x at rest)
+        // and balance compression/rebound damping so bumps never jack the chassis upward off the wheels.
         const float EffectiveSpringRate = FMath::Clamp(
             RequestedSpringRate,
-            NeutralSpringRate * 0.86f,
-            NeutralSpringRate * 1.18f);
-        const float ProgressiveSpringMultiplier = FMath::Lerp(0.92f, 1.24f, DeepCompressionAlpha);
+            NeutralSpringRate * 0.96f,
+            NeutralSpringRate * 1.04f);
+        const float ProgressiveSpringMultiplier = FMath::Lerp(1.0f, 1.30f, DeepCompressionAlpha);
         const float SpringForce = Compression * EffectiveSpringRate * ProgressiveSpringMultiplier * SlopeSupportMultiplier;
-        const float DamperResponseMultiplier = CompressionVelocity >= 0.0f ? 1.18f : 0.50f;
+        const float DamperResponseMultiplier = CompressionVelocity >= 0.0f ? 1.05f : 0.90f;
         const float DamperCorrection = CompressionVelocity * SuspensionDamping * DamperResponseMultiplier * MassScale;
         const float SuspensionForceLimit = FMath::Max(
             RequiredSupportForcePerWheel * 0.42f,
@@ -3248,9 +3416,21 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             -SteeringLongitudinalLimit,
             SteeringLongitudinalLimit);
 
-        // Tire side force is generated from slip angle, not by directly rotating the chassis.
-        // The small reference speed keeps low-speed steering responsive without creating a snap turn.
-        const float SlipReferenceSpeed = FMath::Max(1.0f, TireSlipReferenceSpeed + FMath::Abs(WheelState.ForwardSpeed) * 0.05f);
+        // Real aerodynamic downforce increases tire normal load with v^2, boosting high-speed
+        // cornering grip proportionally to speed instead of washing out into understeer/sliding.
+        const float BodySpeedSq = BodyVelocity.SizeSquared();
+        const float AeroSpeedAlpha = ComputeVehicleAeroSpeedAlpha(FMath::Sqrt(BodySpeedSq), MinimumDownforceSpeed);
+        const float AeroDownforcePerWheel = (AeroSpeedAlpha > 0.0f && GroundedWheels > 0)
+            ? FMath::Clamp(BodySpeedSq * FMath::Max(0.0f, GroundedDownforceCoefficient) * MassScale, 0.0f, FMath::Max(0.0f, MaxGroundedDownforce) * MassScale) / static_cast<float>(GroundedWheels)
+            : 0.0f;
+        const float FrontAeroPerWheel = (WheelState.bFront && AeroSpeedAlpha > 0.0f && GroundedFrontWheels > 0)
+            ? FMath::Clamp(BodySpeedSq * FMath::Max(0.0f, FrontDownforceCoefficient) * MassScale, 0.0f, FMath::Max(0.0f, MaxFrontDownforce) * MassScale) / static_cast<float>(GroundedFrontWheels)
+            : 0.0f;
+        const float TireNormalLoad = WheelState.NormalForce + AeroDownforcePerWheel + FrontAeroPerWheel;
+
+        // Tire side force uses a Pacejka Magic Formula curve from slip angle for crisp turn-in,
+        // strong peak grip around 7-12 deg slip, and smooth saturation without sudden slide-outs.
+        const float SlipReferenceSpeed = FMath::Max(1.0f, TireSlipReferenceSpeed + FMath::Abs(WheelState.ForwardSpeed) * 0.04f);
         const float EffectiveLongitudinalSpeed = FMath::Max(SlipReferenceSpeed, FMath::Abs(WheelState.ForwardSpeed));
         const float SlipAngle = FMath::Atan2(WheelState.LateralSpeed, EffectiveLongitudinalSpeed);
         const float SteeringGripMultiplier = WheelState.bFront ? FMath::Max(0.1f, FrontSteeringGripMultiplier) : FMath::Max(0.1f, RearSteeringGripMultiplier);
@@ -3262,17 +3442,17 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         const float FrontGripBoost = WheelState.bFront
             ? FMath::Lerp(1.0f, EffectiveHighSpeedFrontGripBoost, HighSpeedGripAlpha * SteeringActivity)
             : 1.0f;
-        // HighSpeedLateralGripScale limits capacity only once. Applying it to both stiffness and
-        // capacity compounded the loss and made fast vehicles ignore steering input.
         const float CorneringStiffness = FMath::Max(0.1f, TireCorneringStiffness)
             * FMath::Max(0.1f, LateralGrip) * SteeringGripMultiplier * FrontGripBoost;
-        const float LateralDemand = -SlipAngle * CorneringStiffness * WheelState.NormalForce;
-        const float LateralCapacityBoost = WheelState.bFront ? FMath::Lerp(1.0f, FrontGripBoost, 0.35f) : 1.0f;
-        const float LateralLimitBase = FMath::Min(WheelState.NormalForce * TireLateralFriction, MaxLateralGripForce * MassScale)
+        const float LateralCapacityBoost = WheelState.bFront ? FMath::Lerp(1.0f, FrontGripBoost, 0.45f) : 1.0f;
+        const float LateralLimitBase = FMath::Min(TireNormalLoad * TireLateralFriction * SteeringGripMultiplier, MaxLateralGripForce * MassScale)
             * SpeedLateralGripScale * LateralCapacityBoost;
         const float LongitudinalUsage = FMath::Clamp(FMath::Abs(LongitudinalForce) / LongitudinalLimit, 0.0f, 1.0f);
         const float LateralLimit = LateralLimitBase * FMath::Sqrt(FMath::Max(0.0f, 1.0f - LongitudinalUsage * LongitudinalUsage));
-        const float TargetLateralForce = FMath::Clamp(LateralDemand, -LateralLimit, LateralLimit) * FMath::Clamp(TireLateralForceScale, 0.0f, 1.0f);
+        constexpr float PacejkaShapeC = 1.35f;
+        const float PacejkaStiffnessB = CorneringStiffness / FMath::Max(0.5f, PacejkaShapeC * TireLateralFriction);
+        const float PacejkaNormalized = -FMath::Sin(PacejkaShapeC * FMath::Atan(PacejkaStiffnessB * SlipAngle));
+        const float TargetLateralForce = FMath::Clamp(PacejkaNormalized * LateralLimit, -LateralLimit, LateralLimit) * FMath::Clamp(TireLateralForceScale, 0.0f, 1.0f);
         const float PreviousLateralForce = WheelLateralForces.IsValidIndex(WheelState.Index) ? WheelLateralForces[WheelState.Index] : 0.0f;
         const float SmoothedLateralForce = FMath::FInterpTo(PreviousLateralForce, TargetLateralForce, ForceControlDeltaSeconds, FMath::Max(0.1f, TireForceInterpSpeed));
         const float LateralForceStep = FMath::Max(1000.0f, MaxLateralForceChangePerSecond) * MassScale * ForceControlDeltaSeconds;
@@ -3573,7 +3753,10 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         const float LowSpeedAssistSpeed = FMath::Max(0.0f, LowSpeedSteeringYawAssistSpeed) * SteeringAmountForYaw * ThrottleTurnActivity;
         const float EffectiveYawSpeed = FMath::Max(AbsBodyForwardSpeed, LowSpeedAssistSpeed);
         const float BicycleYawRate = YawDirectionSign * EffectiveYawSpeed * FMath::Tan(BaseSteeringAngle) / FMath::Max(80.0f, Wheelbase);
-        const float PhysicalYawRateLimit = FMath::Max(0.75f, MaxAngularVelocityRadians);
+        // Real-world centripetal acceleration cap (~1.35g = 1323 cm/s^2): at highway speed,
+        // a real car cannot physically yaw faster than a_lat_max / v without spinning out.
+        const float CentripetalYawCap = 1323.0f / FMath::Max(550.0f, AbsBodyForwardSpeed);
+        const float PhysicalYawRateLimit = FMath::Min(FMath::Max(0.75f, MaxAngularVelocityRadians), CentripetalYawCap);
         const float DesiredYawRate = FMath::Clamp(
             BicycleYawRate,
             -PhysicalYawRateLimit,
@@ -3623,13 +3806,45 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
 
             // Stability damping is deliberately conditional. It catches excessive spin or idle yaw, but
             // does not fight the tire-generated turn while the car is following a reasonable bicycle-model yaw rate.
-            const float AllowedYawRate = FMath::Max(0.18f, DesiredYawAbs * 1.45f + 0.12f);
-            const float OvershootAlpha = FMath::Clamp((YawRateAbs - AllowedYawRate) / FMath::Max(0.1f, AllowedYawRate), 0.0f, 1.0f);
-            const float IdleYawDampingAlpha = SteeringAmount < 0.04f ? 1.0f : 0.0f;
-            const float DampingTargetYawRate = SteeringAmount > 0.04f ? DesiredYawRate : 0.0f;
+            // GTA6-style Electronic Stability Control (ESC): aggressively damps excess yaw spin and
+            // straightens the car smoothly when steering is released, while allowing crisp planted turns.
+            const float AllowedYawRate = FMath::Max(0.12f, DesiredYawAbs * 1.15f + 0.06f);
+            const float OvershootAlpha = FMath::Clamp((YawRateAbs - AllowedYawRate) / FMath::Max(0.08f, AllowedYawRate), 0.0f, 1.0f);
+            const float IdleYawDampingAlpha = SteeringAmount < 0.06f ? 1.0f : 0.0f;
+            const float DampingTargetYawRate = SteeringAmount > 0.06f ? DesiredYawRate : 0.0f;
             const float DampingError = DampingTargetYawRate - YawRate;
             const float YawDampingTorque = DampingError * SteeringYawDamping * MassScale * GroundedRatio
-                * FMath::Max(IdleYawDampingAlpha * 0.30f, OvershootAlpha * 0.48f);
+                * FMath::Max(IdleYawDampingAlpha * 1.25f, FMath::Max(0.35f, OvershootAlpha * 1.60f));
+
+            // Traction vector alignment (GTA-style lateral grip): smoothly converts grounded sideways
+            // sliding velocity into forward cornering momentum so the car carves arcs instead of
+            // drifting sideways like a hockey puck.
+            if (GroundedWheels >= 2)
+            {
+                FVector EscVelocity = Body->GetPhysicsLinearVelocity();
+                const FVector FlatForward = FVector::VectorPlaneProject(Forward, GravityUp).GetSafeNormal();
+                const FVector FlatRight = FVector::VectorPlaneProject(Body->GetRightVector(), GravityUp).GetSafeNormal();
+                if (!FlatForward.IsNearlyZero() && !FlatRight.IsNearlyZero() && !EscVelocity.ContainsNaN())
+                {
+                    const float ForwardComp = FVector::DotProduct(EscVelocity, FlatForward);
+                    const float SideComp = FVector::DotProduct(EscVelocity, FlatRight);
+                    const float PlanarSpeed = FMath::Sqrt(ForwardComp * ForwardComp + SideComp * SideComp);
+                    if (PlanarSpeed > 60.0f && FMath::Abs(SideComp) > 5.0f)
+                    {
+                        const float GripStrength = FMath::Clamp(GroundedRatio * FMath::Clamp(LateralGrip, 0.5f, 2.5f), 0.25f, 2.0f);
+                        const float SideKillAlpha = 1.0f - FMath::Exp(-7.5f * GripStrength * ForceControlDeltaSeconds);
+                        const float RemovedSide = SideComp * SideKillAlpha;
+                        // Preserve cornering speed cleanly while eliminating lateral slide.
+                        const float RedirectedForwardBoost = FMath::Abs(RemovedSide) * 0.35f * (ForwardComp >= 0.0f ? 1.0f : -1.0f);
+                        EscVelocity -= FlatRight * RemovedSide;
+                        EscVelocity += FlatForward * RedirectedForwardBoost;
+                        if (!EscVelocity.ContainsNaN())
+                        {
+                            Body->SetPhysicsLinearVelocity(EscVelocity);
+                        }
+                    }
+                }
+            }
 
             const float EffectiveSteeringTorqueLimit = MaxSteeringAssistTorque * MassScale
                 * FMath::Lerp(1.0f, HighSpeedSteeringAuthority, HighSpeedAssistAlpha);

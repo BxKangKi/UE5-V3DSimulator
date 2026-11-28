@@ -140,7 +140,12 @@ private:
     static constexpr double PeriodicSaveIntervalSeconds = 1.0;
     static constexpr double FailedLoadRetryDelaySeconds = 1.0;
     static constexpr double TransientChunkKeepAliveSeconds = 2.0;
-    static constexpr float DesiredRefreshIntervalSeconds = 0.25f;
+    static constexpr float DesiredRefreshIntervalSeconds = 0.50f;
+    TArray<FWorldChunkCoordinate> LastDesiredObserverChunks;
+    bool bHasLastDesiredSnapshot = false;
+    bool bLastDesiredPriorityFocus = false;
+    FWorldChunkCoordinate LastDesiredPriorityChunk{};
+    float LastDesiredLoadRadiusCm = 0.0f;
 
     TMap<FWorldChunkCoordinate, FRuntimeChunk> LoadedChunks;
     TSet<FWorldChunkCoordinate> LoadingChunks;

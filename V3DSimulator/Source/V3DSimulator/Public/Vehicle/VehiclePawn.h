@@ -20,6 +20,9 @@ class UPhysicalMaterial;
 class UStaticMesh;
 class UWorldBakedModelAsset;
 class UBuoyancyComponent;
+class UDynamicPointLightComponent;
+class ULocalLightComponent;
+struct FLightData;
 class USpringArmComponent;
 class UCameraComponent;
 class APlayerController;
@@ -86,8 +89,8 @@ public:
         float SmoothedThrottleInput = 0.0f;
         float SmoothedSteeringInput = 0.0f;
         float ThrottleInputInterpSpeed = 5.0f;
-        float SteeringInputRiseRate = 2.5f;
-        float SteeringInputReturnRate = 10.5f;
+        float SteeringInputRiseRate = 4.8f;
+        float SteeringInputReturnRate = 14.0f;
         float SteeringInputSpeedDamping = 0.0f;
         float SteeringInputCurveExponent = 1.0f;
         float SteeringSpeedForFullAssist = 4300.0f;
@@ -143,6 +146,12 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UPhysicalMaterial> LowFrictionPhysicalMaterial;
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<ULocalLightComponent>> LoadedLightComponents;
+
+    void SpawnVehicleLights(const TArray<FLightData>& Lights);
+    void ClearVehicleLights();
 
     // Default chassis mass is one metric ton. ApplyVehicleBodyPhysicsSettings() pushes this
     // into Chaos so suspension, tire load, drive force, and damping are tuned around a 1000 kg car.
@@ -221,10 +230,10 @@ private:
     float MaxWheelStepHeight = 28.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float GroundedDownforceCoefficient = 0.00085f;
+    float GroundedDownforceCoefficient = 0.0022f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxGroundedDownforce = 36000.0f;
+    float MaxGroundedDownforce = 140000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
     float AirborneDownforceCoefficient = 0.00115f;
@@ -236,10 +245,10 @@ private:
     float MinimumDownforceSpeed = 180.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float FrontDownforceCoefficient = 0.00050f;
+    float FrontDownforceCoefficient = 0.0012f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxFrontDownforce = 17000.0f;
+    float MaxFrontDownforce = 65000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
     float ThrottleFrontDownforce = 3200.0f;
@@ -251,19 +260,19 @@ private:
     float LateralForceCenterOfMassHeightBlend = 0.96f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float EngineForce = 430000.0f;
+    float EngineForce = 950000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float ReverseForce = 140000.0f;
+    float ReverseForce = 320000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float BrakeForce = 620000.0f;
+    float BrakeForce = 1450000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
     float SteeringTorque = 0.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="55.0"))
-    float MaxSteeringAngleDegrees = 34.0f;
+    float MaxSteeringAngleDegrees = 42.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
     float MinSteeringSpeedFactor = 0.30f;
@@ -275,21 +284,21 @@ private:
     float SteeringSpeedForFullAssist = 4300.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float SteeringYawRateAssist = 42000.0f;
+    float SteeringYawRateAssist = 95000.0f;
 
     // Adds anti-understeer yaw assistance only after the configured high-speed threshold.
     // It remains proportional to yaw-rate error and front-wheel contact, so it does not pivot the car in place.
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float HighSpeedYawAssistStrength = 130000.0f;
+    float HighSpeedYawAssistStrength = 240000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="100.0"))
-    float HighSpeedYawAssistStartSpeed = 1100.0f;
+    float HighSpeedYawAssistStartSpeed = 700.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float SteeringYawDamping = 118000.0f;
+    float SteeringYawDamping = 95000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float MaxSteeringAssistTorque = 380000.0f;
+    float MaxSteeringAssistTorque = 650000.0f;
 
     // Small low-speed yaw helper used only as an anti-understeer assist. Normal turning now comes
     // from Ackermann front-wheel angles and tire lateral forces, not from a forced yaw-rate controller.
@@ -297,26 +306,26 @@ private:
     float LowSpeedSteeringYawAssistSpeed = 145.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.1"))
-    float FrontSteeringGripMultiplier = 1.34f;
+    float FrontSteeringGripMultiplier = 1.35f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.1"))
-    float RearSteeringGripMultiplier = 1.24f;
+    float RearSteeringGripMultiplier = 1.48f;
 
     /** Extra front-axle cornering stiffness blended in only while steering at high speed. */
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="2.0"))
-    float HighSpeedFrontGripBoost = 1.28f;
+    float HighSpeedFrontGripBoost = 1.45f;
 
     /**
      * Multiplies high-speed steering angle, front grip reservation, and understeer yaw assistance.
      */
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="2.0"))
-    float HighSpeedSteeringAuthorityScale = 1.30f;
+    float HighSpeedSteeringAuthorityScale = 1.25f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering")
-    float LateralGrip = 1.08f;
+    float LateralGrip = 1.55f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering")
-    float MaxLateralGripForce = 330000.0f;
+    float MaxLateralGripForce = 850000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float RollingResistance = 0.012f;
@@ -373,16 +382,16 @@ private:
     float TireLongitudinalFriction = 1.48f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1"))
-    float TireLateralFriction = 1.24f;
+    float TireLateralFriction = 1.85f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1"))
-    float TireCorneringStiffness = 7.2f;
+    float TireCorneringStiffness = 12.5f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="1.0"))
     float TireSlipReferenceSpeed = 120.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1", ClampMax="1.0"))
-    float HighSpeedLateralGripScale = 0.96f;
+    float HighSpeedLateralGripScale = 1.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="100.0"))
     float HighSpeedLateralGripSpeed = 3400.0f;
@@ -392,16 +401,16 @@ private:
      * This prevents full throttle from consuming all lateral authority and making the car run wide.
      */
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.0", ClampMax="0.90"))
-    float SteeringLateralGripReserve = 0.55f;
+    float SteeringLateralGripReserve = 0.72f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.0", ClampMax="1.0"))
     float DrivenFrontTorqueShare = 0.32f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.0"))
-    float EngineBrakingForce = 72000.0f;
+    float EngineBrakingForce = 120000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="45.0"))
-    float HighSpeedSteeringAngleDegrees = 22.0f;
+    float HighSpeedSteeringAngleDegrees = 16.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0", ClampMax="1.0"))
     float AckermannStrength = 1.0f;
@@ -431,23 +440,23 @@ private:
     float ThrottleInputInterpSpeed = 5.2f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
-    float SteeringInputInterpSpeed = 9.0f;
+    float SteeringInputInterpSpeed = 14.0f;
 
     // Rate-limits steering input so keyboard/gamepad input does not snap the chassis into a yaw impulse.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
-    float SteeringInputRiseRate = 2.65f;
+    float SteeringInputRiseRate = 4.8f;
 
     // Steering returns to center slightly faster than it moves toward full lock.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
-    float SteeringInputReturnRate = 10.5f;
+    float SteeringInputReturnRate = 14.0f;
 
     // High speed reduces steering input rate, matching the slower hand-wheel motion of a real car.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float SteeringInputSpeedDamping = 0.12f;
+    float SteeringInputSpeedDamping = 0.06f;
 
     // Curves low analog values for softer initial turn-in while still allowing full lock.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="1.0", ClampMax="3.0"))
-    float SteeringInputCurveExponent = 1.35f;
+    float SteeringInputCurveExponent = 1.15f;
 
     // Vehicle control is integrated in small deterministic steps. Every force/torque is applied as
     // Force * StepDelta impulse, so one second of input produces the same total impulse in normal
@@ -547,10 +556,10 @@ private:
     float TireLateralForceScale = 0.96f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
-    float TireForceInterpSpeed = 22.0f;
+    float TireForceInterpSpeed = 45.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1000.0"))
-    float MaxLateralForceChangePerSecond = 480000.0f;
+    float MaxLateralForceChangePerSecond = 4500000.0f;
 
     // Direct pitch/roll angular damping used only while wheels are grounded.
     // This removes slow chassis wallow without locking yaw or snapping the car flat.

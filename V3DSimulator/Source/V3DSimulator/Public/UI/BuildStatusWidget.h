@@ -152,7 +152,9 @@ protected:
 
     /** Failed builds stay open so their terminal output can be inspected. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Build Status|Auto Close")
-    bool bAutoCloseOnSuccess = true;
+    bool bAutoCloseOnSuccess = false;
+    FString LastRenderedOutputText;
+    EProjectBuildPhase LastRenderedPhase = EProjectBuildPhase::Idle;
 
 private:
     UPROPERTY(Transient)

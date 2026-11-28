@@ -1221,7 +1221,7 @@ FglTFRuntimeStaticMeshConfig AStaticActor::BuildStreamingMeshConfig()
     // for Lumen's surface cache; screen traces alone cannot cover off-screen world geometry.
     // Mesh builds remain shared and streaming-concurrency limited.
     Config.bBuildLumenCards = true;
-    Config.bBuildNavCollision = !bRenderOnlyStreaming;
+    Config.bBuildNavCollision = false;
     if (bRenderOnlyStreaming)
     {
         Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;

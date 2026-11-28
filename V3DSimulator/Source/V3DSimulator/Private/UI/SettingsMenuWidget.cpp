@@ -73,6 +73,8 @@ namespace
         static const TArray<ESettingsField> Fields = {
             ESettingsField::MouseSensitivity,
             ESettingsField::DarkMode,
+            ESettingsField::VSync,
+            ESettingsField::FrameRateLimit,
             ESettingsField::QualityProfile,
             ESettingsField::BloomIntensity,
             ESettingsField::BloomThreshold,
@@ -261,6 +263,8 @@ namespace
         case ESettingsField::HeightFog: return TEXT("HeightFog");
         case ESettingsField::Cloud: return TEXT("Cloud");
         case ESettingsField::DarkMode: return TEXT("DarkMode");
+        case ESettingsField::VSync: return TEXT("VSync");
+        case ESettingsField::FrameRateLimit: return TEXT("FrameRateLimit");
         case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
         case ESettingsField::ShadowDistanceMeters: return TEXT("ShadowDistanceMeters");
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
@@ -848,6 +852,7 @@ ESettingsControlType USettingsMenuWidget::GetSettingControlType(ESettingsField F
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
     case ESettingsField::DarkMode:
+    case ESettingsField::VSync:
         return ESettingsControlType::Toggle;
 
     case ESettingsField::MouseSensitivity:
@@ -909,6 +914,7 @@ bool USettingsMenuWidget::GetPendingBooleanSettingValue(ESettingsField Field) co
     case ESettingsField::HeightFog: return bPendingHeightFog;
     case ESettingsField::Cloud: return bPendingCloud;
     case ESettingsField::DarkMode: return bPendingDarkMode;
+    case ESettingsField::VSync: return bPendingVSync;
     default: return false;
     }
 }
@@ -998,6 +1004,13 @@ void USettingsMenuWidget::SetSettingFromDropdownSelection(
                 PendingMaxTextureResolution = Values[SelectedIndex];
         }
         break;
+    case ESettingsField::FrameRateLimit:
+        {
+            static const int32 FpsValues[] = {0, 30, 60, 90, 120, 144, 165, 240};
+            if (SelectedIndex >= 0 && SelectedIndex < static_cast<int32>(UE_ARRAY_COUNT(FpsValues)))
+                PendingFrameRateLimit = FpsValues[SelectedIndex];
+        }
+        break;
     case ESettingsField::DynamicGlobalIlluminationMethod:
         PendingDynamicGlobalIlluminationMethod = FMath::Clamp(SelectedIndex, 0, 3); break;
     case ESettingsField::ReflectionMethod:
@@ -1032,6 +1045,7 @@ void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
     case ESettingsField::DarkMode: bPendingDarkMode = !bPendingDarkMode; break;
+    case ESettingsField::VSync: bPendingVSync = !bPendingVSync; break;
     default: return;
     }
     ApplyAndSaveSettingsFromUI();
@@ -1210,6 +1224,14 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleDarkModeFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleDarkModeFromUI);
         break;
+    case ESettingsField::VSync:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleVSyncFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleVSyncFromUI);
+        break;
+    case ESettingsField::FrameRateLimit:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleFrameRateLimitFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleFrameRateLimitFromUI);
+        break;
     case ESettingsField::ShadowDistanceMeters:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI);
@@ -1323,6 +1345,8 @@ void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Butto
     case ESettingsField::HeightFog: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI); break;
     case ESettingsField::Cloud: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI); break;
     case ESettingsField::DarkMode: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleDarkModeFromUI); break;
+    case ESettingsField::VSync: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleVSyncFromUI); break;
+    case ESettingsField::FrameRateLimit: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleFrameRateLimitFromUI); break;
     case ESettingsField::ShadowDistanceMeters: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowDistanceMetersFromUI); break;
     case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
     case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
@@ -1432,6 +1456,8 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     bPendingHeightFog = Settings->bHeightFog;
     bPendingCloud = Settings->bCloud;
     bPendingDarkMode = Settings->bEditorDarkMode;
+    bPendingVSync = Settings->bVSyncEnabled;
+    PendingFrameRateLimit = FMath::Max(0, Settings->FrameRateLimit);
     PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
     PendingShadowDistanceMeters = Settings->GetClampedShadowDistanceMeters();
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
@@ -1469,6 +1495,8 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->bHeightFog = bPendingHeightFog;
     Settings->bCloud = bPendingCloud;
     Settings->bEditorDarkMode = bPendingDarkMode;
+    Settings->bVSyncEnabled = bPendingVSync;
+    Settings->FrameRateLimit = FMath::Max(0, PendingFrameRateLimit);
     Settings->ShadowQuality = PendingShadowQuality;
     Settings->ShadowDistanceMeters = V3DShadowDistance::Normalize(PendingShadowDistanceMeters);
     Settings->TextureQuality = PendingTextureQuality;
@@ -1646,6 +1674,8 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::HeightFog: return FText::FromString(TEXT("Height Fog"));
     case ESettingsField::Cloud: return FText::FromString(TEXT("Cloud"));
     case ESettingsField::DarkMode: return FText::FromString(TEXT("Dark Mode"));
+    case ESettingsField::VSync: return FText::FromString(TEXT("V-Sync"));
+    case ESettingsField::FrameRateLimit: return FText::FromString(TEXT("Max Frame Rate"));
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
     case ESettingsField::ShadowDistanceMeters: return FText::FromString(TEXT("Shadow Distance"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
@@ -1721,6 +1751,7 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
     case ESettingsField::DarkMode:
+    case ESettingsField::VSync:
         Options.Add(GetBoolText(false));
         Options.Add(GetBoolText(true));
         break;
@@ -1754,6 +1785,17 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
             for (const int32 Value : OptionsPx)
             {
                 Options.Add(FText::FromString(FString::Printf(TEXT("%d px"), Value)));
+            }
+        }
+        break;
+    case ESettingsField::FrameRateLimit:
+        {
+            static const int32 FpsOptions[] = {0, 30, 60, 90, 120, 144, 165, 240};
+            for (const int32 Fps : FpsOptions)
+            {
+                Options.Add(Fps <= 0
+                    ? FText::FromString(TEXT("Unlimited"))
+                    : FText::FromString(FString::Printf(TEXT("%d FPS"), Fps)));
             }
         }
         break;
@@ -1825,6 +1867,7 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
     case ESettingsField::DarkMode: bPendingDarkMode = !bPendingDarkMode; break;
+    case ESettingsField::VSync: bPendingVSync = !bPendingVSync; break;
     case ESettingsField::ShadowDistanceMeters:
         {
             int32 Step = V3DShadowDistance::Normalize(PendingShadowDistanceMeters) / V3DShadowDistance::Step;
@@ -1835,6 +1878,15 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::MaxTextureResolution: CycleTextureResolution(PendingMaxTextureResolution, Direction); break;
+    case ESettingsField::FrameRateLimit:
+        {
+            static const int32 FpsValues[] = {0, 30, 60, 90, 120, 144, 165, 240};
+            constexpr int32 Count = static_cast<int32>(UE_ARRAY_COUNT(FpsValues));
+            int32 Idx = 0;
+            for (int32 I = 0; I < Count; ++I) { if (FpsValues[I] == PendingFrameRateLimit) { Idx = I; break; } }
+            PendingFrameRateLimit = FpsValues[(Idx + (Direction >= 0 ? 1 : -1) + Count) % Count];
+        }
+        break;
     case ESettingsField::QualityProfile:
         {
             int32 Quality = GetPendingQualityProfileIndex();
@@ -1905,6 +1957,11 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
     case ESettingsField::HeightFog: return GetBoolText(bPendingHeightFog);
     case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
     case ESettingsField::DarkMode: return GetBoolText(bPendingDarkMode);
+    case ESettingsField::VSync: return GetBoolText(bPendingVSync);
+    case ESettingsField::FrameRateLimit:
+        return PendingFrameRateLimit <= 0
+            ? FText::FromString(TEXT("Unlimited"))
+            : FText::FromString(FString::Printf(TEXT("%d FPS"), PendingFrameRateLimit));
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
     case ESettingsField::ShadowDistanceMeters: return FText::FromString(FString::Printf(TEXT("%d m"), PendingShadowDistanceMeters));
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
@@ -1986,6 +2043,8 @@ void USettingsMenuWidget::CycleRayTracingFromUI() { CycleSettingValueFromUI(ESet
 void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESettingsField::HeightFog); }
 void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
 void USettingsMenuWidget::CycleDarkModeFromUI() { CycleSettingValueFromUI(ESettingsField::DarkMode); }
+void USettingsMenuWidget::CycleVSyncFromUI() { CycleSettingValueFromUI(ESettingsField::VSync); }
+void USettingsMenuWidget::CycleFrameRateLimitFromUI() { CycleSettingValueFromUI(ESettingsField::FrameRateLimit); }
 void USettingsMenuWidget::CycleShadowDistanceMetersFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowDistanceMeters); }
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }

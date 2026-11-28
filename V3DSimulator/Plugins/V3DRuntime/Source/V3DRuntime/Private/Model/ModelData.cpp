@@ -24,8 +24,28 @@ TSharedRef<FJsonObject> FModelCollider::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     FJsonHelper::SetEnumField<EColliderType>(Json, TEXT("Type"), Collider);
+    if (Collider == EColliderType::None)
+    {
+        return Json;
+    }
+
     FJsonHelper::SetVector(Json, Center);
-    FJsonHelper::SetVector(Json, Size, TEXT("D"));
+    if (Collider == EColliderType::Sphere)
+    {
+        const double Radius = FMath::Max(1.0, FMath::Abs(Size.X));
+        Json->SetNumberField(TEXT("Radius"), Radius);
+    }
+    else if (Collider == EColliderType::Capsule)
+    {
+        const double Radius = FMath::Max(1.0, FMath::Abs(Size.X));
+        const double HalfHeight = FMath::Max(Radius, FMath::Max(FMath::Abs(Size.Z), FMath::Abs(Size.Y)));
+        Json->SetNumberField(TEXT("Radius"), Radius);
+        Json->SetNumberField(TEXT("Height"), HalfHeight * 2.0);
+    }
+    else
+    {
+        FJsonHelper::SetVector(Json, Size.GetAbs(), TEXT("D"));
+    }
     return Json;
 }
 
@@ -34,10 +54,59 @@ bool FModelCollider::Deserialization(const TSharedPtr<FJsonObject> &Json)
     if (!Json.IsValid())
         return false;
 
-    FString Type;
+    Collider = EColliderType::None;
+    Center = FVector::ZeroVector;
+    Size = FVector::ZeroVector;
+
     FJsonHelper::TryGetEnumField<EColliderType>(Json, TEXT("Type"), Collider);
+    if (Collider == EColliderType::None)
+    {
+        return true;
+    }
+
     FJsonHelper::TryGetVector(Json, Center);
-    FJsonHelper::TryGetVector(Json, Size, TEXT("D"));
+    FVector LegacyD = FVector::ZeroVector;
+    FJsonHelper::TryGetVector(Json, LegacyD, TEXT("D"));
+
+    if (Collider == EColliderType::Sphere)
+    {
+        double Radius = 0.0;
+        if (!Json->TryGetNumberField(TEXT("Radius"), Radius))
+        {
+            Radius = FMath::Max3(FMath::Abs(LegacyD.X), FMath::Abs(LegacyD.Y), FMath::Abs(LegacyD.Z));
+        }
+        const double SafeRadius = FMath::Max(0.0, FMath::Abs(Radius));
+        Size = FVector(SafeRadius, SafeRadius, SafeRadius);
+    }
+    else if (Collider == EColliderType::Capsule)
+    {
+        double Radius = 0.0;
+        if (!Json->TryGetNumberField(TEXT("Radius"), Radius))
+        {
+            Radius = FMath::Abs(LegacyD.X);
+        }
+        double HalfHeight = 0.0;
+        double FullHeight = 0.0;
+        if (Json->TryGetNumberField(TEXT("Height"), FullHeight))
+        {
+            HalfHeight = FMath::Abs(FullHeight) * 0.5;
+        }
+        else if (Json->TryGetNumberField(TEXT("HalfHeight"), HalfHeight))
+        {
+            HalfHeight = FMath::Abs(HalfHeight);
+        }
+        else
+        {
+            HalfHeight = FMath::Max(FMath::Abs(LegacyD.Z), FMath::Abs(LegacyD.Y));
+        }
+        const double SafeRadius = FMath::Max(0.0, FMath::Abs(Radius));
+        const double SafeHalfHeight = FMath::Max(SafeRadius, HalfHeight);
+        Size = FVector(SafeRadius, SafeHalfHeight, SafeHalfHeight);
+    }
+    else
+    {
+        Size = LegacyD.GetAbs();
+    }
     return true;
 }
 
@@ -48,13 +117,32 @@ bool FModelCollider::Deserialization(const TSharedPtr<FJsonObject> &Json)
 TSharedRef<FJsonObject> FLightData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    FJsonHelper::SetEnumField<ELightType>(Json, TEXT("Type"), Type);
     FJsonHelper::SetVector(Json, Location);
+    Json->SetNumberField(TEXT("Pitch"), Rotation.Pitch);
+    Json->SetNumberField(TEXT("Yaw"), Rotation.Yaw);
+    Json->SetNumberField(TEXT("Roll"), Rotation.Roll);
+    Json->SetNumberField(TEXT("ColorR"), Color.R);
+    Json->SetNumberField(TEXT("ColorG"), Color.G);
+    Json->SetNumberField(TEXT("ColorB"), Color.B);
     FJsonHelper::SetEnumField<ELightUnits>(Json, TEXT("Unit"), Unit);
     Json->SetNumberField(TEXT("Intensity"), Intensity);
     Json->SetNumberField(TEXT("SourceRadius"), SourceRadius);
     Json->SetNumberField(TEXT("SoftSourceRadius"), SoftSourceRadius);
     Json->SetNumberField(TEXT("AttenuationRadius"), AttenuationRadius);
     Json->SetNumberField(TEXT("Length"), Length);
+    if (Type == ELightType::Spot)
+    {
+        Json->SetNumberField(TEXT("InnerConeAngle"), InnerConeAngle);
+        Json->SetNumberField(TEXT("OuterConeAngle"), OuterConeAngle);
+    }
+    else if (Type == ELightType::Rect)
+    {
+        Json->SetNumberField(TEXT("SourceWidth"), SourceWidth);
+        Json->SetNumberField(TEXT("SourceHeight"), SourceHeight);
+        Json->SetNumberField(TEXT("BarnDoorAngle"), BarnDoorAngle);
+        Json->SetNumberField(TEXT("BarnDoorLength"), BarnDoorLength);
+    }
 
     return Json;
 }
@@ -64,13 +152,44 @@ bool FLightData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     if (!Json.IsValid())
         return false;
 
+    Type = ELightType::Point;
+    FString TypeStr;
+    if (Json->TryGetStringField(TEXT("Type"), TypeStr))
+    {
+        if (TypeStr.Equals(TEXT("Spot"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("SpotLight"), ESearchCase::IgnoreCase))
+            Type = ELightType::Spot;
+        else if (TypeStr.Equals(TEXT("Rect"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("RectLight"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("Area"), ESearchCase::IgnoreCase))
+            Type = ELightType::Rect;
+        else
+            Type = ELightType::Point;
+    }
+    else
+    {
+        FJsonHelper::TryGetEnumField<ELightType>(Json, TEXT("Type"), Type);
+    }
     FJsonHelper::TryGetVector(Json, Location);
+    double Pitch = 0.0, Yaw = 0.0, Roll = 0.0;
+    Json->TryGetNumberField(TEXT("Pitch"), Pitch);
+    Json->TryGetNumberField(TEXT("Yaw"), Yaw);
+    Json->TryGetNumberField(TEXT("Roll"), Roll);
+    Rotation = FRotator(Pitch, Yaw, Roll);
+    double CR = 1.0, CG = 1.0, CB = 1.0;
+    Json->TryGetNumberField(TEXT("ColorR"), CR);
+    Json->TryGetNumberField(TEXT("ColorG"), CG);
+    Json->TryGetNumberField(TEXT("ColorB"), CB);
+    Color = FLinearColor(static_cast<float>(CR), static_cast<float>(CG), static_cast<float>(CB), 1.0f);
     FJsonHelper::TryGetEnumField<ELightUnits>(Json, TEXT("Unit"), Unit);
     Json->TryGetNumberField(TEXT("Intensity"), Intensity);
     Json->TryGetNumberField(TEXT("SourceRadius"), SourceRadius);
     Json->TryGetNumberField(TEXT("SoftSourceRadius"), SoftSourceRadius);
     Json->TryGetNumberField(TEXT("AttenuationRadius"), AttenuationRadius);
     Json->TryGetNumberField(TEXT("Length"), Length);
+    Json->TryGetNumberField(TEXT("InnerConeAngle"), InnerConeAngle);
+    Json->TryGetNumberField(TEXT("OuterConeAngle"), OuterConeAngle);
+    Json->TryGetNumberField(TEXT("SourceWidth"), SourceWidth);
+    Json->TryGetNumberField(TEXT("SourceHeight"), SourceHeight);
+    Json->TryGetNumberField(TEXT("BarnDoorAngle"), BarnDoorAngle);
+    Json->TryGetNumberField(TEXT("BarnDoorLength"), BarnDoorLength);
     return true;
 }
 

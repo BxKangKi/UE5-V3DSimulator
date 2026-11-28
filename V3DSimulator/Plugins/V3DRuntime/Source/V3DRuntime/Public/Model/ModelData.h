@@ -43,13 +43,27 @@ struct V3DRUNTIME_API FModelCollider
     bool Deserialization(const TSharedPtr<FJsonObject> &Json);
 };
 
+UENUM(BlueprintType)
+enum class ELightType : uint8
+{
+    Point = 0,
+    Spot = 1,
+    Rect = 2
+};
+
 USTRUCT(BlueprintType)
 struct V3DRUNTIME_API FLightData
 {
     GENERATED_BODY()
 
     UPROPERTY()
+    ELightType Type = ELightType::Point;
+    UPROPERTY()
     FVector Location = FVector::ZeroVector;
+    UPROPERTY()
+    FRotator Rotation = FRotator::ZeroRotator;
+    UPROPERTY()
+    FLinearColor Color = FLinearColor::White;
     UPROPERTY()
     float Intensity = 10.0f;
     UPROPERTY()
@@ -60,6 +74,18 @@ struct V3DRUNTIME_API FLightData
     float AttenuationRadius = 1000.0f;
     UPROPERTY()
     float Length = 10.0f;
+    UPROPERTY()
+    float InnerConeAngle = 22.0f;
+    UPROPERTY()
+    float OuterConeAngle = 44.0f;
+    UPROPERTY()
+    float SourceWidth = 64.0f;
+    UPROPERTY()
+    float SourceHeight = 64.0f;
+    UPROPERTY()
+    float BarnDoorAngle = 88.0f;
+    UPROPERTY()
+    float BarnDoorLength = 20.0f;
     UPROPERTY()
     ELightUnits Unit = ELightUnits::Unitless;
 

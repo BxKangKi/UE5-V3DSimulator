@@ -20,6 +20,8 @@
 #include "Components/BoxComponent.h"
 #include "Components/SphereComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/RectLightComponent.h"
+#include "Components/SpotLightComponent.h"
 #include "Model/DynamicPointLightComponent.h"
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
@@ -82,7 +84,7 @@ namespace
             return false;
         }
 
-        const bool bHasCustomColliders = MeshData && !MeshData->Colliders.IsEmpty();
+        const bool bHasCustomColliders = MeshData && MeshData->Colliders.ContainsByPredicate([](const FModelCollider& C) { return C.Collider != EColliderType::None; });
         const bool bEnableCollision =
             !bRenderOnly && MeshData
             && (MeshData->bComplexCollision || (MeshData->bSimpleCollision && !bHasCustomColliders));
@@ -196,15 +198,29 @@ namespace
             return BestDistanceSq == TNumericLimits<double>::Max()
                 ? TNumericLimits<double>::Max() : BestDistanceSq;
         };
-        struct FChunkSelection
+        // Partition HISM instances into spatial clusters bounded by MaxDistanceCm so transforms
+        // that cannot be simultaneously visible within render distance are excluded into separate
+        // HISM clusters. Each cluster's combined bounding box is evaluated atomically in parallel
+        // so the entire HISM cluster loads/unloads as one unit without per-instance churn.
+        const double ClusterCellSizeCm = FMath::Clamp(MaxDistanceCm, 10000.0, 200000.0);
+        auto MakeRenderClusterKey = [ClusterCellSizeCm](const FVector& WorldPos) -> FIntVector
         {
-            FBox Bounds = FBox(ForceInit);
+            return FIntVector(
+                FMath::FloorToInt(WorldPos.X / ClusterCellSizeCm),
+                FMath::FloorToInt(WorldPos.Y / ClusterCellSizeCm),
+                FMath::FloorToInt(WorldPos.Z / ClusterCellSizeCm));
+        };
+        struct FClusterSelection
+        {
+            FIntVector Key = FIntVector::ZeroValue;
+            FBox CombinedWorldBounds = FBox(ForceInit);
             double Radius = 0.0;
             bool bResident = false;
             bool bSelected = false;
             double DistanceSq = 0.0;
         };
-        TMap<FIntVector, FChunkSelection> Chunks;
+        TMap<FIntVector, int32> ClusterKeyToIndex;
+        TArray<FClusterSelection> ClusterList;
         for (const auto& Pair : Plan.NodeMap)
         {
             if (IsCancelled()) return;
@@ -212,24 +228,50 @@ namespace
             const FModelMeshData* Mesh = Plan.MeshMap.Find(Node.MeshName);
             if (!Mesh) continue;
             const FTransform Transform = Node.Transform * OwnerWorldTransform;
-            const FIntVector Key = V3DHISMChunkPolicy::Key(Transform.GetLocation());
-            FChunkSelection& Chunk = Chunks.FindOrAdd(Key);
-            Chunk.Bounds += V3DHISMChunkPolicy::CellBounds(Key);
+            const FIntVector Key = MakeRenderClusterKey(Transform.GetLocation());
+            int32* FoundIdx = ClusterKeyToIndex.Find(Key);
+            int32 ClusterIdx = FoundIdx ? *FoundIdx : INDEX_NONE;
+            if (ClusterIdx == INDEX_NONE)
+            {
+                ClusterIdx = ClusterList.Num();
+                ClusterKeyToIndex.Add(Key, ClusterIdx);
+                FClusterSelection& NewCluster = ClusterList.AddDefaulted_GetRef();
+                NewCluster.Key = Key;
+            }
+            FClusterSelection& Cluster = ClusterList[ClusterIdx];
             const FVector Half = Mesh->Size.GetAbs() * 0.5;
-            Chunk.Bounds += FBox(-Half, Half).TransformBy(Transform);
-            Chunk.Radius = FMath::Max(Chunk.Radius, FMath::Max(
-                FMath::Min(MaxDistanceCm, V3DHISMChunkPolicy::ChunkSizeCm),
-                V3DStreamingPolicy::LoadRadius(Mesh->Size, Transform.GetScale3D().GetAbs().GetMax(), Distance, MaxDistanceCm)));
-            if (Node.bAlwaysLoaded) Chunk.Radius = FMath::Max(Chunk.Radius, MaxDistanceCm);
-            Chunk.bResident |= LoadedMeshNodes.Contains(Pair.Key);
+            const FBox InstanceWorldBox = FBox(-Half, Half).TransformBy(Transform);
+            Cluster.CombinedWorldBounds += InstanceWorldBox;
+            const double InstRadius = V3DStreamingPolicy::LoadRadius(
+                Mesh->Size, Transform.GetScale3D().GetAbs().GetMax(), Distance, MaxDistanceCm);
+            Cluster.Radius = FMath::Max(Cluster.Radius, InstRadius);
+            if (Node.bAlwaysLoaded) Cluster.Radius = FMath::Max(Cluster.Radius, MaxDistanceCm);
+            Cluster.bResident |= LoadedMeshNodes.Contains(Pair.Key);
         }
-        for (auto& Pair : Chunks)
+        // Parallel worker-thread distance evaluation across all HISM clusters using each cluster's
+        // full combined bounding box as its effective mesh size.
+        if (ClusterList.Num() > 0)
         {
-            if (IsCancelled()) return;
-            FChunkSelection& Chunk = Pair.Value;
-            Chunk.bSelected = V3DHISMChunkPolicy::InRange(Chunk.Bounds, ObserverLocations,
-                FMath::Min(MaxDistanceCm, Chunk.Radius * (Chunk.bResident ? SafeUnloadMultiplier : 1.0f)));
-            Chunk.DistanceSq = NearestObserverDistanceSq(Chunk.Bounds.GetCenter());
+            ParallelFor(ClusterList.Num(), [&](const int32 Idx)
+            {
+                FClusterSelection& Cluster = ClusterList[Idx];
+                if (!Cluster.CombinedWorldBounds.IsValid)
+                {
+                    Cluster.bSelected = false;
+                    Cluster.DistanceSq = TNumericLimits<double>::Max();
+                    return;
+                }
+                const FVector CombinedSize = Cluster.CombinedWorldBounds.GetSize();
+                const double CombinedRadius = FMath::Max(
+                    Cluster.Radius,
+                    V3DStreamingPolicy::LoadRadius(CombinedSize, 1.0, Distance, MaxDistanceCm));
+                const double EffectiveRange = FMath::Min(
+                    MaxDistanceCm * (Cluster.bResident ? SafeUnloadMultiplier : 1.0),
+                    CombinedRadius * (Cluster.bResident ? SafeUnloadMultiplier : 1.0));
+                Cluster.bSelected = V3DHISMChunkPolicy::InRange(
+                    Cluster.CombinedWorldBounds, ObserverLocations, EffectiveRange);
+                Cluster.DistanceSq = NearestObserverDistanceSq(Cluster.CombinedWorldBounds.GetCenter());
+            });
         }
         for (const TPair<FName, FModelNodeData>& NodePair : Plan.NodeMap)
         {
@@ -240,17 +282,15 @@ namespace
 
             const FTransform WorldTransform = Info.Transform * OwnerWorldTransform;
             const bool bIsLoaded = LoadedMeshNodes.Contains(NodePair.Key);
-            const FChunkSelection& Chunk = Chunks.FindChecked(V3DHISMChunkPolicy::Key(WorldTransform.GetLocation()));
-            const bool bChunkInRange = Chunk.bSelected;
-            // Residency is chosen for the whole 1024 m chunk. At the outer boundary keep the
-            // requested hard cap: a mesh whose entire bounds are outside it must never spawn.
-            bool bInRange = false;
-            if (bChunkInRange)
-                for (const FVector& Observer : ObserverLocations)
-                    if (V3DStreamingPolicy::BoundsInRenderRange(FVector::ZeroVector, MeshPtr->Size,
-                        WorldTransform, Observer, MaxDistanceCm)) { bInRange = true; break; }
+            const int32* ClusterIdxPtr = ClusterKeyToIndex.Find(MakeRenderClusterKey(WorldTransform.GetLocation()));
+            const bool bInRange = ClusterIdxPtr && ClusterList[*ClusterIdxPtr].bSelected;
             if (bIsLoaded != bInRange)
-                NodeDistanceSqCache.Add(NodePair.Key, NearestObserverDistanceSq(WorldTransform.GetLocation()));
+            {
+                const double SortDistSq = ClusterIdxPtr
+                    ? ClusterList[*ClusterIdxPtr].DistanceSq
+                    : NearestObserverDistanceSq(WorldTransform.GetLocation());
+                NodeDistanceSqCache.Add(NodePair.Key, SortDistSq);
+            }
 
             if (bIsLoaded)
             {
@@ -259,15 +299,24 @@ namespace
                 continue;
             }
 
-            if (!bRenderOnly && (MeshPtr->Data.bComplexCollision || MeshPtr->Data.bSimpleCollision))
-            {
-                FWorldSceneUnavailableRegion& Region = Plan.UnavailableRegions.AddDefaulted_GetRef();
-                Region.NodeName = NodePair.Key;
-                const FVector Extent = (MeshPtr->Size * 0.5f + BOX_BUFFER_SIZE).GetAbs();
-                Region.WorldBounds = FBox(-Extent, Extent).TransformBy(WorldTransform);
-            }
             if (bInRange)
+            {
+                if (!bRenderOnly && (MeshPtr->Data.bComplexCollision || MeshPtr->Data.bSimpleCollision))
+                {
+                    const FVector HalfExtent = (MeshPtr->Size * 0.5f).GetAbs();
+                    const FBox WorldBox = FBox(-HalfExtent, HalfExtent).TransformBy(WorldTransform);
+                    const double WorldMaxDim = WorldBox.IsValid ? WorldBox.GetSize().GetMax() : 0.0;
+                    // Only gate movement on large/structural collidable geometry (terrain, roads, large floors/buildings),
+                    // never on small props/poles/foliage, and apply a tight world-space buffer after transform scale.
+                    if (WorldBox.IsValid && (MeshPtr->Data.bComplexCollision || WorldMaxDim >= 400.0))
+                    {
+                        FWorldSceneUnavailableRegion& Region = Plan.UnavailableRegions.AddDefaulted_GetRef();
+                        Region.NodeName = NodePair.Key;
+                        Region.WorldBounds = WorldBox.ExpandBy(FVector(50.0, 50.0, 50.0));
+                    }
+                }
                 Plan.PendingLoadNodes.Add(NodePair.Key);
+            }
         }
 
         const float WaterDistanceRadius = FMath::Max(Distance * 1024.0f, 2048.0f);
@@ -294,14 +343,14 @@ namespace
             }
         }
         if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
-        const auto ChunkOrder = [&Plan, &Chunks, &OwnerWorldTransform, &NodeDistanceSqCache](FName A, FName B, bool bUnload)
+        const auto ChunkOrder = [&Plan, &ClusterKeyToIndex, &ClusterList, &MakeRenderClusterKey, &OwnerWorldTransform, &NodeDistanceSqCache](FName A, FName B, bool bUnload)
         {
-            const FIntVector CA = V3DHISMChunkPolicy::Key((Plan.NodeMap.FindChecked(A).Transform * OwnerWorldTransform).GetLocation());
-            const FIntVector CB = V3DHISMChunkPolicy::Key((Plan.NodeMap.FindChecked(B).Transform * OwnerWorldTransform).GetLocation());
+            const FIntVector CA = MakeRenderClusterKey((Plan.NodeMap.FindChecked(A).Transform * OwnerWorldTransform).GetLocation());
+            const FIntVector CB = MakeRenderClusterKey((Plan.NodeMap.FindChecked(B).Transform * OwnerWorldTransform).GetLocation());
             if (CA != CB)
             {
-                const double DA = Chunks.FindChecked(CA).DistanceSq;
-                const double DB = Chunks.FindChecked(CB).DistanceSq;
+                const double DA = ClusterList[ClusterKeyToIndex.FindChecked(CA)].DistanceSq;
+                const double DB = ClusterList[ClusterKeyToIndex.FindChecked(CB)].DistanceSq;
                 if (DA != DB) return bUnload ? DA > DB : DA < DB;
                 if (CA.X != CB.X) return CA.X < CB.X;
                 if (CA.Y != CB.Y) return CA.Y < CB.Y;
@@ -790,8 +839,9 @@ void UWorldSceneStreamAction::StartInstanceBatchPreparation()
     const auto Cancellation = PreparationCancellation;
     TWeakObjectPtr<UWorldSceneStreamAction> WeakThis(this);
     bInstancePreparationInFlight = true;
+    const double ClusterCellSizeCm = FMath::Clamp(MaxRenderDistanceCm, 10000.0, 200000.0);
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [Rows = MoveTemp(Rows), ActorTransform, Begin, Serial, Cancellation, WeakThis]() mutable
+        [Rows = MoveTemp(Rows), ActorTransform, ClusterCellSizeCm, Begin, Serial, Cancellation, WeakThis]() mutable
         {
             if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
             // A bounded four-lane job; each lane writes disjoint rows, and reads only native data.
@@ -804,7 +854,14 @@ void UWorldSceneStreamAction::StartInstanceBatchPreparation()
                     auto& Row = Rows[Index];
                     Row.bValid &= !ActorTransform.ContainsNaN() && !Row.LocalTransform.ContainsNaN()
                         && Row.LocalTransform.GetRotation().IsNormalized();
-                    if (Row.bValid) Row.WorldChunk = V3DHISMChunkPolicy::Key(ActorTransform.TransformPosition(Row.LocalTransform.GetLocation()));
+                    if (Row.bValid)
+                    {
+                        const FVector WorldPos = ActorTransform.TransformPosition(Row.LocalTransform.GetLocation());
+                        Row.WorldChunk = FIntVector(
+                            FMath::FloorToInt(WorldPos.X / ClusterCellSizeCm),
+                            FMath::FloorToInt(WorldPos.Y / ClusterCellSizeCm),
+                            FMath::FloorToInt(WorldPos.Z / ClusterCellSizeCm));
+                    }
                 }
             });
             if (Cancellation.IsValid() && Cancellation->GetValue() != 0) return;
@@ -842,8 +899,15 @@ int32 UWorldSceneStreamAction::ApplyInstanceBatch(int32 MaxCount)
         auto Row = PreparedInstances[PreparedInstanceOffset + Index];
         if (!Row.bValid) { FailGroup(TEXT("InstancePreparation"), TEXT("Invalid instance transform"), Row.NodeName); return 0; }
         if (MeshActor->IsNodeLoaded(Row.NodeName)) continue;
-        if (!IsNodeWithinCurrentRenderRange(Row.NodeName)) { OwnerActor->RequestStreamingRefresh(); continue; }
-        if (bOwnerMoved) Row.WorldChunk = V3DHISMChunkPolicy::Key(ActorTransform.TransformPosition(Row.LocalTransform.GetLocation()));
+        if (bOwnerMoved)
+        {
+            const double ClusterCellSizeCm = FMath::Clamp(MaxRenderDistanceCm, 10000.0, 200000.0);
+            const FVector WorldPos = ActorTransform.TransformPosition(Row.LocalTransform.GetLocation());
+            Row.WorldChunk = FIntVector(
+                FMath::FloorToInt(WorldPos.X / ClusterCellSizeCm),
+                FMath::FloorToInt(WorldPos.Y / ClusterCellSizeCm),
+                FMath::FloorToInt(WorldPos.Z / ClusterCellSizeCm));
+        }
         Visible.Add(MoveTemp(Row));
     }
     TArray<FName> Added;
@@ -871,7 +935,7 @@ void UWorldSceneStreamAction::ProcessChunk()
     { AbortAndRelease(); return; }
     const double SliceStartSeconds = FPlatformTime::Seconds();
     const double SliceBudgetSeconds = FMath::Min(
-        static_cast<double>(FMath::Clamp(FrameTimeBudgetMs, 0.25f, 4.0f)) * 0.001,
+        static_cast<double>(FMath::Clamp(FrameTimeBudgetMs, 0.25f, 1.5f)) * 0.001,
         FV3DStreamingBudget::RemainingSceneSeconds());
     if (SliceBudgetSeconds <= 0.0)
     {
@@ -908,9 +972,33 @@ void UWorldSceneStreamAction::ProcessChunk()
     int32 UnloadsThisSlice = 0;
     while (CurrentUnloadWaterIndex < PendingUnloadWaterNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
     { ProcessUnloadWaterNode(PendingUnloadWaterNodes[CurrentUnloadWaterIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true; }
+    TSet<FName> RemainingUnloadSet;
+    if (CurrentUnloadIndex < PendingUnloadNodes.Num() && IsValid(MeshActor))
+    {
+        RemainingUnloadSet.Reserve(PendingUnloadNodes.Num() - CurrentUnloadIndex);
+        for (int32 UIdx = CurrentUnloadIndex; UIdx < PendingUnloadNodes.Num(); ++UIdx)
+        {
+            RemainingUnloadSet.Add(PendingUnloadNodes[UIdx]);
+        }
+    }
     while (CurrentUnloadIndex < PendingUnloadNodes.Num() && UnloadsThisSlice < UnloadQuota && HasSliceBudget())
     {
-        if (IsValid(MeshActor) && !MeshActor->CanMutateNode(PendingUnloadNodes[CurrentUnloadIndex])) break;
+        const FName UnloadNode = PendingUnloadNodes[CurrentUnloadIndex];
+        if (IsValid(MeshActor) && !MeshActor->IsNodeLoaded(UnloadNode))
+        {
+            ++CurrentUnloadIndex; continue;
+        }
+        if (IsValid(MeshActor) && !MeshActor->CanMutateNode(UnloadNode)) break;
+        TArray<FName> WholePageRemoved;
+        if (IsValid(MeshActor) && MeshActor->UnloadWholeClusterPageForNode(UnloadNode, RemainingUnloadSet, WholePageRemoved))
+        {
+            for (const FName& RemovedName : WholePageRemoved)
+            {
+                DestroyStreamComponents(RemovedName);
+            }
+            ++CurrentUnloadIndex; ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true;
+            continue;
+        }
         ProcessUnloadNode(PendingUnloadNodes[CurrentUnloadIndex++]); ++OperationsThisSlice; ++UnloadsThisSlice; bProgressChanged = true;
     }
     // A fallback starts on a later slice, after the previous native callback has unwound
@@ -939,7 +1027,10 @@ void UWorldSceneStreamAction::ProcessChunk()
                 StartInstanceBatchPreparation();
                 break;
             }
-            const int32 Applied = ApplyInstanceBatch(FMath::Min(256, ChunkSize - OperationsThisSlice));
+            const bool bHasDynamicAttachments = MeshMap.Contains(CurrentLoadingMesh)
+                && (!MeshMap[CurrentLoadingMesh].Data.Colliders.IsEmpty() || !MeshMap[CurrentLoadingMesh].Data.Lights.IsEmpty());
+            const int32 BatchCap = bHasDynamicAttachments ? 16 : 256;
+            const int32 Applied = ApplyInstanceBatch(FMath::Min(BatchCap, FMath::Max(1, ChunkSize - OperationsThisSlice)));
             OperationsThisSlice += Applied; bProgressChanged |= Applied > 0;
             if (Applied == 0 || bGroupFailed) break;
             continue;
@@ -1204,14 +1295,18 @@ void UWorldSceneStreamAction::ProcessUnloadNode(const FName &Name)
 
     if (const FModelMeshData *Mesh = MeshMap.Find(Info->MeshName))
     {
+        const bool bHasBlockingCollision = Mesh->Data.bComplexCollision || Mesh->Data.bSimpleCollision || !Mesh->Data.Colliders.IsEmpty();
+        if (!bHasBlockingCollision) return;
+        const FTransform WorldTransform = Info->Transform * OwnerActor->GetActorTransform();
+        const FVector LocalHalfExtent = (Mesh->Size * 0.5f).GetAbs();
+        const FBox WorldBounds = FBox(-LocalHalfExtent, LocalHalfExtent).TransformBy(WorldTransform);
+        if (WorldBounds.GetSize().GetMax() < 200.0) return;
         if (UWorld* World = OwnerActor->GetWorld())
         {
             if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
             {
-                const FTransform WorldTransform = Info->Transform * OwnerActor->GetActorTransform();
-                const FVector Extent = (Mesh->Size * 0.5f + BOX_BUFFER_SIZE).GetAbs();
                 Gate->SetModelRegionAvailable(MeshActor.Get(), Name,
-                    FBox(-Extent, Extent).TransformBy(WorldTransform), false);
+                    WorldBounds.ExpandBy(50.0), false);
             }
         }
     }
@@ -1414,7 +1509,7 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
         LODScreenSize.Add(Index, CalculateLODScreenSize(Index, Count, bLastIsImpostor));
     }
 
-    const bool bHasCustomColliders = !Mesh->Data.Colliders.IsEmpty();
+    const bool bHasCustomColliders = Mesh->Data.Colliders.ContainsByPredicate([](const FModelCollider& C) { return C.Collider != EColliderType::None; });
     const bool bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
     // When explicit Colliders are authored on the mesh, let those shape components own simple collision
     // instead of also generating an overlapping bounding-box FKBoxElem on the StaticMesh.
@@ -1556,18 +1651,33 @@ void UWorldSceneStreamAction::SpawnStreamComponents(const FName &NodeName, const
     {
         for (const FModelCollider &ColliderData : Data.Colliders)
         {
+            if (ColliderData.Collider == EColliderType::None)
+            {
+                continue;
+            }
+
             UShapeComponent *NewShape = nullptr;
             FTransform ComponentLocalTransform = NodeInfo.Transform;
             // Collider centers in model JSON are expressed in the mesh node's local space.
             // Apply the offset through the node transform so rotation/scale remain consistent.
             ComponentLocalTransform.SetLocation(NodeInfo.Transform.TransformPosition(ColliderData.Center));
+            // Chaos capsule/sphere/box shapes require non-negative scale; mirrored nodes are symmetric around their local center.
+            const FVector AbsScale = ComponentLocalTransform.GetScale3D().GetAbs();
+            ComponentLocalTransform.SetScale3D(FVector(
+                FMath::Max(AbsScale.X, KINDA_SMALL_NUMBER),
+                FMath::Max(AbsScale.Y, KINDA_SMALL_NUMBER),
+                FMath::Max(AbsScale.Z, KINDA_SMALL_NUMBER)));
 
             if (ColliderData.Collider == EColliderType::Box)
             {
                 UBoxComponent *BoxComp = NewObject<UBoxComponent>(MeshActor);
                 if (BoxComp)
                 {
-                    BoxComp->SetBoxExtent(ColliderData.Size);
+                    const FVector SafeExtent(
+                        FMath::Max(1.0, FMath::Abs(ColliderData.Size.X)),
+                        FMath::Max(1.0, FMath::Abs(ColliderData.Size.Y)),
+                        FMath::Max(1.0, FMath::Abs(ColliderData.Size.Z)));
+                    BoxComp->InitBoxExtent(SafeExtent);
                     NewShape = BoxComp;
                 }
             }
@@ -1576,7 +1686,8 @@ void UWorldSceneStreamAction::SpawnStreamComponents(const FName &NodeName, const
                 USphereComponent *SphereComp = NewObject<USphereComponent>(MeshActor);
                 if (SphereComp)
                 {
-                    SphereComp->SetSphereRadius(ColliderData.Size.X);
+                    const float SafeRadius = FMath::Max(1.0f, static_cast<float>(FMath::Abs(ColliderData.Size.X)));
+                    SphereComp->InitSphereRadius(SafeRadius);
                     NewShape = SphereComp;
                 }
             }
@@ -1585,7 +1696,10 @@ void UWorldSceneStreamAction::SpawnStreamComponents(const FName &NodeName, const
                 UCapsuleComponent *CapsuleComp = NewObject<UCapsuleComponent>(MeshActor);
                 if (CapsuleComp)
                 {
-                    CapsuleComp->SetCapsuleSize(ColliderData.Size.X, ColliderData.Size.Y);
+                    const float SafeRadius = FMath::Max(1.0f, static_cast<float>(FMath::Abs(ColliderData.Size.X)));
+                    const float RawHalfHeight = static_cast<float>(FMath::Max(FMath::Abs(ColliderData.Size.Z), FMath::Abs(ColliderData.Size.Y)));
+                    const float SafeHalfHeight = FMath::Max(SafeRadius, RawHalfHeight);
+                    CapsuleComp->InitCapsuleSize(SafeRadius, SafeHalfHeight);
                     NewShape = CapsuleComp;
                 }
             }
@@ -1593,13 +1707,19 @@ void UWorldSceneStreamAction::SpawnStreamComponents(const FName &NodeName, const
             if (NewShape)
             {
                 MeshActor->AddInstanceComponent(NewShape);
-                NewShape->AttachToComponent(MeshActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+                NewShape->SetMobility(EComponentMobility::Movable);
+                NewShape->SetupAttachment(MeshActor->GetRootComponent());
                 NewShape->SetRelativeTransform(ComponentLocalTransform);
                 NewShape->SetCollisionProfileName(TEXT("BlockAll"));
+                NewShape->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+                NewShape->SetCollisionObjectType(ECC_WorldStatic);
+                NewShape->SetCollisionResponseToAllChannels(ECR_Block);
+                NewShape->SetCanEverAffectNavigation(false);
                 if (UWorldSurfaceSubsystem* Surfaces = UWorldSurfaceSubsystem::Get(OwnerActor.Get()))
                     if (UPhysicalMaterial* Physical = Surfaces->GetSimplePhysicalMaterial(MeshActor->GetMeshComponent()))
                         NewShape->SetPhysMaterialOverride(Physical);
                 NewShape->RegisterComponent();
+                NewShape->UpdateBounds();
                 Group.Colliders.Add(NewShape);
             }
         }
@@ -1607,22 +1727,67 @@ void UWorldSceneStreamAction::SpawnStreamComponents(const FName &NodeName, const
 
     for (const FLightData &LightData : Data.Lights)
     {
-        UDynamicPointLightComponent *PointLight = NewObject<UDynamicPointLightComponent>(MeshActor);
-        if (PointLight)
+        if (LightData.Location.ContainsNaN() || LightData.Rotation.ContainsNaN()) continue;
+        const FVector LightLocalLocation = NodeInfo.Transform.TransformPosition(LightData.Location);
+        const FRotator LightLocalRotation = (NodeInfo.Transform.GetRotation() * LightData.Rotation.Quaternion()).Rotator();
+        ULocalLightComponent* SpawnedLight = nullptr;
+        if (LightData.Type == ELightType::Spot)
         {
-            MeshActor->AddInstanceComponent(PointLight);
-            PointLight->AttachToComponent(MeshActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
-            const FVector LightLocalLocation = NodeInfo.Transform.TransformPosition(LightData.Location);
-            PointLight->SetRelativeLocation(LightLocalLocation);
-            PointLight->SetSourceRadius(LightData.SourceRadius);
-            PointLight->SetSoftSourceRadius(LightData.SoftSourceRadius);
-            PointLight->SetSourceLength(LightData.Length);
-            PointLight->SetAttenuationRadius(LightData.AttenuationRadius);
-            PointLight->SetIntensityUnits(LightData.Unit);
-            PointLight->SetIntensity(LightData.Intensity);
-            PointLight->SetLightDecal(DecalLight);
-            PointLight->RegisterComponent();
-            Group.Lights.Add(PointLight);
+            USpotLightComponent* SpotLight = NewObject<USpotLightComponent>(MeshActor);
+            if (SpotLight)
+            {
+                SpotLight->SetSourceRadius(LightData.SourceRadius);
+                SpotLight->SetSoftSourceRadius(LightData.SoftSourceRadius);
+                SpotLight->SetSourceLength(LightData.Length);
+                SpotLight->SetInnerConeAngle(FMath::Clamp(LightData.InnerConeAngle, 0.0f, 80.0f));
+                SpotLight->SetOuterConeAngle(FMath::Clamp(FMath::Max(LightData.InnerConeAngle, LightData.OuterConeAngle), 1.0f, 80.0f));
+                SpotLight->bCastVolumetricShadow = false;
+                SpotLight->bAffectTranslucentLighting = false;
+                SpotLight->MaxDrawDistance = FMath::Max(18000.0f, LightData.AttenuationRadius * 4.0f);
+                SpotLight->MaxDistanceFadeRange = 3000.0f;
+                SpawnedLight = SpotLight;
+            }
+        }
+        else if (LightData.Type == ELightType::Rect)
+        {
+            URectLightComponent* RectLight = NewObject<URectLightComponent>(MeshActor);
+            if (RectLight)
+            {
+                RectLight->SetSourceWidth(FMath::Max(1.0f, LightData.SourceWidth));
+                RectLight->SetSourceHeight(FMath::Max(1.0f, LightData.SourceHeight));
+                RectLight->SetBarnDoorAngle(FMath::Clamp(LightData.BarnDoorAngle, 0.0f, 88.0f));
+                RectLight->SetBarnDoorLength(FMath::Max(0.0f, LightData.BarnDoorLength));
+                RectLight->bCastVolumetricShadow = false;
+                RectLight->bAffectTranslucentLighting = false;
+                RectLight->MaxDrawDistance = FMath::Max(18000.0f, LightData.AttenuationRadius * 4.0f);
+                RectLight->MaxDistanceFadeRange = 3000.0f;
+                SpawnedLight = RectLight;
+            }
+        }
+        else
+        {
+            UDynamicPointLightComponent* PointLight = NewObject<UDynamicPointLightComponent>(MeshActor);
+            if (PointLight)
+            {
+                PointLight->SetSourceRadius(LightData.SourceRadius);
+                PointLight->SetSoftSourceRadius(LightData.SoftSourceRadius);
+                PointLight->SetSourceLength(LightData.Length);
+                PointLight->SetLightDecal(DecalLight);
+                SpawnedLight = PointLight;
+            }
+        }
+        if (SpawnedLight)
+        {
+            MeshActor->AddInstanceComponent(SpawnedLight);
+            SpawnedLight->AttachToComponent(MeshActor->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
+            SpawnedLight->SetRelativeLocation(LightLocalLocation);
+            SpawnedLight->SetRelativeRotation(LightLocalRotation);
+            SpawnedLight->SetLightColor(LightData.Color);
+            SpawnedLight->SetAttenuationRadius(LightData.AttenuationRadius);
+            SpawnedLight->SetIntensityUnits(LightData.Unit);
+            SpawnedLight->SetIntensity(LightData.Intensity);
+            SpawnedLight->RegisterComponent();
+            Group.Lights.Add(SpawnedLight);
         }
     }
 

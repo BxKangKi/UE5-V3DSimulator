@@ -32,6 +32,8 @@ public:
     /** Shared bounded ancestry test used by physics, buoyancy and ragdoll probes. */
     static bool IsSecondaryPhysicsBone(const USkeletalMeshComponent& Mesh, FName BoneName);
     static void KeepSecondaryPhysicsBodies(USkeletalMeshComponent &Mesh);
+    /** Clamps hair/secondary body velocities relative to character movement to prevent high-speed popping. */
+    static void StabilizeSecondaryPhysicsBodies(USkeletalMeshComponent &Mesh, const FVector &ReferenceLinearVelocity, float DeltaSeconds);
     static void DisableRagdollPhysicsButKeepSecondary(USkeletalMeshComponent &Mesh);
     static bool HasNonSecondarySimulatingPhysicsBodies(USkeletalMeshComponent &Mesh);
     /** Removes invalid/duplicate entries from a private runtime PhysicsAsset copy without replacing surviving subobjects. */

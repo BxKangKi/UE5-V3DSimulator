@@ -64,6 +64,8 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetBoolField(TEXT("bHeightFog"), bHeightFog);
     Json->SetBoolField(TEXT("bCloud"), bCloud);
     Json->SetBoolField(TEXT("bEditorDarkMode"), bEditorDarkMode);
+    Json->SetBoolField(TEXT("bVSyncEnabled"), bVSyncEnabled);
+    Json->SetNumberField(TEXT("FrameRateLimit"), FrameRateLimit);
     if (!KeyMappings.IsEmpty())
     {
         TSharedRef<FJsonObject> KeyMapJson = MakeShared<FJsonObject>();
@@ -122,6 +124,12 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetBoolField(TEXT("bHeightFog"), bHeightFog);
         Json->TryGetBoolField(TEXT("bCloud"), bCloud);
         Json->TryGetBoolField(TEXT("bEditorDarkMode"), bEditorDarkMode);
+        Json->TryGetBoolField(TEXT("bVSyncEnabled"), bVSyncEnabled);
+        int32 LoadedFps = FrameRateLimit;
+        if (Json->TryGetNumberField(TEXT("FrameRateLimit"), LoadedFps))
+        {
+            FrameRateLimit = FMath::Clamp(LoadedFps, 0, 1000);
+        }
         KeyMappings.Reset();
         const TSharedPtr<FJsonObject>* KeyMapJson = nullptr;
         if (Json->TryGetObjectField(TEXT("KeyMappings"), KeyMapJson) && KeyMapJson && KeyMapJson->IsValid())
@@ -489,8 +497,15 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         // Settings->SetScreenResolution(FIntPoint(1920, 1080));
         // Settings->SetFullscreenMode(EWindowMode::WindowedFullscreen);
 
+        Settings->SetVSyncEnabled(bVSyncEnabled);
+        const float SafeFpsLimit = FrameRateLimit > 0 ? static_cast<float>(FMath::Clamp(FrameRateLimit, 15, 1000)) : 0.0f;
+        Settings->SetFrameRateLimit(SafeFpsLimit);
         Settings->ApplySettings(false);
         Settings->SaveSettings();
+    }
+    if (GEngine)
+    {
+        GEngine->SetMaxFPS(FrameRateLimit > 0 ? static_cast<float>(FMath::Clamp(FrameRateLimit, 15, 1000)) : 0.0f);
     }
 
     // r.RayTracing is a startup/cook capability, not a runtime user toggle. Gate the

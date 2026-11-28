@@ -237,11 +237,39 @@ float4x3 V3D_SampleImpostorArray(
     float3 W;
     V3D_ImpostorOctahedralGrid(LocalViewDir, SafeFrames, F0, F1, F2, W);
 
-    float2 CellUV = saturate(LocalUV) * InvFrames;
+    // Build the billboard's local tangent plane (matches V3D_ImpostorWPO_VS verbatim),
+    // then reproject the billboard point onto each blended cell's baked camera plane (Right_i, Up_i).
+    // This eliminates 90-180 deg roll jumps on nodes rotated around X/Y whose local +-Z is horizontal.
+    float VLenSq = dot(LocalViewDir, LocalViewDir);
+    float3 ViewFwd = VLenSq > 1.0e-6 ? LocalViewDir * rsqrt(VLenSq) : float3(1.0, 0.0, 0.0);
+    float3 ViewUpRef = abs(ViewFwd.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 ViewRight = normalize(cross(ViewUpRef, ViewFwd));
+    float3 ViewUp = normalize(cross(ViewFwd, ViewRight));
+    float2 QuadCoord = (saturate(LocalUV) - 0.5) * 2.0;
+    float3 BillboardLocalPos = ViewRight * QuadCoord.x - ViewUp * QuadCoord.y;
 
-    float2 UV0 = F0 * InvFrames + CellUV;
-    float2 UV1 = F1 * InvFrames + CellUV;
-    float2 UV2 = F2 * InvFrames + CellUV;
+    float InvGridSpan = rcp(max(SafeFrames - 1.0, 1.0));
+    float3 Dir0 = V3D_HemiOctahedronToDir(F0 * InvGridSpan);
+    float3 UpRef0 = abs(Dir0.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 Right0 = normalize(cross(UpRef0, Dir0));
+    float3 Up0 = normalize(cross(Dir0, Right0));
+    float2 CellUV0 = clamp(float2(dot(BillboardLocalPos, Right0) * 0.5 + 0.5, -dot(BillboardLocalPos, Up0) * 0.5 + 0.5), 0.004, 0.996) * InvFrames;
+
+    float3 Dir1 = V3D_HemiOctahedronToDir(F1 * InvGridSpan);
+    float3 UpRef1 = abs(Dir1.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 Right1 = normalize(cross(UpRef1, Dir1));
+    float3 Up1 = normalize(cross(Dir1, Right1));
+    float2 CellUV1 = clamp(float2(dot(BillboardLocalPos, Right1) * 0.5 + 0.5, -dot(BillboardLocalPos, Up1) * 0.5 + 0.5), 0.004, 0.996) * InvFrames;
+
+    float3 Dir2 = V3D_HemiOctahedronToDir(F2 * InvGridSpan);
+    float3 UpRef2 = abs(Dir2.z) < 0.995 ? float3(0.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
+    float3 Right2 = normalize(cross(UpRef2, Dir2));
+    float3 Up2 = normalize(cross(Dir2, Right2));
+    float2 CellUV2 = clamp(float2(dot(BillboardLocalPos, Right2) * 0.5 + 0.5, -dot(BillboardLocalPos, Up2) * 0.5 + 0.5), 0.004, 0.996) * InvFrames;
+
+    float2 UV0 = F0 * InvFrames + CellUV0;
+    float2 UV1 = F1 * InvFrames + CellUV1;
+    float2 UV2 = F2 * InvFrames + CellUV2;
 
 #if PIXELSHADER
     float2 DdxUV = ddx(LocalUV) * InvFrames;
@@ -312,16 +340,18 @@ float3 V3D_ImpostorWPO_VS(
     float3 DeltaWS = AxisX * DeltaLocal.x + AxisY * DeltaLocal.y + AxisZ * DeltaLocal.z;
     float3 CenterTWS = Parameters.WorldPosition + DeltaWS;
 
-    // Transform camera-to-center direction into exact instance local space via M^-1
-    // (dot(V, Axis) / |Axis|^2), preserving arbitrary 3D rotations, non-uniform scale, and negative mirrors.
+    // Exact 3x3 adjugate inverse of [AxisX, AxisY, AxisZ] so arbitrary rotations,
+    // non-uniform scales, parent-child shear, and negative mirrors map accurately to local space.
     float3 ViewDirWS = ResolvedView.TranslatedWorldCameraOrigin - CenterTWS;
-    float InvLenSqX = rcp(max(dot(AxisX, AxisX), 1.0e-8));
-    float InvLenSqY = rcp(max(dot(AxisY, AxisY), 1.0e-8));
-    float InvLenSqZ = rcp(max(dot(AxisZ, AxisZ), 1.0e-8));
+    float3 CofX = cross(AxisY, AxisZ);
+    float3 CofY = cross(AxisZ, AxisX);
+    float3 CofZ = cross(AxisX, AxisY);
+    float Det = dot(AxisX, CofX);
+    float InvDet = abs(Det) > 1.0e-8 ? rcp(Det) : 1.0;
     float3 LocalForward = float3(
-        dot(ViewDirWS, AxisX) * InvLenSqX,
-        dot(ViewDirWS, AxisY) * InvLenSqY,
-        dot(ViewDirWS, AxisZ) * InvLenSqZ);
+        dot(ViewDirWS, CofX),
+        dot(ViewDirWS, CofY),
+        dot(ViewDirWS, CofZ)) * InvDet;
     float LFwdLenSq = dot(LocalForward, LocalForward);
     LocalForward = LFwdLenSq > 1.0e-8 ? LocalForward * rsqrt(LFwdLenSq) : float3(1.0, 0.0, 0.0);
 
@@ -341,16 +371,23 @@ float3 V3D_ImpostorWPO_VS(
 }
 
 // Computes normalized camera-to-instance direction in Instance Local Space for Pixel Shader.
+// Uses vertex-interpolated Parameters.TangentToWorld so HISM/ISM per-instance rotations are
+// always exact on every GPU/RHI path (BuildBillboardQuadMesh authors Normal=+X, Tangent=+Y, BiTangent=+Z).
 float3 V3D_ImpostorLocalViewDir_PS(FMaterialPixelParameters Parameters)
 {
-    float3 AxisX = TransformLocalVectorToWorld(Parameters, float3(1.0, 0.0, 0.0));
-    float3 AxisY = TransformLocalVectorToWorld(Parameters, float3(0.0, 1.0, 0.0));
-    float3 AxisZ = TransformLocalVectorToWorld(Parameters, float3(0.0, 0.0, 1.0));
+    float3 AxisX = Parameters.TangentToWorld[2];
+    float3 AxisY = Parameters.TangentToWorld[0];
+    float3 AxisZ = Parameters.TangentToWorld[1];
     float3 V = Parameters.CameraVector;
+    float3 CofX = cross(AxisY, AxisZ);
+    float3 CofY = cross(AxisZ, AxisX);
+    float3 CofZ = cross(AxisX, AxisY);
+    float Det = dot(AxisX, CofX);
+    float InvDet = abs(Det) > 1.0e-8 ? rcp(Det) : 1.0;
     float3 LocalViewDir = float3(
-        dot(V, AxisX) * rcp(max(dot(AxisX, AxisX), 1.0e-8)),
-        dot(V, AxisY) * rcp(max(dot(AxisY, AxisY), 1.0e-8)),
-        dot(V, AxisZ) * rcp(max(dot(AxisZ, AxisZ), 1.0e-8)));
+        dot(V, CofX),
+        dot(V, CofY),
+        dot(V, CofZ)) * InvDet;
     float LenSq = dot(LocalViewDir, LocalViewDir);
     return LenSq > 1.0e-8 ? LocalViewDir * rsqrt(LenSq) : float3(1.0, 0.0, 0.0);
 }
@@ -368,6 +405,9 @@ float4x3 V3D_SampleImpostorArray_PS(
     float GridFrames,
     float2 LocalUV)
 {
+    float3 AxisX = Parameters.TangentToWorld[2];
+    float3 AxisY = Parameters.TangentToWorld[0];
+    float3 AxisZ = Parameters.TangentToWorld[1];
     float3 LocalViewDir = V3D_ImpostorLocalViewDir_PS(Parameters);
     float4x3 Sampled = V3D_SampleImpostorArray(
         ImpostorAtlasArray,
@@ -375,7 +415,7 @@ float4x3 V3D_SampleImpostorArray_PS(
         LocalUV,
         LocalViewDir,
         GridFrames);
-    float3 NormalWS = TransformLocalVectorToWorld(Parameters, Sampled[1]);
+    float3 NormalWS = AxisX * Sampled[1].x + AxisY * Sampled[1].y + AxisZ * Sampled[1].z;
     float NLenSq = dot(NormalWS, NormalWS);
     Sampled[1] = NLenSq > 1.0e-8 ? NormalWS * rsqrt(NLenSq) : float3(0.0, 0.0, 1.0);
     return Sampled;

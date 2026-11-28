@@ -18,8 +18,8 @@ UDynamicPointLightComponent::UDynamicPointLightComponent()
     bCastVolumetricShadow = false;
     bAffectTranslucentLighting = false;
     CastStaticShadows = false;
-    MaxDrawDistance = 12000.0f;
-    MaxDistanceFadeRange = 2000.0f;
+    MaxDrawDistance = 18000.0f;
+    MaxDistanceFadeRange = 3000.0f;
 }
 
 void UDynamicPointLightComponent::NotifySubsystemRefresh()

@@ -14,6 +14,7 @@
 #include "DynamicActor.generated.h"
 
 class UBoxComponent;
+class UBuoyancyComponent;
 class UWorldBakedModelAsset;
 class UStaticMesh;
 
@@ -40,6 +41,7 @@ struct V3DSIMULATOR_API FDynamicActorConfig
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Dynamic")
     bool bSimulatePhysics = false;
+    bool bEnableBuoyancy = true;
 
     /** Optional authored rigid-body mass. A value <= 0 keeps Chaos auto-calculated mass. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Dynamic", meta=(ClampMin="0.0"))
@@ -96,6 +98,9 @@ private:
     /** Lightweight per-entity physics/collision proxy. Rendering is owned by UInstancedEntitySubsystem. */
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<UBoxComponent> Root;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UBuoyancyComponent> BuoyancyComponent;
 
     UPROPERTY()
     /** Range-reading facade for one v3d:// model; it never contains or opens a source GLB. */

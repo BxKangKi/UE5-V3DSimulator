@@ -36,6 +36,8 @@
 #include "Misc/CoreDelegates.h"
 #include "Math/RotationMatrix.h"
 #include "ProceduralMeshComponent.h"
+#include "Components/MeshComponent.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "System/MacroLibrary.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/MultiplayerWorldStateActor.h"
@@ -1547,6 +1549,7 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
     ReleaseMaterialDefaultAsset();
 
     ClearPlacementGridMesh();
+    ClearPlacementSilhouette();
     if (IsValid(PlacementGridComponent))
     {
         PlacementGridComponent->SetMaterial(0, nullptr);
@@ -1619,6 +1622,7 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
     EquippedWeapon = nullptr;
     SpawnedStatics.Empty();
     SpawnedVehicles.Empty();
+    SpawnedProps.Empty();
 }
 
 void UGameManagerSubSystem::CompactTrackedEntityReferences()
@@ -1835,6 +1839,7 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
 
     HideLoadingWidget();
     ClearPlacementGridMesh();
+    ClearPlacementSilhouette();
     ReleaseMaterialDefaultAsset();
     ClearTransientRuntimeReferences();
     ResetWorldRuntimeReferences();
@@ -3187,12 +3192,16 @@ void UGameManagerSubSystem::UpdateOceanFollow()
             OceanMaterialSafeMaxRadiusCm);
     }
 
-    FVector DesiredLocation = OceanActor->GetActorLocation();
+    const FVector CurrentOceanLocation = OceanActor->GetActorLocation();
+    FVector DesiredLocation = CurrentOceanLocation;
     DesiredLocation.X = ViewLocation.X;
     DesiredLocation.Y = ViewLocation.Y;
     DesiredLocation.Z = OceanTransform.GetLocation().Z;
 
-    if (!DesiredLocation.Equals(OceanActor->GetActorLocation(), 0.01))
+    constexpr double OceanFollowHorizontalThresholdSq = 500.0 * 500.0;
+    const bool bMovedHorizontally = FVector::DistSquared2D(DesiredLocation, CurrentOceanLocation) > OceanFollowHorizontalThresholdSq;
+    const bool bMovedVertically = !FMath::IsNearlyEqual(DesiredLocation.Z, CurrentOceanLocation.Z, 1.0);
+    if (bMovedHorizontally || bMovedVertically)
     {
         OceanActor->SetActorLocation(DesiredLocation, false, nullptr, ETeleportType::TeleportPhysics);
     }
@@ -3240,6 +3249,7 @@ void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
     if (PlayMode != EPlayMode::Creator || CurrentMode == EToolMode::None)
     {
         ClearPlacementGridMesh();
+        ClearPlacementSilhouette();
         return;
     }
 
@@ -3253,6 +3263,7 @@ void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
     }
 
     UpdatePlacementGrid();
+    UpdatePlacementSilhouette();
 }
 
 void UGameManagerSubSystem::ClearTransientRuntimeReferences()
@@ -3286,6 +3297,7 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     Root = nullptr;
     PlacementGridComponent = nullptr;
     PlacementGridMaterial = nullptr;
+    PlacementPreviewMaterial = nullptr;
 
     // These class references may point at Blueprint packages with large dependency graphs. Revert to
     // lightweight native defaults (or null for optional systems) once the world session is gone.
@@ -3301,12 +3313,14 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     EquippedWeapon = nullptr;
     SpawnedStatics.Empty();
     SpawnedVehicles.Empty();
+    SpawnedProps.Empty();
 
     // This method is used only at world/session teardown. Empty releases the allocator capacity
     // retained by large worlds instead of carrying it into menus and subsequent level loads.
     StaticReferences.Empty();
     VehicleReferences.Empty();
     WeaponReferences.Empty();
+    PropReferences.Empty();
     AvailableItems.Empty();
     ToolbarSlots.Empty();
     bToolbarInitialized = false;
@@ -3432,6 +3446,7 @@ void UGameManagerSubSystem::RefreshBuiltModelLists()
     StaticReferences.Empty();
     VehicleReferences.Empty();
     WeaponReferences.Empty();
+    PropReferences.Empty();
 
     const UModelDatabaseSubsystem* Database = GetGameInstance()
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
@@ -3460,11 +3475,16 @@ void UGameManagerSubSystem::RefreshBuiltModelLists()
         {
             WeaponReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
         }
+        else if (Definition.IsProp())
+        {
+            PropReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
+        }
     }
 
     StaticReferences.Sort();
     VehicleReferences.Sort();
     WeaponReferences.Sort();
+    PropReferences.Sort();
 
     CurrentStaticIndex = StaticReferences.Num() > 0
         ? FMath::Clamp(CurrentStaticIndex, 0, StaticReferences.Num() - 1) : 0;
@@ -3500,6 +3520,21 @@ FToolbarItem UGameManagerSubSystem::MakeToolbarItem(EToolbarItemKind Kind, const
     return Item;
 }
 
+bool UGameManagerSubSystem::ShouldShowModelInItemList(const FString& ModelReference) const
+{
+    const UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    FGuid UUID;
+    FModelDefinition Definition;
+    FString RuntimeReference;
+    if (Database && Database->FindUUIDForReference(ModelReference, UUID)
+        && Database->Resolve(UUID, Definition, RuntimeReference))
+    {
+        return Definition.bShowInItemList;
+    }
+    return true;
+}
+
 void UGameManagerSubSystem::BuildAvailableItems()
 {
     AvailableItems.Empty();
@@ -3508,6 +3543,7 @@ void UGameManagerSubSystem::BuildAvailableItems()
     {
         for (int32 Index = 0; Index < VehicleReferences.Num(); ++Index)
         {
+            if (!ShouldShowModelInItemList(VehicleReferences[Index])) continue;
             AvailableItems.Add(MakeToolbarItem(
                 EToolbarItemKind::Vehicle,
                 GetAssetDisplayName(VehicleReferences[Index]),
@@ -3517,10 +3553,21 @@ void UGameManagerSubSystem::BuildAvailableItems()
 
         for (int32 Index = 0; Index < WeaponReferences.Num(); ++Index)
         {
+            if (!ShouldShowModelInItemList(WeaponReferences[Index])) continue;
             AvailableItems.Add(MakeToolbarItem(
                 EToolbarItemKind::Weapon,
                 GetAssetDisplayName(WeaponReferences[Index]),
                 WeaponReferences[Index],
+                Index));
+        }
+
+        for (int32 Index = 0; Index < PropReferences.Num(); ++Index)
+        {
+            if (!ShouldShowModelInItemList(PropReferences[Index])) continue;
+            AvailableItems.Add(MakeToolbarItem(
+                EToolbarItemKind::Prop,
+                GetAssetDisplayName(PropReferences[Index]),
+                PropReferences[Index],
                 Index));
         }
     }
@@ -3756,6 +3803,10 @@ void UGameManagerSubSystem::ApplySelectedToolbarItem(bool bBroadcastChange)
     case EToolbarItemKind::Vehicle:
         CurrentMode = EToolMode::PlaceVehicle;
         LastSaveMessage = TEXT("Vehicle tool: left-click to place a vehicle at the center crosshair.");
+        break;
+    case EToolbarItemKind::Prop:
+        CurrentMode = EToolMode::PlaceProp;
+        LastSaveMessage = TEXT("Prop tool: left-click to place a prop at the center crosshair.");
         break;
     case EToolbarItemKind::Weapon:
         if (Item.bAvailable && WeaponReferences.IsValidIndex(Item.ModelIndex))
@@ -4099,6 +4150,10 @@ bool UGameManagerSubSystem::TracePlacementLocation(FVector& OutLocation, FHitRes
     {
         Params.AddIgnoredActor(Pawn);
     }
+    if (AActor* PreviewActor = PlacementPreviewActor.Get(); IsValid(PreviewActor))
+    {
+        Params.AddIgnoredActor(PreviewActor);
+    }
     // Ignore the equipped weapon so firing/held weapon meshes do not block placement directly in front of the camera.
     if (IsValid(EquippedWeapon))
     {
@@ -4198,7 +4253,8 @@ bool UGameManagerSubSystem::ShouldShowPlacementGrid() const
 {
     return PlayMode == EPlayMode::Creator
         && bLastTraceHasPlacementLocation
-        && CurrentMode == EToolMode::PlaceStatic;
+        && !bItemListWindowOpen
+        && (CurrentMode == EToolMode::PlaceStatic || CurrentMode == EToolMode::PlaceProp);
 }
 
 void UGameManagerSubSystem::UpdatePlacementGrid()
@@ -4234,6 +4290,150 @@ void UGameManagerSubSystem::UpdatePlacementGrid()
 
     PlacementGridComponent->SetHiddenInGame(false);
     PlacementGridComponent->SetVisibility(true, true);
+}
+
+void UGameManagerSubSystem::ClearPlacementSilhouette()
+{
+    if (ADynamicActor* PreviewActor = PlacementPreviewActor.Get(); IsValid(PreviewActor))
+    {
+        PreviewActor->Destroy();
+    }
+    PlacementPreviewActor.Reset();
+    PlacementPreviewModelReference.Empty();
+    PlacementPreviewStyledMeshCount = 0;
+}
+
+void UGameManagerSubSystem::ApplySilhouetteStyleToPreviewActor(ADynamicActor* PreviewActor)
+{
+    if (!IsValid(PreviewActor))
+    {
+        return;
+    }
+
+    if (!IsValid(PlacementPreviewMaterial))
+    {
+        UMaterialInterface* BaseMat = PlacementGridMaterial.Get();
+        if (!IsValid(BaseMat))
+        {
+            BaseMat = LoadObject<UMaterialInterface>(nullptr, TEXT("/V3DRuntime/Materials/M_V3D_Translucent.M_V3D_Translucent"));
+        }
+        if (IsValid(BaseMat))
+        {
+            PlacementPreviewMaterial = UMaterialInstanceDynamic::Create(BaseMat, this);
+            if (IsValid(PlacementPreviewMaterial))
+            {
+                const FLinearColor GhostColor(0.20f, 0.85f, 1.0f, 0.38f);
+                PlacementPreviewMaterial->SetVectorParameterValue(TEXT("Color"), GhostColor);
+                PlacementPreviewMaterial->SetVectorParameterValue(TEXT("BaseColor"), GhostColor);
+                PlacementPreviewMaterial->SetVectorParameterValue(TEXT("baseColorFactor"), GhostColor);
+                PlacementPreviewMaterial->SetVectorParameterValue(TEXT("EmissiveColor"), FLinearColor(0.15f, 0.70f, 0.95f, 1.0f));
+                PlacementPreviewMaterial->SetVectorParameterValue(TEXT("emissiveFactor"), FLinearColor(0.15f, 0.70f, 0.95f, 1.0f));
+                PlacementPreviewMaterial->SetScalarParameterValue(TEXT("Opacity"), 0.38f);
+                PlacementPreviewMaterial->SetScalarParameterValue(TEXT("Alpha"), 0.38f);
+            }
+        }
+    }
+
+    TInlineComponentArray<UMeshComponent*> MeshComps(PreviewActor);
+    if (MeshComps.Num() == PlacementPreviewStyledMeshCount && PlacementPreviewStyledMeshCount > 0)
+    {
+        return;
+    }
+
+    int32 StyledCount = 0;
+    for (UMeshComponent* MeshComp : MeshComps)
+    {
+        if (!IsValid(MeshComp)) continue;
+        MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        MeshComp->SetCollisionResponseToAllChannels(ECR_Ignore);
+        MeshComp->SetGenerateOverlapEvents(false);
+        MeshComp->SetCastShadow(false);
+        MeshComp->SetReceivesDecals(false);
+        MeshComp->SetCanEverAffectNavigation(false);
+        MeshComp->SetRenderCustomDepth(true);
+        if (IsValid(PlacementPreviewMaterial))
+        {
+            const int32 NumMats = FMath::Max(1, MeshComp->GetNumMaterials());
+            for (int32 MatIdx = 0; MatIdx < NumMats; ++MatIdx)
+            {
+                MeshComp->SetMaterial(MatIdx, PlacementPreviewMaterial);
+            }
+        }
+        ++StyledCount;
+    }
+    PlacementPreviewStyledMeshCount = StyledCount;
+}
+
+void UGameManagerSubSystem::UpdatePlacementSilhouette()
+{
+    UWorld* const World = GetWorld();
+    const FToolbarItem Item = GetSelectedToolbarItem();
+    const bool bPlaceable = PlayMode == EPlayMode::Creator
+        && !bItemListWindowOpen
+        && bLastTraceHasPlacementLocation
+        && Item.bAvailable
+        && !Item.ModelReference.IsEmpty()
+        && (Item.Kind == EToolbarItemKind::Prop || Item.Kind == EToolbarItemKind::Vehicle);
+
+    if (!bPlaceable || !IsValid(World) || !World->IsGameWorld())
+    {
+        if (ADynamicActor* PreviewActor = PlacementPreviewActor.Get(); IsValid(PreviewActor))
+        {
+            PreviewActor->SetActorHiddenInGame(true);
+        }
+        return;
+    }
+
+    APlayerController* const PC = World->GetFirstPlayerController();
+    const FRotator PreviewRot(0.0f, IsValid(PC) ? PC->GetControlRotation().Yaw : 0.0f, 0.0f);
+    const FVector PreviewLoc = (Item.Kind == EToolbarItemKind::Vehicle)
+        ? (LastPreviewLocation + FVector(0.0f, 0.0f, 20.0f))
+        : LastPreviewLocation;
+
+    ADynamicActor* PreviewActor = PlacementPreviewActor.Get();
+    if (!IsValid(PreviewActor) || PlacementPreviewModelReference != Item.ModelReference)
+    {
+        ClearPlacementSilhouette();
+
+        UModelDatabaseSubsystem* Database = GetGameInstance()
+            ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+        FGuid UUID;
+        FModelDefinition Definition;
+        FString RuntimeReference;
+        if (!Database || !Database->FindUUIDForReference(Item.ModelReference, UUID)
+            || !Database->ResolveLoadable(UUID, Definition, RuntimeReference))
+        {
+            return;
+        }
+
+        FActorSpawnParameters Params;
+        Params.Owner = SessionOwner.Get();
+        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        Params.ObjectFlags = RF_Transient;
+        PreviewActor = World->SpawnActor<ADynamicActor>(
+            ADynamicActor::StaticClass(),
+            FTransform(PreviewRot, PreviewLoc),
+            Params);
+        if (!IsValid(PreviewActor))
+        {
+            return;
+        }
+
+        PreviewActor->SetActorEnableCollision(false);
+        PreviewActor->SetRenderOnlyMode(true);
+        if (!PreviewActor->LoadDynamic(RuntimeReference, TEXT("PlacementPreview")))
+        {
+            PreviewActor->Destroy();
+            return;
+        }
+        PlacementPreviewActor = PreviewActor;
+        PlacementPreviewModelReference = Item.ModelReference;
+        PlacementPreviewStyledMeshCount = 0;
+    }
+
+    PreviewActor->SetActorHiddenInGame(false);
+    PreviewActor->SetActorLocationAndRotation(PreviewLoc, PreviewRot, false, nullptr, ETeleportType::TeleportPhysics);
+    ApplySilhouetteStyleToPreviewActor(PreviewActor);
 }
 
 void UGameManagerSubSystem::ClearPlacementGridMesh()
@@ -4495,6 +4695,16 @@ void UGameManagerSubSystem::InputPrimaryPressed()
             LastSaveMessage = TEXT("Could not resolve the center-crosshair location for vehicle placement.");
         }
         break;
+    case EToolbarItemKind::Prop:
+        if (bHasPlacementLocation)
+        {
+            PlaceProp(Location, Item.ModelReference);
+        }
+        else
+        {
+            LastSaveMessage = TEXT("Could not resolve the center-crosshair location for prop placement.");
+        }
+        break;
     case EToolbarItemKind::Weapon:
         if (IsValid(EquippedWeapon))
         {
@@ -4678,6 +4888,75 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
         return;
     }
     LastSaveMessage = TEXT("glTF vehicle placed. Press F to enter.");
+}
+
+void UGameManagerSubSystem::PlaceProp(const FVector& Location, const FString& ModelReference)
+{
+    UWorld* const World = GetWorld();
+    if (!IsValid(World) || !World->IsGameWorld())
+    {
+        LastSaveMessage = TEXT("Prop placement was skipped because no active game world is available.");
+        return;
+    }
+
+    UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    FGuid UUID;
+    FModelDefinition Definition;
+    FString RuntimeReference;
+    if (!Database || !Database->FindUUIDForReference(ModelReference, UUID)
+        || !Database->ResolveLoadable(UUID, Definition, RuntimeReference)
+        || !Definition.IsProp())
+    {
+        LastSaveMessage = TEXT("The built prop model reference is invalid.");
+        return;
+    }
+
+    FActorSpawnParameters Params;
+    Params.Owner = SessionOwner.Get();
+    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+    APlayerController* const PlayerController = World->GetFirstPlayerController();
+    const FRotator SpawnRot = FRotator(
+        0.0f,
+        PlayerController ? PlayerController->GetControlRotation().Yaw : 0.0f,
+        0.0f);
+    UClass* PropSpawnClass = DynamicActorClass ? DynamicActorClass.Get() : ADynamicActor::StaticClass();
+    ADynamicActor* PropActor = World->SpawnActor<ADynamicActor>(
+        PropSpawnClass,
+        FTransform(SpawnRot, Location),
+        Params);
+    if (!IsValid(PropActor) && PropSpawnClass != ADynamicActor::StaticClass())
+    {
+        PropActor = World->SpawnActor<ADynamicActor>(
+            ADynamicActor::StaticClass(),
+            FTransform(SpawnRot, Location),
+            Params);
+    }
+    if (!IsValid(PropActor))
+    {
+        LastSaveMessage = TEXT("Failed to spawn the prop actor.");
+        return;
+    }
+
+    const FString PropObjectName = FString::Printf(TEXT("%s_%d"), *Definition.Name, SpawnedProps.Num() + 1);
+    if (!PropActor->LoadDynamic(RuntimeReference, PropObjectName))
+    {
+        PropActor->Destroy();
+        LastSaveMessage = TEXT("The prop actor was removed because its model could not be loaded.");
+        return;
+    }
+
+    SpawnedProps.Add(TWeakObjectPtr<ADynamicActor>(PropActor));
+    UWorldObjectStreamingSubsystem* Chunks = World->GetSubsystem<UWorldObjectStreamingSubsystem>();
+    if (!Chunks || !Chunks->RegisterPlacedObject(PropActor, UUID))
+    {
+        SpawnedProps.Pop(EAllowShrinking::No);
+        PropActor->Destroy();
+        LastSaveMessage = TEXT("Prop placement was deferred because the target chunk or model UUID is not ready yet.");
+        return;
+    }
+    LastSaveMessage = FString::Printf(TEXT("Prop placed: %s"),
+        *(Definition.DisplayName.IsEmpty() ? Definition.Name : Definition.DisplayName));
 }
 
 

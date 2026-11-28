@@ -215,9 +215,16 @@ namespace GWorldArchivePrivate
         for (const FLightData& L : V.Lights)
         {
             v3d::light P;
-            P.location = ToPortable(L.Location); P.intensity = L.Intensity;
+            P.type = static_cast<uint8>(L.Type);
+            P.location = ToPortable(L.Location);
+            P.rotation = ToPortable(FVector(L.Rotation.Pitch, L.Rotation.Yaw, L.Rotation.Roll));
+            P.color_r = L.Color.R; P.color_g = L.Color.G; P.color_b = L.Color.B;
+            P.intensity = L.Intensity;
             P.source_radius = L.SourceRadius; P.soft_source_radius = L.SoftSourceRadius;
             P.attenuation_radius = L.AttenuationRadius; P.length = L.Length; P.unit = static_cast<uint8>(L.Unit);
+            P.inner_cone_angle = L.InnerConeAngle; P.outer_cone_angle = L.OuterConeAngle;
+            P.source_width = L.SourceWidth; P.source_height = L.SourceHeight;
+            P.barn_door_angle = L.BarnDoorAngle; P.barn_door_length = L.BarnDoorLength;
             R.lights.push_back(std::move(P));
         }
         return R;
@@ -237,9 +244,17 @@ namespace GWorldArchivePrivate
         for (const v3d::light& L : V.lights)
         {
             FLightData& P = R.Lights.AddDefaulted_GetRef();
-            P.Location = ToUnreal(L.location); P.Intensity = L.intensity;
+            P.Type = static_cast<ELightType>(FMath::Clamp<uint8>(L.type, 0, 2));
+            P.Location = ToUnreal(L.location);
+            const FVector Rot = ToUnreal(L.rotation);
+            P.Rotation = FRotator(Rot.X, Rot.Y, Rot.Z);
+            P.Color = FLinearColor(L.color_r, L.color_g, L.color_b, 1.0f);
+            P.Intensity = L.intensity;
             P.SourceRadius = L.source_radius; P.SoftSourceRadius = L.soft_source_radius;
             P.AttenuationRadius = L.attenuation_radius; P.Length = L.length; P.Unit = static_cast<ELightUnits>(L.unit);
+            P.InnerConeAngle = L.inner_cone_angle; P.OuterConeAngle = L.outer_cone_angle;
+            P.SourceWidth = L.source_width; P.SourceHeight = L.source_height;
+            P.BarnDoorAngle = L.barn_door_angle; P.BarnDoorLength = L.barn_door_length;
         }
         return R;
     }
@@ -1580,8 +1595,10 @@ bool FGWorldModelMetadata::IsSane(FString* OutError) const
             NodeIndex = ParentByNode[NodeIndex];
         }
     }
+    // Multiple differently-named glTF nodes (e.g. Wheel_FL/FR/RL/RR) can legitimately share one glTF mesh index,
+    // so MeshMap (keyed by node family name) is bounded by Max(SourceMeshCount, SourceNodeCount).
     if (static_cast<int64>(SceneData.NodeMap.Num()) + SceneData.WaterNodeMap.Num() > SourceNodeCount
-        || SceneData.MeshMap.Num() > SourceMeshCount)
+        || SceneData.MeshMap.Num() > FMath::Max(SourceMeshCount, SourceNodeCount))
     {
         return Fail(TEXT("baked metadata refers to more nodes or meshes than the source GLB"));
     }

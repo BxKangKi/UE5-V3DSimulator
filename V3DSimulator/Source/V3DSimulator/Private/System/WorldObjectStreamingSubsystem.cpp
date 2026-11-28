@@ -112,6 +112,8 @@ void UWorldObjectStreamingSubsystem::Start(const FString& InWorldRoot, const flo
     bRunning = true;
     // Rebuild once now, then wait a full interval instead of repeating the same radius scan on the
     // immediately following tick.
+    bHasLastDesiredSnapshot = false;
+    LastDesiredObserverChunks.Reset();
     DesiredRefreshAccumulator = DesiredRefreshIntervalSeconds;
     RebuildDesiredChunks();
     PumpLoads();
@@ -131,6 +133,7 @@ void UWorldObjectStreamingSubsystem::SetLoadRadiusMeters(const float InLoadRadiu
     LoadRadiusCentimeters = NewRadiusCentimeters;
     if (bRunning)
     {
+        bHasLastDesiredSnapshot = false;
         DesiredRefreshAccumulator = DesiredRefreshIntervalSeconds;
         RebuildDesiredChunks();
         PumpLoads();
@@ -147,6 +150,8 @@ void UWorldObjectStreamingSubsystem::Stop()
     CommandEntityIndex.Empty(); NextCommandIndexAt = 0;
     bHasPriorityStreamingFocus = false;
     PriorityStreamingFocus = FVector::ZeroVector;
+    bHasLastDesiredSnapshot = false;
+    LastDesiredObserverChunks.Reset();
     PendingLoads.Empty();
     LoadingChunks.Empty();
     DesiredChunks.Empty();
@@ -417,6 +422,8 @@ void UWorldObjectStreamingSubsystem::ClearPriorityStreamingFocus()
     if (!bHasPriorityStreamingFocus) return;
     bHasPriorityStreamingFocus = false;
     PriorityStreamingFocus = FVector::ZeroVector;
+    bHasLastDesiredSnapshot = false;
+    LastDesiredObserverChunks.Reset();
     if (bRunning && HasPersistenceAuthority())
     {
         RebuildDesiredChunks();
@@ -426,9 +433,37 @@ void UWorldObjectStreamingSubsystem::ClearPriorityStreamingFocus()
 
 void UWorldObjectStreamingSubsystem::RebuildDesiredChunks()
 {
-    TSet<FWorldChunkCoordinate> NewDesired;
     UWorld* World = GetWorld();
     if (!World) return;
+    TArray<FWorldChunkCoordinate> CurrentObserverChunks;
+    for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+    {
+        const APlayerController* Controller = It->Get();
+        const APawn* Pawn = Controller ? Controller->GetPawn() : nullptr;
+        if (IsValid(Pawn))
+        {
+            const FVector Loc = Pawn->GetActorLocation();
+            if (FMath::IsFinite(Loc.X) && FMath::IsFinite(Loc.Y) && FMath::IsFinite(Loc.Z))
+            {
+                CurrentObserverChunks.Add(ToChunk(Loc));
+            }
+        }
+    }
+    const FWorldChunkCoordinate CurrentPriorityChunk = bHasPriorityStreamingFocus ? ToChunk(PriorityStreamingFocus) : FWorldChunkCoordinate{};
+    if (bHasLastDesiredSnapshot
+        && bLastDesiredPriorityFocus == bHasPriorityStreamingFocus
+        && (!bHasPriorityStreamingFocus || LastDesiredPriorityChunk == CurrentPriorityChunk)
+        && FMath::IsNearlyEqual(LastDesiredLoadRadiusCm, LoadRadiusCentimeters, 1.0f)
+        && LastDesiredObserverChunks == CurrentObserverChunks)
+    {
+        return;
+    }
+    bHasLastDesiredSnapshot = true;
+    bLastDesiredPriorityFocus = bHasPriorityStreamingFocus;
+    LastDesiredPriorityChunk = CurrentPriorityChunk;
+    LastDesiredLoadRadiusCm = LoadRadiusCentimeters;
+    LastDesiredObserverChunks = MoveTemp(CurrentObserverChunks);
+    TSet<FWorldChunkCoordinate> NewDesired;
     const int32 Radius = FMath::CeilToInt(LoadRadiusCentimeters / ChunkSizeCentimeters);
     const int32 Diameter = Radius * 2 + 1;
     // Reserve the one-observer cube up front. The spherical distance check will use less, and

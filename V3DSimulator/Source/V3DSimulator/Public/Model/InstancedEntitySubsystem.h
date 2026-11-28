@@ -10,6 +10,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Model/ModelData.h"
 #include "Engine/EngineTypes.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "InstancedEntitySubsystem.generated.h"
@@ -61,6 +62,7 @@ struct V3DSIMULATOR_API FInstancedVehicleTemplateData
     FBox WheelVisualRestBounds = FBox(ForceInit);
     FBox CombinedLocalBounds = FBox(ForceInit);
     float RuntimeWheelRadius = 0.0f;
+    TArray<FLightData> AuthoredLights;
 
     bool HasConsistentWheelData() const
     {

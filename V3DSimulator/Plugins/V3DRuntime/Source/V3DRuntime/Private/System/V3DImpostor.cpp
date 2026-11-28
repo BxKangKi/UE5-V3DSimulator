@@ -238,73 +238,81 @@ namespace V3DImpostorPrivate
             const int32 OffsetX = CellX * FrameRes;
             const int32 OffsetY = CellY * FrameRes;
 
-            const bool bHasPrimTransforms = SourceMesh.AdditionalTransforms.Num() == SourceMesh.Primitives.Num();
-            for (int32 PrimIdx = 0; PrimIdx < SourceMesh.Primitives.Num(); ++PrimIdx)
+            // Honor glTFRuntime AdditionalTransforms identically to UStaticMesh LOD assembly:
+            // when AdditionalTransforms is non-empty, every primitive is instanced by each transform.
+            const int32 XformCount = SourceMesh.AdditionalTransforms.IsEmpty() ? 1 : SourceMesh.AdditionalTransforms.Num();
+            for (int32 XformIdx = 0; XformIdx < XformCount; ++XformIdx)
             {
-                const FGWorldBakedPrimitive& Prim = SourceMesh.Primitives[PrimIdx];
-                if (Prim.Mode != 4 || Prim.Positions.Num() < 3) continue;
-                const FTransform* PrimXform = bHasPrimTransforms ? &SourceMesh.AdditionalTransforms[PrimIdx] : nullptr;
-                const FResolvedPrimitiveSurface& Surface = Surfaces[PrimIdx];
-                const bool bHasUV0 = !Prim.UVs.IsEmpty() && Prim.UVs[0].Num() == Prim.Positions.Num();
-                const bool bHasNormals = Prim.Normals.Num() == Prim.Positions.Num();
-                const bool bIndexed = Prim.bHasIndices && Prim.Indices.Num() >= 3;
-                const int32 TriCount = bIndexed ? (Prim.Indices.Num() / 3) : (Prim.Positions.Num() / 3);
+                const FTransform* PrimXform = SourceMesh.AdditionalTransforms.IsEmpty()
+                    ? nullptr : &SourceMesh.AdditionalTransforms[XformIdx];
+                const float NormalDetSign = (PrimXform && PrimXform->GetDeterminant() < 0.0f) ? -1.0f : 1.0f;
 
-                for (int32 Tri = 0; Tri < TriCount; ++Tri)
+                for (int32 PrimIdx = 0; PrimIdx < SourceMesh.Primitives.Num(); ++PrimIdx)
                 {
-                    const uint32 I0 = bIndexed ? Prim.Indices[Tri * 3 + 0] : static_cast<uint32>(Tri * 3 + 0);
-                    const uint32 I1 = bIndexed ? Prim.Indices[Tri * 3 + 1] : static_cast<uint32>(Tri * 3 + 1);
-                    const uint32 I2 = bIndexed ? Prim.Indices[Tri * 3 + 2] : static_cast<uint32>(Tri * 3 + 2);
-                    if (I0 >= static_cast<uint32>(Prim.Positions.Num())
-                        || I1 >= static_cast<uint32>(Prim.Positions.Num())
-                        || I2 >= static_cast<uint32>(Prim.Positions.Num()))
+                    const FGWorldBakedPrimitive& Prim = SourceMesh.Primitives[PrimIdx];
+                    if (Prim.Mode != 4 || Prim.Positions.Num() < 3) continue;
+                    const FResolvedPrimitiveSurface& Surface = Surfaces[PrimIdx];
+                    const bool bHasUV0 = !Prim.UVs.IsEmpty() && Prim.UVs[0].Num() == Prim.Positions.Num();
+                    const bool bHasNormals = Prim.Normals.Num() == Prim.Positions.Num();
+                    const bool bIndexed = Prim.bHasIndices && Prim.Indices.Num() >= 3;
+                    const int32 TriCount = bIndexed ? (Prim.Indices.Num() / 3) : (Prim.Positions.Num() / 3);
+
+                    for (int32 Tri = 0; Tri < TriCount; ++Tri)
                     {
-                        continue;
-                    }
+                        const uint32 I0 = bIndexed ? Prim.Indices[Tri * 3 + 0] : static_cast<uint32>(Tri * 3 + 0);
+                        const uint32 I1 = bIndexed ? Prim.Indices[Tri * 3 + 1] : static_cast<uint32>(Tri * 3 + 1);
+                        const uint32 I2 = bIndexed ? Prim.Indices[Tri * 3 + 2] : static_cast<uint32>(Tri * 3 + 2);
+                        if (I0 >= static_cast<uint32>(Prim.Positions.Num())
+                            || I1 >= static_cast<uint32>(Prim.Positions.Num())
+                            || I2 >= static_cast<uint32>(Prim.Positions.Num()))
+                        {
+                            continue;
+                        }
 
-                    const auto XformPos = [PrimXform, &Center](const FVector3f& Raw) -> FVector3f
-                    {
-                        const FVector3f P = PrimXform
-                            ? FVector3f(PrimXform->TransformPosition(FVector(Raw)))
-                            : Raw;
-                        return P - Center;
-                    };
-                    const FVector3f P0 = XformPos(Prim.Positions[I0]);
-                    const FVector3f P1 = XformPos(Prim.Positions[I1]);
-                    const FVector3f P2 = XformPos(Prim.Positions[I2]);
+                        const auto XformPos = [PrimXform, &Center](const FVector3f& Raw) -> FVector3f
+                        {
+                            const FVector3f P = PrimXform
+                                ? FVector3f(PrimXform->TransformPosition(FVector(Raw)))
+                                : Raw;
+                            return P - Center;
+                        };
+                        const FVector3f P0 = XformPos(Prim.Positions[I0]);
+                        const FVector3f P1 = XformPos(Prim.Positions[I1]);
+                        const FVector3f P2 = XformPos(Prim.Positions[I2]);
 
-                    const auto Project = [&](const FVector3f& P) -> FVector3f
-                    {
-                        const float SX = (FVector3f::DotProduct(P, Right) * InvRadius * 0.5f + 0.5f) * (FrameRes - 1);
-                        const float SY = (-FVector3f::DotProduct(P, Up) * InvRadius * 0.5f + 0.5f) * (FrameRes - 1);
-                        const float SZ = FVector3f::DotProduct(P, Forward);
-                        return FVector3f(SX, SY, SZ);
-                    };
+                        const auto Project = [&](const FVector3f& P) -> FVector3f
+                        {
+                            // Map [-Radius, +Radius] cleanly onto [0, FrameRes] to match pixel-center sampling (PX + 0.5).
+                            const float SX = (FVector3f::DotProduct(P, Right) * InvRadius * 0.5f + 0.5f) * static_cast<float>(FrameRes);
+                            const float SY = (-FVector3f::DotProduct(P, Up) * InvRadius * 0.5f + 0.5f) * static_cast<float>(FrameRes);
+                            const float SZ = FVector3f::DotProduct(P, Forward);
+                            return FVector3f(SX, SY, SZ);
+                        };
 
-                    const FVector3f V0 = Project(P0);
-                    const FVector3f V1 = Project(P1);
-                    const FVector3f V2 = Project(P2);
+                        const FVector3f V0 = Project(P0);
+                        const FVector3f V1 = Project(P1);
+                        const FVector3f V2 = Project(P2);
 
-                    const float Area = (V1.X - V0.X) * (V2.Y - V0.Y) - (V2.X - V0.X) * (V1.Y - V0.Y);
-                    if (FMath::Abs(Area) < 1.0e-5f) continue;
-                    const float InvArea = 1.0f / Area;
+                        const float Area = (V1.X - V0.X) * (V2.Y - V0.Y) - (V2.X - V0.X) * (V1.Y - V0.Y);
+                        if (FMath::Abs(Area) < 1.0e-5f) continue;
+                        const float InvArea = 1.0f / Area;
 
-                    const int32 MinX = FMath::Clamp(FMath::FloorToInt(FMath::Min3(V0.X, V1.X, V2.X)), 0, FrameRes - 1);
-                    const int32 MaxX = FMath::Clamp(FMath::CeilToInt(FMath::Max3(V0.X, V1.X, V2.X)), 0, FrameRes - 1);
-                    const int32 MinY = FMath::Clamp(FMath::FloorToInt(FMath::Min3(V0.Y, V1.Y, V2.Y)), 0, FrameRes - 1);
-                    const int32 MaxY = FMath::Clamp(FMath::CeilToInt(FMath::Max3(V0.Y, V1.Y, V2.Y)), 0, FrameRes - 1);
+                        const int32 MinX = FMath::Clamp(FMath::FloorToInt(FMath::Min3(V0.X, V1.X, V2.X)), 0, FrameRes - 1);
+                        const int32 MaxX = FMath::Clamp(FMath::CeilToInt(FMath::Max3(V0.X, V1.X, V2.X)), 0, FrameRes - 1);
+                        const int32 MinY = FMath::Clamp(FMath::FloorToInt(FMath::Min3(V0.Y, V1.Y, V2.Y)), 0, FrameRes - 1);
+                        const int32 MaxY = FMath::Clamp(FMath::CeilToInt(FMath::Max3(V0.Y, V1.Y, V2.Y)), 0, FrameRes - 1);
 
-                    FVector3f FaceNormal = FVector3f::CrossProduct(P1 - P0, P2 - P0).GetSafeNormal(1.0e-6f, Forward);
-                    const auto XformNorm = [PrimXform, &FaceNormal](const FVector3f& Raw) -> FVector3f
-                    {
-                        const FVector3f N = PrimXform
-                            ? FVector3f(PrimXform->TransformVectorNoScale(FVector(Raw)))
-                            : Raw;
-                        return N.GetSafeNormal(1.0e-6f, FaceNormal);
-                    };
-                    const FVector3f N0 = bHasNormals ? XformNorm(Prim.Normals[I0]) : FaceNormal;
-                    const FVector3f N1 = bHasNormals ? XformNorm(Prim.Normals[I1]) : FaceNormal;
-                    const FVector3f N2 = bHasNormals ? XformNorm(Prim.Normals[I2]) : FaceNormal;
+                        FVector3f FaceNormal = (FVector3f::CrossProduct(P1 - P0, P2 - P0) * NormalDetSign).GetSafeNormal(1.0e-6f, Forward);
+                        const auto XformNorm = [PrimXform, NormalDetSign, &FaceNormal](const FVector3f& Raw) -> FVector3f
+                        {
+                            const FVector3f N = PrimXform
+                                ? FVector3f(PrimXform->TransformVectorNoScale(FVector(Raw))) * NormalDetSign
+                                : Raw;
+                            return N.GetSafeNormal(1.0e-6f, FaceNormal);
+                        };
+                        const FVector3f N0 = bHasNormals ? XformNorm(Prim.Normals[I0]) : FaceNormal;
+                        const FVector3f N1 = bHasNormals ? XformNorm(Prim.Normals[I1]) : FaceNormal;
+                        const FVector3f N2 = bHasNormals ? XformNorm(Prim.Normals[I2]) : FaceNormal;
 
                     const FVector2f UV0 = bHasUV0 ? Prim.UVs[0][I0] : FVector2f::ZeroVector;
                     const FVector2f UV1 = bHasUV0 ? Prim.UVs[0][I1] : FVector2f::ZeroVector;
@@ -352,6 +360,7 @@ namespace V3DImpostorPrivate
                         }
                     }
                 }
+            }
             }
             // 1-pixel alpha edge dilation prevents dark bilinear fringes along impostor silhouettes.
             for (int32 PY = 0; PY < FrameRes; ++PY)
@@ -558,10 +567,15 @@ bool V3DImpostor::Bake(
     // Count per-mesh instance frequency so unique buildings/low-poly structures stay on geometry LODs
     // while repeated props (trees, streetlights, poles) and foliage get lightweight impostors.
     TMap<FName, int32> InstanceCountByMesh;
+    TMap<FName, FVector3f> MaxScaleByMesh;
     InstanceCountByMesh.Reserve(Metadata.SceneData.MeshMap.Num());
+    MaxScaleByMesh.Reserve(Metadata.SceneData.MeshMap.Num());
     for (const TPair<FName, FModelNodeData>& NodePair : Metadata.SceneData.NodeMap)
     {
         ++InstanceCountByMesh.FindOrAdd(NodePair.Value.MeshName);
+        const FVector3f NodeAbsScale(NodePair.Value.Transform.GetScale3D().GetAbs());
+        FVector3f& Tracked = MaxScaleByMesh.FindOrAdd(NodePair.Value.MeshName, FVector3f(0.0f));
+        Tracked = Tracked.ComponentMax(NodeAbsScale);
     }
 
     TArray<FGWorldBakedMesh> NewMeshes;
@@ -626,45 +640,58 @@ bool V3DImpostor::Bake(
             continue;
         }
 
-        // Compute tight bounding sphere from source vertices (honoring per-primitive AdditionalTransforms).
-        const bool bHasPrimTransforms = SourceMesh.AdditionalTransforms.Num() == SourceMesh.Primitives.Num();
+        // Compute tight bounding sphere from source vertices (honoring all AdditionalTransforms).
+        const int32 BoundsXformCount = SourceMesh.AdditionalTransforms.IsEmpty() ? 1 : SourceMesh.AdditionalTransforms.Num();
         FBox3f Bounds(ForceInit);
         int32 VertexCount = 0;
-        for (int32 PrimIdx = 0; PrimIdx < SourceMesh.Primitives.Num(); ++PrimIdx)
+        for (int32 XformIdx = 0; XformIdx < BoundsXformCount; ++XformIdx)
         {
-            const FGWorldBakedPrimitive& Prim = SourceMesh.Primitives[PrimIdx];
-            const FTransform* PrimXform = bHasPrimTransforms ? &SourceMesh.AdditionalTransforms[PrimIdx] : nullptr;
-            for (const FVector3f& RawPos : Prim.Positions)
+            const FTransform* PrimXform = SourceMesh.AdditionalTransforms.IsEmpty()
+                ? nullptr : &SourceMesh.AdditionalTransforms[XformIdx];
+            for (int32 PrimIdx = 0; PrimIdx < SourceMesh.Primitives.Num(); ++PrimIdx)
             {
-                const FVector3f Pos = PrimXform
-                    ? FVector3f(PrimXform->TransformPosition(FVector(RawPos)))
-                    : RawPos;
-                if (!FMath::IsFinite(Pos.X) || !FMath::IsFinite(Pos.Y) || !FMath::IsFinite(Pos.Z)) continue;
-                Bounds += Pos;
-                ++VertexCount;
+                const FGWorldBakedPrimitive& Prim = SourceMesh.Primitives[PrimIdx];
+                for (const FVector3f& RawPos : Prim.Positions)
+                {
+                    const FVector3f Pos = PrimXform
+                        ? FVector3f(PrimXform->TransformPosition(FVector(RawPos)))
+                        : RawPos;
+                    if (!FMath::IsFinite(Pos.X) || !FMath::IsFinite(Pos.Y) || !FMath::IsFinite(Pos.Z)) continue;
+                    Bounds += Pos;
+                    ++VertexCount;
+                }
             }
         }
         if (VertexCount < 3 || !Bounds.IsValid) continue;
 
-        const FVector3f BoxSize = Bounds.GetSize();
-        const float MaxAxis = BoxSize.GetMax();
-        const float MinAxis = FMath::Max(BoxSize.GetMin(), 1.0f);
-        // Skip ultra-flat/elongated slabs (roads, walls, ground sheets) that distort as spherical billboards.
-        if (MaxAxis / MinAxis > 12.0f) continue;
+        const FVector3f MaxNodeScale = MaxScaleByMesh.FindRef(Pair.Key);
+        const FVector3f SafeScale(
+            MaxNodeScale.X > 1.0e-4f ? MaxNodeScale.X : 1.0f,
+            MaxNodeScale.Y > 1.0e-4f ? MaxNodeScale.Y : 1.0f,
+            MaxNodeScale.Z > 1.0e-4f ? MaxNodeScale.Z : 1.0f);
+        const FVector3f EffectiveWorldSize = Bounds.GetSize() * SafeScale;
+        const float MaxAxis = EffectiveWorldSize.GetMax();
+        const float MinAxis = FMath::Max(EffectiveWorldSize.GetMin(), 1.0f);
+        // Skip ultra-flat/elongated slabs or microscopic scaled props using actual world-scaled dimensions.
+        if (MaxAxis < 10.0f || MaxAxis / MinAxis > 12.0f) continue;
 
         const FVector3f Center = Bounds.GetCenter();
         float RadiusSq = 0.0f;
-        for (int32 PrimIdx = 0; PrimIdx < SourceMesh.Primitives.Num(); ++PrimIdx)
+        for (int32 XformIdx = 0; XformIdx < BoundsXformCount; ++XformIdx)
         {
-            const FGWorldBakedPrimitive& Prim = SourceMesh.Primitives[PrimIdx];
-            const FTransform* PrimXform = bHasPrimTransforms ? &SourceMesh.AdditionalTransforms[PrimIdx] : nullptr;
-            for (const FVector3f& RawPos : Prim.Positions)
+            const FTransform* PrimXform = SourceMesh.AdditionalTransforms.IsEmpty()
+                ? nullptr : &SourceMesh.AdditionalTransforms[XformIdx];
+            for (int32 PrimIdx = 0; PrimIdx < SourceMesh.Primitives.Num(); ++PrimIdx)
             {
-                const FVector3f Pos = PrimXform
-                    ? FVector3f(PrimXform->TransformPosition(FVector(RawPos)))
-                    : RawPos;
-                if (!FMath::IsFinite(Pos.X) || !FMath::IsFinite(Pos.Y) || !FMath::IsFinite(Pos.Z)) continue;
-                RadiusSq = FMath::Max(RadiusSq, FVector3f::DistSquared(Pos, Center));
+                const FGWorldBakedPrimitive& Prim = SourceMesh.Primitives[PrimIdx];
+                for (const FVector3f& RawPos : Prim.Positions)
+                {
+                    const FVector3f Pos = PrimXform
+                        ? FVector3f(PrimXform->TransformPosition(FVector(RawPos)))
+                        : RawPos;
+                    if (!FMath::IsFinite(Pos.X) || !FMath::IsFinite(Pos.Y) || !FMath::IsFinite(Pos.Z)) continue;
+                    RadiusSq = FMath::Max(RadiusSq, FVector3f::DistSquared(Pos, Center));
+                }
             }
         }
         const float Radius = FMath::Sqrt(RadiusSq) * 1.02f;
